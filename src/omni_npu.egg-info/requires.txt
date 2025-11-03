@@ -1,0 +1,3 @@
+
+[npu]
+torch-npu

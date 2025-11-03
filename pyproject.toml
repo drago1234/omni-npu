@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-npu"
+version = "0.2.0"
+description = "vLLM NPU platform plugin and worker/modelrunner integration"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Omni NPU", email = "kkrazy0630@gmail.com" }]
+license = { text = "MIT" }
+keywords = ["npu", "vllm", "plugin", "torch_npu"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.optional-dependencies]
+npu = [
+  "torch-npu",
+]
+
+[project.urls]
+Homepage = "https://gitee.com/omniai/omninpu"
+
+[project.entry-points."vllm.platform_plugins"]
+omni-npu = "omni_npu.vllm_plugin:plugin"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["omni_npu*"]
