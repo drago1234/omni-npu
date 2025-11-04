@@ -3,6 +3,8 @@
 from typing import Optional, List, Callable, Tuple
 import os
 import torch
+import torch_npu
+import torchair
 from torch.library import Library
 from vllm.logger import init_logger
 import vllm.utils
@@ -141,3 +143,15 @@ class NPUPlatform(Platform):
             if use_mla
             else "omni_npu.attention.backends.attention.AscendAttentionBackend"
         )
+
+    @property
+    def simple_compile_backend(self):
+        """
+        The torch.compile backend for compiling simple and standalone functions.
+        NOTE: for the forward part of the model, vLLM has another separate
+        compilation strategy.
+        """
+        config = torchair.CompilerConfig()
+        config.mode = "reduce-overhead"
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        return npu_backend

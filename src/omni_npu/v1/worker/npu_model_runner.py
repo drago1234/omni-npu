@@ -17,45 +17,18 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
-import copy
-import gc
-import os
-import time
-from typing import TYPE_CHECKING, Dict, Optional, Union, Any, List
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 
-import numpy as np
 import torch
-import torch.distributed as dist
-from vllm.config import CompilationLevel, VllmConfig
-from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_world_size, get_dp_group, get_tensor_model_parallel_rank
-from vllm.logger import logger
-from vllm.model_executor.model_loader import get_model
-from vllm.sequence import IntermediateTensors, VLLM_INVALID_TOKEN_ID
-from vllm.utils import (DeviceMemoryProfiler, is_pin_memory_available,
-                        LayerBlockType, LazyLoader, cdiv)
-from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
-from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
-                                        KVCacheConfig, KVCacheSpec, MambaSpec)
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
-                             KVConnectorOutput,
-                             DraftTokenIds, LogprobsLists, LogprobsTensors,
-                             ModelRunnerOutput, PoolerOutput, SamplerOutput)
-from vllm.v1.worker.ubatch_splitting import (check_ubatch_thresholds,
-                                             ubatch_split)
-from vllm.v1.worker.utils import bind_kv_cache
-from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.v1.worker.block_table import BlockTable
-from vllm.v1.worker.gpu_model_runner import (AttentionGroup, GPUModelRunner,
-                                             PerLayerAttnMetadata)
-from vllm.v1.worker.ubatch_utils import UBatchSlice, UBatchSlices
-from vllm.v1.attention.backends.utils import (
-    AttentionCGSupport, AttentionMetadataBuilder, CommonAttentionMetadata,
-    create_fast_prefill_custom_backend,
-    reorder_batch_to_split_decodes_and_prefills, split_attn_metadata)
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.config import VllmConfig
+
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+)
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from omni_npu.v1.sample.sampler import AscendSamplerV1
 
 
 @contextmanager
@@ -72,18 +45,17 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         with switch_torch_device():
             super().__init__(vllm_config, device)
-        self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
-        self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
 
-    def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
-        super().may_reinitialize_input_batch(kv_cache_config)
-        self.input_batch.token_ids_cpu_tensor = torch.zeros(
-            (self.max_num_reqs, self.model_config.max_model_len),
-            device="cpu",
-            dtype=torch.int64,
-            pin_memory=False,
-        )
-        self.input_batch.token_ids_cpu = self.input_batch.token_ids_cpu_tensor.numpy()
+        # NOTE:(runze) query_lens and seq_lens arguments need to be int64 in FIA op,
+        # otherwise an implicit conversion would happen which might hurt performance.
+        self.query_start_loc = self._make_buffer(self.max_num_reqs + 1,
+                                                 dtype=torch.int64)
+        self.seq_lens = self._make_buffer(self.max_num_reqs,
+                                          dtype=torch.int64)
+
+        # FIXME(runze): reusing VLLM's sampler fails, this sampler class is from omni_infer.
+        # need to check why and try to remove it.
+        self.sampler = AscendSamplerV1()
 
     def _reshape_kv_cache_tensors(
         self,

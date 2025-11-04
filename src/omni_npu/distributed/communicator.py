@@ -34,12 +34,13 @@ class NPUCommunicator(DeviceCommunicatorBase):
         super().__init__(cpu_group, device, device_group, unique_name)
         self.dist_module = torch.distributed
 
-        # Validate platform to help early diagnostics
-        if not hasattr(torch, "npu"):
-            logger.warning("NPUCommunicator initialized without torch.npu present; operations may fail.")
-        else:
-            if not current_platform.is_custom() and getattr(current_platform, "device_type", "") != "npu":
-                logger.info("Forcing NPU communicator on non-NPU platform context.")
+        # FIXME(runze): error says `current_platform` is None here. Fix later
+        # # Validate platform to help early diagnostics
+        # if not hasattr(torch, "npu"):
+        #     logger.warning("NPUCommunicator initialized without torch.npu present; operations may fail.")
+        # else:
+        #     if not current_platform.is_custom() and getattr(current_platform, "device_type", "") != "npu":
+        #         logger.info("Forcing NPU communicator on non-NPU platform context.")
 
     # Collectives
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
