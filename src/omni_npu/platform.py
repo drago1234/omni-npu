@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Optional, List, Callable, Tuple
 import os
 import torch
+from torch.library import Library
 from vllm.logger import init_logger
-from vllm.utils import DEFAULT_MAX_NUM_BATCHED_TOKENS
+import vllm.utils
+from vllm.utils import DEFAULT_MAX_NUM_BATCHED_TOKENS, vllm_lib
 from vllm.platforms.interface import Platform, PlatformEnum
 
 logger = init_logger(__name__)
@@ -12,6 +14,41 @@ logger = init_logger(__name__)
 
 def ensure_v1_engine() -> None:
     return
+
+
+def ascend_direct_register_custom_op(
+        op_name: str,
+        op_func: Callable,
+        mutates_args: list[str] = None,
+        fake_impl: Optional[Callable] = None,
+        target_lib: Optional[Library] = None,
+        dispatch_key: str = "CUDA",
+        tags: Tuple[torch.Tag, ...] = (),
+):
+    # In pytorch 2.5.1, torch.library.infer_schema require the input function to
+    # have annotations supported by typing library. But in pytorch 2.7.0 which
+    # vllm using, torch.library.infer_schema require the python builtin type. In
+    # this case, we should revert built type to typing type for 2.5.1 backward
+    # compatibility.
+    for k, v in op_func.__annotations__.items():
+        if v == list[int]:
+            op_func.__annotations__[k] = List[int]
+        if v == Optional[list[int]]:
+            op_func.__annotations__[k] = Optional[List[int]]
+
+    if mutates_args is None:
+        mutates_args = []
+    import torch.library
+    schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    my_lib = target_lib or vllm_lib
+    my_lib.define(op_name + schema_str, tags=tags)
+    my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
+    if fake_impl is not None:
+        my_lib._register_fake(op_name, fake_impl)
+
+
+def update_utils_custom_op():
+    vllm.utils.direct_register_custom_op = ascend_direct_register_custom_op
 
 
 class NPUPlatform(Platform):
@@ -22,6 +59,11 @@ class NPUPlatform(Platform):
     ray_device_key: str = "NPU"
     dist_backend: str = "hccl"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+
+    def __init__(self):
+        """Initialize the NPU platform and configure environment."""
+        update_utils_custom_op()
+        super().__init__()
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
