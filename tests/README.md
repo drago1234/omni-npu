@@ -1,6 +1,8 @@
-# NPU Communicator Tests
+# omni-npu Test Suite
 
-This directory contains tests for the omni-npu package, separated into unit tests and integration tests.
+This directory contains comprehensive tests for the omni-npu package, separated into unit tests and integration tests.
+
+**Current Status:** NPUCommunicator tests implemented and serving as template for other components.
 
 ## Test Structure
 
@@ -12,16 +14,26 @@ Tests are organized to mirror the source code structure in `src/omni_npu/`.
 ```
 tests/unit/
 ├── __init__.py
-└── distributed/
-    ├── __init__.py
-    └── test_communicator.py    # Unit tests for NPUCommunicator
+├── distributed/
+│   ├── __init__.py
+│   └── test_communicator.py    # ✅ NPUCommunicator tests
+├── attention/                   # 🔲 TODO
+│   └── backends/
+├── v1/                          # 🔲 TODO
+│   ├── sample/
+│   └── worker/
+└── test_platform.py             # 🔲 TODO: NPUPlatform tests
 ```
 
-- Tests initialization with and without torch.npu
-- Tests all collective operations (all_reduce, all_gather, reduce_scatter, etc.)
-- Tests point-to-point operations (send, recv)
-- Tests edge cases and error handling
+**Currently Implemented:**
+- ✅ NPUCommunicator: Initialization, collective ops, point-to-point ops, edge cases
 - Uses mocks to avoid requiring actual NPU hardware
+
+**To Be Implemented:**
+- 🔲 NPUPlatform: Device management, memory operations
+- 🔲 Attention backends: Attention mechanisms, MLA
+- 🔲 NPU Worker & Model Runner: Batch processing, model execution
+- 🔲 Sampler: Sampling strategies
 
 ### Integration Tests (`tests/integration/`)
 **REQUIRE NPU hardware** - verify end-to-end functionality with real devices.
@@ -29,15 +41,22 @@ tests/unit/
 ```
 tests/integration/
 ├── __init__.py
-└── distributed/
-    ├── __init__.py
-    └── test_communicator.py    # Integration tests for NPUCommunicator
+├── distributed/
+│   ├── __init__.py
+│   └── test_communicator.py    # ✅ NPUCommunicator integration tests
+├── attention/                   # 🔲 TODO
+│   └── backends/
+└── v1/                          # 🔲 TODO
+    └── worker/
 ```
 
-- Tests NPU device availability and basic operations
-- Tests communicator initialization with real NPU
-- Tests multi-device distributed operations (requires torchrun)
+**Currently Implemented:**
+- ✅ NPUCommunicator: Device operations, multi-device communication (with torchrun)
 - Automatically skipped if NPU hardware is not available
+
+**To Be Implemented:**
+- 🔲 Attention backends: End-to-end attention with real NPU
+- 🔲 NPU Worker: End-to-end model inference workflows
 
 ## Running Tests
 

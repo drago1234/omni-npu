@@ -1,6 +1,8 @@
-# Quick Start - Testing NPUCommunicator
+# Quick Start - omni-npu Test Suite
 
 ## TL;DR
+
+**Current Status:** NPUCommunicator tests complete. Use as template for other components.
 
 ```bash
 # Install dependencies
@@ -48,16 +50,25 @@ tests/
 
 ## What Gets Tested
 
-### Unit Tests (20+ tests)
+### Currently Implemented (NPUCommunicator)
+
+**Unit Tests (20+ tests)**
 - ✅ Initialization with/without torch.npu
 - ✅ All collective operations (all_reduce, all_gather, etc.)
 - ✅ Point-to-point operations (send, recv)
 - ✅ Edge cases and error handling
 
-### Integration Tests (8+ tests)
+**Integration Tests (8+ tests)**
 - ✅ Real NPU device operations
 - ✅ Multi-device distributed communication
 - ✅ Memory management
+
+### To Be Implemented
+
+- 🔲 **NPUPlatform** - Device management, platform operations
+- 🔲 **Attention Backends** - Attention mechanisms, MLA
+- 🔲 **NPU Worker & Runner** - Model execution, batch processing
+- 🔲 **Sampler** - Sampling strategies
 
 ## Troubleshooting
 
