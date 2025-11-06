@@ -19,13 +19,13 @@ def ensure_v1_engine() -> None:
 
 
 def ascend_direct_register_custom_op(
-        op_name: str,
-        op_func: Callable,
-        mutates_args: list[str] = None,
-        fake_impl: Optional[Callable] = None,
-        target_lib: Optional[Library] = None,
-        dispatch_key: str = "CUDA",
-        tags: Tuple[torch.Tag, ...] = (),
+    op_name: str,
+    op_func: Callable,
+    mutates_args: list[str] = None,
+    fake_impl: Optional[Callable] = None,
+    target_lib: Optional[Library] = None,
+    dispatch_key: str = "CUDA",
+    tags: Tuple[torch.Tag, ...] = (),
 ):
     # In pytorch 2.5.1, torch.library.infer_schema require the input function to
     # have annotations supported by typing library. But in pytorch 2.7.0 which

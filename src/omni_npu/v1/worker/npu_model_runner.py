@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from omni_npu.v1.sample.sampler import AscendSamplerV1
+from omni_npu.layers import fused_moe
 
 
 @contextmanager

@@ -98,7 +98,7 @@ direct_register_custom_op(
 class AscendMetadata:
     num_actual_tokens: int
     block_tables: torch.Tensor
-    query_lens: torch.Tensor
+    query_cumlens: torch.Tensor
     seq_lens: torch.Tensor
     max_query_len: Optional[int] = None
     slot_mapping: torch.Tensor = None
@@ -130,7 +130,7 @@ class AscendAttentionMetadataBuilder(V1AttentionMetadataBuilder[AscendMetadata])
         slot_indices = torch.stack([slot_mapping // self.block_size, slot_mapping % self.block_size], dim=1)
         attn_metadata = AscendMetadata(num_actual_tokens=num_actual_tokens,
                                        block_tables=block_table,
-                                       query_lens=query_cumlens,
+                                       query_cumlens=query_cumlens,
                                        seq_lens=seq_lens,
                                        max_query_len=max_query_len,
                                        slot_mapping=slot_mapping,
@@ -242,15 +242,15 @@ class AscendAttentionBackendImpl(AttentionImpl[AscendMetadata]):
             )
 
     def forward(
-            self,
-            layer: AttentionLayer,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            kv_cache: Tuple,
-            attn_metadata: AscendMetadata,
-            output: Optional[torch.Tensor] = None,
-            trace_flag: bool = True,
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: Tuple,
+        attn_metadata: AscendMetadata,
+        output: Optional[torch.Tensor] = None,
+        trace_flag: bool = True,
     ) -> torch.Tensor:
         num_tokens = query.shape[0]
         if output is None:
@@ -293,7 +293,7 @@ class AscendAttentionBackendImpl(AttentionImpl[AscendMetadata]):
             block_size=block_size,
             sparse_mode=3,
             atten_mask=AscendAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
-            actual_seq_qlen=attn_metadata.query_lens,
+            actual_seq_qlen=attn_metadata.query_cumlens,
             actual_seq_kvlen=attn_metadata.seq_lens,
         )[0]
 
