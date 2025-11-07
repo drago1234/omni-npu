@@ -51,16 +51,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # FIXME(runze) For DSV2 Lite, there are 64 experts. Should read from config.
         max_num_deployed_expert = 64
 
-        if self.warm_up:
-            # This is forced balancing, the goal is to reduce peak memory
-            global_rank = get_world_group().rank_in_group
-            step = hidden_states.shape[0] * 8  # topk 8 expert
-            cur_topk_list = [
-                (i + global_rank // 1) % max_num_deployed_expert for i in range(
-                    global_rank // 1 * step, (global_rank // 1 + 1) * step)]
-            topk_ids = torch.Tensor(cur_topk_list).int().view(hidden_states.shape[0], -1).npu()
-        else:
-            topk_ids = topk_ids.int()
+        topk_ids = topk_ids.int()
 
         expert_range = [0, max_num_deployed_expert]
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
@@ -245,6 +236,7 @@ class AscendFusedMoE(FusedMoE):
         if self.quant_method is None:
             raise RuntimeError("self.quant_method must not be None")
 
+        shared_output = self.shared_experts(hidden_states)
         topk_weights, topk_ids, row_idx = AscendFusedMoE.select_experts(
             hidden_states,
             router_logits,
@@ -260,17 +252,32 @@ class AscendFusedMoE(FusedMoE):
         )
 
         # Matrix multiply.
-        final_hidden_states = self.quant_method.apply(
+        final_hidden_states_list = self.quant_method.apply(
             layer=self,
             x=hidden_states,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-        )[0]
+        )
+
+        final_hidden_states = final_hidden_states_list[0]
+        gathered_tokens = final_hidden_states_list[1]
+        expanded_row_idx = final_hidden_states_list[3]
+
+        final_hidden_states = torch_npu.npu_moe_finalize_routing(
+            gathered_tokens,
+            skip1=shared_output,
+            skip2=None,
+            bias=None,
+            scales=topk_weights.to(gathered_tokens.dtype),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=None,
+            drop_pad_mode=2
+        )
 
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = get_tp_group().all_reduce(final_hidden_states)
 
-        return final_hidden_states
+        return shared_output, final_hidden_states
 
     def weight_loader(
         self,
@@ -405,32 +412,38 @@ class AscendNonOverlapSharedFusedMoE(AscendFusedMoE):
     ):
         super().__init__(**kwargs)
         self._shared_experts = shared_experts
-        self.use_overlapped = False
+        self.use_overlapped = use_overlapped
 
     @property
     def shared_experts(self) -> Optional[torch.nn.Module]:
-        return None
+        return self._shared_experts if self.use_overlapped else None
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        shared_out = self._shared_experts(hidden_states)
+        if not self.use_overlapped:
+            shared_out = self._shared_experts(hidden_states)
 
-        # Reduce outputs if necessary, since the MLP should
-        # have been created with reduce_results=False.
-        if (
-            self.reduce_results
-            and self.tp_size > 1
-            and self.must_reduce_shared_expert_outputs()
-        ):
-            shared_out = tensor_model_parallel_all_reduce(shared_out)
+            # Reduce outputs if necessary, since the MLP should
+            # have been created with reduce_results=False.
+            if (
+                self.reduce_results
+                and self.tp_size > 1
+                and self.must_reduce_shared_expert_outputs()
+            ):
+                shared_out = tensor_model_parallel_all_reduce(shared_out)
 
-        fused_out = super().forward(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+            fused_out = super().forward(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+        else:
+            shared_out, fused_out = super().forward(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
         return shared_out, fused_out
 
 
