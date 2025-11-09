@@ -49,7 +49,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         hidden_states = x.view(-1, x.shape[-1])
         topk_weight = topk_weight.to(x.dtype)
         # FIXME(runze) For DSV2 Lite, there are 64 experts. Should read from config.
-        max_num_deployed_expert = 64
+        max_num_deployed_expert = self.moe.num_experts
 
         topk_ids = topk_ids.int()
 
@@ -159,7 +159,7 @@ class AscendFusedMoE(FusedMoE):
         attn_metadata = get_forward_context().attn_metadata
         # DeekSeekv2 uses grouped_top_k
         # adapt: When num_expert_group=1, it degenerates to fused_topk.
-        if use_grouped_topk:  # and num_expert_group != 1:
+        if use_grouped_topk and num_expert_group != 1:
             # adapt end.
             if topk_group is None:
                 raise ValueError(f"Unsupported topk_group is None")
@@ -265,7 +265,7 @@ class AscendFusedMoE(FusedMoE):
 
         final_hidden_states = torch_npu.npu_moe_finalize_routing(
             gathered_tokens,
-            skip1=shared_output,
+            skip1=None,
             skip2=None,
             bias=None,
             scales=topk_weights.to(gathered_tokens.dtype),
