@@ -48,9 +48,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def moe_infer_fusion(self, layer, x, topk_ids, topk_weight, w1, w2):
         hidden_states = x.view(-1, x.shape[-1])
         topk_weight = topk_weight.to(x.dtype)
-        # FIXME(runze) For DSV2 Lite, there are 64 experts. Should read from config.
         max_num_deployed_expert = self.moe.num_experts
-
         topk_ids = topk_ids.int()
 
         expert_range = [0, max_num_deployed_expert]
@@ -100,10 +98,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                                group_list_type=1)[0]
         intermediate_h = torch_npu.npu_swiglu(mm1_mm3)
         # gmm2: down
-        hidden_states_ordered_by_experts = torch_npu.npu_grouped_matmul([intermediate_h], [w2], bias=None,
-                                                                        group_list=group_list, split_item=3,
-                                                                        group_type=0,
-                                                                        group_list_type=1)[0]
+        hidden_states_ordered_by_experts = torch_npu.npu_grouped_matmul(
+            [intermediate_h],
+            [w2],
+            bias=None,
+            group_list=group_list,
+            split_item=3,
+            group_type=0,
+            group_list_type=1
+        )[0]
         new_x = torch.index_select(hidden_states_ordered_by_experts, 0,
                                    gathered_idxs_unsort.to(torch.float32).argsort().to(torch.int32))
         gathered_tokens = new_x.new_empty(*expanded_x.shape)
@@ -226,6 +229,11 @@ class AscendFusedMoE(FusedMoE):
                            expert_data=expert_data,
                            tp_rank=tp_rank)
 
+    def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
+        """With NPU all-to-all, there is no need to perform all-reduce on final hidden states.
+        """
+        return final_hidden_states
+
     def forward(self,
                 hidden_states: torch.Tensor,
                 router_logits: torch.Tensor,):
@@ -237,6 +245,10 @@ class AscendFusedMoE(FusedMoE):
             raise RuntimeError("self.quant_method must not be None")
 
         shared_output = self.shared_experts(hidden_states)
+        # NOTE(runze): `shared_experts` MLP has been created with
+        # reduce_results=False, so it's necessary to reduce here.
+        shared_output = tensor_model_parallel_all_reduce(shared_output)
+
         topk_weights, topk_ids, row_idx = AscendFusedMoE.select_experts(
             hidden_states,
             router_logits,
@@ -275,6 +287,8 @@ class AscendFusedMoE(FusedMoE):
         )
 
         if self.reduce_results and self.tp_size > 1:
+            # NOTE(runze): this branch should not be triggered because self.reduce_results is False
+            logger.error(f"Reduce should not be performed. Something may be wrong! {self.reduce_results=}.")
             final_hidden_states = get_tp_group().all_reduce(final_hidden_states)
 
         return shared_output, final_hidden_states
