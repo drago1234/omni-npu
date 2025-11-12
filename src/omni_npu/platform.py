@@ -93,6 +93,23 @@ class NPUPlatform(Platform):
         return torch.npu.mem_get_info()
 
     @classmethod
+    def pre_register_and_update(
+        cls, parser: Optional["FlexibleArgumentParser"] = None
+    ) -> None:
+        """
+        Do some pre-registration or update action for the current platform.
+
+        This function is called before global VllmConfig is initialized or cli
+        arguments are parsed. It's used for out-of-tree platforms to register or
+        update the configuration.
+
+        For example, the out-of-tree quantization config can be imported and
+        registered here dynamically.
+        """
+        from omni_npu.layers.fused_moe import layer
+        from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import AscendCompressedTensorsConfig
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:  # type: ignore[name-defined]
         # Minimal defaults to match vLLM expectations.
         parallel_config = vllm_config.parallel_config

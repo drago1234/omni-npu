@@ -20,13 +20,10 @@ from vllm.model_executor.custom_op import CustomOp
 logger = init_logger("vllm.omni_npu.layers.fused_moe.layer")
 
 
+@UnquantizedFusedMoEMethod.register_oot
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     LAST_SEQ_LEN = None
     BEST_EXPERT_TOKENS = None
-
-    def __init__(self, moe: FusedMoEConfig):
-        super().__init__(moe)
-        self.warm_up = True
 
     def apply(
         self,
@@ -41,8 +38,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                     topk_weights,
                                     layer.w13_weight,
                                     layer.w2_weight)
-        if self.warm_up:
-            self.warm_up = False
         return out
 
     def moe_infer_fusion(self, layer, x, topk_ids, topk_weight, w1, w2):
@@ -134,15 +129,6 @@ class AscendFusedMoE(FusedMoE):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-
-        self.quant_method = AscendUnquantizedFusedMoEMethod(self.moe_config)
-        self.quant_method.create_weights(
-            layer=self,
-            num_experts=self.local_num_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size_per_partition=self.intermediate_size_per_partition,
-            params_dtype=self.params_dtype,
-            weight_loader=self.weight_loader)
 
     @staticmethod
     def select_experts(
