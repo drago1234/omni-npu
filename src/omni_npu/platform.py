@@ -24,7 +24,7 @@ def ascend_direct_register_custom_op(
     mutates_args: list[str] = None,
     fake_impl: Optional[Callable] = None,
     target_lib: Optional[Library] = None,
-    dispatch_key: str = "CUDA",
+    dispatch_key: Optional[str] = None,
     tags: Tuple[torch.Tag, ...] = (),
 ):
     # In pytorch 2.5.1, torch.library.infer_schema require the input function to
@@ -40,6 +40,8 @@ def ascend_direct_register_custom_op(
 
     if mutates_args is None:
         mutates_args = []
+    if dispatch_key is None:
+        dispatch_key = NPUPlatform.dispatch_key
     import torch.library
     schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
     my_lib = target_lib or vllm_lib
@@ -106,7 +108,6 @@ class NPUPlatform(Platform):
         For example, the out-of-tree quantization config can be imported and
         registered here dynamically.
         """
-        from omni_npu.layers.fused_moe import layer
         from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import AscendCompressedTensorsConfig
 
     @classmethod
@@ -127,9 +128,6 @@ class NPUPlatform(Platform):
             )
             vllm_config.scheduler_config.enable_chunked_prefill = False
             vllm_config.scheduler_config.chunked_prefill_enabled = False
-            vllm_config.scheduler_config.max_num_batched_tokens = max(
-                vllm_config.scheduler_config.max_model_len, DEFAULT_MAX_NUM_BATCHED_TOKENS
-            )
 
     @classmethod
     def get_punica_wrapper(cls) -> str:

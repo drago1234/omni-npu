@@ -144,51 +144,52 @@ class AscendFusedMoE(FusedMoE):
         routed_scaling_factor: Optional[torch.Tensor] = None,
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ):
-        # For vllm v1, metadata is a dict {layer_name: metadata}
         attn_metadata = get_forward_context().attn_metadata
-        # DeekSeekv2 uses grouped_top_k
-        # adapt: When num_expert_group=1, it degenerates to fused_topk.
+        if attn_metadata is None:
+            # profile run, force load balance
+            ep_rank = get_ep_group().rank
+            global_num_experts = router_logits.shape[1]
+            num_tokens = router_logits.shape[0]
+            topk_ids = torch.arange(
+                ep_rank * num_tokens * top_k,
+                (ep_rank+1) * num_tokens * top_k,
+                dtype=torch.int32,
+                device=router_logits.device,
+            ).view(num_tokens, top_k) % global_num_experts
+            topk_weights = torch.rand_like(topk_ids)
+            row_idx = torch.arange(topk_ids.numel(),
+                                   device=topk_ids.device,
+                                   dtype=torch.int32) \
+                            .view(-1, num_tokens) \
+                            .transpose(0, 1)
+            return topk_weights, topk_ids, row_idx
+
         if use_grouped_topk and num_expert_group != 1:
-            # adapt end.
             if topk_group is None:
                 raise ValueError(f"Unsupported topk_group is None")
             if num_expert_group is None:
                 raise ValueError(f"Unsupported num_expert_group is None")
-
-            if e_score_correction_bias is None and attn_metadata is None:
-                topk_weights, topk_ids, row_idx = grouped_topk(
-                    hidden_states=hidden_states,
-                    gating_output=router_logits,
-                    topk=top_k,
-                    renormalize=renormalize,
-                    num_expert_group=num_expert_group,
-                    topk_group=topk_group,
-                    scoring_func=scoring_func,
-                    e_score_correction_bias=e_score_correction_bias
-                )
-                topk_weights = topk_weights * routed_scaling_factor
-            else:
-                topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
-                    router_logits.float(),
-                    k=top_k,  # topk is currently 8
-                    bias=e_score_correction_bias,  # float32
-                    k_group=topk_group,  # fix: 4
-                    group_count=num_expert_group,  # fix 8
-                    group_select_mode=1,  # 0: maximum in group; 1: topk2.sum(fix)
-                    renorm=0,  # 0: softmax->topk(fix); 1: topk->softmax
-                    norm_type=1,  # 0: softmax; 1: sigmoid(fix)
-                    routed_scaling_factor=routed_scaling_factor,
-                    eps=float(1e-20)
-                )
+            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+                router_logits.float(),
+                k=top_k,
+                bias=e_score_correction_bias,
+                k_group=topk_group,
+                group_count=num_expert_group,
+                group_select_mode=1,
+                renorm=0,
+                norm_type=1,
+                routed_scaling_factor=routed_scaling_factor,
+                eps=1e-20,
+            )
             row_idx = torch.arange(topk_ids.numel(),
                                    device=current_platform.device_type,
                                    dtype=torch.int32) \
                             .view(-1, router_logits.shape[0]) \
                             .transpose(0, 1)
         elif custom_routing_function is None:
-            topk_weights, topk_ids, row_idx = fused_topk(gating_output=router_logits,
-                                                         topk=top_k,
-                                                         renormalize=renormalize)
+            topk_weights, topk_ids, row_idx = torch_npu.npu_moe_gating_top_k_softmax(router_logits, k=top_k)
+            if renormalize:
+                topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
         else:
             topk_weights, topk_ids, row_idx = custom_routing_function(
                 hidden_states=hidden_states,

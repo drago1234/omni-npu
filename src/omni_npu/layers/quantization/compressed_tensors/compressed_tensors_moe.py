@@ -34,7 +34,6 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self.warm_up = True
         self.n_routed_experts = None
         self.smooth_scale = None
-        logger.warning(f"Quant method AscendCompressedTensorsW8A8Int8MoEMethod is being used!!!")
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
         return int8_w8a8_moe_quant_config(
