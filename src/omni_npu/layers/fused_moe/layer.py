@@ -5,7 +5,7 @@ from typing import Optional, Callable
 import torch, torch_npu
 import torch.distributed as dist
 from vllm.logger import init_logger
-from vllm.distributed import get_world_group, get_ep_group, get_tp_group, tensor_model_parallel_all_reduce
+from vllm.distributed import get_ep_group, get_tp_group, tensor_model_parallel_all_reduce
 from vllm.platforms import current_platform
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.layer import (
@@ -236,6 +236,23 @@ class AscendFusedMoE(FusedMoE):
         # reduce_results=False, so it's necessary to reduce here.
         shared_output = tensor_model_parallel_all_reduce(shared_output)
 
+        # NOTE(runze): hidden_states are duplicated across TP ranks.
+        # Deduplicate the tokens by splitting them equally. But first need to pad
+        # them to be divisible by TP size.
+        tp_size = get_tp_group().world_size
+        if tp_size > 1:
+            tp_rank = get_tp_group().rank
+            t_ori = hidden_states.shape[0]
+            t_pad = -(t_ori // -tp_size) * tp_size
+            t_local = t_pad // tp_size
+            num_pads = t_pad - t_ori
+            # pad
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, num_pads), value=0)
+            router_logits = torch.nn.functional.pad(router_logits, (0, 0, 0, num_pads), value=0)
+            # deduplicate
+            hidden_states = hidden_states[tp_rank*t_local:(tp_rank+1)*t_local]
+            router_logits = router_logits[tp_rank*t_local:(tp_rank+1)*t_local]
+
         topk_weights, topk_ids, row_idx = AscendFusedMoE.select_experts(
             hidden_states,
             router_logits,
@@ -277,6 +294,9 @@ class AscendFusedMoE(FusedMoE):
             # NOTE(runze): this branch should not be triggered because self.reduce_results is False
             logger.error(f"Reduce should not be performed. Something may be wrong! {self.reduce_results=}.")
             final_hidden_states = get_tp_group().all_reduce(final_hidden_states)
+
+        if tp_size > 1:
+            final_hidden_states = get_tp_group().all_gather(final_hidden_states, dim=0)[:t_ori]
 
         return shared_output, final_hidden_states
 
