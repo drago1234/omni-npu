@@ -17,10 +17,10 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, CUDAGraphMode
 
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -30,8 +30,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from omni_npu.v1.sample.sampler import AscendSamplerV1
 from omni_npu.layers import fused_moe
-
-
+from vllm.logger import logger
+from vllm.utils import DeviceMemoryProfiler
+from vllm.model_executor.model_loader import get_model
+from omni_npu.compilation.acl_graph import (ACLGraphWrapper,
+                                               set_graph_params,
+)
+from typing import Optional
+from dataclasses import dataclass
 @contextmanager
 def switch_torch_device():
     origin_cuda = torch.cuda
@@ -40,6 +46,10 @@ def switch_torch_device():
         yield
     finally:
         torch.cuda = origin_cuda
+
+@dataclass
+class GraphCaptureContext:
+    stream: torch.npu.Stream
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -110,3 +120,30 @@ class NPUModelRunner(GPUModelRunner):
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         # TODO(tronzhang): error with event synchronize...
         return sampled_token_ids.tolist()
+
+    # Wrap original model with ACLGraphWrapper
+    def load_model(self) -> None:
+        logger.info("Starting to load model %s...", self.model_config.model)
+
+        with DeviceMemoryProfiler() as m:  # noqa: SIM117
+            self.model = get_model(vllm_config=self.vllm_config)
+            if self.lora_config:
+                self.model = self.load_lora_model(self.model, self.vllm_config,
+                                                  self.device)
+        logger.info("Loading model weights took %.4f GB",
+                    m.consumed_memory / float(2**30))
+
+        # wrap the model with full graph wrapper if needed.
+        logger.debug(f"<<< {self.compilation_config.cudagraph_mode.has_full_cudagraphs()=}")
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            self.update_stream: torch.npu.Stream = torch.npu.Stream()
+            set_graph_params(self.compilation_config.cudagraph_capture_sizes)
+            self.model = ACLGraphWrapper(self.model,
+                                         self.vllm_config,
+                                         runtime_mode=CUDAGraphMode.FULL)
+            logger.debug("<<< Wrapped original model with ACLGraphWrapper")
+
+    def capture_model(self) -> int:
+        logger.debug("<<< Capturing model in npu_model_runner")
+        with switch_torch_device():
+            super().capture_model()

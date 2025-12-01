@@ -56,7 +56,7 @@ def update_utils_custom_op():
 
 
 class NPUPlatform(Platform):
-    _enum = PlatformEnum.OOT
+    _enum = PlatformEnum.HUAWEI_NPU
     device_name: str = "npu"
     device_type: str = "npu"
     dispatch_key: str = "PrivateUse1"
@@ -161,12 +161,18 @@ class NPUPlatform(Platform):
 
     @property
     def simple_compile_backend(self):
+        return "eager"
+
+    @classmethod
+    def support_static_graph_mode(cls) -> bool:
         """
-        The torch.compile backend for compiling simple and standalone functions.
-        NOTE: for the forward part of the model, vLLM has another separate
-        compilation strategy.
+        Returns if the graph mode is supported by the current platform.
         """
-        config = torchair.CompilerConfig()
-        config.mode = "reduce-overhead"
-        npu_backend = torchair.get_npu_backend(compiler_config=config)
-        return npu_backend
+        return True
+
+    @classmethod
+    def get_static_graph_wrapper_cls(cls) -> str:
+        """
+        Get piecewise backend class for piecewise graph.
+        """
+        return "omni_npu.compilation.acl_graph.ACLGraphWrapper"

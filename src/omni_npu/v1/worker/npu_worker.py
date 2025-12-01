@@ -147,11 +147,11 @@ class NPUWorker(WorkerBase):
         return None
 
     def compile_or_warm_up_model(self) -> None:
-        # Optional: call capture/compile path if supported in shim
-        try:
-            self.model_runner.capture_model()
-        except Exception:
-            pass
+        if not self.model_config.enforce_eager:
+            try:
+                self.model_runner.capture_model()
+            except Exception:
+                logger.debug("<<< Capture_model failed.")
         set_random_seed(self.model_config.seed)
 
     def get_model(self):

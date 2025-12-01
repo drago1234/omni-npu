@@ -111,8 +111,8 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
     ) -> AscendMLADecodeMetadata:
         return AscendMLADecodeMetadata(
             block_table=block_table_tensor,
-            seq_lens=seq_lens_device,
-            query_cumlens=query_start_loc_device[1:],
+            seq_lens=seq_lens_device.tolist(),
+            query_cumlens=query_start_loc_device[1:].tolist(),
         )
 
     def build(
@@ -122,6 +122,8 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         fast_build: bool = False,
     ) -> AscendMLAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if metadata.prefill is not None:
+            metadata.prefill.query_start_loc = metadata.prefill.query_start_loc.tolist()
         if metadata.prefill is not None and metadata.prefill.chunked_context is not None:
             raise RuntimeError(f"Chunked prefill is not enabled yet.")
         return metadata
@@ -188,19 +190,12 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         x = x.view(self.num_heads, -1, self.kv_lora_rank)
-        # Convert from (B, N * V) to (N, B, V)
-        out = out.view(-1, self.num_heads, self.v_head_dim).transpose(0, 1)
 
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
-        torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
-
-        # Convert from (N, B, V) to (B, N * V)
-        out_new = out.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
-
-        # Adjust output buffer shape back to the original (B, N * V)
-        N, B, V = out.shape
-        out.resize_((B, N * V))
+        out2 = torch.bmm(x, self.W_UV)
+        out_new = out2.transpose(0, 1).contiguous().view(-1, self.num_heads * self.v_head_dim)
         out.copy_(out_new)  # Copy result
+
 
     def _forward_prefill(
         self,
@@ -246,18 +241,20 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert attn_metadata.decode is not None
 
+        ## TODO: TND_NTD layout bug. Currently use BSND.
         # output shape: (N, B, L)
         o = torch.ops.npu.npu_fused_infer_attention_score(
-            decode_ql_nope, kv_cache[0], kv_cache[0], query_rope=decode_q_pe, key_rope=kv_cache[1],
+            decode_ql_nope.unsqueeze(1), kv_cache[0], kv_cache[0], query_rope=decode_q_pe.unsqueeze(1), key_rope=kv_cache[1],
             num_heads=self.num_heads,
-            num_key_value_heads=1, input_layout="TND_NTD",
+            num_key_value_heads=1, input_layout="BSND",
             scale=self.scale,
             antiquant_mode=0, antiquant_scale=None,
             block_table=attn_metadata.decode.block_table,
             block_size=128,
-            actual_seq_lengths=attn_metadata.decode.query_cumlens,
+            # actual_seq_lengths=attn_metadata.decode.query_cumlens,
             actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
         )[0]
+        o = o.squeeze(1).transpose(0, 1).contiguous()
 
         return o
 
@@ -310,10 +307,11 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
-        output = output[:num_actual_toks, ...]
-        q = q[:num_actual_toks, ...]
-        k_c_normed = k_c_normed[:num_actual_toks, ...]
-        k_pe = k_pe[:num_actual_toks, ...]
+        # logger.debug(f"<<< {output.shape=}, {q.shape=}, {k_c_normed.shape=}, {k_pe.shape=}")
+        # output = output[:num_actual_toks, ...]
+        # q = q[:num_actual_toks, ...]
+        # k_c_normed = k_c_normed[:num_actual_toks, ...]
+        # k_pe = k_pe[:num_actual_toks, ...]
 
         assert (
             attn_metadata.num_decodes is not None

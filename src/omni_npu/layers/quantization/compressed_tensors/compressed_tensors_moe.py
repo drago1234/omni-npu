@@ -16,7 +16,7 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSuppor
 
 from vllm.distributed import get_ep_group, GroupCoordinator, get_world_group
 
-from omni_npu.layers.fused_moe.layer import moe_infer_fusion, fused_experts
+from omni_npu.layers.fused_moe.layer import moe_infer_fusion, fused_experts, fused_experts_moe_dispatch_combine
 # from omni.layers.moe.fused_moe.fused_moe import (
 #     fused_experts_moe_dispatch_combine,
 #     moe_infer_fusion,
@@ -138,7 +138,7 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         ]
         self.smooth_scale = torch.ones((self.n_routed_experts, layer.w13_weight_scale.shape[-1] // 2),
                                        dtype=torch.float32, device=current_platform.device_type)
-        torch._dynamo.mark_static(self.smooth_scale)
+        # torch._dynamo.mark_static(self.smooth_scale)
 
     def apply(
         self,
@@ -152,9 +152,13 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor:
         max_num_deployed_expert_per_rank = self.n_routed_experts
         if self.moe.moe_parallel_config.use_ep:
-            is_prefill = attn_metadata is None or attn_metadata.prefill is not None
+            if attn_metadata is not None:
+                attn_metadata = attn_metadata[next(iter(attn_metadata))]
+            is_prefill = attn_metadata is None or getattr(attn_metadata, "prefill", None) is not None
             # if model_extra_config.operator_opt_config.prefill_moe_all_to_all or (model_extra_config.operator_opt_config.decode_moe_dispatch_combine and not is_prefill):
-            if True:
+            # NOTE: Force prefill and decode use dispatch_combine cuz sth. wrong
+            #  with a2a when compiling
+            if is_prefill:
                 out = moe_infer_fusion(
                     layer,
                     x,
@@ -163,6 +167,7 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                     comm_group=comm_group
                 )
             else:
+                # logger.warning(f"<<< running in fused_experts_moe_dispatch_combine")
                 out = fused_experts_moe_dispatch_combine(
                     layer,
                     x,
@@ -293,3 +298,30 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                                                       group_list_type=1, tuning_config=avg_tokens_per_expert)[0]
 
         return out_hidden
+
+    def moe_expert_quant_forward(self, layer, sorted_tokens, expert_tokens, act_dtype, dynamic_scale=None):
+        pertoken_scale = dynamic_scale
+
+        if layer.weight_num_bits == 8:
+            gate_up_proj = torch_npu.npu_grouped_matmul([sorted_tokens], [layer.w13_weight], bias=None, group_list=expert_tokens,
+                                            split_item=3, output_dtype=torch.int32, group_type=0, group_list_type=1)[0]
+
+            scale_2 = torch.ones((len(layer.w13_weight), layer.w13_weight_scale.shape[-1] // 2), dtype=torch.float32,
+                                device=current_platform.device_type)
+            gate_up_proj, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+                gate_up_proj, weight_scale=layer.w13_weight_scale, activation_scale=pertoken_scale, bias=None,
+                quant_scale=scale_2, quant_offset=None,
+                group_index=expert_tokens, activate_left=True, quant_mode=1)
+
+            w2_scale = layer.w2_weight_scale.to(torch.bfloat16)
+
+            out = torch_npu.npu_grouped_matmul([gate_up_proj], [layer.w2_weight], scale=[w2_scale],
+                                            per_token_scale=[pertoken_scale], bias=None,
+                                            group_list=expert_tokens, split_item=3, output_dtype=act_dtype,
+                                            group_type=0,
+                                            group_list_type=1)[0]
+            return out
+        elif layer.weight_num_bits == 4:  #NOTE(Zuo Yuqi) Lazy Implemention: INT4 Quantization is not supported now.
+            raise NotImplementedError(f"Unsupported INT4 compress tensor type.")
+        else:
+            raise NotImplementedError(f"Unsupported compress tensor type. num bits: {layer.weight_num_bits}")

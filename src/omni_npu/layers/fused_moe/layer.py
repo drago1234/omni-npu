@@ -5,7 +5,7 @@ from typing import Optional, Callable
 import torch, torch_npu
 import torch.distributed as dist
 from vllm.logger import init_logger
-from vllm.distributed import get_ep_group, get_tp_group, tensor_model_parallel_all_reduce, GroupCoordinator
+from vllm.distributed import get_world_group, get_ep_group, get_tp_group, get_pp_group, tensor_model_parallel_all_reduce, GroupCoordinator
 from vllm.platforms import current_platform
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.layer import (
@@ -75,6 +75,16 @@ class AscendFusedMoE(FusedMoE):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.moe_all_to_all_group = get_world_group().device_group
+        self.moe_all_to_all_group_name = self.moe_all_to_all_group._get_backend(
+                    torch.device("npu")).get_hccl_comm_name(
+                    get_world_group().rank_in_group)
+        
+        self.moe_rs_group = get_pp_group().device_group
+        self.moe_rs_group_rank = get_pp_group().rank_in_group
+        self.moe_rs_group_name = self.moe_rs_group._get_backend(
+                    torch.device("npu")).get_hccl_comm_name(
+                    self.moe_rs_group_rank)
 
     @staticmethod
     def select_experts(
@@ -216,6 +226,8 @@ class AscendFusedMoE(FusedMoE):
             routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias
         )
+        
+        attn_metadata = get_forward_context().attn_metadata
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -223,6 +235,7 @@ class AscendFusedMoE(FusedMoE):
             x=hidden_states,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            attn_metadata=attn_metadata,
         )
 
         if self.reduce_results and self.tp_size > 1:
@@ -582,3 +595,101 @@ def grouped_topk(
     # adapt end
 
     return topk_weights, topk_ids, row_idx
+
+def fused_experts_moe_dispatch_combine(layer: torch.nn.Module,
+                                            hidden_states: torch.Tensor,
+                                            topk_weights: torch.Tensor,
+                                            topk_ids: torch.Tensor,
+                                            max_num_deployed_expert: int,
+                                            is_prefill: bool,
+                                            is_route_expert: bool,
+                                            ):
+    expert_parallel_size = get_ep_group().world_size
+
+    if expert_parallel_size > 1:
+        # For vllm v1, metadata is a dict {layer_name: metadata}
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[next(iter(attn_metadata))]
+        # mc2_mask = attn_metadata.decode.mc2_mask if attn_metadata is not None and getattr(attn_metadata, "decode", None) is not None else None
+        mc2_mask = None # NOTE(Zuo Yuqi) Lazy Implemention
+        global_bs = 0
+        act_dtype = hidden_states.dtype
+        # route
+        shared_expert_rank_num = 0 # NOTE(Zuo Yuqi) Lazy Implemention
+        kwargs = {
+            "x": hidden_states,
+            "expert_ids": topk_ids,  # [n*topk]
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": shared_expert_rank_num,  # 32
+            "moe_expert_num": max_num_deployed_expert,  # ENABLE_OMNI_PLANNER, 0 redundancy 256, 1 redundancy expert 320
+            "global_bs": global_bs,  # 0 Default (all); all tokens can be set
+        }
+        experts_tp_size = layer.tp_size
+        world_size = get_world_group().world_size
+        # In fact, what we get is the die number, and the ep group is not adapted by default.
+        # The default ep group is experts_num/die_num.
+        global_rank = get_world_group().rank_in_group
+        all_to_all_group_size = world_size // experts_tp_size
+
+        ffn_dies = world_size
+
+        kwargs.update({
+            "scales": None,  # Quantization coefficient
+            "quant_mode": 2,  # 0: Non-quantization; 1: Static quantization; 2: Dynamic quantization, NOTE(Zuo Yuqi) Lazy Implemention: static quantization is not supported here.
+            "group_ep": layer.moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
+            "ep_world_size": all_to_all_group_size,
+            "ep_rank_id": global_rank // experts_tp_size,
+            "group_tp": layer.moe_rs_group_name,
+            "tp_world_size": experts_tp_size,
+            "tp_rank_id": global_rank % experts_tp_size,
+            "x_active_mask": mc2_mask,
+        })
+
+        output = torch_npu.npu_moe_distribute_dispatch_v2(**kwargs)
+        expand_x, dynamic_scale, expand_idx, expert_token_nums, ep_recv_counts = output[0:5]
+
+        if global_rank < ffn_dies:
+            group_list = expert_token_nums.to(torch.int64)
+
+            if shared_expert_rank_num > 0 and global_rank // experts_tp_size < shared_expert_rank_num:
+                x = {"x_int8": expand_x, "pertoken_scale": dynamic_scale}
+                hidden_states_experts = layer(x)
+            else:
+                # cal experts
+                group_list = group_list[
+                            :len(layer.w13_weight)]  # Adapt to redundant and non-redundant layers, #ENABLE_OMNI_PLANNER
+                hidden_states_experts = layer.quant_method.moe_expert_quant_forward(layer, expand_x, group_list, act_dtype, dynamic_scale)
+        else:
+            hidden_states = torch.zeros_like(expand_x).to(torch.bfloat16)
+            ep_recv_counts = torch.zeros_like(ep_recv_counts)
+
+        # moeCombine
+        kwargs = {
+            "expand_x": hidden_states_experts,
+            "expert_ids": topk_ids,  # [n*topk]
+            "assist_info_for_combine": expand_idx,
+            "expert_scales": topk_weights.to(torch.float32),  # weight [n*topk]
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": shared_expert_rank_num,
+            "moe_expert_num": max_num_deployed_expert,  # ENABLE_OMNI_PLANNER, 0 redundancy 256, 1 redundancy expert 320
+            "global_bs": global_bs,  # 0 Default (all); you can set all tokens
+        }
+        tp_recv_counts = output[5]
+        stage3_kwargs = {
+            "ep_send_counts": ep_recv_counts,  # dispatch's send_counts
+            "group_ep": layer.moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
+            "ep_world_size": all_to_all_group_size,
+            "ep_rank_id": global_rank // experts_tp_size,
+            "tp_send_counts": tp_recv_counts,
+            "group_tp": layer.moe_rs_group_name,
+            "tp_world_size": experts_tp_size,
+            "tp_rank_id": global_rank % experts_tp_size,
+            "x_active_mask": mc2_mask,
+        }
+        kwargs.update(stage3_kwargs)
+
+        hidden_states_route = torch_npu.npu_moe_distribute_combine_v2(**kwargs)
+    else:
+        raise ValueError("ep number should be greater than 1.")
+    return hidden_states_route
