@@ -56,7 +56,12 @@ def update_utils_custom_op():
 
 
 class NPUPlatform(Platform):
-    _enum = PlatformEnum.HUAWEI_NPU
+    try:
+        # In case vllm already defined HUAWEI_NPU platform
+        _enum = PlatformEnum.HUAWEI_NPU
+    except AttributeError:
+        # fallback to OOT
+        _enum = PlatformEnum.OOT
     device_name: str = "npu"
     device_type: str = "npu"
     dispatch_key: str = "PrivateUse1"

@@ -36,8 +36,7 @@ from vllm.model_executor.model_loader import get_model
 from omni_npu.compilation.acl_graph import (ACLGraphWrapper,
                                                set_graph_params,
 )
-from typing import Optional
-from dataclasses import dataclass
+
 @contextmanager
 def switch_torch_device():
     origin_cuda = torch.cuda
@@ -46,10 +45,6 @@ def switch_torch_device():
         yield
     finally:
         torch.cuda = origin_cuda
-
-@dataclass
-class GraphCaptureContext:
-    stream: torch.npu.Stream
 
 
 class NPUModelRunner(GPUModelRunner):

@@ -13,11 +13,12 @@ from vllm.platforms import current_platform
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
+from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 
 logger = init_logger(__name__)
 
 
-class NPUCommunicator(DeviceCommunicatorBase):
+class NPUCommunicator(CudaCommunicator):
     """
     Device communicator for Ascend NPU using torch.distributed with HCCL backend.
     This MVP implementation delegates collectives to torch.distributed and
