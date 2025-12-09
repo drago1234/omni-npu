@@ -3,16 +3,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import torch
 from torch.distributed import ProcessGroup
 
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.distributed.device_communicators.base_device_communicator import (
-    DeviceCommunicatorBase,
-)
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 
 logger = init_logger(__name__)
@@ -20,7 +16,7 @@ logger = init_logger(__name__)
 
 class NPUCommunicator(CudaCommunicator):
     """
-    Device communicator for Ascend NPU using torch.distributed with HCCL backend.
+    Device communicator for NPU using torch.distributed with HCCL backend.
     This MVP implementation delegates collectives to torch.distributed and
     follows the same semantics as CpuCommunicator where possible.
     """
@@ -41,6 +37,18 @@ class NPUCommunicator(CudaCommunicator):
                 "NPUCommunicator requires torch.npu to be available. "
                 "Please ensure torch_npu is properly installed."
             )
+
+    def prepare_communication_buffer_for_model(self, model: torch.nn.Module) -> None:
+        if not self.is_ep_communicator:
+            return
+
+        moe_modules = [
+            module for module in model.modules()
+            if module.__class__.__name__ in ["FusedMoE", "SharedFusedMoE", "NPUFusedMoE", "NPUSharedFusedMoE"]
+        ]
+        for module in moe_modules:
+            if hasattr(module, "quant_method") and hasattr(module.quant_method, "init_prepare_finalize"):
+                module.quant_method.init_prepare_finalize(module)
 
     # Collectives
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]

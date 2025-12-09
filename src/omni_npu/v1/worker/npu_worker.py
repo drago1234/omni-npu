@@ -1,10 +1,10 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import os
 from typing import Optional, Union
 
 import torch
-import torch.distributed
 import torch_npu
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -13,7 +13,6 @@ from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.tasks import SupportedTask
 from vllm.v1.outputs import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     DraftTokenIds,
     ModelRunnerOutput,
@@ -47,6 +46,7 @@ class NPUWorker(WorkerBase):
         device_config = self.device_config
         assert device_config.device_type == "npu"
         assert current_platform.device_type == "npu"
+        current_platform.pre_register_and_update()
 
         # Torch profiler (optional) using NPU activities if enabled via env
         if envs.VLLM_TORCH_PROFILER_DIR:
@@ -95,6 +95,7 @@ class NPUWorker(WorkerBase):
             from vllm.v1.utils import report_usage_stats
             report_usage_stats(self.vllm_config)
         self.profiler = self._init_profiler()
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profile to determine memory available for KV cache on NPU."""
@@ -184,7 +185,7 @@ class NPUWorker(WorkerBase):
     def pin_lora(self, lora_id: int) -> bool:
 
         return self.model_runner.pin_lora(lora_id)
-    
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",

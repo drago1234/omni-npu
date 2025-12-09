@@ -1,58 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional, List, Callable, Tuple
-import os
+from typing import Optional
 import torch
 import torch_npu
 import torchair
-from torch.library import Library
 from vllm.logger import init_logger
-import vllm.utils
-from vllm.utils import DEFAULT_MAX_NUM_BATCHED_TOKENS, vllm_lib
 from vllm.platforms.interface import Platform, PlatformEnum
 
 logger = init_logger(__name__)
-
-
-def ensure_v1_engine() -> None:
-    return
-
-
-def ascend_direct_register_custom_op(
-    op_name: str,
-    op_func: Callable,
-    mutates_args: list[str] = None,
-    fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None,
-    dispatch_key: Optional[str] = None,
-    tags: Tuple[torch.Tag, ...] = (),
-):
-    # In pytorch 2.5.1, torch.library.infer_schema require the input function to
-    # have annotations supported by typing library. But in pytorch 2.7.0 which
-    # vllm using, torch.library.infer_schema require the python builtin type. In
-    # this case, we should revert built type to typing type for 2.5.1 backward
-    # compatibility.
-    for k, v in op_func.__annotations__.items():
-        if v == list[int]:
-            op_func.__annotations__[k] = List[int]
-        if v == Optional[list[int]]:
-            op_func.__annotations__[k] = Optional[List[int]]
-
-    if mutates_args is None:
-        mutates_args = []
-    if dispatch_key is None:
-        dispatch_key = NPUPlatform.dispatch_key
-    import torch.library
-    schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
-    my_lib = target_lib or vllm_lib
-    my_lib.define(op_name + schema_str, tags=tags)
-    my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
-    if fake_impl is not None:
-        my_lib._register_fake(op_name, fake_impl)
-
-
-def update_utils_custom_op():
-    vllm.utils.direct_register_custom_op = ascend_direct_register_custom_op
 
 
 class NPUPlatform(Platform):
@@ -71,7 +26,6 @@ class NPUPlatform(Platform):
 
     def __init__(self):
         """Initialize the NPU platform and configure environment."""
-        update_utils_custom_op()
         super().__init__()
 
     @classmethod
@@ -113,7 +67,8 @@ class NPUPlatform(Platform):
         For example, the out-of-tree quantization config can be imported and
         registered here dynamically.
         """
-        from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import AscendCompressedTensorsConfig
+        from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import NPUCompressedTensorsConfig
+        import omni_npu.layers.fused_moe.layer
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:  # type: ignore[name-defined]
@@ -147,21 +102,20 @@ class NPUPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(
         cls,
-        selected_backend: str,
+        selected_backend: "_Backend",
         head_size: int,
         dtype: torch.dtype,
-        kv_cache_dtype: torch.dtype,
+        kv_cache_dtype: Optional[str],
         block_size: int,
         use_v1: bool,
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
     ) -> str:
-        ensure_v1_engine()
         return (
-            "omni_npu.attention.backends.mla.AscendMLABackend"
+            "omni_npu.attention.backends.mla.NPUMLABackend"
             if use_mla
-            else "omni_npu.attention.backends.attention.AscendAttentionBackend"
+            else "omni_npu.attention.backends.attention.NPUAttentionBackend"
         )
 
     @property

@@ -1,2 +1,0 @@
-[vllm.platform_plugins]
-omni-npu = omni_npu.vllm_plugin:plugin

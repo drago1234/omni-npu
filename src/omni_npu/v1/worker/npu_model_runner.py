@@ -1,44 +1,24 @@
-#
+# SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-# Copyright 2023 The vLLM team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# This file is a part of the vllm-ascend project.
-# Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
-#
-
-from contextlib import contextmanager, nullcontext
-
+from contextlib import contextmanager
 import torch
-from vllm.config import VllmConfig, CUDAGraphMode
-
+from vllm.config import (
+    CUDAGraphMode,
+    VllmConfig,
+)
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     MambaSpec,
 )
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.distributed.parallel_state import get_pp_group
-
-from omni_npu.v1.sample.sampler import AscendSamplerV1
-from omni_npu.v1.sample.rejection_sampler import AscendRejectionSampler
-from omni_npu.layers import fused_moe
 from vllm.logger import logger
-from vllm.utils import DeviceMemoryProfiler
-from vllm.model_executor.model_loader import get_model
-from omni_npu.compilation.acl_graph import (ACLGraphWrapper,
-                                               set_graph_params,
-)
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+from omni_npu.v1.sample.sampler import NPUSamplerV1
+from omni_npu.v1.sample.rejection_sampler import NPURejectionSampler
+from omni_npu.compilation.acl_graph import ACLGraphWrapper, set_graph_params
+
 
 @contextmanager
 def switch_torch_device():
@@ -64,10 +44,10 @@ class NPUModelRunner(GPUModelRunner):
 
         # FIXME(runze): reusing VLLM's sampler fails, this sampler class is from omni_infer.
         # need to check why and try to remove it.
-        self.sampler = AscendSamplerV1()
+        self.sampler = NPUSamplerV1()
 
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.rejection_sampler = AscendRejectionSampler()
+            self.rejection_sampler = NPURejectionSampler()
 
     def _reshape_kv_cache_tensors(
         self,
@@ -122,27 +102,20 @@ class NPUModelRunner(GPUModelRunner):
         # TODO(tronzhang): error with event synchronize...
         return sampled_token_ids.tolist()
 
-    # Wrap original model with ACLGraphWrapper
-    def load_model(self) -> None:
-        logger.info("Starting to load model %s...", self.model_config.model)
 
-        with DeviceMemoryProfiler() as m:  # noqa: SIM117
-            self.model = get_model(vllm_config=self.vllm_config)
-            if self.lora_config:
-                self.model = self.load_lora_model(self.model, self.vllm_config,
-                                                  self.device)
-            if hasattr(self, "drafter"):
-                logger.info("Loading drafter model...")
-                self.drafter.load_model(self.model)
-        logger.info("Loading model weights took %.4f GB",
-                    m.consumed_memory / float(2**30))
+    def load_model(self, eep_scale_up: bool = False) -> None:
+        """
+        Args:
+            eep_scale_up: the model loading is for elastic EP scale up.
+        """
+        super().load_model(eep_scale_up)
 
         # wrap the model with full graph wrapper if needed.
         logger.debug(f"<<< {self.compilation_config.cudagraph_mode.has_full_cudagraphs()=}")
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             set_graph_params(self.compilation_config.cudagraph_capture_sizes)
-            self.model = ACLGraphWrapper(self.model,
+            self.model = ACLGraphWrapper(self.model.runnable,
                                          self.vllm_config,
                                          runtime_mode=CUDAGraphMode.FULL)
             logger.debug("<<< Wrapped original model with ACLGraphWrapper")

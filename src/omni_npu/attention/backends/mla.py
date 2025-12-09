@@ -1,7 +1,7 @@
 """
-Minimal, self-contained Ascend MLA attention backend for omni_npu.
+Minimal, self-contained NPU MLA attention backend for omni_npu.
 
-This implementation currently delegates to the standard Ascend attention
+This implementation currently delegates to the standard NPU attention
 backend to remain fully self-contained and avoid external dependencies.
 It satisfies vLLM's backend interface so the platform selector can
 import and use it. We can iterate later with true MLA specialization.
@@ -29,22 +29,22 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger("vllm.omni_npu.attention.backends.mla")
 
 
-class AscendMLABackend(MLACommonBackend):
+class NPUMLABackend(MLACommonBackend):
     @staticmethod
     def get_name() -> str:
-        return "AscendMLA"
+        return "NPUMLA"
 
     @staticmethod
-    def get_metadata_cls() -> type["AscendMLAMetadata"]:
-        return AscendMLAMetadata
+    def get_metadata_cls() -> type["NPUMLAMetadata"]:
+        return NPUMLAMetadata
 
     @staticmethod
-    def get_builder_cls() -> type["AscendMLAMetadataBuilder"]:
-        return AscendMLAMetadataBuilder
+    def get_builder_cls() -> type["NPUMLAMetadataBuilder"]:
+        return NPUMLAMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> type["AscendMLAImpl"]:
-        return AscendMLAImpl
+    def get_impl_cls() -> type["NPUMLAImpl"]:
+        return NPUMLAImpl
 
     @staticmethod
     def reshape_kv_cache(
@@ -66,16 +66,16 @@ class AscendMLABackend(MLACommonBackend):
 
 
 @dataclass
-class AscendMLADecodeMetadata(MLACommonDecodeMetadata):
+class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
 
 
 @dataclass
-class AscendMLAMetadata(MLACommonMetadata[AscendMLADecodeMetadata]):
+class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
     pass
 
 
-class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
+class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_uniform_spec_as_decode: ClassVar[bool] = True
 
@@ -87,7 +87,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         device: torch.device,
     ):
         super().__init__(
-            kv_cache_spec, layer_names, vllm_config, device, AscendMLAMetadata
+            kv_cache_spec, layer_names, vllm_config, device, NPUMLAMetadata
         )
 
         if self._use_fi_prefill:
@@ -107,8 +107,8 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
-    ) -> AscendMLADecodeMetadata:
-        return AscendMLADecodeMetadata(
+    ) -> NPUMLADecodeMetadata:
+        return NPUMLADecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device.tolist(),
             query_cumlens=query_start_loc_device[1:].tolist(),
@@ -119,7 +119,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> AscendMLAMetadata:
+    ) -> NPUMLAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc = metadata.prefill.query_start_loc.tolist()
@@ -128,7 +128,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         return metadata
 
 
-class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
+class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
     can_return_lse_for_decode: bool = False
     SHARE_MASK_TRIL_SPARSE = None
 
@@ -170,7 +170,7 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
             raise NotImplementedError(
-                "AscendMLAImpl does not support one of the following: "
+                "NPUMLAImpl does not support one of the following: "
                 "alibi_slopes, sliding_window, logits_soft_cap"
             )
 
@@ -179,14 +179,14 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
                 "Encoder self-attention and "
                 "encoder/decoder cross-attention "
                 "are not implemented for "
-                "AscendMLAImpl"
+                "NPUMLAImpl"
             )
 
-        if AscendMLAImpl.SHARE_MASK_TRIL_SPARSE is None:
-            AscendMLAImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
+        if NPUMLAImpl.SHARE_MASK_TRIL_SPARSE is None:
+            NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
                 torch.ones((2048, 2048), dtype=torch.bool, device="npu")
             )
-            AscendMLAImpl.DECORE_ATTN_MASK = AscendMLAImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
+            NPUMLAImpl.DECORE_ATTN_MASK = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         x = x.view(self.num_heads, -1, self.kv_lora_rank)
@@ -203,7 +203,7 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: AscendMLAMetadata,
+        attn_metadata: NPUMLAMetadata,
         k_scale: torch.Tensor,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
@@ -222,7 +222,7 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
             num_heads=self.num_heads,
             num_key_value_heads=self.num_heads,
             input_layout="TND",
-            atten_mask=AscendMLAImpl.SHARE_MASK_TRIL_SPARSE,
+            atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
             sparse_mode=3,
             actual_seq_lengths=tnd_cumlens,
             actual_seq_lengths_kv=tnd_cumlens,
@@ -236,7 +236,7 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
         decode_ql_nope: torch.Tensor,
         decode_q_pe: torch.Tensor,
         kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: AscendMLAMetadata,
+        attn_metadata: NPUMLAMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert attn_metadata.decode is not None
@@ -244,7 +244,7 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
         T, N, D = decode_ql_nope.shape
         S = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
         if T > batch_size:
-            attn_mask = AscendMLAImpl.DECORE_ATTN_MASK
+            attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
             sparse_mode = 3
         else:
             assert T == batch_size
@@ -281,7 +281,7 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
         k_c_normed: torch.Tensor,  # key in unified attn
         k_pe: torch.Tensor,  # value in unified attn
         kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: AscendMLAMetadata,
+        attn_metadata: NPUMLAMetadata,
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         output_block_scale: Optional[torch.Tensor] = None,
@@ -290,7 +290,7 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
-                "fused output quantization is not yet supported for AscendMLAImpl"
+                "fused output quantization is not yet supported for NPUMLAImpl"
             )
 
         if attn_metadata is None:

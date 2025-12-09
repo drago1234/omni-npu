@@ -1,5 +1,5 @@
 """
-Ascend Attention backend vendored into omni_npu.attention.backends.
+NPU Attention backend vendored into omni_npu.attention.backends.
 
 This is a minimized, self-contained version derived from omniinfer sources,
 with the following adjustments:
@@ -41,14 +41,14 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 NZ_DIM = 16
 
 
-class AscendAttentionState(Enum):
+class NPUAttentionState(Enum):
     PrefillNoCache = 0
     PrefillCacheHit = 1
     DecodeOnly = 2
     ChunkedPrefill = 3
 
 
-def unified_ascend_attention_with_output(
+def unified_npu_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -86,8 +86,8 @@ def unified_attention_with_output_fake(
 
 
 direct_register_custom_op(
-    op_name="unified_ascend_attention_with_output",
-    op_func=unified_ascend_attention_with_output,
+    op_name="unified_npu_attention_with_output",
+    op_func=unified_npu_attention_with_output,
     mutates_args=["output"],
     fake_impl=unified_attention_with_output_fake,
     dispatch_key="PrivateUse1",
@@ -95,7 +95,7 @@ direct_register_custom_op(
 
 
 @dataclass
-class AscendMetadata:
+class NPUMetadata:
     num_actual_tokens: int
     block_tables: torch.Tensor
     query_cumlens: torch.Tensor
@@ -105,7 +105,7 @@ class AscendMetadata:
     slot_indices: torch.Tensor = None
 
 
-class AscendAttentionMetadataBuilder(V1AttentionMetadataBuilder[AscendMetadata]):
+class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -119,7 +119,7 @@ class AscendAttentionMetadataBuilder(V1AttentionMetadataBuilder[AscendMetadata])
     def build(self,
               common_prefix_len: int,
               common_attn_metadata: CommonAttentionMetadata,
-              fast_build: bool = False) -> AscendMetadata:
+              fast_build: bool = False) -> NPUMetadata:
 
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_cumlens = common_attn_metadata.query_start_loc[1:]
@@ -128,7 +128,7 @@ class AscendAttentionMetadataBuilder(V1AttentionMetadataBuilder[AscendMetadata])
         slot_mapping = common_attn_metadata.slot_mapping
         max_query_len = common_attn_metadata.max_query_len
         slot_indices = torch.stack([slot_mapping // self.block_size, slot_mapping % self.block_size], dim=1)
-        attn_metadata = AscendMetadata(num_actual_tokens=num_actual_tokens,
+        attn_metadata = NPUMetadata(num_actual_tokens=num_actual_tokens,
                                        block_tables=block_table,
                                        query_cumlens=query_cumlens,
                                        seq_lens=seq_lens,
@@ -138,7 +138,7 @@ class AscendAttentionMetadataBuilder(V1AttentionMetadataBuilder[AscendMetadata])
         return attn_metadata
 
 
-class AscendAttentionBackend(AttentionBackend):
+class NPUAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -147,19 +147,19 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "VLLM_ASCEND_ATTN"
+        return "VLLM_NPU_ATTN"
 
     @staticmethod
-    def get_impl_cls() -> type["AscendAttentionBackendImpl"]:
-        return AscendAttentionBackendImpl
+    def get_impl_cls() -> type["NPUAttentionBackendImpl"]:
+        return NPUAttentionBackendImpl
 
     @staticmethod
     def get_metadata_cls():
-        return AscendMetadata
+        return NPUMetadata
 
     @staticmethod
     def get_builder_cls():
-        return AscendAttentionMetadataBuilder
+        return NPUAttentionMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -182,7 +182,7 @@ class AscendAttentionBackend(AttentionBackend):
         dtype: torch.dtype = torch.bfloat16,
     ) -> Tuple[torch.Tensor, ...]:
         raw_tensor = raw_tensor.view(dtype=dtype)
-        shape = AscendAttentionBackend.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
+        shape = NPUAttentionBackend.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
         sizes = [math.prod(shape), ] * 2
         if raw_tensor.numel() != sum(sizes):
             raise RuntimeError(f"Raw tensor has {raw_tensor.numel()} elements, while"
@@ -191,7 +191,7 @@ class AscendAttentionBackend(AttentionBackend):
         return tuple(t.view(shape) for t in tensors)
 
 
-class AscendAttentionBackendImpl(AttentionImpl[AscendMetadata]):
+class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
     SHARE_MASK_TRIL_SPARSE = None
 
     def __init__(
@@ -236,8 +236,8 @@ class AscendAttentionBackendImpl(AttentionImpl[AscendMetadata]):
         except Exception:
             self.enable_graph_mode = False
 
-        if AscendAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE is None:
-            AscendAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
+        if NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE is None:
+            NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
                 torch.ones((2048, 2048), dtype=torch.bool, device="npu")
             )
 
@@ -248,7 +248,7 @@ class AscendAttentionBackendImpl(AttentionImpl[AscendMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: Tuple,
-        attn_metadata: AscendMetadata,
+        attn_metadata: NPUMetadata,
         output: Optional[torch.Tensor] = None,
         trace_flag: bool = True,
     ) -> torch.Tensor:
@@ -292,7 +292,7 @@ class AscendAttentionBackendImpl(AttentionImpl[AscendMetadata]):
             block_table=attn_metadata.block_tables,
             block_size=block_size,
             sparse_mode=3,
-            atten_mask=AscendAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
+            atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
             actual_seq_qlen=attn_metadata.query_cumlens,
             actual_seq_kvlen=attn_metadata.seq_lens,
         )[0]

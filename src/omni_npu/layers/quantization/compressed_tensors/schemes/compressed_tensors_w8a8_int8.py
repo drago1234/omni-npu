@@ -11,7 +11,7 @@ from vllm.model_executor.parameter import (ChannelQuantScaleParameter,
                                            PerTensorScaleParameter)
 
 
-class AscendCompressedTensorsW8A8Int8LinearMethod(CompressedTensorsScheme):
+class NPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
     _kernel_backends_being_used: set[str] = set()
 
     def __init__(

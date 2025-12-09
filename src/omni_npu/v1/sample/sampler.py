@@ -131,7 +131,7 @@ def generate_random_sequence(
     torch.npu.default_stream().wait_stream(stream)
     return q
 
-class AscendTopKTopPSamplerV1(TopKTopPSampler):
+class NPUTopKTopPSamplerV1(TopKTopPSampler):
     """
     Module that performs optional top-k and top-p filtering followed by
     weighted random sampling of logits.
@@ -190,10 +190,10 @@ def _apply_penalties_v1(logits: torch.Tensor, prompt_mask: torch.Tensor,
 
     return logits
 
-class AscendSamplerV1(SamplerV1):
+class NPUSamplerV1(SamplerV1):
     def __init__(self):
         super().__init__()
-        self.topk_topp_sampler = AscendTopKTopPSamplerV1()
+        self.topk_topp_sampler = NPUTopKTopPSamplerV1()
         self.penalty_cache = None
 
     def apply_penalties(
