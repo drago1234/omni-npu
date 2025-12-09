@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 import os
-from typing import Optional
+from typing import Callable, Optional
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 import torch_npu
 
@@ -14,7 +15,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEQuantConfig, int8_w8a8_moe_quant_config
 from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSupported
 
-from vllm.distributed import get_ep_group, GroupCoordinator, get_world_group
+from vllm.distributed import get_ep_group, GroupCoordinator, get_world_group, get_tensor_model_parallel_world_size
 
 from omni_npu.layers.fused_moe.layer import moe_infer_fusion, fused_experts, fused_experts_moe_dispatch_combine
 # from omni.layers.moe.fused_moe.fused_moe import (
@@ -38,13 +39,7 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self.smooth_scale = None
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
-        return int8_w8a8_moe_quant_config(
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            per_act_token_quant=True
-        )
+        return None
 
     def create_weights(
         self,
@@ -144,14 +139,61 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        pertoken_scale: Optional[torch.Tensor] = None,
-        attn_metadata: Optional[AttentionMetadata] = None,
-        comm_group: Optional[GroupCoordinator] = None
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        enable_eplb: bool = False,
+        expert_load_view: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         max_num_deployed_expert_per_rank = self.n_routed_experts
         if self.moe.moe_parallel_config.use_ep:
+
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size > 1:
+                from vllm.distributed import get_tp_group
+                tp_rank = get_tp_group().rank
+                t_ori = x.shape[0]
+                t_pad = -(t_ori // -tp_size) * tp_size
+                t_local = t_pad // tp_size
+                num_pads = t_pad - t_ori
+                # pad
+                x = F.pad(x, (0, 0, 0, num_pads), value=0)
+                router_logits = F.pad(router_logits, (0, 0, 0, num_pads), value=0)
+                # deduplicate
+                x = x[tp_rank * t_local:(tp_rank+1) * t_local]
+                router_logits = router_logits[tp_rank*t_local:(tp_rank+1)*t_local]
+
+                from omni_npu.layers.fused_moe.layer import AscendFusedMoE
+                topk_weights, topk_ids, row_idx = AscendFusedMoE.select_experts(
+                    x,
+                    router_logits,
+                    top_k=top_k,
+                    use_grouped_topk=use_grouped_topk,
+                    renormalize=renormalize,
+                    topk_group=topk_group,
+                    num_expert_group=num_expert_group,
+                    custom_routing_function=custom_routing_function,
+                    scoring_func=scoring_func,
+                    routed_scaling_factor=routed_scaling_factor,
+                    e_score_correction_bias=e_score_correction_bias
+                )
+
+            from vllm.forward_context import get_forward_context
+            attn_metadata=get_forward_context().attn_metadata
+
             if attn_metadata is not None:
                 attn_metadata = attn_metadata[next(iter(attn_metadata))]
             is_prefill = attn_metadata is None or getattr(attn_metadata, "prefill", None) is not None
@@ -164,8 +206,9 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                     x,
                     topk_ids,
                     topk_weights,
-                    comm_group=comm_group
+                    comm_group=None
                 )
+
             else:
                 # logger.warning(f"<<< running in fused_experts_moe_dispatch_combine")
                 out = fused_experts_moe_dispatch_combine(
@@ -177,6 +220,10 @@ class AscendCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
                     is_prefill=is_prefill,
                     is_route_expert=True,
                 )
+
+            if tp_size > 1:
+                out = get_tp_group().all_gather(out, dim=0)[:t_ori]
+                out /= get_tp_group().world_size
             # else:
             #     if os.getenv("ASCEND_PLATFORM", "A3") == "A2":
             #         out = fused_experts_allgather_ep_a2(layer=layer,

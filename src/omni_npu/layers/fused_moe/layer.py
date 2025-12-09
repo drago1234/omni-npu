@@ -15,57 +15,10 @@ from vllm.model_executor.layers.fused_moe.layer import (
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.shared_fused_moe import SharedFusedMoE
+
 
 logger = init_logger("vllm.omni_npu.layers.fused_moe.layer")
-
-
-@UnquantizedFusedMoEMethod.register_oot
-class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
-    LAST_SEQ_LEN = None
-    BEST_EXPERT_TOKENS = None
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.moe.moe_parallel_config.use_ep:
-            out = moe_infer_fusion(layer, x, topk_ids, topk_weights)
-        else:
-            out = fused_experts(layer, x, topk_ids, topk_weights)
-
-        return out
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = torch.nn.Parameter(layer.w13_weight.transpose(1, 2).contiguous(), requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(layer.w2_weight.transpose(1, 2).contiguous(), requires_grad=False)
-        self.n_routed_experts = len(layer.w13_weight)
-        self.local_expert_indices_offset = (
-            get_ep_group().rank_in_group * self.n_routed_experts
-        )
-        self.local_expert_indices = [
-            self.local_expert_indices_offset + i for i in range(self.n_routed_experts)
-        ]
-        self.initialized = True
-
-    def gmm_expert(self, layer, h, expert_tokens, dynamic_scale=None, avg_tokens_per_expert=None):
-        group_list_type = int(layer.moe_parallel_config.use_ep)
-        mm1_mm3 = torch_npu.npu_grouped_matmul([h], [layer.w13_weight],
-                                               group_list=expert_tokens, split_item=3, group_type=0,
-                                               group_list_type=group_list_type)[0]
-        intermediate_h = torch_npu.npu_swiglu(mm1_mm3)
-        out_hidden = torch_npu.npu_grouped_matmul(
-            [intermediate_h],
-            [layer.w2_weight],
-            bias=None,
-            group_list=expert_tokens,
-            split_item=3,
-            group_type=0,
-            group_list_type=group_list_type
-        )[0]
-        return out_hidden
 
 
 class AscendFusedMoE(FusedMoE):
@@ -75,16 +28,23 @@ class AscendFusedMoE(FusedMoE):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.moe_all_to_all_group = get_world_group().device_group
-        self.moe_all_to_all_group_name = self.moe_all_to_all_group._get_backend(
-                    torch.device("npu")).get_hccl_comm_name(
-                    get_world_group().rank_in_group)
-        
-        self.moe_rs_group = get_pp_group().device_group
-        self.moe_rs_group_rank = get_pp_group().rank_in_group
-        self.moe_rs_group_name = self.moe_rs_group._get_backend(
-                    torch.device("npu")).get_hccl_comm_name(
-                    self.moe_rs_group_rank)
+
+    def _load_per_channel_weight_scale(self, expert_data: torch.Tensor,
+                                       shard_dim: int, shard_id: str,
+                                       loaded_weight: torch.tensor,
+                                       tp_rank: int):
+        # adapt loaded_weight shape
+        loaded_weight = loaded_weight.squeeze(-1)
+        # adapt end
+        # for per channel weight quantization
+        if shard_id == "w2":
+            expert_data.copy_(loaded_weight)
+        elif shard_id in ("w1", "w3"):
+            self._load_w13(shard_id=shard_id,
+                           shard_dim=shard_dim,
+                           loaded_weight=loaded_weight,
+                           expert_data=expert_data,
+                           tp_rank=tp_rank)
 
     @staticmethod
     def select_experts(
@@ -155,265 +115,10 @@ class AscendFusedMoE(FusedMoE):
 
         return topk_weights, topk_ids, row_idx
 
-    def _load_per_channel_weight_scale(self, expert_data: torch.Tensor,
-                                       shard_dim: int, shard_id: str,
-                                       loaded_weight: torch.tensor,
-                                       tp_rank: int):
-        # adapt loaded_weight shape
-        loaded_weight = loaded_weight.squeeze(-1)
-        # adapt end
-        # for per channel weight quantization
-        if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
-        elif shard_id in ("w1", "w3"):
-            self._load_w13(shard_id=shard_id,
-                           shard_dim=shard_dim,
-                           loaded_weight=loaded_weight,
-                           expert_data=expert_data,
-                           tp_rank=tp_rank)
 
-    def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
-        """With NPU all-to-all, there is no need to perform all-reduce on final hidden states.
-        """
-        if self.moe_parallel_config.use_ep:
-            return final_hidden_states
-
-        return tensor_model_parallel_all_reduce(final_hidden_states)
-
-    def forward(self,
-                hidden_states: torch.Tensor,
-                router_logits: torch.Tensor,):
-                # topk_weights: torch.Tensor,
-                # topk_ids: torch.Tensor,
-                # pertoken_scale: torch.Tensor,
-                # comm_group: Optional[GroupCoordinator] = None):
-        if self.quant_method is None:
-            raise RuntimeError("self.quant_method must not be None")
-
-        shared_output = self.shared_experts(hidden_states)
-        # NOTE(runze): `shared_experts` MLP has been created with
-        # reduce_results=False, so it's necessary to reduce here.
-        if self.moe_parallel_config.use_ep:
-            shared_output = tensor_model_parallel_all_reduce(shared_output)
-
-        # NOTE(runze): hidden_states are duplicated across TP ranks.
-        # Deduplicate the tokens by splitting them equally. But first need to pad
-        # them to be divisible by TP size.
-        tp_size = get_tp_group().world_size  # attn tp size
-        if self.moe_parallel_config.use_ep and tp_size > 1:
-            tp_rank = get_tp_group().rank
-            t_ori = hidden_states.shape[0]
-            t_pad = -(t_ori // -tp_size) * tp_size
-            t_local = t_pad // tp_size
-            num_pads = t_pad - t_ori
-            # pad
-            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, num_pads), value=0)
-            router_logits = torch.nn.functional.pad(router_logits, (0, 0, 0, num_pads), value=0)
-            # deduplicate
-            hidden_states = hidden_states[tp_rank*t_local:(tp_rank+1)*t_local]
-            router_logits = router_logits[tp_rank*t_local:(tp_rank+1)*t_local]
-
-        topk_weights, topk_ids, row_idx = AscendFusedMoE.select_experts(
-            hidden_states,
-            router_logits,
-            top_k=self.top_k,
-            use_grouped_topk=self.use_grouped_topk,
-            renormalize=self.renormalize,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.e_score_correction_bias
-        )
-        
-        attn_metadata = get_forward_context().attn_metadata
-
-        # Matrix multiply.
-        final_hidden_states = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            attn_metadata=attn_metadata,
-        )
-
-        if self.reduce_results and self.tp_size > 1:
-            # NOTE(runze): this branch should not be triggered because self.reduce_results is False
-            logger.error(f"Reduce should not be performed. Something may be wrong! {self.reduce_results=}.")
-            final_hidden_states = get_tp_group().all_reduce(final_hidden_states)
-
-        if self.moe_parallel_config.use_ep and tp_size > 1:
-            final_hidden_states = get_tp_group().all_gather(final_hidden_states, dim=0)[:t_ori]
-
-        return shared_output, final_hidden_states
-
-    def weight_loader(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
-    ) -> None:
-        if self.ep_size > 1:
-            ep_rank = self.ep_rank
-            if expert_id < ep_rank * self.local_num_experts or expert_id >= (ep_rank + 1) * self.local_num_experts:
-                return False if return_success else None
-            tp_rank = 0
-            expert_id -= ep_rank * self.local_num_experts
-        else:
-            tp_rank = self.tp_rank
-        # compressed-tensors checkpoints with packed weights are stored flipped
-        loaded_weight = loaded_weight.t().contiguous() if (
-                self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod") else loaded_weight
-
-        if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(f"shard_id must be ['w1','w2','w3'] but "
-                             f"got {shard_id}.")
-
-        WEIGHT_SCALE_SUPPORTED = [
-            e.value for e in FusedMoeWeightScaleSupported
-        ]
-        # Fetch the dim to shard the parameter/loaded weight
-        # based on the shard id. This will be whatever
-        # dimension intermediate_size is used.
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
-
-        expert_data = param.data[expert_id]
-
-        # is_transposed: if the dim to shard the weight
-        # should be flipped. Required by GPTQ, compressed-tensors
-        # should be whatever dimension intermediate_size is
-        is_transposed = getattr(param, "is_transposed", False)
-        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if is_transposed:
-            shard_dim = ~shard_dim
-
-        # Case input scale: input_scale loading is only supported for fp8
-        if "input_scale" in weight_name:
-            # this is needed for compressed-tensors only
-            loaded_weight = loaded_weight.to(param.data.device)
-
-            if param.data[expert_id] != 1 and (param.data[expert_id] -
-                                               loaded_weight).abs() > 1e-5:
-                raise ValueError(
-                    "input_scales of w1 and w3 of a layer "
-                    f"must be equal. But got {param.data[expert_id]} "
-                    f"vs. {loaded_weight}")
-
-            self._load_single_value(param=param,
-                                    loaded_weight=loaded_weight,
-                                    expert_id=expert_id)
-            return True if return_success else None
-
-        # Case g_idx
-        if "g_idx" in weight_name:
-            self._load_g_idx(shard_dim=0,
-                             shard_id=shard_id,
-                             loaded_weight=loaded_weight,
-                             expert_data=expert_data,
-                             tp_rank=tp_rank)
-            return True if return_success else None
-
-        # Case weight scales and zero_points
-        if ("scale" in weight_name or "zero" in weight_name or "offset" in weight_name or "bias" in weight_name):
-            # load the weight scales and zp based on the quantization scheme
-            # supported weight scales/zp can be found in
-            # FusedMoeWeightScaleSupported
-            quant_method = getattr(param, "quant_method", None)
-            if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
-                if "int4_scale" in weight_name:
-                    shard_dim = 1
-                self._load_per_channel_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=tp_rank)
-            elif quant_method == FusedMoeWeightScaleSupported.GROUP.value:
-                shard_dim = 1
-                if "bias" in weight_name:
-                    shard_dim = 0
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=tp_rank)
-            elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
-                self._load_per_tensor_weight_scale(shard_id=shard_id,
-                                                   param=param,
-                                                   loaded_weight=loaded_weight,
-                                                   expert_id=expert_id)
-            else:
-                raise ValueError(
-                    f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}")
-            return True if return_success else None
-        # Case weight_shape
-        if "weight_shape" in weight_name:
-            # only required by compressed-tensors
-            self._load_single_value(param=param,
-                                    loaded_weight=loaded_weight,
-                                    expert_id=expert_id)
-            return True if return_success else None
-
-        # Case model weights
-        if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=tp_rank)
-            return True if return_success else None
-
-
-class AscendNonOverlapSharedFusedMoE(AscendFusedMoE):
-
-    def __init__(
-        self,
-        shared_experts: torch.nn.Module,
-        use_overlapped: bool = True,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self._shared_experts = shared_experts
-        self.use_overlapped = use_overlapped
-
-    @property
-    def shared_experts(self) -> Optional[torch.nn.Module]:
-        return self._shared_experts if self.use_overlapped else None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.use_overlapped:
-            shared_out = self._shared_experts(hidden_states)
-
-            # Reduce outputs if necessary, since the MLP should
-            # have been created with reduce_results=False.
-            if (
-                self.reduce_results
-                and self.tp_size > 1
-                and self.must_reduce_shared_expert_outputs()
-            ):
-                shared_out = tensor_model_parallel_all_reduce(shared_out)
-
-            fused_out = super().forward(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-            )
-        else:
-            shared_out, fused_out = super().forward(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-            )
-        return shared_out, fused_out
+@SharedFusedMoE.register_oot
+class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
+    pass
 
 
 def moe_infer_fusion(
@@ -534,68 +239,6 @@ def fused_experts(
     return torch_npu.npu_moe_finalize_routing(out, None, None, None, topk_weights,
                                               expanded_src_to_dst_row, topk_ids).to(torch.bfloat16)
 
-
-def fused_topk(
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-):
-    topk_weights, topk_ids, row_idx = torch_npu.npu_moe_gating_top_k_softmax(gating_output, k=topk)
-
-    if renormalize:
-        topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-
-    return topk_weights, topk_ids, row_idx
-
-
-def grouped_topk(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    num_expert_group: int = 0,
-    topk_group: int = 0,
-    scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None
-):
-    gating_output = gating_output.float()
-    # scores = torch.softmax(gating_output, dim=-1)
-    if scoring_func == "softmax":
-        scores = torch.softmax(gating_output, dim=-1)
-    elif scoring_func == "sigmoid":
-        scores = gating_output.sigmoid()
-    else:
-        raise ValueError(f"Unsupported scoring function: {scoring_func}")
-
-    if e_score_correction_bias is not None:
-        scores = scores + e_score_correction_bias.unsqueeze(0)
-    num_token = scores.shape[0]
-    group_scores = scores.view(num_token, num_expert_group,
-                               -1).max(dim=-1).values  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1,
-                           sorted=False)[1]  # [n, top_k_group]
-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-    score_mask = group_mask.unsqueeze(-1).expand(
-        num_token, num_expert_group,
-        scores.shape[-1] // num_expert_group).reshape(num_token, -1)  # [n, e]
-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
-    topk_weights, topk_ids = torch.topk(tmp_scores,
-                                        k=topk,
-                                        dim=-1,
-                                        sorted=False)
-
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-    topk_ids = topk_ids.int()
-    # adapt add row_idx
-    row_idx = torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=topk_ids.dtype)
-    row_idx = row_idx.reshape(topk_ids.shape[1], topk_ids.shape[0]).transpose(1, 0).contiguous()
-    # adapt end
-
-    return topk_weights, topk_ids, row_idx
-
 def fused_experts_moe_dispatch_combine(layer: torch.nn.Module,
                                             hidden_states: torch.Tensor,
                                             topk_weights: torch.Tensor,
@@ -634,13 +277,21 @@ def fused_experts_moe_dispatch_combine(layer: torch.nn.Module,
 
         ffn_dies = world_size
 
+        moe_all_to_all_group_name = get_world_group().device_group._get_backend(
+                    torch.device("npu")).get_hccl_comm_name(
+                    get_world_group().rank_in_group)
+
+        moe_rs_group_name = get_pp_group().device_group._get_backend(
+                    torch.device("npu")).get_hccl_comm_name(
+                    get_pp_group().rank_in_group)
+
         kwargs.update({
             "scales": None,  # Quantization coefficient
             "quant_mode": 2,  # 0: Non-quantization; 1: Static quantization; 2: Dynamic quantization, NOTE(Zuo Yuqi) Lazy Implemention: static quantization is not supported here.
-            "group_ep": layer.moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
+            "group_ep": moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
             "ep_world_size": all_to_all_group_size,
             "ep_rank_id": global_rank // experts_tp_size,
-            "group_tp": layer.moe_rs_group_name,
+            "group_tp": moe_rs_group_name,
             "tp_world_size": experts_tp_size,
             "tp_rank_id": global_rank % experts_tp_size,
             "x_active_mask": mc2_mask,
@@ -678,11 +329,11 @@ def fused_experts_moe_dispatch_combine(layer: torch.nn.Module,
         tp_recv_counts = output[5]
         stage3_kwargs = {
             "ep_send_counts": ep_recv_counts,  # dispatch's send_counts
-            "group_ep": layer.moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
+            "group_ep": moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
             "ep_world_size": all_to_all_group_size,
             "ep_rank_id": global_rank // experts_tp_size,
             "tp_send_counts": tp_recv_counts,
-            "group_tp": layer.moe_rs_group_name,
+            "group_tp": moe_rs_group_name,
             "tp_world_size": experts_tp_size,
             "tp_rank_id": global_rank % experts_tp_size,
             "x_active_mask": mc2_mask,
