@@ -225,6 +225,7 @@ class AscendSamplerV1(SamplerV1):
             logits: torch.Tensor,
             sampling_metadata: SamplingMetadata,
             update_penalty: Optional[bool] = True,
+            predict_bonus_token: bool = False,
     ) -> SamplerOutputV1:
         result = super().forward(logits, sampling_metadata)
         if self.penalty_cache is not None and update_penalty:

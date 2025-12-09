@@ -28,7 +28,10 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.distributed.parallel_state import get_pp_group
+
 from omni_npu.v1.sample.sampler import AscendSamplerV1
+from omni_npu.v1.sample.rejection_sampler import AscendRejectionSampler
 from omni_npu.layers import fused_moe
 from vllm.logger import logger
 from vllm.utils import DeviceMemoryProfiler
@@ -62,6 +65,9 @@ class NPUModelRunner(GPUModelRunner):
         # FIXME(runze): reusing VLLM's sampler fails, this sampler class is from omni_infer.
         # need to check why and try to remove it.
         self.sampler = AscendSamplerV1()
+
+        if self.speculative_config and get_pp_group().is_last_rank:
+            self.rejection_sampler = AscendRejectionSampler()
 
     def _reshape_kv_cache_tensors(
         self,
@@ -125,6 +131,9 @@ class NPUModelRunner(GPUModelRunner):
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config,
                                                   self.device)
+            if hasattr(self, "drafter"):
+                logger.info("Loading drafter model...")
+                self.drafter.load_model(self.model)
         logger.info("Loading model weights took %.4f GB",
                     m.consumed_memory / float(2**30))
 

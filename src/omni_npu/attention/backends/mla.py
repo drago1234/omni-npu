@@ -76,7 +76,8 @@ class AscendMLAMetadata(MLACommonMetadata[AscendMLADecodeMetadata]):
 
 
 class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
-    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_uniform_spec_as_decode: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -97,8 +98,6 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             raise ValueError("DCP should not be enabled.")
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
-        if self.reorder_batch_threshold != 1:
-            raise ValueError(f"reorder_batch_threshold should be 1, but got {self.reorder_batch_threshold}.")
 
     def _build_decode(
         self,
@@ -187,6 +186,7 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
             AscendMLAImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
                 torch.ones((2048, 2048), dtype=torch.bool, device="npu")
             )
+            AscendMLAImpl.DECORE_ATTN_MASK = AscendMLAImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         x = x.view(self.num_heads, -1, self.kv_lora_rank)
@@ -240,21 +240,37 @@ class AscendMLAImpl(MLACommonBaseImpl[AscendMLAMetadata]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert attn_metadata.decode is not None
+        batch_size = attn_metadata.decode.block_table.shape[0]
+        T, N, D = decode_ql_nope.shape
+        S = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
+        if T > batch_size:
+            attn_mask = AscendMLAImpl.DECORE_ATTN_MASK
+            sparse_mode = 3
+        else:
+            assert T == batch_size
+            attn_mask = None
+            sparse_mode = 0
 
         ## TODO: TND_NTD layout bug. Currently use BSND.
-        # output shape: (N, B, L)
+        # output shape: (B, S, N, D)
         o = torch.ops.npu.npu_fused_infer_attention_score(
-            decode_ql_nope.unsqueeze(1), kv_cache[0], kv_cache[0], query_rope=decode_q_pe.unsqueeze(1), key_rope=kv_cache[1],
+            decode_ql_nope.view(-1, S, N, D), kv_cache[0], kv_cache[0],
+            query_rope=decode_q_pe.view(-1, S, N, self.qk_rope_head_dim),
+            key_rope=kv_cache[1],
             num_heads=self.num_heads,
-            num_key_value_heads=1, input_layout="BSND",
+            num_key_value_heads=1,
+            input_layout="BSND",
             scale=self.scale,
-            antiquant_mode=0, antiquant_scale=None,
+            antiquant_mode=0,
+            antiquant_scale=None,
             block_table=attn_metadata.decode.block_table,
             block_size=128,
             # actual_seq_lengths=attn_metadata.decode.query_cumlens,
             actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
+            atten_mask=attn_mask,
+            sparse_mode=sparse_mode,
         )[0]
-        o = o.squeeze(1).transpose(0, 1).contiguous()
+        o = o.view(-1, N, D).transpose(0, 1).contiguous()
 
         return o
 
