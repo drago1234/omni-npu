@@ -69,6 +69,8 @@ class NPUPlatform(Platform):
         """
         from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import NPUCompressedTensorsConfig
         import omni_npu.layers.fused_moe.layer
+        from omni_npu.connector import register_connectors
+        register_connectors()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:  # type: ignore[name-defined]
