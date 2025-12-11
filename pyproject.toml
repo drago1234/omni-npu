@@ -33,6 +33,9 @@ Homepage = "https://gitee.com/omniai/omninpu"
 [project.entry-points."vllm.platform_plugins"]
 omni-npu = "omni_npu.vllm_plugin:plugin"
 
+[project.entry-points."vllm.general_plugins"]
+omni_npu_patches = "omni_npu.vllm_patches:apply_patches"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
