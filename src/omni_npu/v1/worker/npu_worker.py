@@ -46,25 +46,9 @@ class NPUWorker(WorkerBase):
         device_config = self.device_config
         assert device_config.device_type == "npu"
         assert current_platform.device_type == "npu"
+        self.profiler = None
         current_platform.pre_register_and_update()
 
-        # Torch profiler (optional) using NPU activities if enabled via env
-        if envs.VLLM_TORCH_PROFILER_DIR:
-            trace_dir = envs.VLLM_TORCH_PROFILER_DIR
-            logger.info("Profiling enabled. Traces will be saved to: %s", trace_dir)
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    getattr(torch.profiler.ProfilerActivity, "NPU", torch.profiler.ProfilerActivity.CPU),
-                ],
-                record_shapes=envs.VLLM_TORCH_PROFILER_RECORD_SHAPES,
-                profile_memory=envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
-                with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
-                with_flops=envs.VLLM_TORCH_PROFILER_WITH_FLOPS,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir, use_gzip=True),
-            )
-        else:
-            self.profiler = None
 
     def init_device(self):
         if self.device_config.device.type == "npu" and current_platform.device_type == "npu":
@@ -147,6 +131,17 @@ class NPUWorker(WorkerBase):
         # for NPU we don't need additional allocation here.
         return None
 
+    def profile(self, is_start: bool = True):
+        if self.profiler is None:
+            raise RuntimeError("Profiler is not enabled.")
+        if getattr(self, '_use_token_for_profile', False):
+            logger.info("origin profiler is disabled because PROFILER_TOKEN_THRESHOLD is set.")
+            return
+        if is_start:
+            self.profiler.start()
+        else:
+            self.profiler.stop()
+
     def compile_or_warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
             try:
@@ -163,12 +158,6 @@ class NPUWorker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
-
-    def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",  # type: ignore[name-defined]
-    ) -> Optional[Union[ModelRunnerOutput, AsyncModelRunnerOutput]]:
-        return self.model_runner.execute_model(scheduler_output)
 
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)
@@ -190,20 +179,21 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
-        if envs.VLLM_TORCH_PROFILER_DIR:
+        if envs.VLLM_TORCH_PROFILER_DIR and self._use_token_for_profile:
             if not self.profile_already_start and scheduler_output.total_num_scheduled_tokens==len(scheduler_output.num_scheduled_tokens)==self.profiler_token_threshold:
                 self.profiler.start()
                 self.profile_already_start = True
                 self.profile_step = 0
 
         output = self.model_runner.execute_model(scheduler_output)
-        if envs.VLLM_TORCH_PROFILER_DIR:
+        if envs.VLLM_TORCH_PROFILER_DIR and self._use_token_for_profile:
             if self.profile_already_start and not self.profile_finished:
                 self.profile_step += 1
             if not self.profile_finished and self.profile_step > self.profiler_stop_step:
                 self.profiler.stop()
                 self.profile_finished = True
-        return output if self.is_driver_worker else None
+        return output
+
 
     def _init_profiler(self):
         # Torch profiler. Enabled and configured through env vars:
@@ -213,6 +203,8 @@ class NPUWorker(WorkerBase):
         self.profile_already_start = False
         self.profile_step = 0
         self.profile_finished = False
+        self._use_token_for_profile = os.getenv("PROFILER_TOKEN_THRESHOLD") is not None
+
         if envs.VLLM_TORCH_PROFILER_DIR:
             self.profiler_token_threshold = int(os.environ.get('PROFILER_TOKEN_THRESHOLD',"1"))
             self.profiler_stop_step = int(os.environ.get('PROFILER_STOP_STEP',"5"))
@@ -231,8 +223,10 @@ class NPUWorker(WorkerBase):
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU,
                 ],
-                with_stack=True,
-                record_shapes=True,
+                record_shapes=envs.VLLM_TORCH_PROFILER_RECORD_SHAPES,
+                profile_memory=envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY,
+                with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
+                with_flops=envs.VLLM_TORCH_PROFILER_WITH_FLOPS,
                 experimental_config=experimental_config,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     torch_profiler_trace_dir))
