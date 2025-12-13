@@ -6,7 +6,9 @@ import torch_npu
 import torchair
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
+from omni_npu.logger import update_configure_vllm_root_logger
 
+update_configure_vllm_root_logger()
 logger = init_logger(__name__)
 
 
