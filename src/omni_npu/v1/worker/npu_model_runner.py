@@ -6,7 +6,7 @@ from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
 )
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, prepare_communication_buffer_for_model
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.logger import logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.spec_decode.eagle import EagleProposer
 
 from omni_npu.v1.sample.sampler import NPUSamplerV1
 from omni_npu.v1.sample.rejection_sampler import NPURejectionSampler
@@ -109,6 +110,9 @@ class NPUModelRunner(GPUModelRunner):
             eep_scale_up: the model loading is for elastic EP scale up.
         """
         super().load_model(eep_scale_up)
+
+        if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
+            prepare_communication_buffer_for_model(self.drafter.model)
 
         # wrap the model with full graph wrapper if needed.
         logger.debug(f"<<< {self.compilation_config.cudagraph_mode.has_full_cudagraphs()=}")

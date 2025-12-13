@@ -137,27 +137,33 @@ class ACLGraphWrapper:
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
         attn_metadata =  get_forward_context().attn_metadata
-        auto_dispatch_capture = False
         asl = None
         aslkv = None
         if attn_metadata is not None:
             attn_metadata = attn_metadata[next(iter(attn_metadata))]
-            if attn_metadata.decode:
+            if not hasattr(attn_metadata, "decode"):
+                # GQA
+                asl = attn_metadata.query_cumlens
+                aslkv = attn_metadata.seq_lens
+            elif attn_metadata.decode:
+                # MLA
                 asl = attn_metadata.decode.query_cumlens
                 aslkv = attn_metadata.decode.seq_lens
-                auto_dispatch_capture = True
-                logger.debug(f"<<< {asl=}, {aslkv=}")
 
-        if aclgraph_runtime_mode == CUDAGraphMode.NONE or \
-                            aclgraph_runtime_mode != self.runtime_mode:
+        if (
+            aclgraph_runtime_mode == CUDAGraphMode.NONE
+            or aclgraph_runtime_mode != self.runtime_mode
+        ):
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
             # running without aclgraphs.
             # We do not trigger capture/replay if the runtime mode is not
             # matches. This enables properly dispatching to the correct
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
-            logger.debug(f"<<< {asl=}, {aslkv=}, {auto_dispatch_capture=} return runnable")
             return self.runnable(*args, **kwargs)
+
+        if not batch_descriptor.uniform_decode:
+            raise RuntimeError(f"Currently only uniform decode supports graph mode. {self.runtime_mode=}, {aclgraph_runtime_mode=}.")
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
@@ -197,8 +203,8 @@ class ACLGraphWrapper:
 
                 # mind-exploding: carefully manage the reference and memory.
                 forward_context.capturing = True
-                logger.debug(f"<<< {asl=}, {aslkv=}, {auto_dispatch_capture=}")
-                with torch.npu.graph(aclgraph, pool=self.graph_pool, auto_dispatch_capture=auto_dispatch_capture):
+                logger.debug(f"<<< {asl=}, {aslkv=}")
+                with torch.npu.graph(aclgraph, pool=self.graph_pool, auto_dispatch_capture=True):
                     # `output` is managed by pytorch's aclgraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.aclgraph_options.weak_ref_output:
@@ -233,16 +239,18 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}")
 
         logger.debug(f"<<< Replaying aclgraph, {batch_descriptor=}, {aslkv=}")
-        if attn_metadata and attn_metadata.decode:
+        if aslkv is not None:
             ## NOTE: The parameter list should match.
             # entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
             aslkv = self._pad_list(aslkv, batch_descriptor.num_tokens) # padding  aslkv to match gear
             entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths_kv": aslkv}])
+        else:
+            raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
         entry.aclgraph.replay()
         return entry.output
 
     def _pad_list(self, lst, n):
-        if not lst:
+        if not lst or len(lst) == n:
             return lst
         return lst + [lst[-1]] * (n - len(lst)) if len(lst) < n else lst[:n]
 

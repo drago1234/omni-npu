@@ -5,7 +5,7 @@ from typing import Optional, Callable
 import torch, torch_npu
 from vllm.logger import init_logger
 from vllm.distributed import (
-    get_ep_group, 
+    get_ep_group,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_gather,
     get_tensor_model_parallel_world_size,
@@ -87,11 +87,8 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             share_output = None
             if layer.shared_experts is not None:
                 share_output = layer.shared_experts(x)
-            attn_metadata = get_forward_context().attn_metadata
-            if attn_metadata is not None:
-                attn_metadata = attn_metadata[next(iter(attn_metadata))]
-            is_prefill = attn_metadata is None or getattr(attn_metadata, "prefill", None) is not None
-            if is_prefill or self.fused_experts is None:
+            batch_descriptor = get_forward_context().batch_descriptor
+            if batch_descriptor is None or not batch_descriptor.uniform_decode:
                 output = moe_infer_fusion(
                     layer=layer,
                     x=hidden_states,
@@ -186,6 +183,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         return out_hidden
 
 
+@FusedMoE.register_oot
 class NPUFusedMoE(FusedMoE):
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
         """With NPU all-to-all, there is no need to perform all-reduce on final hidden states.

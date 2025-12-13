@@ -10,10 +10,9 @@ with the following adjustments:
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple, ClassVar
 import math
 
-import numpy as np
 import torch
 import torch_npu
 
@@ -23,17 +22,12 @@ from vllm.attention.backends.abstract import (
     AttentionLayer,
     AttentionType,
 )
-from vllm.config import get_current_vllm_config, CompilationLevel
-from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
-from vllm.utils import (
-    direct_register_custom_op,
-    is_pin_memory_available,
-    supports_dynamo,
-)
 from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder as V1AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    AttentionCGSupport,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -41,71 +35,20 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 NZ_DIM = 16
 
 
-class NPUAttentionState(Enum):
-    PrefillNoCache = 0
-    PrefillCacheHit = 1
-    DecodeOnly = 2
-    ChunkedPrefill = 3
-
-
-def unified_npu_attention_with_output(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    forward_context: ForwardContext = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    if isinstance(attn_metadata, dict):
-        attn_metadata = attn_metadata[layer_name]
-
-    self_layer = forward_context.no_compile_layers[layer_name]
-    kv_cache = self_layer.kv_cache[forward_context.virtual_engine]
-    self_layer.impl.forward(  # type: ignore[attr-defined]
-        self_layer,
-        query,
-        key,
-        value,
-        kv_cache,
-        attn_metadata,
-        output,
-        trace_flag=False,
-    )
-    return
-
-
-def unified_attention_with_output_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="unified_npu_attention_with_output",
-    op_func=unified_npu_attention_with_output,
-    mutates_args=["output"],
-    fake_impl=unified_attention_with_output_fake,
-    dispatch_key="PrivateUse1",
-)
-
-
 @dataclass
 class NPUMetadata:
     num_actual_tokens: int
     block_tables: torch.Tensor
-    query_cumlens: torch.Tensor
-    seq_lens: torch.Tensor
+    query_cumlens: list[int]
+    seq_lens: list[int]
     max_query_len: Optional[int] = None
     slot_mapping: torch.Tensor = None
-    slot_indices: torch.Tensor = None
 
 
 class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
+    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -127,14 +70,12 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         max_query_len = common_attn_metadata.max_query_len
-        slot_indices = torch.stack([slot_mapping // self.block_size, slot_mapping % self.block_size], dim=1)
         attn_metadata = NPUMetadata(num_actual_tokens=num_actual_tokens,
                                        block_tables=block_table,
-                                       query_cumlens=query_cumlens,
-                                       seq_lens=seq_lens,
+                                       query_cumlens=query_cumlens.tolist(),
+                                       seq_lens=seq_lens.tolist(),
                                        max_query_len=max_query_len,
-                                       slot_mapping=slot_mapping,
-                                       slot_indices=slot_indices)
+                                       slot_mapping=slot_mapping)
         return attn_metadata
 
 
@@ -227,15 +168,6 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         if self.num_heads % self.num_kv_heads != 0:
             raise RuntimeError("self.num_heads must be divisible by self.num_kv_heads")
 
-        cur_vllm_config = get_current_vllm_config()
-        try:
-            level = getattr(getattr(cur_vllm_config, "npu_compilation_config", None), "level", None)
-            self.enable_graph_mode = bool(
-                level is not None and level > getattr(CompilationLevel, "NO_COMPILATION", 0)
-            ) and supports_dynamo()
-        except Exception:
-            self.enable_graph_mode = False
-
         if NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE is None:
             NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
                 torch.ones((2048, 2048), dtype=torch.bool, device="npu")
@@ -252,52 +184,55 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         output: Optional[torch.Tensor] = None,
         trace_flag: bool = True,
     ) -> torch.Tensor:
-        num_tokens = query.shape[0]
-        if output is None:
-            output = torch.empty(num_tokens,
-                                 self.num_heads,
-                                 self.head_size,
-                                 dtype=query.dtype,
-                                 device=query.device)
+        assert output is not None, "Output tensor must be provided."
 
+        num_tokens = query.shape[0]
         if attn_metadata is None:
-            return output.view(num_tokens, self.hidden_size)
+            return output
 
         if not (layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0):
             raise RuntimeError("layer._k_scale_float and layer._v_scale_float must both be 1.0")
 
-        # View q k v to TND.
+        # View q to TND, kv to TH.
         query = query.view(-1, self.num_heads, self.head_size).contiguous()
-        key = key.view(-1, self.num_kv_heads, self.head_size).contiguous()
-        value = value.view(-1, self.num_kv_heads, self.head_size).contiguous()
+        key = key.view(-1, self.num_kv_heads*self.head_size).contiguous()
+        value = value.view(-1, self.num_kv_heads*self.head_size).contiguous()
+        batch_descriptor = get_forward_context().batch_descriptor
 
         # update kv cache
-        if kv_cache[0].numel() > 0 or kv_cache[1].numel():
-            block_size = kv_cache[0].shape[-2]
-            assert block_size == 128, f"{block_size}"
-            cast_key = key.reshape(-1, self.num_kv_heads * self.head_size)
-            cast_value = value.reshape(-1, self.num_kv_heads * self.head_size)
-            slots = attn_metadata.slot_indices
-            torch_npu.npu_scatter_nd_update_(kv_cache[0], slots, cast_key)
-            torch_npu.npu_scatter_nd_update_(kv_cache[1], slots, cast_value)
+        slots = attn_metadata.slot_mapping.view(-1, 1)
+        torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
+        torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
-        attn_output = torch_npu.npu_fused_infer_attention_score_v2(
-            query,
-            kv_cache[0],
-            kv_cache[1],
-            num_query_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
-            input_layout="TND",
-            softmax_scale=self.scale,
-            block_table=attn_metadata.block_tables,
-            block_size=block_size,
-            sparse_mode=3,
-            atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
-            actual_seq_qlen=attn_metadata.query_cumlens,
-            actual_seq_kvlen=attn_metadata.seq_lens,
-        )[0]
+        if batch_descriptor is not None and batch_descriptor.uniform_decode:
+            attn_output = torch_npu.npu_fused_infer_attention_score(
+                query.unsqueeze(1),
+                kv_cache[0],
+                kv_cache[1],
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BSND",
+                scale=self.scale,
+                block_table=attn_metadata.block_tables,
+                block_size=kv_cache[0].shape[1],
+                actual_seq_lengths_kv=attn_metadata.seq_lens,
+            )[0].squeeze(1)
+        else:
+            attn_output = torch_npu.npu_fused_infer_attention_score_v2(
+                query,
+                kv_cache[0],
+                kv_cache[1],
+                num_query_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="TND",
+                softmax_scale=self.scale,
+                block_table=attn_metadata.block_tables,
+                block_size=kv_cache[0].shape[1],
+                sparse_mode=3,
+                atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
+                actual_seq_qlen=attn_metadata.query_cumlens,
+                actual_seq_kvlen=attn_metadata.seq_lens,
+            )[0]
 
-        output = output.view_as(attn_output)
         output.copy_(attn_output)
-
-        return output.view(num_tokens, self.hidden_size)
+        return output

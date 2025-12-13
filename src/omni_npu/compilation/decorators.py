@@ -1,21 +1,18 @@
 import functools
-import logging
 import vllm.compilation.decorators as _dec_mododule
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 
-logger = logging.getLogger(__name__)
+
+logger = init_logger("vllm.omni_npu.compilation.decorators")
+
 
 def _bypass_prefill(self, *args, **kwargs):
     # patch vllm's _support_torch_compile's __call__
-    attn_metadata = get_forward_context().attn_metadata
-    has_prefill = False
-    if attn_metadata is not None:
-        attn_metadata = attn_metadata[next(iter(attn_metadata))]
-        has_prefill = attn_metadata.num_prefills > 0
-    if has_prefill or attn_metadata is None or attn_metadata.decode is None:
-        logger.debug(f"<<< use original forward, {has_prefill=}, {attn_metadata=}")
+    batch_descriptor = get_forward_context().batch_descriptor
+    if batch_descriptor is None or not batch_descriptor.uniform_decode:
+        logger.debug(f"<<< use original forward")
         return True, self.forward(*args, **kwargs)
-    logger.debug("<<< use original call.")
     return False, None
 
 def _wrap_call(original_call):

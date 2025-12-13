@@ -144,10 +144,7 @@ class NPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
-            try:
-                self.model_runner.capture_model()
-            except Exception:
-                logger.debug("<<< Capture_model failed.")
+            self.model_runner.capture_model()
         set_random_seed(self.model_config.seed)
 
     def get_model(self):
