@@ -36,6 +36,7 @@ class NPUWorker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        local_rank = (local_rank + vllm_config.parallel_config.data_parallel_rank * vllm_config.parallel_config.tensor_parallel_size) % 16
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,

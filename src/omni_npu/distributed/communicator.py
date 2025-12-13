@@ -180,3 +180,20 @@ class NPUCommunicator(CudaCommunicator):
     def destroy(self) -> None:  # type: ignore[override]
         # Nothing special for HCCL torch.distributed
         return None
+
+    def dispatch(
+            self,
+            hidden_states: torch.Tensor,
+            router_logits: torch.Tensor,
+            is_sequence_parallel: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Dispatch the hidden states and router logits to the appropriate device.
+        This is a no-op in the base class.
+        """
+        return hidden_states, router_logits
+
+    def combine(
+            self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ) -> torch.Tensor:
+        return hidden_states

@@ -22,7 +22,7 @@ class NPUPlatform(Platform):
     dispatch_key: str = "PrivateUse1"
     ray_device_key: str = "NPU"
     dist_backend: str = "hccl"
-    device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+    #device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
     def __init__(self):
         """Initialize the NPU platform and configure environment."""
