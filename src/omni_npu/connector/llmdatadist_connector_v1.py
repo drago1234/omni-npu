@@ -173,6 +173,20 @@ class LLMDataDistConnector(KVConnectorBase_V1):
         if self.connector_scheduler is None:
             raise RuntimeError("self.connector_scheduler cannot be None")
         return self.connector_scheduler.request_finished(request, block_ids, spec_token_ids)
+    
+    def get_finished_count(self) -> int | None:
+        """
+        Get the count of requests expected to complete send/receive operations
+        via this connector. This method is used to initialize the
+        KVOutputAggregator, overwriting the default world_size.
+
+        Returns:
+            int: expected sending or receiving completion count.
+        """
+        # for prefill instance, only rank 0 manage the request id from decode instance
+        if self.is_prefill:
+            return 1
+        return None
 
     ############################################################
     # Worker Side Methods
