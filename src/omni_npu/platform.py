@@ -41,6 +41,11 @@ class NPUPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
+    def import_core_kernels(cls):
+        from omni_npu.compilation.decorators import patch_compile_decorators
+        patch_compile_decorators()
+
+    @classmethod
     def get_current_memory_usage(cls, device: Optional[torch.types.Device] = None) -> float:
         torch.npu.reset_peak_memory_stats(device)
         return torch.npu.max_memory_allocated(device)

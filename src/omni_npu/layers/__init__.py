@@ -1,2 +1,0 @@
-from omni_npu.compilation.decorators import patch_compile_decorators
-patch_compile_decorators()
