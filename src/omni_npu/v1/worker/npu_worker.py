@@ -158,7 +158,7 @@ class NPUWorker(WorkerBase):
         return self.model_runner.get_supported_tasks()
 
     def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(1)
+        self.model_runner._dummy_run(1, uniform_decode=True, force_attention=True)
 
     def add_lora(self, lora_request) -> bool:  # type: ignore[no-untyped-def]
         return self.model_runner.add_lora(lora_request)
