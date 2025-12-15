@@ -175,8 +175,8 @@ class NPUWorker(WorkerBase):
 
     def execute_model(
         self,
-        scheduler_output: "SchedulerOutput",
-    ) -> Optional[ModelRunnerOutput]:
+        scheduler_output: "SchedulerOutput",  # type: ignore[name-defined]
+    ) -> Optional[Union[ModelRunnerOutput, AsyncModelRunnerOutput]]:
         if envs.VLLM_TORCH_PROFILER_DIR and self._use_token_for_profile:
             if not self.profile_already_start and scheduler_output.total_num_scheduled_tokens==len(scheduler_output.num_scheduled_tokens)==self.profiler_token_threshold:
                 self.profiler.start()
@@ -191,7 +191,6 @@ class NPUWorker(WorkerBase):
                 self.profiler.stop()
                 self.profile_finished = True
         return output
-
 
     def _init_profiler(self):
         # Torch profiler. Enabled and configured through env vars:

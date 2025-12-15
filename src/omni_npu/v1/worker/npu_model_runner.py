@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from typing import TYPE_CHECKING, Optional, Union
+
 import torch
 from vllm.config import (
     CUDAGraphMode,
@@ -14,11 +16,15 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.logger import logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 from omni_npu.v1.sample.sampler import NPUSamplerV1
 from omni_npu.v1.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import ACLGraphWrapper, set_graph_params
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 
 @contextmanager
@@ -42,6 +48,14 @@ class NPUModelRunner(GPUModelRunner):
                                                  dtype=torch.int64)
         self.seq_lens = self._make_buffer(self.max_num_reqs,
                                           dtype=torch.int64)
+
+        # sampled_token_ids is int32 in npu, sampled_token_ids_pinned_cpu should
+        # be same dtype to synchronize.
+        self.sampled_token_ids_pinned_cpu = torch.empty(
+            (self.max_model_len, 1),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory)
 
         # FIXME(runze): reusing VLLM's sampler fails, this sampler class is from omni_infer.
         # need to check why and try to remove it.
@@ -99,11 +113,6 @@ class NPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         torch.npu.synchronize()
 
-    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
-        # TODO(tronzhang): error with event synchronize...
-        return sampled_token_ids.tolist()
-
-
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
         Args:
@@ -128,3 +137,14 @@ class NPUModelRunner(GPUModelRunner):
         logger.debug("<<< Capturing model in npu_model_runner")
         with switch_torch_device():
             super().capture_model()
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+    ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        with (switch_torch_device()
+              if self.use_async_scheduling else nullcontext()):
+            return super().execute_model(scheduler_output,
+                                         intermediate_tensors)
