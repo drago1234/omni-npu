@@ -136,7 +136,7 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         )
 
         if self._is_dynamic_token_w8a8(weight_quant, input_quant):
-            return NPUCompressedTensorsW8A8Int8MoEMethod(self, layer.moe_config)
+            return NPUCompressedTensorsW8A8Int8MoEMethod(self, layer)
         elif self._is_dynamic_token_w4a8_int(weight_quant, input_quant):
             raise NotImplementedError
         else:

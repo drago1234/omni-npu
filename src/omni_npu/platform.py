@@ -78,6 +78,7 @@ class NPUPlatform(Platform):
         import omni_npu.layers.fused_moe.layer
         from omni_npu.connector import register_connectors
         register_connectors()
+        from omni_npu.distributed.eplb_state import EplbState
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:  # type: ignore[name-defined]

@@ -260,6 +260,9 @@ def moe_infer_fusion(
     )
     group_list = tokens_per_local_expert.to(torch.int64)
 
+    if layer.enable_eplb:
+        layer.planner.record_activation(layer.moe_layer_idx, group_list, support_multi_stream=False)
+
     hidden_states_ordered_by_experts = layer.quant_method.gmm_expert(
         layer,
         hidden_states_sorted_by_experts,

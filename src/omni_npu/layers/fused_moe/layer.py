@@ -27,6 +27,7 @@ from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp, moe_infer_fusi
 from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
 torch.npu.config.allow_internal_format = True
+
 logger = init_logger("vllm.omni_npu.layers.fused_moe.layer")
 
 

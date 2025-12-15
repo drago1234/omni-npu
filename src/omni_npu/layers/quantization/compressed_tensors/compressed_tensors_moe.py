@@ -21,17 +21,44 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
     FusedMoEModularKernel,
 )
+from vllm.distributed import get_ep_group, GroupCoordinator, get_world_group
+from vllm.config import get_current_vllm_config
+
 from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
 from omni_npu.layers.fused_moe.fused_moe import moe_infer_fusion, fused_experts_tp
-
 
 torch.npu.config.allow_internal_format = True
 logger = init_logger("vllm.omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe")
 
 
 class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
+    def __init__(
+        self,
+        parent,
+        layer,
+    ):
+        super().__init__(parent, layer.moe_config)
+        self.init_eplb(layer)
+
+    def init_eplb(self, layer):
+        self.enable_eplb = layer.enable_eplb
+        self.n_routed_experts = layer.moe_config.num_experts
+        self.prefix = layer.layer_name
+        self.vllm_config = get_current_vllm_config().model_config.hf_config
+        if self.enable_eplb:
+            from omni_placement.omni_planner import OmniPlanner
+            self.planner = OmniPlanner(config_file=None,
+                            device="npu",
+                            rank=get_world_group().rank_in_group,
+                            world_size=get_world_group().world_size,
+                            num_experts=self.n_routed_experts,
+                            num_redundancy_shared_expert_rank=0)
+            self.moe_layer_idx = OmniPlanner.get_deepseek_v3_moe_layer_idx(self.prefix, self.vllm_config.first_k_dense_replace)
+            self.expert_mapping = self.planner.expert_mapping_on_current_layer(self.moe_layer_idx)
+
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -214,6 +241,17 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
         )
+        if enable_eplb:
+            _, topk_ids, _ = self.planner.plan(
+                layer_idx_moe=self.moe_layer_idx,
+                tokens=x,
+                token_expert_ids=topk_ids,
+                token_expert_scores=topk_weights,
+                top_k=top_k,
+                expert_mapping=self.expert_mapping,
+            )
+            layer.planner = self.planner
+            layer.moe_layer_idx = self.moe_layer_idx
 
         if layer.moe_parallel_config.use_ep:
             share_output = None
@@ -240,6 +278,10 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
                     global_num_experts=global_num_experts,
                     expert_map=expert_map,
                 )
+                if enable_eplb:
+                    group_list = self.fused_experts.prepare_finalize.expert_token_nums
+                    self.planner.record_activation(self.moe_layer_idx, group_list, support_multi_stream=False)
+
             if tp_size > 1:
                 output = tensor_model_parallel_all_gather(output, dim=0)[:t_ori]
                 if share_output is not None:

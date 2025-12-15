@@ -71,6 +71,7 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
         self.expand_idx = expand_idx
         self.ep_recv_counts = ep_recv_counts
         self.tp_recv_counts = tp_recv_counts
+        self.expert_token_nums = expert_token_nums
         return expand_x, dynamic_scale, expert_tokens_meta, None, None
 
     def finalize(
