@@ -24,6 +24,7 @@ class NPUFusedMoEPermuteExpertsUnpermute(FusedMoEPermuteExpertsUnpermute):
         layer: torch.nn.Module
     ):
         super().__init__(quant_config)
+        self.local_expert_num = len(layer.w13_weight)
         if self.quant_config.use_int8_w8a8:
             self.scale_2 = torch.ones((len(layer.w13_weight), layer.w13_weight_scale.shape[-1] // 2), dtype=torch.float32,
                                       device=current_platform.device_type)
@@ -77,9 +78,9 @@ class NPUFusedMoEPermuteExpertsUnpermute(FusedMoEPermuteExpertsUnpermute):
         local_num_experts: int,
         expert_tokens_meta: Optional[ExpertTokensMetadata],
     ) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], torch.dtype]:
-        workspace13 = (M * topk * get_ep_group().world_size, N)
-        workspace2 = (M * topk * get_ep_group().world_size, N // 2)
-        output = (M * topk * get_ep_group().world_size, K)
+        workspace13 = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, N)
+        workspace2 = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, N // 2)
+        output = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, K)
         return (workspace13, workspace2, output, a.dtype)
 
     def apply(
