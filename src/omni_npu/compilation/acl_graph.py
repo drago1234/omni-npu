@@ -239,6 +239,9 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}")
 
         logger.debug(f"<<< Replaying aclgraph, {batch_descriptor=}, {aslkv=}")
+
+        entry.aclgraph.replay()
+        # Updates after replay to improve performance, temporal ordering ensured via inter-stream events.
         if aslkv is not None:
             ## NOTE: The parameter list should match.
             # entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
@@ -246,7 +249,6 @@ class ACLGraphWrapper:
             entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
-        entry.aclgraph.replay()
         return entry.output
 
     def _pad_list(self, lst, n):
