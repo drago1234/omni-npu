@@ -41,8 +41,9 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         raise NotImplementedError(
             "NPU hardware dose not support \"get_min_capability\" feature.")
 
+    @staticmethod
     def _is_dynamic_token_w8a8(
-        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+        weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
         weight_strategy = (
@@ -56,8 +57,9 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         # Only symmetric weight quantization supported.
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
+    @staticmethod
     def _is_dynamic_token_w4a8_int(
-        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+        weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:
         is_weight_4_bits = weight_quant.num_bits == 4
         is_activation_8_bits = input_quant.num_bits == 8
@@ -78,6 +80,7 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         weight_quant: QuantizationArgs,
         input_quant: QuantizationArgs,
         format: Optional[str] = None,
+        layer_name: Optional[str] = None,
     ) -> "CompressedTensorsScheme":
         # use the per-layer format if defined, otherwise, use global format
         format = format if format is not None else self.quant_format

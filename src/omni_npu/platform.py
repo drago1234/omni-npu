@@ -98,6 +98,9 @@ class NPUPlatform(Platform):
             )
             vllm_config.scheduler_config.enable_chunked_prefill = False
             vllm_config.scheduler_config.chunked_prefill_enabled = False
+        vllm_config.compilation_config.pass_config.fuse_norm_quant = False
+        vllm_config.compilation_config.pass_config.fuse_act_quant = False
+        vllm_config.compilation_config.pass_config.fuse_attn_quant = False
 
     @classmethod
     def get_punica_wrapper(cls) -> str:
@@ -112,21 +115,18 @@ class NPUPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(
         cls,
-        selected_backend: "_Backend",
+        selected_backend,
         head_size: int,
         dtype: torch.dtype,
         kv_cache_dtype: Optional[str],
         block_size: int,
-        use_v1: bool,
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        attn_type: str | None = None,
     ) -> str:
-        return (
-            "omni_npu.attention.backends.mla.NPUMLABackend"
-            if use_mla
-            else "omni_npu.attention.backends.attention.NPUAttentionBackend"
-        )
+        return ("omni_npu.attention.backends.mla.NPUMLABackend" if use_mla else
+                "omni_npu.attention.backends.attention.NPUAttentionBackend")
 
     @property
     def simple_compile_backend(self):

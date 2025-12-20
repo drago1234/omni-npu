@@ -1,6 +1,6 @@
 # omni-npu (vLLM NPU Plugin)
 
-A vLLM (0.11.0) out-of-tree platform plugin that enables running vLLM on NPU (Ascend/torch_npu).
+A vLLM (0.12.0) out-of-tree platform plugin that enables running vLLM on NPU (Ascend/torch_npu).
 
 - Loaded via vLLM plugin entry points (no code changes to vLLM required).
 - Provides a minimal NPU Platform, Worker, and a standalone NPU ModelRunner adapter.
@@ -9,14 +9,14 @@ A vLLM (0.11.0) out-of-tree platform plugin that enables running vLLM on NPU (As
 ## Requirements
 
 - Python >= 3.12
-- vLLM == 0.11.0
+- vLLM == 0.12.0
 - torch and torch_npu for your platform (vendor-specific install)
 
 ## Install (order matters)
 
 ```bash
-# 1) Install vLLM first (pin to 0.11.0 for compatibility)
-pip install vllm==0.11.0
+# 1) Install vLLM first (pin to 0.12.0 for compatibility)
+pip install vllm==0.12.0
 
 # 2) Install vendor runtime (example: torch_npu for Ascend)
 # Follow your vendor instructions; example:

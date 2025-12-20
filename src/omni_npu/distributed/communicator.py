@@ -47,8 +47,7 @@ class NPUCommunicator(CudaCommunicator):
             if module.__class__.__name__ in ["FusedMoE", "SharedFusedMoE", "NPUFusedMoE", "NPUSharedFusedMoE"]
         ]
         for module in moe_modules:
-            if hasattr(module, "quant_method") and hasattr(module.quant_method, "init_prepare_finalize"):
-                module.quant_method.init_prepare_finalize(module)
+            module.maybe_init_modular_kernel()
 
     # Collectives
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]

@@ -155,7 +155,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         layer.w13_weight_scale = torch.nn.Parameter(layer.w13_weight_scale.to(torch.float32).squeeze(-1), requires_grad=False)
         layer.w2_weight_scale = torch.nn.Parameter(layer.w2_weight_scale.squeeze(-1), requires_grad=False)
 
-    def maybe_make_prepare_finalize(self) -> Optional[FusedMoEPrepareAndFinalize]:
+    def maybe_make_prepare_finalize(self, routing_tables) -> Optional[FusedMoEPrepareAndFinalize]:
         return NpuMoEPrepareAndFinalize(self.moe)
 
     def select_gemm_impl(
@@ -164,31 +164,6 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         layer: torch.nn.Module,
     ) -> FusedMoEPermuteExpertsUnpermute:
         return NPUFusedMoEPermuteExpertsUnpermute(self.moe_quant_config, layer)
-
-    def init_prepare_finalize(self, layer: torch.nn.Module):
-        assert self.moe is not None
-
-        # We must get the quant config here so that the layer is
-        # completely initialized, i.e. all weights loaded and post
-        # processed.
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-
-        prepare_finalize = self.maybe_make_prepare_finalize()
-
-        if prepare_finalize is not None:
-            logger.debug(
-                "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
-            )
-            assert self.topk_indices_dtype is None
-            assert self.fused_experts is None, (
-                f"Attempt to override experts for {id(self)}!"
-            )
-            self.topk_indices_dtype = prepare_finalize.topk_indices_dtype()
-            experts = self.select_gemm_impl(prepare_finalize, layer)
-            self.fused_experts = FusedMoEModularKernel(
-                prepare_finalize,
-                experts,
-            )
 
     def apply(
         self,
@@ -258,7 +233,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
             if layer.shared_experts is not None:
                 share_output = layer.shared_experts(x)
             batch_descriptor = get_forward_context().batch_descriptor
-            if batch_descriptor is None or not batch_descriptor.uniform_decode:
+            if batch_descriptor is None or not batch_descriptor.uniform:
                 output = moe_infer_fusion(
                     layer=layer,
                     x=hidden_states,
@@ -361,3 +336,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
                                                       group_list_type=1, tuning_config=avg_tokens_per_expert)[0]
 
         return out_hidden
+
+    @property
+    def supports_eplb(self) -> bool:
+        return True

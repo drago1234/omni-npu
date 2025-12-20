@@ -76,7 +76,7 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
 
 
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
-    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_uniform_spec_as_decode: ClassVar[bool] = True
 
     def __init__(
@@ -107,11 +107,13 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
+        dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> NPUMLADecodeMetadata:
         return NPUMLADecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device.tolist(),
             query_cumlens=query_start_loc_device[1:].tolist(),
+            dcp_tot_seq_lens=dcp_tot_seq_lens_device
         )
 
     def build(

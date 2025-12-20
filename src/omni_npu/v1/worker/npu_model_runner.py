@@ -4,6 +4,7 @@ from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
+import torch.nn as nn
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
@@ -38,6 +39,7 @@ def switch_torch_device():
 
 
 class NPUModelRunner(GPUModelRunner):
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         with switch_torch_device():
             super().__init__(vllm_config, device)
@@ -68,6 +70,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         kv_cache_config: KVCacheConfig,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int],
     ) -> dict[str, torch.Tensor]:
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
@@ -148,3 +151,14 @@ class NPUModelRunner(GPUModelRunner):
               if self.use_async_scheduling else nullcontext()):
             return super().execute_model(scheduler_output,
                                          intermediate_tensors)
+
+    @torch.inference_mode
+    def sample_tokens(self, grammar_output):
+        with switch_torch_device():
+            return super().sample_tokens(grammar_output)
+
+    def get_model(self) -> nn.Module:
+        # get raw model out of the aclgraph wrapper.
+        if isinstance(self.model, ACLGraphWrapper):
+            return self.model.unwrap()
+        return self.model

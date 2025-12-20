@@ -36,6 +36,7 @@ from .utils import get_config_from_dict_or_env
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 logger = init_logger(__name__)
 
@@ -103,7 +104,8 @@ class DatadistConnectorMetadataPrefill(KVConnectorMetadata):
 
 
 class LLMDataDistConnector(KVConnectorBase_V1):
-    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
+    def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
+                 kv_cache_config: Optional["KVCacheConfig"] = None):
         if vllm_config.kv_transfer_config is None:
             raise RuntimeError("vllm_config.kv_transfer_config cannot be None")
 

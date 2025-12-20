@@ -19,10 +19,12 @@ from vllm.model_executor.layers.fused_moe.layer import (
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPermuteExpertsUnpermute,
-    FusedMoEPrepareAndFinalize,
-    FusedMoEModularKernel
+    FusedMoEPrepareAndFinalize
 )
-from vllm.model_executor.layers.shared_fused_moe.shared_fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
+    FusedMoEModularMethod,
+)
+from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp, moe_infer_fusion
 from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
@@ -89,7 +91,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             if layer.shared_experts is not None:
                 share_output = layer.shared_experts(x)
             batch_descriptor = get_forward_context().batch_descriptor
-            if batch_descriptor is None or not batch_descriptor.uniform_decode:
+            if batch_descriptor is None or not batch_descriptor.uniform:
                 output = moe_infer_fusion(
                     layer=layer,
                     x=hidden_states,
@@ -124,7 +126,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 topk_weights=topk_weights
             )
 
-    def maybe_make_prepare_finalize(self) -> Optional[FusedMoEPrepareAndFinalize]:
+    def maybe_make_prepare_finalize(self, routing_tables) -> Optional[FusedMoEPrepareAndFinalize]:
         return NpuMoEPrepareAndFinalize(self.moe)
 
     def select_gemm_impl(
@@ -133,31 +135,6 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         layer: torch.nn.Module,
     ) -> FusedMoEPermuteExpertsUnpermute:
         return NPUFusedMoEPermuteExpertsUnpermute(self.moe_quant_config, layer)
-
-    def init_prepare_finalize(self, layer: torch.nn.Module):
-        assert self.moe is not None
-
-        # We must get the quant config here so that the layer is
-        # completely initialized, i.e. all weights loaded and post
-        # processed.
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-
-        prepare_finalize = self.maybe_make_prepare_finalize()
-
-        if prepare_finalize is not None:
-            logger.debug(
-                "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
-            )
-            assert self.topk_indices_dtype is None
-            assert self.fused_experts is None, (
-                f"Attempt to override experts for {id(self)}!"
-            )
-            self.topk_indices_dtype = prepare_finalize.topk_indices_dtype()
-            experts = self.select_gemm_impl(prepare_finalize, layer)
-            self.fused_experts = FusedMoEModularKernel(
-                prepare_finalize,
-                experts,
-            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
@@ -193,6 +170,20 @@ class NPUFusedMoE(FusedMoE):
             return final_hidden_states
 
         return tensor_model_parallel_all_reduce(final_hidden_states)
+
+    def maybe_init_modular_kernel(self) -> None:
+        self.ensure_moe_quant_config_init()
+        routing_tables = self._maybe_init_expert_routing_tables()
+        prepare_finalize = self.quant_method.maybe_make_prepare_finalize(
+            routing_tables=routing_tables
+        )
+        if prepare_finalize is not None:
+            logger.debug(
+                "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
+            )
+            self.quant_method = FusedMoEModularMethod.make(
+                self, self.quant_method, prepare_finalize, None
+            )
 
     @staticmethod
     def select_experts(
@@ -264,3 +255,17 @@ class NPUFusedMoE(FusedMoE):
 @SharedFusedMoE.register_oot
 class NPUSharedFusedMoE(SharedFusedMoE, NPUFusedMoE):
     pass
+
+
+@FusedMoEModularMethod.register_oot
+class NPUFusedMoEModularMethod(FusedMoEModularMethod):
+
+    def __init__(self, old_quant_method, experts):
+        super().__init__(old_quant_method, experts)
+        self.old_quant_method.fused_experts = self.fused_experts
+
+    def apply(self, *args, **kwargs):
+        return self.old_quant_method.apply(*args, **kwargs)
+
+    def gmm_expert(self, *args, **kwargs):
+        return self.old_quant_method.gmm_expert(*args, **kwargs)

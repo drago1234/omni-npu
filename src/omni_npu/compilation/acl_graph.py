@@ -162,7 +162,7 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if not batch_descriptor.uniform_decode:
+        if not batch_descriptor.uniform:
             raise RuntimeError(f"Currently only uniform decode supports graph mode. {self.runtime_mode=}, {aclgraph_runtime_mode=}.")
 
         if batch_descriptor not in self.concrete_aclgraph_entries:

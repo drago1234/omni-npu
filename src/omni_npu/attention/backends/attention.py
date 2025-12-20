@@ -204,7 +204,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
         torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
-        if batch_descriptor is not None and batch_descriptor.uniform_decode:
+        if batch_descriptor is not None and batch_descriptor.uniform:
             attn_output = torch_npu.npu_fused_infer_attention_score(
                 query.unsqueeze(1),
                 kv_cache[0],

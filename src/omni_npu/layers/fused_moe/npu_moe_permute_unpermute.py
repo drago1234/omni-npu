@@ -68,8 +68,6 @@ class NPUFusedMoEPermuteExpertsUnpermute(FusedMoEPermuteExpertsUnpermute):
 
     def workspace_shapes(
         self,
-        a: torch.Tensor,
-        aq: torch.Tensor,
         M: int,
         N: int,
         K: int,
@@ -81,7 +79,7 @@ class NPUFusedMoEPermuteExpertsUnpermute(FusedMoEPermuteExpertsUnpermute):
         workspace13 = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, N)
         workspace2 = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, N // 2)
         output = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, K)
-        return (workspace13, workspace2, output, a.dtype)
+        return (workspace13, workspace2, output)
 
     def apply(
         self,
