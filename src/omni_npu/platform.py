@@ -11,6 +11,36 @@ from omni_npu.logger import update_configure_vllm_root_logger
 update_configure_vllm_root_logger()
 logger = init_logger(__name__)
 
+class ConfigUpdater:
+    """Handles configuration validation and updates for the NPU platform."""
+
+    @classmethod
+    def update_vllm_config(cls, vllm_config: 'VllmConfig') -> None:
+        """Update the vLLM configuration for NPU compatibility.
+
+        Args:
+            vllm_config: The vLLM configuration to update.
+        """
+        from omni_npu.compilation.ge_compile_config import NPUCompilationConfig
+        vllm_config.npu_compilation_config = NPUCompilationConfig()
+        import os
+        vllm_config.npu_compilation_config.use_gegraph = os.getenv("TORCH_COMPILE_GE", "False").lower() == "true"
+        cls._handle_graph_mode(vllm_config)
+
+        additional_config = vllm_config.additional_config
+        if additional_config:
+            graph_model_compile_config = additional_config.get("graph_model_compile_config", {})
+            vllm_config.npu_compilation_config.build_from_cli(graph_model_compile_config, vllm_config)
+            logger.debug(f"Graph model compile config: {graph_model_compile_config}")
+            
+
+    @staticmethod
+    def _handle_graph_mode(vllm_config: 'VllmConfig') -> None:
+        """Handle graph mode configuration for NPU."""
+        from vllm.utils.torch_utils import supports_dynamo
+        if not supports_dynamo():
+            logger.warning("Graph mode unsupported due to low torch version. Disabling.")
+            vllm_config.npu_compilation_config.use_gegraph = False
 
 class NPUPlatform(Platform):
     try:
@@ -82,6 +112,7 @@ class NPUPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:  # type: ignore[name-defined]
+        ConfigUpdater.update_vllm_config(vllm_config)
         # Minimal defaults to match vLLM expectations.
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "omni_npu.v1.worker.npu_worker.NPUWorker"
