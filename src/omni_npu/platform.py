@@ -43,7 +43,7 @@ class NPUPlatform(Platform):
         return torch.no_grad()
 
     @classmethod
-    def import_core_kernels(cls):
+    def import_kernels(cls):
         from omni_npu.compilation.decorators import patch_compile_decorators
         patch_compile_decorators()
 
