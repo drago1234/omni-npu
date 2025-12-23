@@ -106,8 +106,7 @@ class NPUPlatform(Platform):
         For example, the out-of-tree quantization config can be imported and
         registered here dynamically.
         """
-        from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import NPUCompressedTensorsConfig
-        import omni_npu.layers.fused_moe.layer
+        from omni_npu import layers
         from omni_npu.distributed.eplb_state import EplbState
 
     @classmethod
@@ -156,8 +155,13 @@ class NPUPlatform(Platform):
         use_sparse: bool,
         attn_type: str | None = None,
     ) -> str:
-        return ("omni_npu.attention.backends.mla.NPUMLABackend" if use_mla else
-                "omni_npu.attention.backends.attention.NPUAttentionBackend")
+        if use_mla:
+            if use_sparse:
+                return "omni_npu.attention.backends.dsa.NPUDSABackend"
+            else:
+                return "omni_npu.attention.backends.mla.NPUMLABackend"
+        else:
+            return "omni_npu.attention.backends.attention.NPUAttentionBackend"
 
     @property
     def simple_compile_backend(self):

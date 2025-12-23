@@ -1,20 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, Any, cast
 
 import torch
 import torch.nn as nn
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
+    get_layers_from_vllm_config,
 )
 from vllm.distributed.parallel_state import get_pp_group, prepare_communication_buffer_for_model
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVCacheSpec,
     KVCacheConfig,
     MambaSpec,
+    MLAAttentionSpec,
 )
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.logger import logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.sequence import IntermediateTensors
@@ -105,6 +110,24 @@ class NPUModelRunner(GPUModelRunner):
             self._update_hybrid_attention_mamba_layout(kv_caches)
 
         return kv_caches
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        if self.vllm_config.model_config.use_mla and hasattr(self.vllm_config.model_config.hf_config, "index_topk"):
+            indexer_head_size = self.vllm_config.model_config.hf_config.index_head_dim
+            kv_cache_spec: dict[str, KVCacheSpec] = {}
+            layer_type = cast(type[Any], AttentionLayerBase)
+            attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
+            for layer_name, attn_module in attn_layers.items():
+                kv_cache_spec[layer_name] = MLAAttentionSpec(
+                    block_size=self.vllm_config.cache_config.block_size,
+                    num_kv_heads=1,
+                    head_size=attn_module.head_size + indexer_head_size,
+                    dtype=kv_cache_dtype_str_to_dtype(self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config),
+                    cache_dtype_str=self.vllm_config.cache_config.cache_dtype
+                )
+            return kv_cache_spec
+        else:
+            return super().get_kv_cache_spec()
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:

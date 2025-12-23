@@ -19,9 +19,8 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSuppor
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPermuteExpertsUnpermute,
     FusedMoEPrepareAndFinalize,
-    FusedMoEModularKernel,
 )
-from vllm.distributed import get_ep_group, GroupCoordinator, get_world_group
+from vllm.distributed import get_world_group
 from vllm.config import get_current_vllm_config
 
 from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
@@ -57,7 +56,6 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
                             num_redundancy_shared_expert_rank=0)
             self.moe_layer_idx = OmniPlanner.get_deepseek_v3_moe_layer_idx(self.prefix, self.vllm_config.first_k_dense_replace)
             self.expert_mapping = self.planner.expert_mapping_on_current_layer(self.moe_layer_idx)
-
 
     def create_weights(
         self,

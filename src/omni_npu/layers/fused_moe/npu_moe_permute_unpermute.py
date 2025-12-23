@@ -74,8 +74,8 @@ class NPUFusedMoEPermuteExpertsUnpermute(FusedMoEPermuteExpertsUnpermute):
         topk: int,
         global_num_experts: int,
         local_num_experts: int,
-        expert_tokens_meta: Optional[ExpertTokensMetadata],
-    ) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], torch.dtype]:
+        expert_tokens_meta: ExpertTokensMetadata | None,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         workspace13 = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, N)
         workspace2 = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, N // 2)
         output = (M * min(topk, self.local_expert_num) * get_ep_group().world_size, K)
@@ -107,7 +107,7 @@ class NPUFusedMoEPermuteExpertsUnpermute(FusedMoEPermuteExpertsUnpermute):
             # w8a8
             gate_up_proj = torch_npu.npu_grouped_matmul(
                 [hidden_states],
-                [w1], 
+                [w1],
                 bias=None,
                 group_list=group_list,
                 split_item=3,
@@ -139,7 +139,7 @@ class NPUFusedMoEPermuteExpertsUnpermute(FusedMoEPermuteExpertsUnpermute):
             # bf16
             gate_up_proj = torch_npu.npu_grouped_matmul(
                 [hidden_states],
-                [w1], 
+                [w1],
                 bias=None,
                 group_list=group_list,
                 split_item=3,
