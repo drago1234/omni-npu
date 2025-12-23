@@ -24,7 +24,7 @@ class NPUPlatform(Platform):
     dispatch_key: str = "PrivateUse1"
     ray_device_key: str = "NPU"
     dist_backend: str = "hccl"
-    #device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+    device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
     def __init__(self):
         """Initialize the NPU platform and configure environment."""
@@ -46,6 +46,8 @@ class NPUPlatform(Platform):
     def import_kernels(cls):
         from omni_npu.compilation.decorators import patch_compile_decorators
         patch_compile_decorators()
+        from omni_npu.connector import register_connectors
+        register_connectors()
 
     @classmethod
     def get_current_memory_usage(cls, device: Optional[torch.types.Device] = None) -> float:
@@ -76,8 +78,6 @@ class NPUPlatform(Platform):
         """
         from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import NPUCompressedTensorsConfig
         import omni_npu.layers.fused_moe.layer
-        from omni_npu.connector import register_connectors
-        register_connectors()
         from omni_npu.distributed.eplb_state import EplbState
 
     @classmethod

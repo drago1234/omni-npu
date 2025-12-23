@@ -19,6 +19,7 @@ from vllm.logger import logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.spec_decode.eagle import EagleProposer
 
 from omni_npu.v1.sample.sampler import NPUSamplerV1
 from omni_npu.v1.sample.rejection_sampler import NPURejectionSampler

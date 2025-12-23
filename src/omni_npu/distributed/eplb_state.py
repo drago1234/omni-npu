@@ -2,7 +2,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 from dataclasses import dataclass
 import torch
-from typing import Optional
+from typing import Optional, Sequence
 from vllm.config import ParallelConfig
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.logger import init_logger
@@ -65,3 +65,14 @@ class EplbState:
         rank_mapping: Optional[dict[int, int]] = None,
     ) -> Optional[torch.Tensor]:
         pass
+
+    @staticmethod
+    def build_initial_global_physical_to_logical_map(
+        num_routed_experts: int,
+        num_redundant_experts: int,
+    ) -> Sequence[int]:
+        global_physical_to_logical_map = list(range(num_routed_experts))
+        global_physical_to_logical_map += [
+            i % num_routed_experts for i in range(num_redundant_experts)
+        ]
+        return global_physical_to_logical_map

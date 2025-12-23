@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder as V1AttentionMetadataBuilder,
     CommonAttentionMetadata,
     AttentionCGSupport,
+    split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -43,11 +44,13 @@ class NPUMetadata:
     seq_lens: list[int]
     max_query_len: Optional[int] = None
     slot_mapping: torch.Tensor = None
+    num_prefills: int = 0
 
 
 class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
-    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
-
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_uniform_spec_as_decode: ClassVar[bool] = True
+    reorder_batch_threshold: int = 1
 
     def __init__(
         self,
@@ -58,6 +61,10 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
+        self._init_reorder_batch_threshold(
+            self.reorder_batch_threshold,
+            self.supports_uniform_spec_as_decode,
+        )
 
     def build(self,
               common_prefix_len: int,
@@ -70,12 +77,20 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
         max_query_len = common_attn_metadata.max_query_len
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=self.supports_uniform_spec_as_decode,
+            )
+        )
         attn_metadata = NPUMetadata(num_actual_tokens=num_actual_tokens,
                                        block_tables=block_table,
                                        query_cumlens=query_cumlens.tolist(),
                                        seq_lens=seq_lens.tolist(),
                                        max_query_len=max_query_len,
-                                       slot_mapping=slot_mapping)
+                                       slot_mapping=slot_mapping,
+                                       num_prefills=num_prefills)
         return attn_metadata
 
 
@@ -197,14 +212,13 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         query = query.view(-1, self.num_heads, self.head_size).contiguous()
         key = key.view(-1, self.num_kv_heads*self.head_size).contiguous()
         value = value.view(-1, self.num_kv_heads*self.head_size).contiguous()
-        batch_descriptor = get_forward_context().batch_descriptor
 
         # update kv cache
         slots = attn_metadata.slot_mapping.view(-1, 1)
         torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
         torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
-        if batch_descriptor is not None and batch_descriptor.uniform:
+        if attn_metadata.num_prefills == 0:
             attn_output = torch_npu.npu_fused_infer_attention_score(
                 query.unsqueeze(1),
                 kv_cache[0],

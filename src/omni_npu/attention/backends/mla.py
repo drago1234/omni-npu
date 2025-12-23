@@ -26,7 +26,7 @@ from vllm.v1.attention.backends.mla.common import (
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-logger = init_logger("vllm.omni_npu.attention.backends.mla")
+logger = init_logger(__name__)
 
 
 class NPUMLABackend(MLACommonBackend):
@@ -326,10 +326,10 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
         # logger.debug(f"<<< {output.shape=}, {q.shape=}, {k_c_normed.shape=}, {k_pe.shape=}")
-        # output = output[:num_actual_toks, ...]
-        # q = q[:num_actual_toks, ...]
-        # k_c_normed = k_c_normed[:num_actual_toks, ...]
-        # k_pe = k_pe[:num_actual_toks, ...]
+        output = output[:num_actual_toks, ...]
+        q = q[:num_actual_toks, ...]
+        k_c_normed = k_c_normed[:num_actual_toks, ...]
+        k_pe = k_pe[:num_actual_toks, ...]
 
         assert (
             attn_metadata.num_decodes is not None

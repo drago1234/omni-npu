@@ -29,8 +29,7 @@ from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp, moe_infer_fusi
 from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
 torch.npu.config.allow_internal_format = True
-
-logger = init_logger("vllm.omni_npu.layers.fused_moe.layer")
+logger = init_logger(__name__)
 
 
 @UnquantizedFusedMoEMethod.register_oot
@@ -90,8 +89,9 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             share_output = None
             if layer.shared_experts is not None:
                 share_output = layer.shared_experts(x)
-            batch_descriptor = get_forward_context().batch_descriptor
-            if batch_descriptor is None or not batch_descriptor.uniform:
+            attn_metadata = get_forward_context().attn_metadata
+            use_all2all = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
+            if use_all2all:
                 output = moe_infer_fusion(
                     layer=layer,
                     x=hidden_states,
