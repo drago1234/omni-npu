@@ -238,7 +238,7 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
             query=q_nope,
             key=kv_cache[0],
             value=kv_cache[0],
-            sparse_indices=self.indexer.topk_indices_buffer,
+            sparse_indices=self.indexer.topk_indices_buffer[:attn_metadata.num_actual_tokens].view(attn_metadata.num_actual_tokens, 1, self.indexer.topk_tokens),
             scale_value=self.scale,
             sparse_block_size=1,
             block_table=block_table,
@@ -257,7 +257,7 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
         q: torch.Tensor,
         k_c_normed: torch.Tensor,  # key in unified attn
         k_pe: torch.Tensor,  # value in unified attn
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        kv_cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         attn_metadata: NPUDSAMetadata,
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
@@ -289,6 +289,7 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
             # same expert outputs.
             return output.fill_(0)
 
+        num_actual_toks = attn_metadata.num_actual_tokens
         assert isinstance(kv_cache, (list, tuple)), f"{type(kv_cache)=}."
         assert len(kv_cache) == 3, f"{len(kv_cache)=}."
         k_nope, k_rope, _ = kv_cache
@@ -299,6 +300,8 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
+        output = output[:num_actual_toks, ...]
+        q = q[:num_actual_toks, ...]
 
         assert (
             attn_metadata.num_decodes is not None

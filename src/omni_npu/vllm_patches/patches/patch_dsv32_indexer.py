@@ -114,7 +114,7 @@ class DSV32IndexerPatch(VLLMPatch):
         assert len(kv_cache) >= 3, (f"Expected kv_cache to have at least 3 elements, but got {len(kv_cache)}")
         
         if kv_cache[2] is not None:
-            torch_npu.npu_scatter_nd_update(
+            torch_npu.npu_scatter_nd_update_(
                 kv_cache[2].view(-1, 1, k.shape[-1]),
                 attn_metadata.slot_mapping.view(-1, 1),
                 k.view(-1, 1, k.shape[-1])
@@ -141,6 +141,6 @@ class DSV32IndexerPatch(VLLMPatch):
             sparse_count=self.topk_tokens,
             sparse_mode=3
         )
-        self.topk_indices_buffer = topk_indices
-        return topk_indices      
+        self.topk_indices_buffer[:attn_metadata.num_actual_tokens] = topk_indices.view(-1, self.topk_tokens)
+        return self.topk_indices_buffer      
         
