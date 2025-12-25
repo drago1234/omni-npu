@@ -76,13 +76,23 @@ class NPUWorker(WorkerBase):
             current_platform.set_device(self.device)
             torch.npu.empty_cache()
             # Initialize distributed before measuring memory
+            backend = getattr(current_platform, "dist_backend", "hccl")
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
                 self.distributed_init_method,
                 self.local_rank,
-                getattr(current_platform, "dist_backend", "hccl"),
+                backend,
             )
+
+            # Only initialize the custom layer-parallel communication domain when
+            # explicitly enabled by the high-performance launcher script.
+            if os.getenv("VLLM_CUSTOM_MODEL_ENABLE"):
+                from ..distributed.parallel_state_ext import ( 
+                    ensure_layer_parallel_initialized,
+                )
+
+                ensure_layer_parallel_initialized(backend=backend)
             # Set random seed
             set_random_seed(self.model_config.seed)
             # Snapshot available memory

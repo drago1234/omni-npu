@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
+from __future__ import annotations
+
+"""Layer-parallel communication ops.
+
+This module provides thin wrappers around vLLM's collectives (via
+`vllm.distributed.parallel_state.GroupCoordinator`), scoped to a specific
+`layer_name_inside_block` and an optional `tensor_tag` ("x" / "y").
+
+All wrappers are **no-ops** if the resolved group is missing or has
+`world_size <= 1` (common in single-rank / non-distributed runs).
+"""
+
+from typing import TYPE_CHECKING
+
+import torch
+import torch.distributed as dist
+
+from .parallel_state_ext import get_layer_parallel_group
+
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+__all__ = [
+    "layer_parallel_all_reduce",
+    "layer_parallel_all_gather",
+    "layer_parallel_reduce_scatter",
+    "layer_parallel_all2all_single",
+]
+
+
+def _get_group(
+    layer_name_inside_block: str,
+    tensor_tag: str | None = None,
+) -> GroupCoordinator | None:
+    """Resolve the `GroupCoordinator` for a layer (fast-path for `world_size <= 1`)."""
+    group = get_layer_parallel_group(layer_name_inside_block, tensor_tag)
+    if group is None or group.world_size <= 1:
+        return None
+    return group
+
+
+def layer_parallel_all_reduce(
+    input: torch.Tensor,
+    layer_name_inside_block: str,
+    tensor_tag: str | None = None,
+) -> torch.Tensor:
+    """All-reduce `input` over the layer-parallel group."""
+    group = _get_group(layer_name_inside_block, tensor_tag)
+    if group is None:
+        return input
+    return group.all_reduce(input)
+
+
+def layer_parallel_all_gather(
+    input: torch.Tensor,
+    layer_name_inside_block: str,
+    tensor_tag: str | None = None,
+    dim: int = -1,
+) -> torch.Tensor:
+    """All-gather `input` over the layer-parallel group and concat on `dim`."""
+    group = _get_group(layer_name_inside_block, tensor_tag)
+    if group is None:
+        return input
+    return group.all_gather(input, dim=dim)
+
+
+def layer_parallel_reduce_scatter(
+    input: torch.Tensor,
+    layer_name_inside_block: str,
+    tensor_tag: str | None = None,
+    dim: int = -1,
+) -> torch.Tensor:
+    """Reduce-scatter `input` over the layer-parallel group along `dim`."""
+    group = _get_group(layer_name_inside_block, tensor_tag)
+    if group is None:
+        return input
+    return group.reduce_scatter(input, dim=dim)
+
+
+def layer_parallel_all2all_single(
+    input: torch.Tensor,
+    layer_name_inside_block: str,
+    tensor_tag: str | None = None,
+    dim: int = 0,
+) -> torch.Tensor:
+    """ProcessGroup-based all_to_all_single along `dim` (PyTorch standard collective)."""
+    group = _get_group(layer_name_inside_block, tensor_tag)
+    if group is None:
+        return input
+
+    if not isinstance(dim, int):
+        raise TypeError(f"dim must be int, got {type(dim)!r}.")
+
+    process_group = getattr(group, "device_group", None)
+    if process_group is None:
+        raise RuntimeError(
+            "layer_parallel_all2all_single requires GroupCoordinator.device_group "
+            "(a torch.distributed ProcessGroup)."
+        )
+
+    ndim = input.dim()
+    dim = dim + ndim if dim < 0 else dim
+    if dim < 0 or dim >= ndim:
+        raise ValueError(
+            f"Invalid dim={dim} for input with dim={ndim}."
+        )
+
+    world_size = getattr(group, "world_size", None) or dist.get_world_size(
+        group=process_group
+    )
+    split_size = input.size(dim)
+    if split_size % world_size != 0:
+        raise ValueError(
+            f"Input size along dim={dim} (resolved dim={dim}) must be "
+            f"divisible by world_size={world_size}, got {split_size}."
+        )
+
+    if dim != 0:
+        in_buf = input.transpose(0, dim).contiguous()
+    else:
+        in_buf = input.contiguous() if not input.is_contiguous() else input
+
+    out_buf = torch.empty_like(in_buf)
+    dist.all_to_all_single(out_buf, in_buf, group=process_group)
+
+    if dim != 0:
+        return out_buf.transpose(0, dim).contiguous()
+    return out_buf
