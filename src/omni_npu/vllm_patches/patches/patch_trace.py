@@ -5,9 +5,6 @@
 # export OMNI_NPU_VLLM_PATCHES_ALL=1
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from omni_trace.utils import safe_print, ip_str, trace_output_directory
-from omni_trace.prof_wrapper import (torchnpu_prof_wrapper, timer_prof_wrapper, viztracer_prof_wrapper, marker_prof_wrapper)
-
 import time
 from typing import Optional, List, Tuple
 import os
@@ -25,13 +22,6 @@ from vllm.v1.engine.core import EngineCore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-wrapper_dict = {
-    "torchnpu": torchnpu_prof_wrapper,
-    "timer": timer_prof_wrapper,
-    "viztracer": viztracer_prof_wrapper,
-    "marker": marker_prof_wrapper
-}
 
 namelist_path = os.getenv("PROFILING_NAMELIST")
 
@@ -67,6 +57,13 @@ class ProfilerDynamicPatch(VLLMPatch):
         self.apply_patches(namelist_path)
 
     def apply_patches(self, namelist_path: str):
+        from omni_trace.prof_wrapper import (torchnpu_prof_wrapper, timer_prof_wrapper, viztracer_prof_wrapper, marker_prof_wrapper)
+        wrapper_dict = {
+            "torchnpu": torchnpu_prof_wrapper,
+            "timer": timer_prof_wrapper,
+            "viztracer": viztracer_prof_wrapper,
+            "marker": marker_prof_wrapper
+        }
         try:
             with open(namelist_path, 'r') as f:
                 config = yaml.safe_load(f)
@@ -184,6 +181,7 @@ class RequestStatusPatch(VLLMPatch):
         return self._status
 
     def status_set(self, value):
+        from omni_trace.utils import safe_print, ip_str, trace_output_directory
         self._status = value
         self.waiting_pull_len += 1
         if value == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -208,6 +206,7 @@ class OpenAIServingChatTokenLoggerPatch(VLLMPatch):
         _attr_names_to_apply = ['chat_completion_stream_generator']
 
     async def chat_completion_stream_generator(self, *args, **kwargs) -> AsyncGenerator:
+        from omni_trace.utils import safe_print, ip_str, trace_output_directory
         yield_count = 0
         request_id = args[2]
         async for item in _ORIGINAL_CHAT_COMPLETION_STREAM_GENERATOR(self, *args, **kwargs):
@@ -227,4 +226,3 @@ class OpenAIServingChatTokenLoggerPatch(VLLMPatch):
             if item == "data: [DONE]\n\n":
                 safe_print(trace_output_directory, f"<<<Action: Finish decode pickle and start response; Timestamp:{time.time()}; RequestID:{request_id}; Role:{os.getenv('ROLE')}_{ip_str}")
             yield item
-            
