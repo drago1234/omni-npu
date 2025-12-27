@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Optional
-
+from dataclasses import replace
 import torch
 import torch_npu
 
 from vllm.logger import init_logger
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.rejection_sampler import (
     RejectionSampler,
     GREEDY_TEMPERATURE,
@@ -21,20 +24,20 @@ from omni_npu.v1.sample.sampler import apply_top_k_top_p
 
 
 class NPURejectionSampler(RejectionSampler):
+    def __init__(self, sampler: Sampler):
+        super().__init__(sampler)
 
 
     def forward(
         self,
         metadata: SpecDecodeMetadata,
         # [num_tokens, vocab_size]
-        draft_probs: Optional[torch.Tensor],
-        # [num_tokens, vocab_size]
-        target_logits: torch.Tensor,
-        # [batch_size, 1]
-        bonus_token_ids: torch.Tensor,
+        draft_probs: torch.Tensor | None,
+        # [num_tokens + batch_size, vocab_size]
+        logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> torch.Tensor:
-        '''
+    ) -> SamplerOutput:
+        """
         Args:
             metadata:
                 Metadata for spec decoding.
@@ -42,27 +45,53 @@ class NPURejectionSampler(RejectionSampler):
                 Probability distribution for the draft tokens. Shape is
                 [num_tokens, vocab_size]. Can be None if probabilities are
                 not provided, which is the case for ngram spec decode.
-            target_logits (torch.Tensor):
+            logits (torch.Tensor):
                 Target model's logits probability distribution.
-                Shape is [num_tokens, vocab_size]. Here, probabilities from
-                different requests are flattened into a single tensor because
-                this is the shape of the output logits.
-                NOTE: `target_logits` can be updated in place to save memory.
-            bonus_token_ids (torch.Tensor):
-                A tensor containing bonus tokens. Shape is [batch_size, 1].
-                Bonus tokens are added to the end of the sequence if all
-                proposed tokens are accepted. We generate the bonus tokens
-                outside of the rejection sampler with the default sampling
-                strategy. It allows for more flexibility in the sampling
-                process such as top_p, top_k sampling.
+                Shape is [num_tokens + batch_size, vocab_size]. Here,
+                probabilities from different requests are flattened into a
+                single tensor because this is the shape of the output logits.
+                NOTE: `logits` can be updated in place to save memory.
             sampling_metadata (vllm.v1.sample.metadata.SamplingMetadata):
                 Additional metadata needed for sampling, such as temperature,
                 top-k/top-p parameters, or other relevant information.
         Returns:
-            output_token_ids (torch.Tensor):
-                A tensor containing the final output token IDs.
-        '''
+            SamplerOutput:
+                Contains the final output token IDs and their logprobs if
+                requested.
+        """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+
+        bonus_logits_indices = metadata.bonus_logits_indices
+        target_logits_indices = metadata.target_logits_indices
+
+        # When indexing with a tensor (bonus_logits_indices), PyTorch
+        # creates a new tensor with separate storage from the original
+        # logits tensor. This means any in-place operations on bonus_logits
+        # won't affect the original logits tensor.
+        assert logits is not None
+        bonus_logits = logits[bonus_logits_indices]
+        bonus_sampler_output = self.sampler(
+            logits=bonus_logits,
+            sampling_metadata=replace(
+                sampling_metadata,
+                max_num_logprobs=-1,
+            ),
+            predict_bonus_token=True
+            # Apdator: NPU sampler does not have logprobs_mode_override parameter
+        )
+        bonus_token_ids = bonus_sampler_output.sampled_token_ids
+
+        # Just like `bonus_logits`, `target_logits` is a new tensor with
+        # separate storage from the original `logits` tensor. Therefore,
+        # it is safe to update `target_logits` in place.
+        raw_target_logits = logits[target_logits_indices]
+        # Use float32 for the target_logits.
+        raw_target_logits = raw_target_logits.to(torch.float32)
+        target_logits = self.apply_logits_processors(
+            raw_target_logits, sampling_metadata, metadata
+        )
+
+
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `compute_probs` function.
@@ -85,7 +114,21 @@ class NPURejectionSampler(RejectionSampler):
             bonus_token_ids,
             sampling_metadata,
         )
-        return output_token_ids
+        logprobs_tensors = None
+        if sampling_metadata.max_num_logprobs:
+            logprobs_tensors = self._get_logprobs_tensors(
+                sampling_metadata.max_num_logprobs,
+                metadata,
+                logits,
+                target_logits if self.is_processed_logprobs_mode else raw_target_logits,
+                bonus_sampler_output.logprobs_tensors.logprobs,
+                output_token_ids,
+            )
+
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=logprobs_tensors,
+        )
 
 
 

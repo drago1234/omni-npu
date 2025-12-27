@@ -14,6 +14,7 @@ import torch
 import torch_npu
 
 from vllm.attention.backends.abstract import AttentionLayer, AttentionType
+from vllm.forward_context import get_forward_context
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import (
@@ -22,6 +23,7 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     MLACommonBaseImpl,
+    QueryLenSupport,
 )
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -78,6 +80,7 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_uniform_spec_as_decode: ClassVar[bool] = True
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
         self,
@@ -242,37 +245,56 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert attn_metadata.decode is not None
-        batch_size = attn_metadata.decode.block_table.shape[0]
-        T, N, D = decode_ql_nope.shape
-        S = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
-        if T > batch_size:
-            attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
-            sparse_mode = 3
-        else:
-            assert T == batch_size
-            attn_mask = None
-            sparse_mode = 0
 
-        ## TODO: TND_NTD layout bug. Currently use BSND.
-        # output shape: (B, S, N, D)
-        o = torch.ops.npu.npu_fused_infer_attention_score(
-            decode_ql_nope.view(-1, S, N, D), kv_cache[0], kv_cache[0],
-            query_rope=decode_q_pe.view(-1, S, N, self.qk_rope_head_dim),
-            key_rope=kv_cache[1],
-            num_heads=self.num_heads,
-            num_key_value_heads=1,
-            input_layout="BSND",
-            scale=self.scale,
-            antiquant_mode=0,
-            antiquant_scale=None,
-            block_table=attn_metadata.decode.block_table,
-            block_size=128,
-            # actual_seq_lengths=attn_metadata.decode.query_cumlens,
-            actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
-            atten_mask=attn_mask,
-            sparse_mode=sparse_mode,
-        )[0]
-        o = o.view(-1, N, D).transpose(0, 1).contiguous()
+        ## TODO: TND_NTD layout bug. Currently graph mode only support BSND.
+        # output shape: (N, T, D)
+        batch_descriptor = get_forward_context().batch_descriptor
+        if batch_descriptor is not None and batch_descriptor.uniform:
+            batch_size = attn_metadata.decode.block_table.shape[0]
+            T, N, D = decode_ql_nope.shape
+            S = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
+            if T > batch_size:
+                attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
+                sparse_mode = 3
+            else:
+                assert T == batch_size
+                attn_mask = None
+                sparse_mode = 0
+
+            o = torch.ops.npu.npu_fused_infer_attention_score(
+                decode_ql_nope.view(-1, S, N, D), kv_cache[0], kv_cache[0],
+                query_rope=decode_q_pe.view(-1, S, N, self.qk_rope_head_dim),
+                key_rope=kv_cache[1],
+                num_heads=self.num_heads,
+                num_key_value_heads=1,
+                input_layout="BSND",
+                scale=self.scale,
+                antiquant_mode=0,
+                antiquant_scale=None,
+                block_table=attn_metadata.decode.block_table,
+                block_size=128,
+                # actual_seq_lengths=attn_metadata.decode.query_cumlens,
+                actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
+                atten_mask=attn_mask,
+                sparse_mode=sparse_mode,
+            )[0]
+            o = o.view(-1, N, D).transpose(0, 1).contiguous()
+        else:
+            o = torch.ops.npu.npu_fused_infer_attention_score(
+                decode_ql_nope, kv_cache[0], kv_cache[0],
+                query_rope=decode_q_pe,
+                key_rope=kv_cache[1],
+                num_heads=self.num_heads,
+                num_key_value_heads=1,
+                input_layout="TND_NTD",
+                scale=self.scale,
+                antiquant_mode=0,
+                antiquant_scale=None,
+                block_table=attn_metadata.decode.block_table,
+                block_size=128,
+                actual_seq_lengths=attn_metadata.decode.query_cumlens,
+                actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
+            )[0]
 
         return o
 
