@@ -210,7 +210,7 @@ class NPUFusedMoE(FusedMoE):
                 dtype=torch.int32,
                 device=router_logits.device,
             ).view(num_tokens, top_k) % global_num_experts
-            topk_weights = torch.rand_like(topk_ids)
+            topk_weights = torch.rand_like(topk_ids, dtype=router_logits.dtype)
             row_idx = torch.arange(topk_ids.numel(),
                                    device=topk_ids.device,
                                    dtype=torch.int32) \
