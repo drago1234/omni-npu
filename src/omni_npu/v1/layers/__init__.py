@@ -1,0 +1,1 @@
+from omni_npu.v1.layers.rotary_emb import NPUDeepseekScalingRotaryEmbedding

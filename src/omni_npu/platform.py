@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Optional
 import torch
 import torch_npu
@@ -155,13 +156,22 @@ class NPUPlatform(Platform):
         use_sparse: bool,
         attn_type: str | None = None,
     ) -> str:
-        if use_mla:
-            if use_sparse:
-                return "omni_npu.attention.backends.dsa.NPUDSABackend"
+        if "omni_models_v1" in os.environ.get("VLLM_PLUGINS", ""):
+            if use_mla:
+                if use_sparse:
+                    return "omni_npu.attention.backends.dsa.NPUDSABackend"
+                else:
+                    return "omni_npu.v1.attention.backends.mla.NPUMLABackend"
             else:
-                return "omni_npu.attention.backends.mla.NPUMLABackend"
+                return "omni_npu.attention.backends.attention.NPUAttentionBackend"
         else:
-            return "omni_npu.attention.backends.attention.NPUAttentionBackend"
+            if use_mla:
+                if use_sparse:
+                    return "omni_npu.attention.backends.dsa.NPUDSABackend"
+                else:
+                    return "omni_npu.attention.backends.mla.NPUMLABackend"
+            else:
+                return "omni_npu.attention.backends.attention.NPUAttentionBackend"
 
     @property
     def simple_compile_backend(self):

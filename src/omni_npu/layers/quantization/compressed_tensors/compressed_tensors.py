@@ -1,5 +1,8 @@
-from typing import List, Optional, Any
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from typing import List, Optional, Any
+import os
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from vllm.model_executor.layers.linear import (
@@ -213,6 +216,9 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         )
         weight_num_bits = self._get_weight_num_bits("mlp.experts", weight_quant)
         if self._is_dynamic_token_w8a8(weight_quant, input_quant, weight_num_bits):
+            if "omni_models_v1" in os.environ.get("VLLM_PLUGINS", ""):
+                from omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethodV1
+                return NPUCompressedTensorsW8A8Int8MoEMethodV1(self, layer)
             return NPUCompressedTensorsW8A8Int8MoEMethod(self, layer)
         elif self._is_dynamic_token_w4a8_int(weight_quant, input_quant, weight_num_bits):
             raise NotImplementedError
@@ -238,4 +244,3 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         if isinstance(layer, FusedMoE):
             return self.get_moe_method(layer)
         return None
-
