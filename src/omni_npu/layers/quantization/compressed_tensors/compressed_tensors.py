@@ -27,7 +27,13 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
 
 from omni_npu.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import NPUCompressedTensorsW8A8Int8
 from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethod
-
+from omni_npu.v1.layers.linear import (
+    UnquantizedFlashCommLinearMethod,
+    FlashCommLinearBase
+)
+from omni_npu.v1.quantization.compressed_tensors import (
+    W8A8Int8FCLinearMethod
+)
 
 NPU_COMPRESSED_TENSORS = "npu-compressed-tensors"
 
@@ -227,6 +233,36 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
             )
 
+    def get_fc_method(self, layer: FlashCommLinearBase, layer_name: Optional[str] = None ) -> Optional[QuantizeMethodBase]:
+        if should_ignore_layer(
+            layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return UnquantizedFlashCommLinearMethod()
+
+        matched_target = find_matched_target(
+            layer_name=layer_name,
+            module=layer,
+            targets=self.target_scheme_map.keys())
+    
+        scheme_dict = self.target_scheme_map[matched_target]
+        weight_quant=scheme_dict["weights"]
+        input_quant=scheme_dict["input_activations"]
+        format = self.quant_format
+
+        act_quant_format = is_activation_quantization_format(format)
+        if act_quant_format:
+            weight_num_bits = self._get_weight_num_bits(layer_name, weight_quant)
+            if weight_num_bits == 16:
+                return UnquantizedFlashCommLinearMethod()
+
+            if self._is_dynamic_token_w8a8(weight_quant, input_quant, weight_num_bits):
+                return W8A8Int8FCLinearMethod(self)
+
+            if self._is_dynamic_token_w4a8_int(weight_quant, input_quant, weight_num_bits):
+                raise NotImplementedError
+
+        raise NotImplementedError("No compressed-tensors compatible method was found.")
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -243,4 +279,6 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
             return quant_method
         if isinstance(layer, FusedMoE):
             return self.get_moe_method(layer)
+        if isinstance(layer, FlashCommLinearBase):
+            return self.get_fc_method(layer, prefix)
         return None
