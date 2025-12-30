@@ -2,87 +2,83 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 # This patch is used for enable_eplb fix in ParallelConfig and FusedMoE
-# Please use this patch by adding VLLM_PLUGINS="omni-npu,omni_npu_patches" OMNI_NPU_VLLM_PATCHES="EPLBParallelConfig,EPLBFusedMoE" before vllm serve
-from vllm.config.parallel import ParallelConfig
+# Please use this patch by adding VLLM_PLUGINS="omni-npu,omni_npu_patches" OMNI_NPU_VLLM_PATCHES="EPLBEngineConfig,EPLBSharedFusedMoE" before vllm serve
+from vllm import EngineArgs
+_Orig_Create_Engine_Config = EngineArgs.create_engine_config
+from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 import os
 import torch
 from typing import Callable, TYPE_CHECKING, Any, Literal, Optional, Union
 from typing_extensions import Self
-from pydantic import model_validator
-from pydantic.dataclasses import dataclass
 
 import vllm.envs as envs
-from vllm.config import get_current_vllm_config
-from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.distributed import get_tensor_model_parallel_world_size, get_dp_group
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE, FusedMoEMethodBase, UnquantizedFusedMoEMethod, maybe_roundup_hidden_size, determine_expert_map, get_compressed_expert_map
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
-from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEParallelConfig,
-    FusedMoEQuantConfig,
-)
+from vllm.config import VllmConfig
+if TYPE_CHECKING:
+    from vllm.usage.usage_lib import UsageContext
+else:
+    UsageContext = Any
 
 logger = init_logger(__name__)
 
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 
-@config
-@dataclass
-@register_patch("EPLBParallelConfig", ParallelConfig)
-class ParallelConfigPatch(VLLMPatch):
+@register_patch("EPLBEngineConfig", EngineArgs)
+class EngineConfigPatch(VLLMPatch):
     """
-    ParallelConfig for EPLB on NPU devices (when eplb enabled).
+    EngineConfig for EPLB on NPU devices (when eplb enabled).
     """
+    _attr_names_to_apply = ['create_engine_config']
 
-    _attr_names_to_apply = ['_validate_parallel_config']
+    def create_engine_config(
+        self,
+        usage_context: UsageContext | None = None,
+        headless: bool = False,
+    ) -> VllmConfig:
 
-    @model_validator(mode="after")
-    def _validate_parallel_config(self) -> Self:
-        if self._api_process_rank >= self._api_process_count:
-            raise ValueError(
-                "Invalid value of `_api_process_rank`. "
-                f"Expected to be `-1` or `[0, {self._api_process_count})`, "
-                f"but found: {self._api_process_rank}")
+        from vllm.platforms import current_platform
 
-        if self.data_parallel_size_local > self.data_parallel_size:
-            raise ValueError(
-                f"data_parallel_size_local ({self.data_parallel_size_local}) "
-                f"must be <= data_parallel_size ({self.data_parallel_size})")
+        _orig_is_cuda_alike = current_platform.is_cuda_alike
 
-        if self.data_parallel_size <= 1 and self.data_parallel_external_lb:
-            raise ValueError(
-                "data_parallel_external_lb can only be set when data_parallel_size > 1"
+        def _npu_temp_cuda_alike_true():
+            if getattr(current_platform, "device_type", None) == "npu":
+                return True
+            return _orig_is_cuda_alike()
+
+        current_platform.is_cuda_alike = _npu_temp_cuda_alike_true
+        try:
+            return _Orig_Create_Engine_Config(self, usage_context, headless)
+        finally:
+            current_platform.is_cuda_alike = _orig_is_cuda_alike
+
+@register_patch("EPLBSharedFusedMoE", SharedFusedMoE)
+class SharedFusedMoEPatch(VLLMPatch):
+    """
+    A FusedMoE operation that also computes the results of shared experts.
+    If an all2all communicator is being used the shared expert computation
+    can be interleaved with the fused all2all dispatch communication step.
+    """
+    _attr_names_to_apply = ['__init__']
+
+    def __init__(
+        self,
+        shared_experts: torch.nn.Module | None,
+        gate: torch.nn.Module | None = None,
+        use_overlapped: bool = True,
+        **kwargs,
+    ):
+        super(SharedFusedMoE, self).__init__(**kwargs)
+        self._shared_experts = shared_experts
+        self.use_overlapped = (
+            use_overlapped
+            and not (
+                # TODO(wentao): find the root cause and remove this condition
+                False
+                or (self.moe_config.use_flashinfer_cutlass_kernels and self.dp_size > 1)
             )
-
-        if self.enable_eplb:
-            if not self.enable_expert_parallel:
-                raise ValueError(
-                    "enable_expert_parallel must be True to use EPLB.")
-            if self.tensor_parallel_size * self.data_parallel_size <= 1:
-                raise ValueError(
-                    "EPLB requires tensor_parallel_size or data_parallel_size "
-                    f"to be greater than 1, but got "
-                    f"TP={self.tensor_parallel_size},DP={self.data_parallel_size}."
-                )
-        else:
-            if self.eplb_config.num_redundant_experts != 0:
-                raise ValueError(
-                    "num_redundant_experts is set to "
-                    f"{self.eplb_config.num_redundant_experts} but EPLB is not "
-                    "enabled. Either enable EPLB or unset "
-                    "num_redundant_experts.")
-
-        if self.prefill_context_parallel_size > 1:
-            raise ValueError(
-                "Prefill context parallelism is not fully supported. "
-                "Please set prefill_context_parallel_size to 1.")
-        return self
+            and self._shared_experts is not None
+        )
+        self._gate = gate

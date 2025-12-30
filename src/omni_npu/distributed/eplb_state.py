@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import torch
 from typing import Optional, Sequence
-from vllm.config import ParallelConfig
+from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.logger import init_logger
 from vllm.config import get_current_vllm_config
@@ -21,50 +21,10 @@ class EplbState:
     planner: Optional[OmniPlanner] = None
     start_step: bool = False
 
-    @classmethod
-    def build(cls,
-              model: MixtureOfExperts,
-              device: torch.device,
-              parallel_config: ParallelConfig,
-              global_expert_load: Optional[torch.Tensor] = None,
-              old_global_expert_indices: Optional[torch.Tensor] = None,
-              rank_mapping: Optional[dict[int, int]] = None,
-              ) -> "EplbState":
-        if OmniPlanner is not None:
-            param_dict = dict(model.named_parameters())
-            planner = OmniPlanner()
-            planner.init_dram_weights(param_dict, first_k_dense_replace=3)
-            return cls(planner)
-        else:
-            planner = None
-
-    def step(
-        self,
-        model: MixtureOfExperts,
-        is_dummy: bool = False,
-        is_profile: bool = False,
-        log_stats: bool = False) -> None:
-        if OmniPlanner is not None:
-            if not self.start_step:
-                self.planner.start_dynamic_optimize_expert_load_balance()
-                self.start_step = True
-            self.planner.place_experts()
-        else:
-            pass
-
-    @staticmethod
-    def recv_state() -> tuple[torch.Tensor, torch.Tensor]:
-        pass
-
-    def rearrange(
-        self,
-        model: MixtureOfExperts,
-        is_profile: bool = False,
-        execute_shuffle: bool = True,
-        global_expert_load: Optional[torch.Tensor] = None,
-        rank_mapping: Optional[dict[int, int]] = None,
-    ) -> Optional[torch.Tensor]:
-        pass
+    def __init__(self, parallel_config: ParallelConfig, device: torch.device):
+        self.planner = None
+        self.start_step = None
+        self.is_async = False
 
     @staticmethod
     def build_initial_global_physical_to_logical_map(
@@ -76,3 +36,70 @@ class EplbState:
             i % num_routed_experts for i in range(num_redundant_experts)
         ]
         return global_physical_to_logical_map
+
+    def add_model(
+        self,
+        model: MixtureOfExperts,
+        model_config: ModelConfig,
+        global_expert_load: torch.Tensor | None = None,
+        old_global_expert_indices: torch.Tensor | None = None,
+        rank_mapping: dict[int, int] | None = None,
+    ):
+        if OmniPlanner is not None:
+            param_dict = dict(model.named_parameters())
+            planner = OmniPlanner()
+            planner.init_dram_weights(param_dict, first_k_dense_replace=3)
+            self.planner = planner
+        else:
+            self.planner = None
+
+    def step(
+        self,
+        is_dummy: bool = False,
+        is_profile: bool = False,
+        log_stats: bool = False,
+    ) -> None:
+        if OmniPlanner is not None:
+            if not self.start_step:
+                self.planner.start_dynamic_optimize_expert_load_balance()
+                self.start_step = True
+            self.planner.place_experts()
+        else:
+            pass
+
+    def rearrange(
+        self,
+        is_profile: bool = False,
+        execute_shuffle: bool = True,
+        global_expert_loads: list[torch.Tensor] | None = None,
+        rank_mapping: dict[int, int] | None = None,
+    ) -> torch.Tensor | None:
+        pass
+
+    def start_async_loop(
+        self,
+        rank_mapping: dict[int, int] | None = None,
+        is_profile: bool = False,
+    ):
+        pass
+
+    @staticmethod
+    def recv_state() -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        pass
+
+    @classmethod
+    def get_eep_state(
+        cls, parallel_config: ParallelConfig
+    ) -> tuple[
+        list[torch.Tensor] | None,
+        list[torch.Tensor] | None,
+        dict[int, int] | None,
+    ]:
+        global_expert_loads = None
+        old_global_expert_indices_per_model = None
+        rank_mapping = None
+        return (
+            global_expert_loads, 
+            old_global_expert_indices_per_model, 
+            rank_mapping,
+        )        

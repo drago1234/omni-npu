@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.mla.common import (
 )
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -70,7 +71,7 @@ class NPUMLABackend(MLACommonBackend):
 @dataclass
 class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
-
+    mc2_mask: torch.Tensor = None
 
 @dataclass
 class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
@@ -101,6 +102,14 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             raise ValueError("DCP should not be enabled.")
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
+        
+        self.uniform_decode_query_len = (
+            1
+            if not get_current_vllm_config().speculative_config
+            else 1 + get_current_vllm_config().speculative_config.num_speculative_tokens
+        )
+        self.batch_size = get_current_vllm_config().scheduler_config.max_num_seqs * self.uniform_decode_query_len
+        self.mc2_mask = torch.zeros(self.batch_size, dtype=torch.bool, device=current_platform.device_type)
 
     def _build_decode(
         self,
@@ -126,12 +135,18 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         fast_build: bool = False,
     ) -> NPUMLAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if metadata.prefill is None:
+            self.generate_activate_mask(common_attn_metadata.num_actual_tokens, self.batch_size)
+            metadata.decode.mc2_mask = self.mc2_mask
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc = metadata.prefill.query_start_loc.tolist()
         if metadata.prefill is not None and metadata.prefill.chunked_context is not None:
             raise RuntimeError(f"Chunked prefill is not enabled yet.")
         return metadata
-
+    
+    def generate_activate_mask(self, actual_seqs_num, batch_size):
+        self.mc2_mask.fill_(False)
+        self.mc2_mask[:actual_seqs_num].fill_(True)
 
 class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
     can_return_lse_for_decode: bool = False

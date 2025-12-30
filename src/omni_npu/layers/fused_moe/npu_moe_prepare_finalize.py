@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     PrepareResultType,
     TopKWeightAndReduce,
 )
+from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 
 
@@ -32,6 +33,8 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
         self.expand_idx = None
         self.ep_recv_counts = None
         self.tp_recv_counts = None
+        self.mc2_mask = None
+        self.mask_view = None
 
     def prepare(
         self,
@@ -47,19 +50,26 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
             quant_mode = 2  # Dynamic quantization
         else:
             quant_mode = 0  # No quantization
+        self.attn_metadata = get_forward_context().attn_metadata
+        self.mc2_mask = self.attn_metadata[next(iter(self.attn_metadata))].decode.mc2_mask
+
+        decode_gear = get_forward_context().batch_descriptor.num_reqs
+        self.mask = self.mc2_mask[:decode_gear]
+
+        self.num_experts = num_experts
         kwargs = {
             "x": a1,
             "expert_ids": topk_ids,  # [n*topk]
             "expert_shard_type": 0,  # Set it to 0 for now
             "shared_expert_rank_num": 0,  # 32
-            "moe_expert_num": num_experts, #ENABLE_OMNI_PLANNER, 0 redundancy 256, 1 redundancy expert 320
+            "moe_expert_num": self.num_experts, #ENABLE_OMNI_PLANNER, 0 redundancy 256, 1 redundancy expert 320
             "global_bs": 0,  # 0 Default (all); all tokens can be set
             "scales": None,  # Quantization coefficient
             "quant_mode": quant_mode,
             "group_ep": self.moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
             "ep_world_size": self.moe.ep_size,
             "ep_rank_id": self.moe.ep_rank,
-            "x_active_mask": None,
+            "x_active_mask": self.mask,
         }
 
         output = torch_npu.npu_moe_distribute_dispatch_v2(**kwargs)
@@ -90,14 +100,14 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
             "expert_scales": topk_weights.to(torch.float32),  # weight [n*topk]
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
-            "moe_expert_num":  self.moe.num_experts, #ENABLE_OMNI_PLANNER, 0 redundancy 256, 1 redundancy expert 320
+            "moe_expert_num":  self.num_experts, #ENABLE_OMNI_PLANNER, 0 redundancy 256, 1 redundancy expert 320
             "global_bs": 0,  # 0 Default (all); all tokens can be set
             "ep_send_counts": self.ep_recv_counts,  # dispatch's send_counts
             "group_ep": self.moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
             "ep_world_size": self.moe.ep_size,
             "ep_rank_id": self.moe.ep_rank,
             "tp_send_counts": self.tp_recv_counts,
-            "x_active_mask": None,
+            "x_active_mask": self.mask,
         }
 
         hidden_states_route = torch_npu.npu_moe_distribute_combine_v2(**kwargs)

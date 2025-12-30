@@ -3,7 +3,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from vllm.platforms import current_platform
-
+from vllm.distributed import get_ep_group
 
 def fused_topk(
     gating_output: torch.Tensor,
@@ -208,7 +208,7 @@ def moe_infer_fusion(
     topk_weights: torch.Tensor,
 ):
     x = x.view(-1, x.shape[-1])
-    max_num_deployed_expert = layer.moe_config.num_experts
+    max_num_deployed_expert = layer.w13_weight.shape[0] * get_ep_group().world_size
     topk_ids = topk_ids.int()
 
     expert_range = [0, max_num_deployed_expert]

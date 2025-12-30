@@ -47,6 +47,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         self.n_routed_experts = layer.moe_config.num_experts
         self.prefix = layer.layer_name
         self.vllm_config = get_current_vllm_config().model_config.hf_config
+        self.num_of_redundant_experts = 0
         if self.enable_eplb:
             from omni_placement.omni_planner import OmniPlanner
             self.planner = OmniPlanner(config_file=None,
@@ -57,6 +58,9 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
                             num_redundancy_shared_expert_rank=0)
             self.moe_layer_idx = OmniPlanner.get_deepseek_v3_moe_layer_idx(self.prefix, self.vllm_config.first_k_dense_replace)
             self.expert_mapping = self.planner.expert_mapping_on_current_layer(self.moe_layer_idx)
+            self.num_of_redundant_experts = self.planner.get_num_of_redundant_experts(moe_layer_idx=self.moe_layer_idx,
+                                                                                      num_expert_per_device_origin=layer.local_num_experts,
+                                                                                      rank_device=get_world_group().rank_in_group)
 
     def create_weights(
         self,
@@ -68,7 +72,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         **extra_weight_attrs,
     ):
         params_dtype = torch.int8
-
+        num_experts = num_experts + self.num_of_redundant_experts
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -190,6 +194,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
 
         tp_size = get_tensor_model_parallel_world_size()  # attn tp size
         hidden_states = x
+        global_num_experts=global_num_experts + get_world_group().world_size * self.num_of_redundant_experts
         if layer.moe_parallel_config.use_ep and tp_size > 1:
             tp_rank = get_tensor_model_parallel_rank()
             t_ori = x.shape[0]
@@ -232,8 +237,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
             if layer.shared_experts is not None:
                 share_output = layer.shared_experts(x)
             attn_metadata = get_forward_context().attn_metadata
-            use_all2all = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-            if use_all2all:
+            batch_descriptor = get_forward_context().batch_descriptor
+            if batch_descriptor is None or not batch_descriptor.uniform:
                 output = moe_infer_fusion(
                     layer=layer,
                     x=hidden_states,
