@@ -54,7 +54,7 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
         self.mc2_mask = self.attn_metadata[next(iter(self.attn_metadata))].decode.mc2_mask
 
         decode_gear = get_forward_context().batch_descriptor.num_reqs
-        self.mask = self.mc2_mask[:decode_gear]
+        self.mask = self.mc2_mask[:decode_gear] if self.mc2_mask is not None else None
 
         self.num_experts = num_experts
         kwargs = {

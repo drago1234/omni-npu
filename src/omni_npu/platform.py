@@ -33,7 +33,6 @@ class ConfigUpdater:
             graph_model_compile_config = additional_config.get("graph_model_compile_config", {})
             vllm_config.npu_compilation_config.build_from_cli(graph_model_compile_config, vllm_config)
             logger.debug(f"Graph model compile config: {graph_model_compile_config}")
-            
 
     @staticmethod
     def _handle_graph_mode(vllm_config: 'VllmConfig') -> None:
@@ -108,6 +107,7 @@ class NPUPlatform(Platform):
         registered here dynamically.
         """
         from omni_npu import layers
+        from omni_npu.layers import NPUCompressedTensorsConfig
         from omni_npu.distributed.eplb_state import EplbState
 
     @classmethod
@@ -121,14 +121,6 @@ class NPUPlatform(Platform):
         if cache_config and cache_config.block_size is None:
             cache_config.block_size = 128
 
-        # If MLA is enabled on non-GPU, disable chunked prefill/prefix caching to be safe.
-        model_config = vllm_config.model_config
-        if model_config and model_config.use_mla:
-            logger.info(
-                "MLA enabled on NPU; disabling chunked prefill and setting max_num_batched_tokens"
-            )
-            vllm_config.scheduler_config.enable_chunked_prefill = False
-            vllm_config.scheduler_config.chunked_prefill_enabled = False
         vllm_config.compilation_config.pass_config.fuse_norm_quant = False
         vllm_config.compilation_config.pass_config.fuse_act_quant = False
         vllm_config.compilation_config.pass_config.fuse_attn_quant = False

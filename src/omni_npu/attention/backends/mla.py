@@ -28,6 +28,8 @@ from vllm.v1.attention.backends.mla.common import (
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.platforms import current_platform
+from omni_npu.attention import ops
+
 
 logger = init_logger(__name__)
 
@@ -80,7 +82,6 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
 
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
-    supports_uniform_spec_as_decode: ClassVar[bool] = True
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
@@ -102,13 +103,13 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             raise ValueError("DCP should not be enabled.")
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
-        
+
         self.uniform_decode_query_len = (
             1
-            if not get_current_vllm_config().speculative_config
-            else 1 + get_current_vllm_config().speculative_config.num_speculative_tokens
+            if not self.vllm_config.speculative_config
+            else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
-        self.batch_size = get_current_vllm_config().scheduler_config.max_num_seqs * self.uniform_decode_query_len
+        self.batch_size = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
         self.mc2_mask = torch.zeros(self.batch_size, dtype=torch.bool, device=current_platform.device_type)
 
     def _build_decode(
@@ -123,8 +124,8 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     ) -> NPUMLADecodeMetadata:
         return NPUMLADecodeMetadata(
             block_table=block_table_tensor,
-            seq_lens=seq_lens_device.tolist(),
-            query_cumlens=query_start_loc_device[1:].tolist(),
+            seq_lens=seq_lens_cpu.tolist(),
+            query_cumlens=query_start_loc_cpu[1:].tolist(),
             dcp_tot_seq_lens=dcp_tot_seq_lens_device
         )
 
@@ -135,15 +136,14 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         fast_build: bool = False,
     ) -> NPUMLAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
-        if metadata.prefill is None:
+        if metadata.prefill is None and self.vllm_config.kv_transfer_config is not None:
+            # for pd-mixed, TP is used, no need to use mc2_mask
             self.generate_activate_mask(common_attn_metadata.num_actual_tokens, self.batch_size)
             metadata.decode.mc2_mask = self.mc2_mask
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc = metadata.prefill.query_start_loc.tolist()
-        if metadata.prefill is not None and metadata.prefill.chunked_context is not None:
-            raise RuntimeError(f"Chunked prefill is not enabled yet.")
         return metadata
-    
+
     def generate_activate_mask(self, actual_seqs_num, batch_size):
         self.mc2_mask.fill_(False)
         self.mc2_mask[:actual_seqs_num].fill_(True)
@@ -216,6 +216,80 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         out_new = out2.transpose(0, 1).contiguous().view(-1, self.num_heads * self.v_head_dim)
         out.copy_(out_new)  # Copy result
 
+    def _compute_prefill_context(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c_cache: torch.Tensor,
+        k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        k_scale: torch.Tensor,
+    ):
+        assert attn_metadata.prefill is not None
+        prefill_metadata = attn_metadata.prefill
+        assert prefill_metadata.chunked_context is not None
+
+        output = None
+        iters = len(prefill_metadata.chunked_context.seq_tot)
+        workspace = prefill_metadata.chunked_context.workspace
+
+        for i in range(iters):
+            toks = prefill_metadata.chunked_context.seq_tot[i]
+            ops.gather_and_maybe_dequant_cache(
+                src_cache=(kv_c_cache, k_pe_cache),
+                dst=workspace,
+                block_table=prefill_metadata.block_table,
+                cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
+                batch_size=attn_metadata.num_prefills,
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=k_scale,
+                seq_starts=prefill_metadata.chunked_context.starts[i],
+            )
+
+            kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
+            k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
+
+            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+            attn_output, attn_softmax_lse = torch.ops.npu.npu_fused_infer_attention_score(
+                q_nope,
+                k_nope,
+                v,
+                query_rope=q_pe,
+                key_rope=k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1),
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_heads,
+                input_layout="TND",
+                atten_mask=None,
+                sparse_mode=0,  # for prefix, no mask on attention matrix
+                actual_seq_lengths=prefill_metadata.query_start_loc[1:],
+                actual_seq_lengths_kv=prefill_metadata.chunked_context.cu_seq_lens[i, 1:],
+                scale=self.scale,
+                next_tokens=0,
+                softmax_lse_flag=True,
+            )
+
+            if output is None:
+                output = attn_output
+                output_lse = attn_softmax_lse
+            else:
+                output_tmp = torch.empty_like(output)
+                output_lse_tmp = torch.empty_like(output_lse)
+                ops.merge_attn_states(
+                    output=output_tmp,
+                    output_lse=output_lse_tmp,
+                    prefix_output=output,
+                    prefix_lse=output_lse,
+                    suffix_output=attn_output,
+                    suffix_lse=attn_softmax_lse,
+                )
+                output = output_tmp
+                output_lse = output_lse_tmp
+
+        return output, output_lse
 
     def _forward_prefill(
         self,
@@ -230,10 +304,12 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
+
+        has_context = attn_metadata.prefill.chunked_context is not None
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         tnd_cumlens = attn_metadata.prefill.query_start_loc[1:]
-        o = torch.ops.npu.npu_fused_infer_attention_score(
+        output, output_lse = torch.ops.npu.npu_fused_infer_attention_score(
             q_nope,
             k_nope,
             v,
@@ -247,9 +323,30 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             actual_seq_lengths=tnd_cumlens,
             actual_seq_lengths_kv=tnd_cumlens,
             scale=self.scale,
-            next_tokens=0
-        )[0]
-        return o.flatten(start_dim=-2)
+            next_tokens=0,
+            softmax_lse_flag=has_context,
+        )
+
+        if has_context:
+            context_output, context_lse = self._compute_prefill_context(
+                q_nope=q_nope,
+                q_pe=q_pe,
+                kv_c_cache=kv_cache[0],
+                k_pe_cache=kv_cache[1],
+                attn_metadata=attn_metadata,
+                k_scale=k_scale,
+            )
+            merged_output = torch.empty_like(output)
+            ops.merge_attn_states(
+                output=merged_output,
+                prefix_output=context_output,
+                prefix_lse=context_lse,
+                suffix_output=output,
+                suffix_lse=output_lse,
+            )
+            output = merged_output
+
+        return output.flatten(start_dim=-2)
 
     def _forward_decode(
         self,
