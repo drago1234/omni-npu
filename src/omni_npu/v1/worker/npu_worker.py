@@ -27,6 +27,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
+from omni_npu.v1.models.config_loader.loader import model_config_updater
 
 logger = init_logger(__name__)
 
@@ -92,6 +93,9 @@ class NPUWorker(WorkerBase):
                     ensure_layer_parallel_initialized,
                 )
 
+                # Initialize the model best practice configs.
+                self.init_model_best_practice_configs()
+
                 ensure_layer_parallel_initialized(backend=backend)
             # Set random seed
             set_random_seed(self.model_config.seed)
@@ -109,6 +113,10 @@ class NPUWorker(WorkerBase):
             from vllm.v1.utils import report_usage_stats
             report_usage_stats(self.vllm_config)
         self.profiler = self._init_profiler()
+
+    @model_config_updater
+    def init_model_best_practice_configs(self):
+        return self.model_config, self.vllm_config, self.scheduler_config
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
