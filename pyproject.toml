@@ -36,6 +36,7 @@ omni-npu = "omni_npu.vllm_plugin:plugin"
 [project.entry-points."vllm.general_plugins"]
 omni_npu_patches = "omni_npu.vllm_patches:apply_patches"
 omni_custom_models = "omni_npu.v1.models:register_models"
+omni_models_v0 = "omni_npu.v0.models:register_model"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,0 +1,12 @@
+[
+   {
+      "model": "qwen3_30b_a3b",
+      "hardware": "A3",
+      "precision": "bf16",
+      "prefill_node_num": 1,
+      "decode_node_num": 1,
+      "pd_disaggregation": true,
+      "prefill_config_file": "qwen3_30b_a3b_bf16_a3_1p1d_p.json",
+      "decode_config_file": "qwen3_30b_a3b_bf16_a3_1p1d_d.json"
+   }
+]

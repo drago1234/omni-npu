@@ -3,8 +3,7 @@
 import os
 from typing import Optional
 import torch
-import torch_npu
-import torchair
+import os
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
 from omni_npu.logger import update_configure_vllm_root_logger
@@ -108,6 +107,9 @@ class NPUPlatform(Platform):
         """
         from omni_npu import layers
         from omni_npu.distributed.eplb_state import EplbState
+        if "omni_models_v0" in os.environ.get("VLLM_PLUGINS", ""):
+            from omni_npu.v0.patches.model_patch import patch_all
+            patch_all()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:  # type: ignore[name-defined]
@@ -155,6 +157,8 @@ class NPUPlatform(Platform):
                     return "omni_npu.v1.attention.backends.mla.NPUMLABackend"
             else:
                 return "omni_npu.attention.backends.attention.NPUAttentionBackend"
+        elif "omni_models_v0" in os.environ.get("VLLM_PLUGINS", ""):
+            return "omni_npu.v0.layers.attention.backend.attention.NPUAttentionBackend"
         else:
             if use_mla:
                 if use_sparse:
