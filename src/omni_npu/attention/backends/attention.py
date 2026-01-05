@@ -45,6 +45,8 @@ class NPUMetadata:
     max_query_len: Optional[int] = None
     slot_mapping: torch.Tensor = None
     num_prefills: int = 0
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
 
 
 class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
@@ -81,7 +83,6 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold,
-                require_uniform=self.supports_uniform_spec_as_decode,
             )
         )
         attn_metadata = NPUMetadata(num_actual_tokens=num_actual_tokens,
@@ -90,7 +91,10 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
                                        seq_lens=seq_lens.tolist(),
                                        max_query_len=max_query_len,
                                        slot_mapping=slot_mapping,
-                                       num_prefills=num_prefills)
+                                       num_prefills=num_prefills,
+                                       num_decodes=num_decodes,
+                                       num_decode_tokens=num_decode_tokens,
+                                    )
         return attn_metadata
 
 
@@ -149,6 +153,7 @@ class NPUAttentionBackend(AttentionBackend):
 
 class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
     SHARE_MASK_TRIL_SPARSE = None
+    DECORE_ATTN_MASK = None
 
     def __init__(
         self,
@@ -187,6 +192,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
                 torch.ones((2048, 2048), dtype=torch.bool, device="npu")
             )
+            NPUAttentionBackendImpl.DECORE_ATTN_MASK = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
 
     def forward(
         self,
@@ -218,9 +224,25 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
         torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
-        if attn_metadata.num_prefills == 0:
+        batch_descriptor = get_forward_context().batch_descriptor
+
+        use_bsnd = (attn_metadata.num_prefills == 0
+                    and batch_descriptor is not None
+                    and batch_descriptor.uniform)
+        if use_bsnd:
+            batch_size = attn_metadata.block_tables.shape[0]
+            T, N, D = query.shape
+            assert attn_metadata.num_decode_tokens % attn_metadata.num_decodes == 0
+            S = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
+            if T > batch_size:
+                atten_mask = NPUAttentionBackendImpl.DECORE_ATTN_MASK
+                sparse_mode = 3
+            else:
+                assert T == batch_size
+                atten_mask = None
+                sparse_mode = 0
             attn_output = torch_npu.npu_fused_infer_attention_score(
-                query.unsqueeze(1),
+                query.view(-1, S, N, D),
                 kv_cache[0],
                 kv_cache[1],
                 num_heads=self.num_heads,
@@ -230,7 +252,9 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                 block_table=attn_metadata.block_tables,
                 block_size=kv_cache[0].shape[1],
                 actual_seq_lengths_kv=attn_metadata.seq_lens,
-            )[0].squeeze(1)
+                atten_mask=atten_mask,
+                sparse_mode=sparse_mode,
+            )[0].view(-1, N, D)
         else:
             attn_output = torch_npu.npu_fused_infer_attention_score_v2(
                 query,
