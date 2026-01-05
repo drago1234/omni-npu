@@ -129,6 +129,7 @@ class DSV32IndexerPatch(VLLMPatch):
         actual_seq_lens_key = metadata.seq_lens.to(torch.int32)
         block_table = metadata.block_table
 
+        bs = q.shape[0]
         topk_indices = torch.ops.custom.npu_lightning_indexer(
             query=q,
             key=kv_cache[2],
@@ -141,6 +142,5 @@ class DSV32IndexerPatch(VLLMPatch):
             sparse_count=self.topk_tokens,
             sparse_mode=3
         )
-        self.topk_indices_buffer[:attn_metadata.num_actual_tokens] = topk_indices.view(-1, self.topk_tokens)
+        self.topk_indices_buffer[:bs] = topk_indices.view(-1, self.topk_tokens)
         return self.topk_indices_buffer      
-        

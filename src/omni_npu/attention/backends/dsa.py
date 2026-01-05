@@ -23,11 +23,12 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     MLACommonBaseImpl,
+    QueryLenSupport,
 )
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-logger = init_logger("vllm.omni_npu.attention.backends.dsa")
+logger = init_logger(__name__)
 
 
 class NPUDSABackend(MLACommonBackend):
@@ -85,6 +86,7 @@ class NPUDSAMetadata(MLACommonMetadata[NPUDSADecodeMetadata]):
 class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_uniform_spec_as_decode: ClassVar[bool] = True
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
         self,
@@ -234,11 +236,12 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
         actual_seq_lens_key = metadata.seq_lens.to(torch.int32)
         block_table = metadata.block_table
 
+        bs = q_nope.shape[0]
         return torch.ops.custom.npu_sparse_flash_attention(
             query=q_nope,
             key=kv_cache[0],
             value=kv_cache[0],
-            sparse_indices=self.indexer.topk_indices_buffer[:attn_metadata.num_actual_tokens].view(attn_metadata.num_actual_tokens, 1, self.indexer.topk_tokens),
+            sparse_indices=self.indexer.topk_indices_buffer[:bs].view(bs, 1, self.indexer.topk_tokens),
             scale_value=self.scale,
             sparse_block_size=1,
             block_table=block_table,

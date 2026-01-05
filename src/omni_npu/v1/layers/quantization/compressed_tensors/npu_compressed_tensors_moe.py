@@ -5,8 +5,8 @@ from typing import Optional, Callable, Union
 from abc import ABC
 import torch
 import torch_npu
-from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config, FusedMoEQuantConfig
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
 from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethod
@@ -18,21 +18,25 @@ from omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize i
 
 class NPUFusedMoEMethodBase(ABC):
     def __init__(self):
-        self.prepare_permute_and_unpermute_finalize = None
+        self.prefill_prepare_permute_and_unpermute_finalize = None
+        self.decode_prepare_permute_and_unpermute_finalize = None
 
     def set_prepare_permute_and_unpermute_finalize(
         self,
-        prepare_permute_and_unpermute_finalize: FusedMoEPreparePermuteAndUnpermuteFinalize,
+        prefill_prepare_permute_and_unpermute_finalize: FusedMoEPreparePermuteAndUnpermuteFinalize,
+        decode_prepare_permute_and_unpermute_finalize: FusedMoEPreparePermuteAndUnpermuteFinalize,
     ):
-        self.prepare_permute_and_unpermute_finalize = prepare_permute_and_unpermute_finalize
+        self.prefill_prepare_permute_and_unpermute_finalize = prefill_prepare_permute_and_unpermute_finalize
+        self.decode_prepare_permute_and_unpermute_finalize = decode_prepare_permute_and_unpermute_finalize
 
     def apply_prepare_permute(
         self,
+        prepare_permute_and_unpermute_finalize: FusedMoEPreparePermuteAndUnpermuteFinalize,
         layer: torch.nn.Module,
         x: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
-        return self.prepare_permute_and_unpermute_finalize.prepare_permute(layer, x, topk_ids)
+        return prepare_permute_and_unpermute_finalize.prepare_permute(layer, x, topk_ids)
 
     def apply_experts(
         self,
@@ -43,12 +47,13 @@ class NPUFusedMoEMethodBase(ABC):
 
     def apply_unpermute_finalize(
         self,
+        prepare_permute_and_unpermute_finalize: FusedMoEPreparePermuteAndUnpermuteFinalize,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         prepare_permute_result: PreparePermuteResult,
     ):
-        return self.prepare_permute_and_unpermute_finalize.unpermute_finalize(hidden_states, topk_ids, topk_weights, prepare_permute_result)
+        return prepare_permute_and_unpermute_finalize.unpermute_finalize(hidden_states, topk_ids, topk_weights, prepare_permute_result)
 
 
 class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMethod, NPUFusedMoEMethodBase):
@@ -106,11 +111,23 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        prepare_permute_result = self.apply_prepare_permute(layer, x, topk_ids)
+        attn_metadata = get_forward_context().attn_metadata
+        is_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
+
+        if is_prefill:
+            prepare_permute_and_unpermute_finalize = self.prefill_prepare_permute_and_unpermute_finalize
+        else:
+            prepare_permute_and_unpermute_finalize = self.decode_prepare_permute_and_unpermute_finalize
+
+        prepare_permute_result = self.apply_prepare_permute(
+            prepare_permute_and_unpermute_finalize, layer, x, topk_ids
+        )
 
         hidden_states = self.apply_experts(layer, prepare_permute_result)
 
-        return self.apply_unpermute_finalize(hidden_states, topk_ids, topk_weights, prepare_permute_result)
+        return self.apply_unpermute_finalize(
+            prepare_permute_and_unpermute_finalize, hidden_states, topk_ids, topk_weights, prepare_permute_result
+        )
 
     def apply_experts(self, layer: torch.nn.Module, prepare_permute_result: PreparePermuteResult) -> torch.Tensor:
         hidden_states = prepare_permute_result.hidden_states_sorted_by_experts

@@ -252,6 +252,12 @@ class ACLGraphWrapper:
         return entry.output
 
     def _pad_list(self, lst, n):
+        if isinstance(lst, torch.Tensor):
+            if lst.size(0) < n:
+                return torch.cat([lst, lst[-1:].repeat(n - lst.size(0))])
+            else:
+                return lst[:n]
+
         if not lst or len(lst) == n:
             return lst
         return lst + [lst[-1]] * (n - len(lst)) if len(lst) < n else lst[:n]

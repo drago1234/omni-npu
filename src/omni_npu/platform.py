@@ -107,7 +107,6 @@ class NPUPlatform(Platform):
         registered here dynamically.
         """
         from omni_npu import layers
-        from omni_npu.layers import NPUCompressedTensorsConfig
         from omni_npu.distributed.eplb_state import EplbState
 
     @classmethod
@@ -148,7 +147,7 @@ class NPUPlatform(Platform):
         use_sparse: bool,
         attn_type: str | None = None,
     ) -> str:
-        if "omni_models_v1" in os.environ.get("VLLM_PLUGINS", ""):
+        if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
             if use_mla:
                 if use_sparse:
                     return "omni_npu.attention.backends.dsa.NPUDSABackend"

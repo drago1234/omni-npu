@@ -51,7 +51,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from omni_npu.v1.layers.fused_moe.layer import NPUHighPerfFusedMoE
+from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 
@@ -180,7 +180,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self.experts = NPUHighPerfFusedMoE(
+        self.experts = NPUFusedMoEV1(
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,

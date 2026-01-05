@@ -14,7 +14,7 @@ from omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize i
 )
 
 
-class NPUHighPerfFusedMoE(NPUSharedFusedMoE):
+class NPUFusedMoEV1(NPUSharedFusedMoE):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ensure_moe_quant_config_init()

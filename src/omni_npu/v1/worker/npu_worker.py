@@ -27,7 +27,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
-from omni_npu.v1.models.config_loader.loader import model_config_updater
+
 
 logger = init_logger(__name__)
 
@@ -88,7 +88,7 @@ class NPUWorker(WorkerBase):
 
             # Only initialize the custom layer-parallel communication domain when
             # explicitly enabled by the high-performance launcher script.
-            if os.getenv("VLLM_CUSTOM_MODEL_ENABLE"):
+            if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
                 from ..distributed.parallel_state_ext import ( 
                     ensure_layer_parallel_initialized,
                 )
@@ -113,10 +113,6 @@ class NPUWorker(WorkerBase):
             from vllm.v1.utils import report_usage_stats
             report_usage_stats(self.vllm_config)
         self.profiler = self._init_profiler()
-
-    @model_config_updater
-    def init_model_best_practice_configs(self):
-        return self.model_config, self.vllm_config, self.scheduler_config
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
