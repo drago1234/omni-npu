@@ -237,8 +237,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
             if layer.shared_experts is not None:
                 share_output = layer.shared_experts(x)
             attn_metadata = get_forward_context().attn_metadata
-            batch_descriptor = get_forward_context().batch_descriptor
-            if batch_descriptor is None or not batch_descriptor.uniform:
+            use_all2all = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
+            if use_all2all:
                 output = moe_infer_fusion(
                     layer=layer,
                     x=hidden_states,

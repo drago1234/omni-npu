@@ -113,6 +113,8 @@ class NPUWorker(WorkerBase):
             from vllm.v1.utils import report_usage_stats
             report_usage_stats(self.vllm_config)
         self.profiler = self._init_profiler()
+        from omni_npu.distributed.eplb_state import _init_omni_eplb_configs
+        _init_omni_eplb_configs(self.vllm_config, self.local_rank)
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:

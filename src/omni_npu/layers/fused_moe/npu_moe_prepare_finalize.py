@@ -34,7 +34,7 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
         self.ep_recv_counts = None
         self.tp_recv_counts = None
         self.mc2_mask = None
-        self.mask_view = None
+        self.mask = None
 
     def prepare(
         self,
@@ -53,7 +53,7 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
         self.attn_metadata = get_forward_context().attn_metadata
         self.mc2_mask = self.attn_metadata[next(iter(self.attn_metadata))].decode.mc2_mask
 
-        decode_gear = get_forward_context().batch_descriptor.num_reqs
+        decode_gear = get_forward_context().batch_descriptor.num_tokens
         self.mask = self.mc2_mask[:decode_gear] if self.mc2_mask is not None else None
 
         self.num_experts = num_experts

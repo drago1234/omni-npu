@@ -3,10 +3,6 @@
 
 # This patch is used for enable_eplb fix in ParallelConfig and FusedMoE
 # Please use this patch by adding VLLM_PLUGINS="omni-npu,omni_npu_patches" OMNI_NPU_VLLM_PATCHES="EPLBEngineConfig,EPLBSharedFusedMoE" before vllm serve
-from vllm import EngineArgs
-_Orig_Create_Engine_Config = EngineArgs.create_engine_config
-from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
-from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 import os
 import torch
@@ -16,12 +12,16 @@ from typing_extensions import Self
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.config import VllmConfig
+from vllm import EngineArgs
+from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 if TYPE_CHECKING:
     from vllm.usage.usage_lib import UsageContext
 else:
     UsageContext = Any
+from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 logger = init_logger(__name__)
+_orig_create_engine_config = EngineArgs.create_engine_config
 
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
@@ -50,7 +50,7 @@ class EngineConfigPatch(VLLMPatch):
 
         current_platform.is_cuda_alike = _npu_temp_cuda_alike_true
         try:
-            return _Orig_Create_Engine_Config(self, usage_context, headless)
+            return _orig_create_engine_config(self, usage_context, headless)
         finally:
             current_platform.is_cuda_alike = _orig_is_cuda_alike
 

@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import torch
 from typing import Optional, Sequence
+from vllm.config import VllmConfig
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.logger import init_logger
@@ -45,7 +46,7 @@ class EplbState:
         old_global_expert_indices: torch.Tensor | None = None,
         rank_mapping: dict[int, int] | None = None,
     ):
-        if OmniPlanner is not None:
+        if OmniPlanner is not None and model_config.runner != "draft":
             param_dict = dict(model.named_parameters())
             planner = OmniPlanner()
             planner.init_dram_weights(param_dict, first_k_dense_replace=3)
@@ -102,4 +103,16 @@ class EplbState:
             global_expert_loads, 
             old_global_expert_indices_per_model, 
             rank_mapping,
-        )        
+        ) 
+def _init_omni_eplb_configs(vllm_config: VllmConfig, local_rank: int)-> None:
+    if vllm_config.additional_config is None or "omni_placement_config" not in vllm_config.additional_config:
+        return
+    if not vllm_config.parallel_config.enable_eplb:
+        return
+    else:            
+        if local_rank == 0:
+            logger.info("Enable omni eplb for vLLM NPUWorker in local rank 0")
+            from omni_placement.utils import apply_omni_eplb_attributes
+            apply_omni_eplb_attributes(additional_config=vllm_config.additional_config)
+        else:
+            return       
