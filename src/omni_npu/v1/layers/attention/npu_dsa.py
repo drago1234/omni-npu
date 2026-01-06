@@ -15,17 +15,17 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.config import VllmConfig, CacheConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.linear import (
-    ReplicatedLinear,
-    ColumnParallelLinear,
-    RowParallelLinear
-)
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.attention.layer import MLAAttention
 
 from omni_npu.attention.backends.dsa import NPUDSAMetadata
 from omni_npu.v1.layers.utils import yarn_get_mscale
+from omni_npu.v1.layers.linear import (
+    RowParallelFlashCommLinear,
+    ColumnParallelFlashCommLinear
+)
 
 
 class Indexer(torch.nn.Module):
@@ -198,7 +198,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
 
         if self.q_lora_rank is not None:
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
+            self.q_b_proj = ColumnParallelFlashCommLinear(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -206,7 +206,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 prefix=f"{prefix}.q_b_proj",
             )
         else:
-            self.q_proj = ColumnParallelLinear(
+            self.q_proj = ColumnParallelFlashCommLinear(
                 self.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -214,14 +214,14 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 prefix=f"{prefix}.q_proj",
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
+        self.kv_b_proj = ColumnParallelFlashCommLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = RowParallelFlashCommLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,

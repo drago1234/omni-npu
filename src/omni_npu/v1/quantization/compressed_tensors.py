@@ -106,7 +106,7 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
                 x_scale, layer.layer_name_inside_block, "x", x_dim
             )
             x = layer_parallel_all_gather(x, layer.layer_name_inside_block, "x", x_dim)
-        elif x_transform == "All2All":
+        elif x_transform == "ALL2ALL":
             x_scale = layer_parallel_all2all_single(
                 x_scale, layer.layer_name_inside_block, "x", x_dim
             )
@@ -229,7 +229,7 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
                 x_scale, layer_name_inside_block, "x", x_dim
             )
             x = layer_parallel_all_gather(x, layer.layer_name_inside_block, "x", x_dim)
-        elif x_transform == "All2All":
+        elif x_transform == "ALL2ALL":
             x_scale = layer_parallel_all2all_single(
                 x_scale, layer_name_inside_block, "x", x_dim
             )
