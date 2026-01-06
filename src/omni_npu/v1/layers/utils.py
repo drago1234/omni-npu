@@ -1,22 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 import logging
+from contextlib import nullcontext
 
 import torch
 import torch_npu
 import torchair
-from contextlib import nullcontext
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(ch)
 
 def get_npu_execution_type(stream_label):
     if stream_label is None:
-        logger.info("entering default stream")
         return nullcontext()
     # Using strings to determine whether to include an item in the image, and later we will use logical differentiation based on parameters.
     elif isinstance(stream_label, str):

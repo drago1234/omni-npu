@@ -1,30 +1,19 @@
-import logging
 import os
-
-from contextlib import nullcontext
+from abc import abstractmethod
+from typing import Optional
 
 import torch
 import torch_npu
 import torchair
 
-from abc import abstractmethod
-from typing import Optional
-from vllm.model_executor.layers.quantization.base_config import (QuantizationConfig,
-                                                                 QuantizeMethodBase)
-
-from omni_npu.v1.layers.linear import MergedColumnParallelFlashCommLinear,RowParallelFlashCommLinear
-
-
-from omni_npu.v1.layers.utils import get_npu_execution_type
-
 from omni_npu.layers.activation import SiluAndMul
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(ch)
+from omni_npu.v1.layers.linear import (
+    MergedColumnParallelFlashCommLinear,
+    RowParallelFlashCommLinear)
+from omni_npu.v1.layers.utils import get_npu_execution_type
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase)
 
 SCALE_PARALLEL = os.getenv("SCALE_PARALLEL", "False") == "true"
 class FusedMLPMethodBase(QuantizeMethodBase):

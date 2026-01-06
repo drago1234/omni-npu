@@ -5,34 +5,28 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
-from vllm.logger import init_logger
-from vllm.model_executor.parameter import (
-    ModelWeightParameter,
-    ChannelQuantScaleParameter,
-)
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
 
-
+from omni_npu.v1.distributed.communication_op_ext import (
+    layer_parallel_all_gather,
+    layer_parallel_all2all_single,
+)
+from omni_npu.v1.fused_mlp.layer import FusedMLPMethodBase
 from omni_npu.v1.layers.linear import (
     FlashCommLinearMethodBase,
     UnquantizedFlashCommLinearMethod,
     FlashCommLinearBase,
     layer_parallel_communication_op,
 )
-from omni_npu.v1.utils import ACL_FORMAT_FRACTAL_NZ
-from omni_npu.v1.distributed.communication_op_ext import (
-    layer_parallel_all_gather,
-    layer_parallel_all2all_single,
-)
-
-from omni_npu.v1.distributed.communication_op_ext import (
-    layer_parallel_all_reduce,
-    layer_parallel_reduce_scatter,
-)
-from omni_npu.v1.fused_mlp.layer import FusedMLPMethodBase
 from omni_npu.v1.layers.utils import get_npu_execution_type
+from omni_npu.v1.utils import ACL_FORMAT_FRACTAL_NZ
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from vllm.model_executor.parameter import (
+    ModelWeightParameter,
+    ChannelQuantScaleParameter,
+)
 
 logger = init_logger(__name__)
 
@@ -167,10 +161,10 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
             y_int32 = torch_npu.npu_quant_matmul(
                 x1=x,
                 x2=layer.gate_up_proj.weight,
-                scale=x_scale,
-                pertoken_scale=None,
+                scale=layer.gate_up_proj.weight_scale,
+                pertoken_scale=x_scale,
                 bias=None,
-                output_dtype=torch.int32,
+                output_dtype=layer.gate_up_proj.orig_dtype,
             )
 
         return y_int32
@@ -227,19 +221,20 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
         x_scale: torch.Tensor,
         x_transform: Optional[str] = None,
         x_dim: Optional[int] = 0,
+        layer_name_inside_block: Optional[str] = None,
     ):
         # TODO scale_parallel is not supported yet. scale_parallel = model_extra_config.operator_opt_config.enable_scale_parallel
         if x_transform == "AllGather":
             x_scale = layer_parallel_all_gather(
-                x_scale, layer.layer_name_inside_block, "x", x_dim
+                x_scale, layer_name_inside_block, "x", x_dim
             )
             x = layer_parallel_all_gather(x, layer.layer_name_inside_block, "x", x_dim)
         elif x_transform == "All2All":
             x_scale = layer_parallel_all2all_single(
-                x_scale, layer.layer_name_inside_block, "x", x_dim
+                x_scale, layer_name_inside_block, "x", x_dim
             )
             x = layer_parallel_all2all_single(
-                x, layer.layer_name_inside_block, "x", x_dim
+                x, layer_name_inside_block, "x", x_dim
             )
         return x, x_scale
 
@@ -251,7 +246,7 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
     ) -> torch.Tensor:
         x, x_scale = self.apply_quant(x, layer.gate_up_proj.x_transform, stream_label)
         x, x_scale = self._layer_parallel_apply_x_transform(
-            layer, x, x_scale, layer.gate_up_proj.x_transform, layer.gate_up_proj.x_dim
+            layer, x, x_scale, layer.gate_up_proj.x_transform, layer.gate_up_proj.x_dim,layer.gate_up_proj.layer_name_inside_block
         )
         y_gate_up_int32 = self.apply_part1_gate_up_on_stream(
             layer, x, x_scale, stream_label
@@ -259,19 +254,20 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
         y_gate_up_int32 = layer_parallel_communication_op(
             y_gate_up_int32,
             layer.gate_up_proj.y_transform,
-            layer.layer_name_inside_block,
+            layer.gate_up_proj.layer_name_inside_block,
             "y",
             layer.gate_up_proj.y_dim,
         )
         int_int32, int_scale = self.apply_part2_activation_on_stream(
             layer, y_gate_up_int32, x_scale, stream_label
         )
-        int_int32 = self._layer_parallel_apply_x_transform(
+        int_int32,int_scale = self._layer_parallel_apply_x_transform(
             layer,
             int_int32,
             int_scale,
             layer.down_proj.x_transform,
             layer.down_proj.x_dim,
+            layer.down_proj.layer_name_inside_block,
         )
         output = self.apply_part3_down_on_stream(
             layer, int_int32, int_scale, stream_label
@@ -279,7 +275,7 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
         return layer_parallel_communication_op(
             output,
             layer.down_proj.y_transform,
-            layer.layer_name_inside_block,
+            layer.down_proj.layer_name_inside_block,
             "y",
             layer.down_proj.y_dim,
         )

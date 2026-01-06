@@ -1,10 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import List, Optional, Any
 import os
+from typing import List, Optional, Any
+
 import torch
-from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
+
+from compressed_tensors.quantization import (
+    QuantizationArgs,
+    QuantizationStrategy)
+from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethod
+from omni_npu.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import \
+    NPUCompressedTensorsW8A8Int8
+from omni_npu.v1.fused_mlp.layer import FusedMLP
+from omni_npu.v1.layers.linear import (
+    UnquantizedFlashCommLinearMethod,
+    FlashCommLinearBase
+)
+from omni_npu.v1.quantization.compressed_tensors import (
+    W8A8Int8FCLinearMethod
+)
+from omni_npu.v1.quantization.compressed_tensors import W8A8Int8MlpMethod
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -13,26 +30,15 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig, 
+    CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
     QUANTIZATION_SCHEME_MAP_TYPE
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import CompressedTensorsScheme
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer
-)
-
-from omni_npu.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import NPUCompressedTensorsW8A8Int8
-from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethod
-from omni_npu.v1.layers.linear import (
-    UnquantizedFlashCommLinearMethod,
-    FlashCommLinearBase
-)
-from omni_npu.v1.quantization.compressed_tensors import (
-    W8A8Int8FCLinearMethod
 )
 
 NPU_COMPRESSED_TENSORS = "npu-compressed-tensors"
@@ -86,15 +92,13 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
             layer_name=layer_name,
             module=layer,
             targets=self.target_scheme_map.keys())
-    
         # Find the quant_scheme
         scheme_dict = self.target_scheme_map[matched_target]
-    
         # Adapter: pass layer_name
         scheme = self._get_scheme_from_parts(
             layer_name=layer_name,
             weight_quant=scheme_dict["weights"],
-            input_quant=scheme_dict["input_activations"])    
+            input_quant=scheme_dict["input_activations"])
         return scheme
 
     @classmethod
@@ -150,7 +154,6 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
                 if module in layer_name:
                     return module_num_bits
             raise ValueError(f"weight name mismatch, please check weights num_bits in config.json and model weight name. layer_name={layer_name}")
-    
         else:
             return weight_quant.num_bits
 
@@ -233,7 +236,7 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
             )
 
-    def get_fc_method(self, layer: FlashCommLinearBase, layer_name: Optional[str] = None ) -> Optional[QuantizeMethodBase]:
+    def get_fc_method(self, layer: FlashCommLinearBase, layer_name: Optional[str] = None) -> Optional[QuantizeMethodBase]:
         if should_ignore_layer(
             layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
@@ -243,10 +246,9 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
             layer_name=layer_name,
             module=layer,
             targets=self.target_scheme_map.keys())
-    
         scheme_dict = self.target_scheme_map[matched_target]
-        weight_quant=scheme_dict["weights"]
-        input_quant=scheme_dict["input_activations"]
+        weight_quant = scheme_dict["weights"]
+        input_quant = scheme_dict["input_activations"]
         format = self.quant_format
 
         act_quant_format = is_activation_quantization_format(format)
@@ -281,4 +283,6 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
             return self.get_moe_method(layer)
         if isinstance(layer, FlashCommLinearBase):
             return self.get_fc_method(layer, prefix)
+        if isinstance(layer, FusedMLP):
+            return W8A8Int8MlpMethod(self)
         return None

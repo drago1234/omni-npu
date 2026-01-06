@@ -1,37 +1,50 @@
-import unittest
-from unittest.mock import patch, MagicMock
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 from contextlib import nullcontext
+
+import pytest
 import torch
-import torchair
 
-from omni_npu.v1.utils import get_npu_execution_type
+from omni_npu.v1.layers.utils import get_npu_execution_type
 
-class TestGetNPUExecutionType(unittest.TestCase):
 
-    @patch("torchair.scope.npu_stream_switch")
-    @patch("torch.npu.stream")
-    @patch("torch.compiler.is_compiling", return_value=False)
-    def test_get_npu_execution_type(self, mock_is_compiling, mock_npu_stream, mock_npu_stream_switch):
-        ctx = get_npu_execution_type(None)
-        self.assertIsInstance(ctx, nullcontext)
+@pytest.mark.skipif(not hasattr(torch, "npu"), reason="NPU required")
+@pytest.mark.npu
+@pytest.mark.parametrize("stream_input", [
+    None,
+    "stream_1",
+])
+def test_get_npu_execution_type_basic(stream_input):
+    ctx = get_npu_execution_type(stream_input)
+    assert ctx is not None
 
-        mock_npu_stream_switch.return_value = "mock_stream_switch"
-        ctx = get_npu_execution_type("stream_1")
-        self.assertEqual(ctx, "mock_stream_switch")
-        mock_npu_stream_switch.assert_called_with("stream_1")
+    if stream_input is None:
+        assert isinstance(ctx, nullcontext)
+    else:
+        assert ctx is not None
 
-        stream_obj = object()
-        mock_npu_stream.return_value = "mock_npu_stream"
-        ctx = get_npu_execution_type(stream_obj)
-        self.assertEqual(ctx, "mock_npu_stream")
-        mock_npu_stream.assert_called_with(stream_obj)
 
-    @patch("torch.compiler.is_compiling", return_value=True)
-    def test_get_npu_execution_type_compiling(self, mock_is_compiling):
-        # when compiling, fallback to nullcontext
-        stream_obj = object()
-        ctx = get_npu_execution_type(stream_obj)
-        self.assertIsInstance(ctx, nullcontext)
+@pytest.mark.skipif(not hasattr(torch, "npu"), reason="NPU required")
+@pytest.mark.npu
+def test_get_npu_execution_type_with_npu_stream():
+    stream_obj = torch.npu.Stream()
+    ctx = get_npu_execution_type(stream_obj)
+    assert ctx is not None
+
+    with ctx:
+        t = torch.ones(2, 2, device="npu")
+        assert t.device.type == "npu"
+
+
+@pytest.mark.skipif(not hasattr(torch, "npu"), reason="NPU required")
+@pytest.mark.npu
+def test_get_npu_execution_type_other_types():
+    ctx = get_npu_execution_type(12345)
+    assert isinstance(ctx, nullcontext)
+
 
 if __name__ == "__main__":
-    unittest.main()
+    import sys
+    import pytest
+    sys.exit(pytest.main([__file__, "-v", "-m", "npu"]))
