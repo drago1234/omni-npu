@@ -72,7 +72,7 @@ def patch_compile_decorators():
     import os
     use_gegraph = os.getenv("TORCH_COMPILE_GE", "False").lower() == "true"
     if use_gegraph:
-        logger.debug("<<< use gegraph!")
+        logger.debug("<<< patch_compile_decorators:use ge graph!")
         _dec_mododule._support_torch_compile = support_ge_compile
     else:
         _original_decorator = _dec_mododule._support_torch_compile

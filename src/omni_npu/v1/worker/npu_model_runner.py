@@ -155,6 +155,13 @@ class NPUModelRunner(GPUModelRunner):
         Args:
             eep_scale_up: the model loading is for elastic EP scale up.
         """
+        logger.debug(f"<<< {self.vllm_config.npu_compilation_config.use_gegraph=}")
+        if self.vllm_config.npu_compilation_config.use_gegraph:
+            from vllm.model_executor.model_loader import get_model as original_get_model
+            self.model = original_get_model(vllm_config=self.vllm_config)
+            if hasattr(self.model, "process_weights_after_loading") and callable(getattr(self.model, "process_weights_after_loading")):
+                self.model.process_weights_after_loading()
+            return
         super().load_model(eep_scale_up)
 
         if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
@@ -172,6 +179,10 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         logger.debug("<<< Capturing model in npu_model_runner")
+        if self.vllm_config.npu_compilation_config.use_gegraph:
+            logger.info(f"<<< capture_model use gegraph, dummy_run max_num_reqs={self.max_num_reqs}")
+            self._dummy_run(self.max_num_reqs, force_attention=True, uniform_decode=True)
+            return
         with switch_torch_device():
             super().capture_model()
 

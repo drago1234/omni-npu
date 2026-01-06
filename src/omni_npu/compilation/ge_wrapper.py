@@ -128,6 +128,7 @@ class TorchNpuCompilerWrapperWithCustomDispatcher:
     def call_dispatcher(self, *args, **kwargs):
         use_eager_model = self.should_use_eager_mode(*args, **kwargs)
         if self.do_not_compile or use_eager_model:
+            logger.debug(f"[ge graph] call_dispatcher do_not_compile:{self.do_not_compile},use_eager_model:{use_eager_model}")
             return self.forward(*args, **kwargs)
 
         if not self.vllm_config.npu_compilation_config.use_ge_graph_cached:
@@ -165,6 +166,15 @@ class TorchNpuCompilerWrapperWithCustomDispatcher:
         return None
 
     def __call__(self, *args, **kwargs):
+        logger.debug(f"[ge graph], call enter")
+        from vllm.forward_context import get_forward_context
+        attn_metadata = get_forward_context().attn_metadata
+        batch_descriptor = get_forward_context().batch_descriptor
+        uniform = batch_descriptor.uniform if batch_descriptor is not None else False
+        has_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
+        if has_prefill or not uniform:
+            logger.debug(f"<<< [ge graph]use original forward")
+            return self.forward(*args, **kwargs)
         return self.call_dispatcher(*args, **kwargs)
 
     @abstractmethod
