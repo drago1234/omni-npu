@@ -4,7 +4,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 import torch
-from src.omni_npu.layers.npu_rms_norm import NPURMSNorm
+from omni_npu.layers.npu_rms_norm import NPURMSNorm
 
 
 class TestNPURMSNorm(unittest.TestCase):

@@ -4,7 +4,7 @@
 import unittest
 from unittest.mock import patch, MagicMock
 import torch
-from src.omni_npu.layers.activation import NPUSiluAndMul
+from omni_npu.layers.activation import NPUSiluAndMul
 
 
 class TestNPUSiluAndMul(unittest.TestCase):
