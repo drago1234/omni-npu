@@ -16,6 +16,7 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     MLACommonBaseImpl,
+    QueryLenSupport,
     MLACommonPrefillMetadata
 )
 from vllm.v1.attention.backends.utils import (
@@ -83,6 +84,7 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_uniform_spec_as_decode: ClassVar[bool] = True
+    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
         self,
@@ -116,8 +118,8 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     ) -> NPUMLADecodeMetadata:
         return NPUMLADecodeMetadata(
             block_table=block_table_tensor,
-            seq_lens=seq_lens_device,
-            query_cumlens=query_start_loc_device[1:],
+            seq_lens=seq_lens_device.tolist(),
+            query_cumlens=query_start_loc_device[1:].tolist(),
             dcp_tot_seq_lens=dcp_tot_seq_lens_device
         )
 

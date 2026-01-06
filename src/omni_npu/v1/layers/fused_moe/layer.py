@@ -34,8 +34,10 @@ class NPUFusedMoEV1(NPUSharedFusedMoE):
         router_logits: torch.Tensor,
     ):
         router_logits, _ = self.gate(hidden_states)
-
-        share_expert_output = self.shared_experts(hidden_states)
+        if self.shared_experts is not None:
+            share_expert_output = self.shared_experts(hidden_states)
+        else:
+            share_expert_output = None
 
         tp_size = get_tensor_model_parallel_world_size()  # attn tp size
         x = hidden_states
@@ -78,4 +80,4 @@ class NPUFusedMoEV1(NPUSharedFusedMoE):
         if tp_size > 1:
             route_expert_output = tensor_model_parallel_all_gather(route_expert_output, dim=0)[:t_ori]
 
-        return route_expert_output, share_expert_output
+        return share_expert_output, route_expert_output
