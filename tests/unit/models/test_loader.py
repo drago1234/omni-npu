@@ -229,6 +229,43 @@ class TestConfigLoaderUnit(unittest.TestCase):
         # Verify logger.info was called
         mock_logger.info.assert_called()
 
+    def test_load_model_extra_config(self):
+        """Test load_model_extra_config function with mocked dependencies"""
+        from omni_npu.v1.models.config_loader.loader import load_model_extra_config
+        
+        # Mock all required classes and dependencies
+        mock_model_config = MagicMock()
+        mock_model_config.hf_config.model_type = "deepseek_v3"
+        mock_model_config.hf_config.quantization_config = {
+            'format': 'int-quantized',
+            'config_groups': {'group_0': {'weights': {'num_bits': 8}, 'input_activations': {'num_bits': 8}}},
+            'kv_cache_scheme': 'default'
+        }
+        mock_model_config.enforce_eager = False
+        
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.additional_config = None
+        mock_vllm_config.npu_compilation_config.use_gegraph = False
+        mock_vllm_config.parallel_config.enable_eplb = False
+        
+        mock_scheduler_config = MagicMock()
+        mock_scheduler_config.enable_chunked_prefill = False
+        
+        # Mock external dependencies
+        with patch('omni_npu.v1.models.config_loader.loader.parse_hf_config', return_value=('deepseek_v3', 'w8a8c16')), \
+             patch('omni_npu.v1.models.config_loader.loader.update_task_config') as mock_update, \
+             patch('omni_npu.v1.models.config_loader.loader._validate_config') as mock_validate, \
+             patch('omni_npu.v1.models.config_loader.loader._print_model_config') as mock_print:
+            
+            load_model_extra_config(mock_model_config, mock_vllm_config, mock_scheduler_config)
+            
+            # Verify that update_task_config was called
+            mock_update.assert_called_once()
+            # Verify that _validate_config was called
+            mock_validate.assert_called_once()
+            # Verify that _print_model_config was called
+            mock_print.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

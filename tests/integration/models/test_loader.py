@@ -143,9 +143,9 @@ class TestConfigLoaderIntegration(unittest.TestCase):
         self.assertIsNotNone(model_extra_config.parall_config)
         self.assertIsNotNone(model_extra_config.operator_opt_config)
 
-    def test_model_config_updater_decorator(self):
-        """Test model_config_updater decorator with mocked inputs"""
-        from omni_npu.v1.models.config_loader.loader import model_config_updater
+    def test_load_model_extra_config(self):
+        """Test load_model_extra_config function with mocked inputs"""
+        from omni_npu.v1.models.config_loader.loader import load_model_extra_config
         import torch
         
         # Mock the required classes
@@ -172,28 +172,28 @@ class TestConfigLoaderIntegration(unittest.TestCase):
             def __init__(self):
                 self.additional_config = {"enable_pd_elastic_scaling": True}
                 self.npu_compilation_config = MockNpuCompilationConfig()
+                self.parallel_config = MockParallelConfig()
         
         class MockNpuCompilationConfig:
             def __init__(self):
                 self.use_gegraph = False
                 self.decode_gear_list = [1]
         
+        class MockParallelConfig:
+            def __init__(self):
+                self.enable_eplb = False
+        
         class MockSchedulerConfig:
             def __init__(self):
                 self.enable_chunked_prefill = False
         
-        # Apply decorator to a mock function
-        @model_config_updater()
-        def mock_func(self):
-            return MockModelConfig(), MockVllmConfig(), MockSchedulerConfig()
-        
         # Mock torch_npu
         with unittest.mock.patch('torch_npu.npu.get_device_name', return_value='Ascend910B'):
             with unittest.mock.patch.dict(os.environ, {'ROLE': "prefill", 'PREFILL_POD_NUM': '1', 'DECODE_POD_NUM': '1'}):
-                # Call the decorated function
-                result = mock_func(None)
+                # Call the function directly
+                load_model_extra_config(MockModelConfig(), MockVllmConfig(), MockSchedulerConfig())
                 
-                self.assertIsNone(result)  # Decorator returns None
+                # Verify that config was loaded (no assertion needed as function doesn't return value)
 
     def test_duplicate_config_detection(self):
         """Test that duplicate configurations from different JSON files are detected"""

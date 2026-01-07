@@ -93,10 +93,12 @@ class NPUWorker(WorkerBase):
                     ensure_layer_parallel_initialized,
                 )
 
-                # Initialize the model best practice configs.
-                self.init_model_best_practice_configs()
-
                 ensure_layer_parallel_initialized(backend=backend)
+
+                # Initialize the model best practice configs.
+                from omni_npu.v1.models.config_loader.loader import load_model_extra_config
+                load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
+                
             # Set random seed
             set_random_seed(self.model_config.seed)
             # Snapshot available memory

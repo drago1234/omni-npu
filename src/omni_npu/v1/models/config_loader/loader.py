@@ -10,69 +10,65 @@ import torch_npu
 # import logging
 from vllm.logger import init_logger
 
-from .features import apply_eager_mode_config, apply_fusion_pass, apply_omni_cache
+from .features import apply_eager_mode_config, apply_omni_cache
 
 logger = init_logger(__name__)
 
 default_config_path = os.path.normpath(os.path.join(os.path.abspath(__file__), '../../configs'))
 
 
-def model_config_updater(func):
-    def wrapper(self):
-        model_config, vllm_config, scheduler_config= func(self)
-        model_name, quant_type= parse_hf_config(model_config.hf_config)
-        is_pd_disaggregation = False
-        is_prefill_node = None
-        if os.getenv('ROLE', None):
-            is_pd_disaggregation = True
-            is_prefill_node = True if os.getenv('ROLE', None)=='prefill' else False
-        if vllm_config.additional_config is not None:
-            enable_pd_elastic_scaling = vllm_config.additional_config.get("enable_pd_elastic_scaling", False)
-            enable_low_latency=vllm_config.additional_config.get("enable_low_latency", False)
-            enable_omni_cache = vllm_config.additional_config.get("enable_omni_cache", False)
-        else:
-            enable_pd_elastic_scaling = False
-            enable_low_latency = False
-            enable_omni_cache = False
+def load_model_extra_config(model_config, vllm_config, scheduler_config):
+    model_name, quant_type= parse_hf_config(model_config.hf_config)
+    is_pd_disaggregation = False
+    is_prefill_node = None
+    if os.getenv('ROLE', None):
+        is_pd_disaggregation = True
+        is_prefill_node = True if os.getenv('ROLE', None)=='prefill' else False
+    if vllm_config.additional_config is not None:
+        enable_pd_elastic_scaling = vllm_config.additional_config.get("enable_pd_elastic_scaling", False)
+        enable_low_latency=vllm_config.additional_config.get("enable_low_latency", False)
+        enable_omni_cache = vllm_config.additional_config.get("enable_omni_cache", False)
+    else:
+        enable_pd_elastic_scaling = False
+        enable_low_latency = False
+        enable_omni_cache = False
 
-        if model_config.enforce_eager:
-            graph_mode = 'eager_mode'
-        elif vllm_config.npu_compilation_config.use_gegraph:
-            graph_mode = 'ge_graph'
-        else:
-            graph_mode = 'acl_graph'
+    if model_config.enforce_eager:
+        graph_mode = 'eager_mode'
+    elif vllm_config.npu_compilation_config.use_gegraph:
+        graph_mode = 'ge_graph'
+    else:
+        graph_mode = 'acl_graph'
 
-        enable_chunked_prefill = scheduler_config.enable_chunked_prefill
-        enable_eplb=vllm_config.parallel_config.enable_eplb
-        
-        device_name = torch_npu.npu.get_device_name(0)
+    enable_chunked_prefill = scheduler_config.enable_chunked_prefill
+    enable_eplb=vllm_config.parallel_config.enable_eplb
+    
+    device_name = torch_npu.npu.get_device_name(0)
 
-        if device_name.startswith("Ascend910B"):
-            hardware_platform = "A2"
-        elif device_name.startswith("Ascend910"):
-            hardware_platform = "A3"
-        else:
-            raise ValueError(f"Unsupported device: {device_name}. Only Ascend910/Ascend910B are supported.")
-        
-        update_task_config(
-            model_name = model_name,
-            hardware_platform = hardware_platform,
-            is_pd_disaggregation = is_pd_disaggregation,
-            is_prefill_node = is_prefill_node,
-            quant_type = quant_type,
-            prefill_node_num = int(os.getenv("PREFILL_POD_NUM", 1)),
-            decode_node_num = int(os.getenv("DECODE_POD_NUM", 1)),
-            enable_eplb = enable_eplb,
-            enable_chunked_prefill = enable_chunked_prefill,
-            enable_low_latency = enable_low_latency,
-            graph_mode = graph_mode,
-            enable_pd_elastic_scaling = enable_pd_elastic_scaling,
-            enable_omni_cache = enable_omni_cache
-        )
-        _validate_config(vllm_config.additional_config)
-        _print_model_config()
-        return None
-    return wrapper
+    if device_name.startswith("Ascend910B"):
+        hardware_platform = "A2"
+    elif device_name.startswith("Ascend910"):
+        hardware_platform = "A3"
+    else:
+        raise ValueError(f"Unsupported device: {device_name}. Only Ascend910/Ascend910B are supported.")
+    
+    update_task_config(
+        model_name = model_name,
+        hardware_platform = hardware_platform,
+        is_pd_disaggregation = is_pd_disaggregation,
+        is_prefill_node = is_prefill_node,
+        quant_type = quant_type,
+        prefill_node_num = int(os.getenv("PREFILL_POD_NUM", 1)),
+        decode_node_num = int(os.getenv("DECODE_POD_NUM", 1)),
+        enable_eplb = enable_eplb,
+        enable_chunked_prefill = enable_chunked_prefill,
+        enable_low_latency = enable_low_latency,
+        graph_mode = graph_mode,
+        enable_pd_elastic_scaling = enable_pd_elastic_scaling,
+        enable_omni_cache = enable_omni_cache
+    )
+    _validate_config(vllm_config.additional_config)
+    _print_model_config()
 
 @dataclass
 class TaskConfig:
