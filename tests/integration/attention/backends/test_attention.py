@@ -4,6 +4,7 @@ Integration tests for NPUAttentionBackendImpl that require NPU hardware.
 """
 
 import unittest
+from unittest.mock import MagicMock, patch
 import torch
 import pytest
 from omni_npu.attention.backends.attention import (
@@ -29,84 +30,86 @@ class TestNPUAttentionBackendDefaultImplIntegration(unittest.TestCase):
         self.impl_cls = NPUAttentionBackendImpl
         self.metadata_cls = NPUMetadata
         self.device = "npu"
+        self.dtype = torch.bfloat16
 
     def test_forward_decode_path_calls_npu_fused_infer_attention_score(self):
-        # Initialize the attention implementation
         impl = self.impl_cls(
             num_heads=8,
             head_size=128,
             scale=0.125,
             num_kv_heads=4,
-            attn_type=AttentionType.DECODER,
+            attn_type=AttentionType.DECODER,  # ← pure decode
         )
 
-        # Mock the attention layer with required attributes
         layer = unittest.mock.MagicMock()
         layer._k_scale_float = 1.0
         layer._v_scale_float = 1.0
 
-        # Define tensor dimensions
-        num_tokens = 10
-        hidden_size = 8 * 128      # = 1024 (num_heads * head_size)
-        kv_hidden_size = 4 * 128   # = 512  (num_kv_heads * head_size)
+        # Decode: 2 sequences, each generates 1 token → total 2 tokens
+        num_decodes = 2
+        num_decode_tokens = num_decodes
+        hidden_size = 8 * 128      # 1024
+        kv_hidden_size = 4 * 128   # 512
         block_size = 16
-        block_id = 0               # Use block 0 for simplicity
-
-        # Create input tensors on NPU
-        query = torch.randn(num_tokens, hidden_size, device=self.device, dtype=torch.float16)
-        key = torch.randn(num_tokens, kv_hidden_size, device=self.device, dtype=torch.float16)
-        value = torch.randn(num_tokens, kv_hidden_size, device=self.device, dtype=torch.float16)
-
-        # Allocate KV cache: shape [num_blocks, block_size, kv_hidden_size]
         num_blocks = 100
-        k_cache = torch.zeros(num_blocks, block_size, kv_hidden_size, device=self.device, dtype=torch.float16)
-        v_cache = torch.zeros(num_blocks, block_size, kv_hidden_size, device=self.device, dtype=torch.float16)
+
+        # Tensors: [2, ...]
+        query = torch.randn(num_decode_tokens, hidden_size, device=self.device, dtype=self.dtype)
+        key = torch.randn(num_decode_tokens, kv_hidden_size, device=self.device, dtype=self.dtype)
+        value = torch.randn(num_decode_tokens, kv_hidden_size, device=self.device, dtype=self.dtype)
+
+        k_cache = torch.zeros(num_blocks, block_size, kv_hidden_size, device=self.device, dtype=self.dtype)
+        v_cache = torch.zeros(num_blocks, block_size, kv_hidden_size, device=self.device, dtype=self.dtype)
         kv_cache = (k_cache, v_cache)
 
-        # Compute max number of blocks needed per sequence (ceil(seq_len / block_size))
-        max_blocks_per_seq = (num_tokens + block_size - 1) // block_size  # = 1
-        # Block table: [num_seqs=1, max_blocks_per_seq=1], filled with block_id=0
-        block_tables = torch.full(
-            (1, max_blocks_per_seq),
-            block_id,
-            dtype=torch.int32,
-            device=self.device
+        # Each sequence has current length: e.g., [10, 15]
+        seq_lens = [10, 15]
+        # So slot_mapping: write to position 10 (index 9) and 15 (index 14)
+        slot_mapping = torch.tensor([9, 14], dtype=torch.int32, device=self.device)
+
+        # Block tables: [2 sequences, max_blocks]
+        max_blocks_per_seq = 10
+        block_tables = torch.randint(0, num_blocks, (num_decodes, max_blocks_per_seq), dtype=torch.int32, device=self.device)
+
+        # Output: [2, 8, 128]  ← 注意！NPU 算子返回 TND layout
+        output = torch.empty(num_decode_tokens, 8, 128, device=self.device, dtype=self.dtype)
+
+        # Metadata for pure decode
+        metadata = MagicMock(
+            num_actual_tokens=num_decode_tokens,  # 2
+            num_prefills=0,                       # ← 必须为 0！
+            num_decode_tokens=num_decode_tokens,  # 2
+            num_decodes=num_decodes,              # 2
+            seq_lens=seq_lens,                    # [10, 15] → length=2
+            query_cumlens=[0, 1, 2],              # cumsum([1,1]) → length=3
+            slot_mapping=slot_mapping,            # [9, 14] → length=2
+            block_tables=block_tables,            # [2, 10]
+            max_query_len=1,                      # decode: 1 token per seq
         )
 
-        # Output buffer: must match expected output shape [num_tokens, num_heads, head_size]
-        output = torch.empty(num_tokens, 8, 128, device=self.device, dtype=torch.float16)
-
-        # Construct metadata for decode-only path (num_prefills=0)
-        metadata = self.metadata_cls(
-            num_actual_tokens=num_tokens,
-            block_tables=block_tables,
-            query_cumlens=[0, num_tokens],     # Cumulative lengths: [0, 10]
-            seq_lens=[num_tokens],             # Each sequence length = 10
-            max_query_len=1,                   # Decode: one token per sequence
-            slot_mapping=torch.arange(num_tokens, device=self.device),  # Physical slot indices [0..9]
-            num_prefills=0,
+        # Mock forward context
+        mock_ctx = MagicMock()
+        mock_ctx.batch_descriptor = MagicMock(
+            num_reqs=num_decodes,    # 2
+            max_q_len=1,
+            max_seq_len=max(seq_lens),
+            uniform=True,
         )
 
-        # Run forward pass
-        result = impl.forward(
-            layer=layer,
-            query=query,
-            key=key,
-            value=value,
-            kv_cache=kv_cache,
-            attn_metadata=metadata,
-            output=output,
-        )
+        with patch('omni_npu.attention.backends.attention.get_forward_context', return_value=mock_ctx):
+            result = impl.forward(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=metadata,
+                output=output,
+            )
 
-        # Verify output is written in-place
-        self.assertIs(result, output)
-
-        # Synchronize to catch any asynchronous NPU kernel errors
-        torch.npu.synchronize()
-
-        # Optional: sanity check for invalid values
-        self.assertFalse(torch.isnan(result).any(), "Output contains NaN")
-        self.assertFalse(torch.isinf(result).any(), "Output contains Inf")
-
+            self.assertIs(result, output)
+            torch.npu.synchronize()
+            self.assertFalse(torch.isnan(result).any())
+            self.assertFalse(torch.isinf(result).any())
 if __name__ == '__main__':
     unittest.main()

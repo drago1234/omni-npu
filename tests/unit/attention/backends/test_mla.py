@@ -114,8 +114,8 @@ class MLACommonMetadata(Generic[TDecodeMeta]):
     decode: TDecodeMeta = None
     num_actual_tokens: int = 0
     num_prefills: int = 0
-    num_decodes: int = 0
-    num_decode_tokens: int = 0
+    num_decodes: int = 4
+    num_decode_tokens: int = 8
     slot_mapping: Optional[torch.Tensor] = None
 
 class MLACommonMetadataBuilder(Generic[TMetadata]):
@@ -549,7 +549,7 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
         k_pe = torch.randn(num_prefill_tokens, 64, dtype=dtype, device=device)
         k_scale = torch.tensor(1.0, dtype=dtype, device=device)
 
-        metadata = NPUMLAMetadata(
+        metadata = MagicMock(
             prefill=type('PrefillMeta', (), {'query_start_loc': [0, 8]})(),
             decode=None,
             num_actual_tokens=8,
@@ -558,11 +558,12 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             num_decode_tokens=0,
             slot_mapping=None,
         )
-
+        metadata.prefill.chunked_context = None
         kv_cache = (torch.empty(0), torch.empty(0))
 
         mock_output = torch.randn(num_prefill_tokens, 32, 128, dtype=dtype, device=device)
-        with patch("torch.ops.npu.npu_fused_infer_attention_score", return_value=(mock_output,)) as mock_op:
+        mock_lse = torch.randn(8, 32).npu()
+        with patch("torch.ops.npu.npu_fused_infer_attention_score", return_value=(mock_output, mock_lse)) as mock_op:
             result = impl._forward_prefill(q, kv_c_normed, k_pe, kv_cache, metadata, k_scale)
 
         mock_op.assert_called_once()

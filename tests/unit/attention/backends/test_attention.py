@@ -84,7 +84,9 @@ sys.modules['vllm.platforms'] = platforms_mod
 
 # --- vllm.forward_context ---
 forward_ctx_mod = types.ModuleType('vllm.forward_context')
-forward_ctx_mod.get_forward_context = MagicMock(return_value=None)
+forward_ctx_mod.get_forward_context = MagicMock(
+    batch_descriptor=None
+)
 sys.modules['vllm.forward_context'] = forward_ctx_mod
 
 # --- vllm.v1 module hierarchy ---
@@ -289,11 +291,11 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
         layer._k_scale_float = 1.0
         layer._v_scale_float = 1.0
 
-        query = torch.randn(10, 8 * 128)
-        key = torch.randn(10, 4 * 128)
-        value = torch.randn(10, 4 * 128)
-        kv_cache = (torch.zeros(100, 16, 4 * 128), torch.zeros(100, 16, 4 * 128))
-        output = torch.empty_like(query)  # [10, 1024]
+        batch_size = 12
+        query = torch.randn(batch_size, 8 * 128)
+        key = torch.randn(batch_size, 4 * 128)
+        value = torch.randn(batch_size, 4 * 128)
+        kv_cache = (torch.zeros(batch_size ** 2, 16, 4 * 128), torch.zeros(100, 16, 4 * 128))
 
         metadata = self.metadata_cls(
             num_actual_tokens=10,
@@ -303,12 +305,15 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             max_query_len=1,
             slot_mapping=torch.arange(10),
             num_prefills=0,
+            num_decode_tokens=8,
+            num_decodes=2,
         )
 
-        decode_output = output.unsqueeze(1).clone()  # [10, 1, 1024]
+        attn_output = torch.randn(batch_size, 8, 128)
+        output = torch.empty_like(attn_output)
 
         with patch.object(self.torch_npu_mock, 'npu_scatter_nd_update_', wraps=self.torch_npu_mock.npu_scatter_nd_update_) as mock_scatter, \
-             patch.object(self.torch_npu_mock, 'npu_fused_infer_attention_score', return_value=(decode_output,)) as mock_decode:
+             patch.object(self.torch_npu_mock, 'npu_fused_infer_attention_score', return_value=(attn_output,)) as mock_decode:
 
             result = impl.forward(
                 layer=layer,
