@@ -13,13 +13,10 @@ import pytest
 import torch
 
 # Skip all tests if NPU is not available
-try:
-    import torch_npu
-    NPU_AVAILABLE = hasattr(torch, 'npu') and torch.npu.device_count() > 0
-except ImportError:
-    NPU_AVAILABLE = False
-
-skipif_no_npu = unittest.skipIf(not NPU_AVAILABLE, "NPU hardware not available")
+from ..utils.common_utils import (
+    skipif_no_npu,
+    NPU_AVAILABLE
+)
 
 
 @pytest.mark.integration

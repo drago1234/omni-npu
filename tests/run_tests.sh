@@ -40,6 +40,7 @@ case "$TEST_TYPE" in
         echo "Running integration tests (requires NPU hardware)..."
         echo "  - Single-device tests with pytest"
         pytest integration/distributed/test_communicator.py::TestNPUCommunicatorIntegration -v
+        pytest integration/attention -v
         echo ""
         echo "  - Multi-device tests with torchrun (2 NPUs)"
         torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v
