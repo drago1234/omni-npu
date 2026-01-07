@@ -8,7 +8,14 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
-from tests.unit.distributed.test_communicator import VLLM_MODULES_TO_MOCK
+
+VLLM_MODULES_TO_MOCK = {
+    "vllm",
+    "vllm.distributed",
+    "vllm.distributed.parallel_state",
+    "vllm.distributed.device_communicators",
+    "vllm.distributed.device_communicators.cuda_communicator"
+}
 
 
 class TestCommunicationOpExtensions(unittest.TestCase):
