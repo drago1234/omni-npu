@@ -21,7 +21,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -47,62 +46,17 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from omni_npu.v1.fused_mlp.layer import FusedMLP
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
-from omni_npu.v1.layers.linear import (
-    MergedColumnParallelFlashCommLinear,
-    RowParallelFlashCommLinear
-)
+
 
 logger = init_logger(__name__)
 
+class DeepseekV2MLP(FusedMLP):
+    pass
 
-class DeepseekV2MLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: QuantizationConfig | None = None,
-        reduce_results: bool = True,
-        disable_tp: bool = False,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-
-        # If is_sequence_parallel, the input and output tensors are sharded
-        # across the ranks within the tp_group. In this case the weights are
-        # replicated and no collective ops are needed.
-        # Otherwise we use standard TP with an allreduce at the end.
-        self.gate_up_proj = MergedColumnParallelFlashCommLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            disable_tp=disable_tp,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelFlashCommLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            disable_tp=disable_tp,
-            prefix=f"{prefix}.down_proj",
-        )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class DeepseekV2MoE(nn.Module):

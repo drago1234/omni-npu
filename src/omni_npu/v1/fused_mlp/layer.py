@@ -3,19 +3,15 @@ from abc import abstractmethod
 from typing import Optional
 
 import torch
-import torch_npu
-import torchair
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
+from vllm.model_executor.layers.activation import SiluAndMul
 
-from omni_npu.layers.activation import SiluAndMul
-from omni_npu.v1.layers.linear import (
-    MergedColumnParallelFlashCommLinear,
-    RowParallelFlashCommLinear)
+from omni_npu.v1.layers.linear import MergedColumnParallelFlashCommLinear, RowParallelFlashCommLinear
 from omni_npu.v1.layers.utils import get_npu_execution_type
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase)
 
 SCALE_PARALLEL = os.getenv("SCALE_PARALLEL", "False") == "true"
+
+
 class FusedMLPMethodBase(QuantizeMethodBase):
     """Base method for FusedMLP
 
@@ -24,8 +20,7 @@ class FusedMLPMethodBase(QuantizeMethodBase):
     This method only implement the apply method.
     """
 
-    def create_weights(self, layer: torch.nn.Module, *weight_args,
-                       **extra_weight_attrs):
+    def create_weights(self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs):
         """Create weights for a layer.
 
         The weights will be set as attributes of the layer."""
@@ -100,6 +95,8 @@ class FusedMLP(torch.nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
+        disable_tp: bool = False,
+        reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -110,6 +107,7 @@ class FusedMLP(torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            disable_tp=disable_tp,
         )
         self.down_proj = RowParallelFlashCommLinear(
             intermediate_size,
@@ -117,12 +115,12 @@ class FusedMLP(torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            disable_tp=disable_tp,
+            reduce_results=reduce_results,
         )
         if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
+            raise ValueError(f"Unsupported activation: {hidden_act}. " "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
-
         quant_method: Optional[QuantizeMethodBase] = None
 
         if quant_config is None:
@@ -134,9 +132,6 @@ class FusedMLP(torch.nn.Module):
         assert isinstance(quant_method, FusedMLPMethodBase)
         self.quant_method = quant_method
 
-    def forward(self, x,
-                stream_label: Optional[str | torch.npu.Stream] = None):
-        output = self.quant_method.apply(self, x,
-                                         stream_label=stream_label)
+    def forward(self, x, stream_label: Optional[str | torch.npu.Stream] = None):
+        output = self.quant_method.apply(self, x, stream_label=stream_label)
         return output
-
