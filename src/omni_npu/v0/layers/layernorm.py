@@ -11,7 +11,7 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 
 
 
-class RMSNorm(RMSNormGPU):
+class NPURMSNorm(RMSNormGPU):
     def forward(
             self,
             x: torch.Tensor,
@@ -31,7 +31,7 @@ class RMSNorm(RMSNormGPU):
             self.variance_epsilon,
         )[0]
 
-class RMSNormFlashComm(RMSNorm):
+class RMSNormFlashComm(NPURMSNorm):
     def __init__(
         self,
         hidden_size: int,

@@ -10,40 +10,36 @@ from vllm.logger import init_logger
 
 from omni_npu.compilation.ge_compile_config import get_torchair_config
 
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.forward_context import get_forward_context
 
 logger = init_logger(__name__)
 torch._dynamo.config.inline_inbuilt_nn_modules=False
 
+def get_tp_pad_size(num_seqs: int):
+    tp_size = get_tensor_model_parallel_world_size()
+    return (tp_size - num_seqs % tp_size) % tp_size
+
 def GE_graph_padding(
     graph_pad_size: int,
     input_ids: torch.Tensor,
     positions: torch.Tensor,
 ):
+    if graph_pad_size < 0:
+        return input_ids, positions
+
     attn_metadata_dict = get_forward_context().attn_metadata
 
-    if graph_pad_size < 0:
-        return input_ids, positions, attn_metadata_dict
+    if attn_metadata_dict is None:
+        return input_ids, positions
 
-    if not attn_metadata_dict:
-        return input_ids, positions, attn_metadata_dict
-
-    first_key = next(iter(attn_metadata_dict))
-    attn_metadata = attn_metadata_dict[first_key]
-
-    if attn_metadata is None or getattr(attn_metadata, "decode", None) is None:
-        return input_ids, positions, attn_metadata_dict
+    attn_metadata = attn_metadata_dict[next(iter(attn_metadata_dict))]
 
     slot_mapping = attn_metadata.slot_mapping
-    block_table = attn_metadata.decode.block_table
+    block_table = attn_metadata.block_tables
+    seq_lens_tensor = attn_metadata.seq_lens_tensor
 
-    assert block_table.shape[0] == slot_mapping.shape[0], (
-        f"block_table.shape[0] ({block_table.shape[0]}) != "
-        f"slot_mapping.shape[0] ({slot_mapping.shape[0]})"
-    )
-
-    # padding tensors
     pad_slots = torch.full(
         (graph_pad_size,),
         PAD_SLOT_ID,
@@ -66,22 +62,40 @@ def GE_graph_padding(
     input_ids = torch.cat([input_ids, pad_input_ids], dim=0)
     positions = torch.cat([positions, pad_positions], dim=0)
 
-    # pad block_table on dim 0
-    pad_block_table = torch.zeros(
-        (graph_pad_size,) + block_table.shape[1:],
-        dtype=block_table.dtype,
-        device=block_table.device,
-    )
-    block_table = torch.cat([block_table, pad_block_table], dim=0)
+    if attn_metadata.num_prefills > 0:
+        pad_block_table = torch.zeros(
+            (1,) + block_table.shape[1:],
+            dtype=block_table.dtype,
+            device=block_table.device,
+        )
+        block_table = torch.cat([block_table, pad_block_table], dim=0)
 
-    # write back
-    attn_metadata.slot_mapping = slot_mapping
-    attn_metadata.decode.block_table = block_table
+        # write back
+        attn_metadata.slot_mapping = slot_mapping
+        attn_metadata.block_tables = block_table
+        attn_metadata.seq_lens.append(graph_pad_size)
+        attn_metadata.query_cumlens.append(input_ids.shape[0])
+    else:
+        pad_seq_lens_tensor = torch.ones(
+            (graph_pad_size,),
+            dtype=seq_lens_tensor.dtype,
+            device=seq_lens_tensor.device,
+        )
+        pad_block_table = torch.zeros(
+            (graph_pad_size,) + block_table.shape[1:],
+            dtype=block_table.dtype,
+            device=block_table.device,
+        )
+        seq_lens_tensor = torch.cat([seq_lens_tensor, pad_seq_lens_tensor], dim=0)
+        block_table = torch.cat([block_table, pad_block_table], dim=0)
 
-    attn_metadata.decode.seq_lens += [1] * graph_pad_size
+        # write back
+        attn_metadata.slot_mapping = slot_mapping
+        attn_metadata.block_tables = block_table
+        attn_metadata.seq_lens_tensor = seq_lens_tensor
+        attn_metadata.seq_lens += [1] * graph_pad_size
 
-    return input_ids, positions, attn_metadata_dict
-
+    return input_ids, positions
 
 class TorchNpuCompilerWrapperWithCustomDispatcher:
 
@@ -135,46 +149,45 @@ class TorchNpuCompilerWrapperWithCustomDispatcher:
             return self.compiled_model(*args, **kwargs)
 
         elif self.vllm_config.npu_compilation_config.use_ge_graph_cached:
-            if len(args) == 0 and len(kwargs) == 0:
-                raise ValueError(
-                    "If you use the compile cache function, you must input a tensor or directly input the gear size")
-
-            inputs = 0
-            if len(args) > 0:
-                inputs = args[0]
-                positions = args[1]
-                args = args[2:]
-            elif len(kwargs) > 0:
-                if kwargs["input_ids"] is not None:
-                    inputs = kwargs["input_ids"]
-                else:
-                    inputs = kwargs["inputs_embeds"]
-                positions = kwargs["positions"]
-
-            gear_size = inputs.shape[0]
-            graph_pad_size = self.vllm_config.npu_compilation_config.decode_gear_list[-1]-gear_size
-            inputs, positions, attn_metadata_dict = GE_graph_padding(graph_pad_size, inputs, positions)
-            gear_size = inputs.shape[0]
-            kwargs["attn_metadata"] = attn_metadata_dict
-            kwargs["input_ids"] = inputs
-            kwargs["positions"] = positions
-
+            gear_size = args[0].shape[0]
             return self.cached_compiled_models[gear_size](*args, **kwargs)
-
 
         logger.error(f"encountered a missed scene")
         return None
 
     def __call__(self, *args, **kwargs):
         logger.debug(f"[ge graph], call enter")
-        from vllm.forward_context import get_forward_context
+        if len(args) > 0:
+            inputs = args[0]
+            positions = args[1]
+            args = args[2:]
+        elif len(kwargs) > 0:
+            if kwargs["input_ids"] is not None:
+                inputs = kwargs["input_ids"]
+            else:
+                inputs = kwargs["inputs_embeds"]
+            positions = kwargs["positions"]
+        else:
+            raise ValueError("No input_ids or inputs_embeds found in kwargs")
+
         attn_metadata = get_forward_context().attn_metadata
         batch_descriptor = get_forward_context().batch_descriptor
         uniform = batch_descriptor.uniform if batch_descriptor is not None else False
-        has_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-        if has_prefill or not uniform:
+        is_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
+
+        gear_size = inputs.shape[0]
+        if attn_metadata is not None and attn_metadata[next(iter(attn_metadata))].num_prefills > 0:
+            graph_pad_size = get_tp_pad_size(gear_size)
+        else:
+            graph_pad_size = self.vllm_config.scheduler_config.max_num_seqs - gear_size
+        inputs, positions = GE_graph_padding(graph_pad_size, inputs, positions)
+        kwargs["input_ids"] = inputs
+        kwargs["positions"] = positions
+
+        if is_prefill or not uniform:
             logger.debug(f"<<< [ge graph]use original forward")
             return self.forward(*args, **kwargs)
+
         return self.call_dispatcher(*args, **kwargs)
 
     @abstractmethod

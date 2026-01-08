@@ -31,7 +31,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-
+from vllm.config import get_current_vllm_config
 
 NZ_DIM = 16
 
@@ -42,6 +42,7 @@ class NPUMetadata:
     block_tables: torch.Tensor
     query_cumlens: list[int]
     seq_lens: list[int]
+    seq_lens_tensor: torch.Tensor = None
     max_query_len: Optional[int] = None
     slot_mapping: torch.Tensor = None
     num_prefills: int = 0
@@ -88,6 +89,7 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
                                        block_tables=block_table,
                                        query_cumlens=query_cumlens.tolist(),
                                        seq_lens=seq_lens.tolist(),
+                                       seq_lens_tensor=seq_lens,
                                        max_query_len=max_query_len,
                                        slot_mapping=slot_mapping,
                                        num_prefills=num_prefills)
@@ -176,8 +178,8 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             )
         self.alibi_slopes = alibi_slopes
         self.attn_type = attn_type
-        self.enable_graph_mode = False
-        
+        self.vllm_config = get_current_vllm_config()
+        self.enable_ge_graph_mode = self.vllm_config.npu_compilation_config.use_gegraph
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(f"Only support decoder models, but {attn_type=}.")
 
@@ -209,7 +211,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         if not (layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0):
             raise RuntimeError("layer._k_scale_float and layer._v_scale_float must both be 1.0")
 
-        # View q to TND, kv to TH.
+        # View q,k,v to TND.
         query = query.view(-1, self.num_heads, self.head_size).contiguous()
         key = key.view(-1, self.num_kv_heads, self.head_size).contiguous()
         value = value.view(-1, self.num_kv_heads, self.head_size).contiguous()
@@ -228,8 +230,8 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             )
 
         if attn_metadata.num_prefills == 0:
-            if self.enable_graph_mode:
-                attn_output = tng.npu_fused_infer_attention_score_v2(
+            if self.enable_ge_graph_mode:
+                attn_output = tng.ops.npu_fused_infer_attention_score_v2(
                     torch.transpose(query.view(num_batch, -1, self.num_heads, self.head_size), 1, 2),
                     kv_cache[0].view(-1, self.num_kv_heads, self.head_size // NZ_DIM, block_size, NZ_DIM),
                     kv_cache[1].view(-1, self.num_kv_heads, self.head_size // NZ_DIM, block_size, NZ_DIM),
@@ -239,7 +241,8 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                     softmax_scale=self.scale,
                     block_table=attn_metadata.block_tables,
                     block_size=block_size,
-                    actual_seq_kvlen=attn_metadata.seq_lens,
+                    actual_seq_kvlen=attn_metadata.seq_lens_tensor,
+                    inner_precise=1,
                 )[0]
             else:
                 attn_output = torch_npu.npu_fused_infer_attention_score(

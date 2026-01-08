@@ -159,8 +159,6 @@ class NPUModelRunner(GPUModelRunner):
         if self.vllm_config.npu_compilation_config.use_gegraph:
             from vllm.model_executor.model_loader import get_model as original_get_model
             self.model = original_get_model(vllm_config=self.vllm_config)
-            if hasattr(self.model, "process_weights_after_loading") and callable(getattr(self.model, "process_weights_after_loading")):
-                self.model.process_weights_after_loading()
             return
         super().load_model(eep_scale_up)
 

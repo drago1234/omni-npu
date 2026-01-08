@@ -51,7 +51,7 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.distributed import get_pp_group
 
 from omni_npu.v0.models.qwen.fused_moe import FusedMoE
-from omni_npu.v0.layers.layernorm import RMSNormFlashComm, RMSNorm
+from omni_npu.v0.layers.layernorm import RMSNormFlashComm, NPURMSNorm
 from omni_npu.v0.layers.linear import (RowParallelFlashCommLinear, QKVParallelFlashCommLinear)
 from omni_npu.v0.layers.rotary_embedding import get_rope
 from omni_npu.v0.layers.utils import ConditionalTNGScope
@@ -70,20 +70,25 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         super().__init__()
 
         self.n_routed_experts = config.num_experts
-        self.experts = FusedMoE(num_experts=self.n_routed_experts,
-                                top_k=config.num_experts_per_tok,
-                                hidden_size=config.hidden_size,
-                                intermediate_size=config.moe_intermediate_size,
-                                renormalize=config.norm_topk_prob,
-                                quant_config=quant_config,
-                                prefix=f"{prefix}.experts",
-                                )
+        self.experts = FusedMoE(
+                num_experts=self.n_routed_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                renormalize=config.norm_topk_prob,
+                quant_config=quant_config,
+                prefix=f"{prefix}.experts",
+            )
 
-        self.gate = ReplicatedLinear(config.hidden_size,
-                                     self.n_routed_experts,
-                                     bias=False,
-                                     quant_config=None,
-                                     prefix=f"{prefix}.gate")
+        self.gate = RowParallelFlashCommLinear(
+                config.hidden_size,
+                self.n_routed_experts,
+                tp_size=1,
+                tp_rank=0,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate"
+            )
 
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool = False) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -193,8 +198,8 @@ class Qwen3MoeAttention(nn.Module):
             prefix=f"{prefix}.attn"
         )
         
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.q_norm = NPURMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = NPURMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -580,8 +585,6 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
         ],
     }
 
-    fall_back_to_pt_during_load = False
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -611,11 +614,10 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             intermediate_tensors: Optional[IntermediateTensors] = None,
-            inputs_embeds = None,
-            **kwargs
+            inputs_embeds: torch.Tensor | None = None,
     ) -> Optional[torch.Tensor]:
         attn_metadata = get_forward_context().attn_metadata
-        hidden_states = self.model(input_ids, positions, attn_metadata, intermediate_tensors, None)
+        hidden_states = self.model(input_ids, positions, attn_metadata, intermediate_tensors, inputs_embeds)
         return hidden_states
 
     def compute_logits(
@@ -631,7 +633,7 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP):
         return loader.load_weights(weights)
     
     def should_use_eager_mode(self, *args, **kwargs):
-        attn_metadata = kwargs.get("attn_metadata", None)
+        attn_metadata = get_forward_context().attn_metadata
         if not attn_metadata:
             return True
 
