@@ -47,6 +47,7 @@ def layer_module(monkeypatch):
 
     distributed_module = types.ModuleType("vllm.distributed")
     distributed_module.get_ep_group = lambda: SimpleNamespace(rank=0)
+    distributed_module.get_tp_group = lambda: SimpleNamespace(all_gather=lambda x, dim=0: x)
     distributed_module.tensor_model_parallel_all_reduce = MagicMock(side_effect=lambda tensor: tensor)
     distributed_module.tensor_model_parallel_all_gather = MagicMock(
         side_effect=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim)

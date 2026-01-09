@@ -33,19 +33,50 @@ def fused_module(monkeypatch):
 
     orig_arange = torch.arange
     orig_tensor = torch.tensor
+    orig_ones = torch.ones
+    orig_zeros = torch.zeros
+    orig_full = torch.full
+
+    def _coerce_device(kwargs):
+        dev = kwargs.get("device")
+        if dev is None:
+            try:
+                if orig_tensor([]).device.type == "npu":
+                    kwargs["device"] = "cpu"
+            except Exception:
+                pass
+            return
+        if isinstance(dev, torch.device):
+            if dev.type == "npu":
+                kwargs["device"] = "cpu"
+        elif dev == "npu":
+            kwargs["device"] = "cpu"
 
     def _safe_arange(*args, **kwargs):
-        if kwargs.get("device") == "npu":
-            kwargs["device"] = "cpu"
+        _coerce_device(kwargs)
         return orig_arange(*args, **kwargs)
 
     def _safe_tensor(*args, **kwargs):
-        if kwargs.get("device") == "npu":
-            kwargs["device"] = "cpu"
+        _coerce_device(kwargs)
         return orig_tensor(*args, **kwargs)
+
+    def _safe_ones(*args, **kwargs):
+        _coerce_device(kwargs)
+        return orig_ones(*args, **kwargs)
+
+    def _safe_zeros(*args, **kwargs):
+        _coerce_device(kwargs)
+        return orig_zeros(*args, **kwargs)
+
+    def _safe_full(*args, **kwargs):
+        _coerce_device(kwargs)
+        return orig_full(*args, **kwargs)
 
     monkeypatch.setattr(torch, "arange", _safe_arange)
     monkeypatch.setattr(torch, "tensor", _safe_tensor)
+    monkeypatch.setattr(torch, "ones", _safe_ones)
+    monkeypatch.setattr(torch, "zeros", _safe_zeros)
+    monkeypatch.setattr(torch, "full", _safe_full)
     monkeypatch.setattr(
         torch.distributed,
         "all_to_all_single",
@@ -261,6 +292,7 @@ def test_moe_infer_fusion_runs_routing(fused_module):
         quant_config=None,
         enable_eplb=False,
         quant_method=MagicMock(),
+        w13_weight=torch.zeros(1, 1, 1),
     )
     expanded_x = torch.ones(2, 2)
     expanded_row_idx = torch.zeros(2, 1, dtype=torch.int32)

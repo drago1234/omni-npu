@@ -45,13 +45,23 @@ def permute_module(monkeypatch):
         def __init__(self, quant_config):
             self.quant_config = quant_config
 
+    class DummyPrepareAndFinalize:
+        pass
+
     modular_kernel_module.ExpertTokensMetadata = DummyExpertTokensMetadata
     modular_kernel_module.FusedMoEActivationFormat = DummyActivationFormat
     modular_kernel_module.FusedMoEPermuteExpertsUnpermute = DummyPermuteExpertsUnpermute
+    modular_kernel_module.FusedMoEPrepareAndFinalize = DummyPrepareAndFinalize
+    modular_kernel_module.PrepareResultType = tuple
     modular_kernel_module.TopKWeightAndReduce = object
 
     distributed_module = types.ModuleType("vllm.distributed")
     distributed_module.get_ep_group = lambda: SimpleNamespace(world_size=2)
+    distributed_module.get_tp_group = lambda: SimpleNamespace(all_gather=lambda x, dim=0: x)
+    distributed_module.tensor_model_parallel_all_reduce = lambda tensor: tensor
+    distributed_module.tensor_model_parallel_all_gather = lambda tensor, dim=0: tensor
+    distributed_module.get_tensor_model_parallel_world_size = lambda: 1
+    distributed_module.get_tensor_model_parallel_rank = lambda: 0
 
     platforms_module = types.ModuleType("vllm.platforms")
     platforms_module.current_platform = SimpleNamespace(device_type="cpu")

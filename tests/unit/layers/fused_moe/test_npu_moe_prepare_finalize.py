@@ -22,6 +22,11 @@ def prepare_module(monkeypatch):
         device_group=device_group,
         rank_in_group=0,
     )
+    distributed_module.tensor_model_parallel_all_reduce = lambda tensor: tensor
+    distributed_module.tensor_model_parallel_all_gather = lambda tensor, dim=0: tensor
+    distributed_module.get_tensor_model_parallel_world_size = lambda: 1
+    distributed_module.get_tensor_model_parallel_rank = lambda: 0
+    distributed_module.get_tp_group = lambda: SimpleNamespace(all_gather=lambda x, dim=0: x)
 
     fused_moe_module = types.ModuleType("vllm.model_executor.layers.fused_moe")
 
@@ -51,12 +56,16 @@ def prepare_module(monkeypatch):
     class DummyFusedMoEPrepareAndFinalize:
         pass
 
+    class DummyPermuteExpertsUnpermute:
+        pass
+
     class DummyActivationFormat:
         Standard = "standard"
 
     modular_kernel_module.ExpertTokensMetadata = DummyExpertTokensMetadata
     modular_kernel_module.FusedMoEActivationFormat = DummyActivationFormat
     modular_kernel_module.FusedMoEPrepareAndFinalize = DummyFusedMoEPrepareAndFinalize
+    modular_kernel_module.FusedMoEPermuteExpertsUnpermute = DummyPermuteExpertsUnpermute
     modular_kernel_module.PrepareResultType = tuple
     modular_kernel_module.TopKWeightAndReduce = object
 
@@ -176,6 +185,7 @@ def test_finalize_calls_combine_and_copies_output(prepare_module):
     prepare.expand_idx = torch.tensor([0, 1])
     prepare.ep_recv_counts = torch.tensor([2])
     prepare.tp_recv_counts = torch.tensor([2])
+    prepare.num_experts = moe.num_experts
 
     combined = torch.full((2, 2), 7.0)
     stubs.torch_npu.npu_moe_distribute_combine_v2.return_value = combined
