@@ -1,14 +1,16 @@
 import functools
+from typing import TypeVar, Union
+
+import torch.nn as nn
+
 import vllm.compilation.decorators as _dec_mododule
 from vllm.forward_context import get_forward_context
+from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 
 
 logger = init_logger(__name__)
 
-from typing import Callable, Optional, TypeVar, Union
-import torch
-import torch.nn as nn
 
 _T = TypeVar('_T', bound=type[nn.Module])
 
@@ -51,7 +53,7 @@ def _bypass_prefill(self, *args, **kwargs):
     batch_descriptor = get_forward_context().batch_descriptor
     uniform = batch_descriptor.uniform if batch_descriptor is not None else False
     has_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-    if has_prefill or not uniform:
+    if has_prefill or not uniform or get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE:
         logger.debug(f"<<< use original forward")
         return True, self.forward(*args, **kwargs)
     return False, None

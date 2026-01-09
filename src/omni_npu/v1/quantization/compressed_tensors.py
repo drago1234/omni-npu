@@ -59,7 +59,7 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
-        logger.info("NpuW8A8LinearMethod params_dtype=%s", params_dtype)
+        logger.debug("NpuW8A8LinearMethod params_dtype=%s", params_dtype)
 
         weight_scale = ChannelQuantScaleParameter(
             data=torch.empty(sum(output_partition_sizes), dtype=params_dtype),

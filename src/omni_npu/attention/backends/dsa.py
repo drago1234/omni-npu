@@ -14,8 +14,10 @@ import torch
 import torch_npu
 
 from vllm.attention.backends.abstract import AttentionLayer, AttentionType
+from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBackend,
     MLACommonDecodeMetadata,
@@ -85,7 +87,6 @@ class NPUDSAMetadata(MLACommonMetadata[NPUDSADecodeMetadata]):
 
 class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
-    supports_uniform_spec_as_decode: ClassVar[bool] = True
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
@@ -107,6 +108,14 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             raise ValueError("DCP should not be enabled.")
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
+
+        self.uniform_decode_query_len = (
+            1
+            if not self.vllm_config.speculative_config
+            else 1 + self.vllm_config.speculative_config.num_speculative_tokens
+        )
+        max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
+        self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
 
     def _build_decode(
         self,
@@ -132,6 +141,10 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         fast_build: bool = False,
     ) -> NPUDSAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
+            # for pd-mixed, TP is used, no need to use mc2_mask
+            metadata.decode.mc2_mask = self._generate_activate_mask(metadata.num_actual_tokens)
+            metadata.slot_mapping = self._align_slot_mapping(metadata.slot_mapping, metadata.num_reqs)
         if metadata.prefill is not None:
             metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1]
             metadata.prefill.seq_lens = metadata.prefill.query_cumlens
@@ -139,6 +152,18 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         if metadata.prefill is not None and metadata.prefill.chunked_context is not None:
             raise RuntimeError(f"Chunked prefill is not enabled yet.")
         return metadata
+
+    def _generate_activate_mask(self, actual_seqs_num):
+        self.mc2_mask.fill_(False)
+        self.mc2_mask[:actual_seqs_num].fill_(True)
+        return self.mc2_mask
+
+    def _align_slot_mapping(self, slot_mapping: torch.Tensor, num_reqs) -> torch.Tensor:
+        num_tokens_padded = num_reqs * self.uniform_decode_query_len
+        slot_mapping_numel = slot_mapping.numel()
+        if slot_mapping_numel < num_tokens_padded:
+            slot_mapping = torch.nn.functional.pad(slot_mapping, (0, num_tokens_padded - slot_mapping_numel), value=PAD_SLOT_ID)
+        return slot_mapping
 
 
 class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):

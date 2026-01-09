@@ -104,13 +104,13 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
 
-        self.uniform_decode_query_len = (
+        uniform_decode_query_len = (
             1
             if not self.vllm_config.speculative_config
             else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
-        self.batch_size = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
-        self.mc2_mask = torch.zeros(self.batch_size, dtype=torch.bool, device=current_platform.device_type)
+        max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * uniform_decode_query_len
+        self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
 
     def _build_decode(
         self,
@@ -136,17 +136,18 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         fast_build: bool = False,
     ) -> NPUMLAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
-        if metadata.prefill is None and self.vllm_config.kv_transfer_config is not None:
+        if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
             # for pd-mixed, TP is used, no need to use mc2_mask
-            self.generate_activate_mask(common_attn_metadata.num_actual_tokens, self.batch_size)
-            metadata.decode.mc2_mask = self.mc2_mask
+            metadata.decode.mc2_mask = self.generate_activate_mask(common_attn_metadata.num_actual_tokens)
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc = metadata.prefill.query_start_loc.tolist()
         return metadata
 
-    def generate_activate_mask(self, actual_seqs_num, batch_size):
+    def generate_activate_mask(self, actual_seqs_num):
         self.mc2_mask.fill_(False)
         self.mc2_mask[:actual_seqs_num].fill_(True)
+        return self.mc2_mask
+
 
 class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
     can_return_lse_for_decode: bool = False

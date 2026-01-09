@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 from vllm.config import (
+    CompilationMode,
     CUDAGraphMode,
     VllmConfig,
     get_layers_from_vllm_config,
@@ -59,6 +60,11 @@ class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         with switch_torch_device():
             super().__init__(vllm_config, device)
+
+        # enable mtp acl graph mode
+        if self.speculative_config and isinstance(self.drafter, EagleProposer):
+            if self.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+                self.drafter.use_cuda_graph = self.compilation_config.cudagraph_mode.has_mode(CUDAGraphMode.PIECEWISE)
 
         # NOTE:(runze) query_lens and seq_lens arguments need to be int64 in FIA op,
         # otherwise an implicit conversion would happen which might hurt performance.
@@ -446,10 +452,8 @@ class NPUModelRunner(GPUModelRunner):
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
-                use_cudagraphs = (
-                    cudagraph_runtime_mode.has_mode(CUDAGraphMode.PIECEWISE)
-                    and not self.speculative_config.enforce_eager
-                )
+                # enable mtp acl graph mode
+                use_cudagraphs = cudagraph_runtime_mode.has_mode(CUDAGraphMode.PIECEWISE)
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a

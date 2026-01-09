@@ -5,11 +5,14 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, List
-import torch.distributed as dist
+
 import torch
+import torch.distributed as dist
 import torch_npu
+
 from vllm.platforms import current_platform
 from vllm.distributed import get_ep_group
+from vllm.forward_context import get_forward_context
 
 
 @dataclass
@@ -178,6 +181,17 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             torch.device(current_platform.device_type)
         ).get_hccl_comm_name(get_ep_group().rank_in_group)
 
+    def _get_mc2_mask(self, num_tokens: int) -> torch.Tensor | None:
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[next(iter(attn_metadata))]
+
+        if hasattr(attn_metadata, 'decode') and attn_metadata.decode is not None:
+            mc2_mask = attn_metadata.decode.mc2_mask[:num_tokens]
+        else:
+            mc2_mask = None
+        return mc2_mask
+
     def prepare_permute(
       self,
       layer: torch.nn.Module,
@@ -201,7 +215,7 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             "group_ep": self.moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
             "ep_world_size": self.ep_size,
             "ep_rank_id": self.ep_rank,
-            "x_active_mask": None,
+            "x_active_mask": self._get_mc2_mask(topk_ids.shape[0]),
         }
         output = torch_npu.npu_moe_distribute_dispatch_v2(**kwargs)
         expand_x, dynamic_scale, expand_idx, expert_token_nums, ep_recv_counts, tp_recv_counts = output[0:6]
@@ -236,7 +250,7 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             "ep_world_size": self.ep_size,
             "ep_rank_id": self.ep_rank,
             "tp_send_counts": dispatch_combine_prepare_permute_result.tp_recv_counts,
-            "x_active_mask": None,
+            "x_active_mask": self._get_mc2_mask(topk_ids.shape[0]),
         }
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(**kwargs)
         return hidden_states

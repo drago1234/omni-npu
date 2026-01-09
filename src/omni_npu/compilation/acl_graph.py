@@ -245,19 +245,14 @@ class ACLGraphWrapper:
         if aslkv is not None:
             ## NOTE: The parameter list should match.
             # entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
-            aslkv = self._pad_list(aslkv, batch_descriptor.num_tokens) # padding  aslkv to match gear
-            entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths_kv": aslkv}])
+            if not isinstance(aslkv, torch.Tensor):
+                aslkv = self._pad_list(aslkv, batch_descriptor.num_tokens) # padding  aslkv to match gear
+                entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
         return entry.output
 
     def _pad_list(self, lst, n):
-        if isinstance(lst, torch.Tensor):
-            if lst.size(0) < n:
-                return torch.cat([lst, lst[-1:].repeat(n - lst.size(0))])
-            else:
-                return lst[:n]
-
         if not lst or len(lst) == n:
             return lst
         return lst + [lst[-1]] * (n - len(lst)) if len(lst) < n else lst[:n]

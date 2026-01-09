@@ -263,7 +263,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             f"{prefix}.indexer",
         )
 
-        self.dsa_attn = MLAAttention(
+        self.attn = MLAAttention(
             num_heads=self.num_local_heads,
             scale=self.scaling,
             qk_nope_head_dim=self.qk_nope_head_dim,
@@ -345,7 +345,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
     ):
         attn_output = attn_output.transpose(0, 1)
         attn_output = (
-            torch.matmul(attn_output, self.dsa_attn.impl.W_UV)
+            torch.matmul(attn_output, self.attn.impl.W_UV)
             .transpose(1, 0)
             .reshape(-1, self.num_local_heads * self.v_head_dim)
         )
@@ -368,7 +368,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         )
         q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim).transpose(0, 1)
         q_nope = (
-            torch.matmul(q_nope, self.dsa_attn.impl.W_UK_T)
+            torch.matmul(q_nope, self.attn.impl.W_UK_T)
             .transpose(1, 0)
             .view(-1, self.num_local_heads, self.kv_lora_rank)
         )
@@ -389,7 +389,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             k_pe = k_pe.squeeze(2)
             k_nope = None
         else:
-            kv_cache = self.dsa_attn.kv_cache[get_forward_context().virtual_engine]
+            kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
             k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
                 latent_cache.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim), # bnsd
                 self.kv_a_layernorm.weight,
@@ -428,7 +428,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             token_x=hidden_states.view(bs, 1, -1),
             weight_dq=self.q_a_proj.weight,
             weight_uq_qr=self.q_b_proj.weight,
-            weight_uk=self.dsa_attn.impl.W_UK_T,
+            weight_uk=self.attn.impl.W_UK_T,
             weight_dkv_kr=self.kv_a_proj_with_mqa.weight,
             rmsnorm_gamma_cq=self.q_a_layernorm.weight,
             rmsnorm_gamma_ckv=self.kv_a_layernorm.weight,
@@ -464,7 +464,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         sin: torch.Tensor,
         attn_metadata: Optional['NPUDSAMetadata'] = None,
     ) -> torch.Tensor:
-        kv_cache = self.dsa_attn.kv_cache[get_forward_context().virtual_engine]
+        kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
         if self.use_mlaprolog:
             q_nope, q_pe, q_norm, k_nope, k_pe, dequant_scale_q_nope, dequant_scale_q_norm = \
                 self._forward_mlaprolog(hidden_states, cos, sin, attn_metadata, kv_cache)
@@ -474,17 +474,19 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             else:
                 q_lora = self.q_proj(hidden_states)[0]
             kv = self.kv_a_proj_with_mqa(hidden_states)[0]
+
             if self.q_lora_rank is not None:
                 q_norm = self.q_a_layernorm(q_lora)
                 q = self.q_b_proj(q_norm)[0]
             else:
                 q = q_lora
+
             bsz, _ = q.shape
             q = q.view(bsz, self.num_local_heads, 1, self.qk_head_dim)
             q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) # b,n,s,d
             q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim).transpose(0, 1) # n, bs, d
             q_nope = (
-                torch.matmul(q_nope, self.dsa_attn.impl.W_UK_T)
+                torch.matmul(q_nope, self.attn.impl.W_UK_T)
                 .transpose(1, 0)
                 .view(bsz, 1, self.num_local_heads, -1)
             )

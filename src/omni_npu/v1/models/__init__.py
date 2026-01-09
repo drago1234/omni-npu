@@ -9,6 +9,9 @@ def register_models():
         "DeepseekV3ForCausalLM",
         "omni_npu.v1.models.deepseek.deepseek_v3:DeepseekV3ForCausalLM")
     ModelRegistry.register_model(
+        "DeepSeekMTPModel",
+        "omni_npu.v1.models.deepseek.deepseek_mtp:DeepSeekMTP")
+    ModelRegistry.register_model(
         "Qwen3ForCausalLM",
         "omni_npu.v1.models.qwen.qwen3:Qwen3ForCausalLM")
     ModelRegistry.register_model(

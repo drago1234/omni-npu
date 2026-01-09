@@ -214,7 +214,6 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if config is None:
             config = vllm_config.model_config.hf_config
-        model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
@@ -420,9 +419,6 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
 class DeepseekV2ForCausalLM(
     nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle
 ):
-    packed_modules_mapping = {
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
     model_cls = DeepseekV2Model
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -431,28 +427,6 @@ class DeepseekV2ForCausalLM(
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-
-        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
-        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
-        self.use_mha = config.model_type == "deepseek" or all(
-            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
-        )
-
-        if self.use_mha:
-            self.packed_modules_mapping["qkv_proj"] = ["q_proj", "k_proj", "v_proj"]
-
-        # `packed_modules_mapping` needs to be modified before
-        # initializing DeepseekV2Model, as it is passed inplace to
-        # quantization config init and may be used to select the
-        # quant_method for relevant layers during initialization.
-        self.fuse_qkv_a_proj = (
-            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
-        )
-        if self.fuse_qkv_a_proj:
-            self.packed_modules_mapping["fused_qkv_a_proj"] = [
-                "q_a_proj",
-                "kv_a_proj_with_mqa",
-            ]
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

@@ -143,7 +143,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.mla_attn = MLAAttention(
+        self.attn = MLAAttention(
             num_heads=self.num_local_heads,
             scale=self.scaling,
             qk_nope_head_dim=self.qk_nope_head_dim,
@@ -182,7 +182,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         sin: torch.Tensor,
         attn_metadata: Optional['NPUMLAMetadata'] = None,
     ) -> torch.Tensor:
-        kv_cache = self.mla_attn.kv_cache[get_forward_context().virtual_engine]
+        kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
         nz_block_size = 16
         if self.q_lora_rank is not None:
             q_lora = self.q_a_proj(hidden_states)[0]
@@ -201,7 +201,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) # b,n,s,d
         q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim).transpose(0, 1) # n, bs, d
         q_nope = (
-            torch.matmul(q_nope, self.mla_attn.impl.W_UK_T)
+            torch.matmul(q_nope, self.attn.impl.W_UK_T)
             .transpose(1, 0)
             .view(bsz, 1, self.num_local_heads, -1)
         )
@@ -248,7 +248,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         # Apply UV, (N, B, L) @ W_UV (N, L, V) -> (N, B, V)
         attn_output = attn_output.view(self.num_local_heads, bsz, self.kv_lora_rank) # adapter BSND_NBSD
         attn_output = (
-            torch.matmul(attn_output, self.mla_attn.impl.W_UV)
+            torch.matmul(attn_output, self.attn.impl.W_UV)
             .transpose(1, 0)
             .reshape(bsz, 1, -1)
         )
@@ -299,7 +299,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             k_pe = k_pe.squeeze(2)
             attn_output.fill_(0)
         else:
-            kv_cache = self.mla_attn.kv_cache[get_forward_context().virtual_engine]
+            kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
             _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
                 latent_cache.view(-1, 1, 1, 576), # bnsd
                 self.kv_a_layernorm.weight,
@@ -324,7 +324,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             if prefill_metadata.max_query_len > 1:
-                attn_mask = self.mla_attn.impl.SHARE_MASK_TRIL_SPARSE
+                attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE
                 sparse_mode = 3
             else:
                 attn_mask = None

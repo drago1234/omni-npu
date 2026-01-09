@@ -29,9 +29,10 @@ class ConfigUpdater:
 
         additional_config = vllm_config.additional_config
         if additional_config:
-            graph_model_compile_config = additional_config.get("graph_model_compile_config", {})
-            vllm_config.npu_compilation_config.build_from_cli(graph_model_compile_config, vllm_config)
-            logger.debug(f"Graph model compile config: {graph_model_compile_config}")
+            graph_model_compile_config = additional_config.get("graph_model_compile_config", None)
+            if graph_model_compile_config is not None:
+                vllm_config.npu_compilation_config.build_from_cli(graph_model_compile_config, vllm_config)
+                logger.debug(f"Graph model compile config: {graph_model_compile_config}")
 
     @staticmethod
     def _handle_graph_mode(vllm_config: 'VllmConfig') -> None:

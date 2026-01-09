@@ -33,8 +33,17 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
         self.expand_idx = None
         self.ep_recv_counts = None
         self.tp_recv_counts = None
-        self.mc2_mask = None
-        self.mask = None
+
+    def _get_mc2_mask(self, num_tokens: int) -> torch.Tensor | None:
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[next(iter(attn_metadata))]
+
+        if hasattr(attn_metadata, 'decode') and attn_metadata.decode is not None:
+            mc2_mask = attn_metadata.decode.mc2_mask[:num_tokens]
+        else:
+            mc2_mask = None
+        return mc2_mask
 
     def prepare(
         self,
@@ -50,11 +59,6 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
             quant_mode = 2  # Dynamic quantization
         else:
             quant_mode = 0  # No quantization
-        self.attn_metadata = get_forward_context().attn_metadata
-        self.mc2_mask = self.attn_metadata[next(iter(self.attn_metadata))].decode.mc2_mask
-
-        decode_gear = get_forward_context().batch_descriptor.num_tokens
-        self.mask = self.mc2_mask[:decode_gear] if self.mc2_mask is not None else None
 
         self.num_experts = num_experts
         kwargs = {
@@ -69,7 +73,7 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
             "group_ep": self.moe_all_to_all_group_name,  # Unlike torch, it is obtained by name.
             "ep_world_size": self.moe.ep_size,
             "ep_rank_id": self.moe.ep_rank,
-            "x_active_mask": self.mask,
+            "x_active_mask": self._get_mc2_mask(topk_ids.shape[0]),
         }
 
         output = torch_npu.npu_moe_distribute_dispatch_v2(**kwargs)
@@ -107,7 +111,7 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
             "ep_world_size": self.moe.ep_size,
             "ep_rank_id": self.moe.ep_rank,
             "tp_send_counts": self.tp_recv_counts,
-            "x_active_mask": self.mask,
+            "x_active_mask": self._get_mc2_mask(topk_ids.shape[0]),
         }
 
         hidden_states_route = torch_npu.npu_moe_distribute_combine_v2(**kwargs)
@@ -128,4 +132,3 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
 
     def output_is_reduced(self) -> bool:
         return False
-
