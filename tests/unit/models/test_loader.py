@@ -32,30 +32,35 @@ class TestConfigLoaderUnit(unittest.TestCase):
         """Set up test fixtures"""
         # Mock torch_npu availability
         self.torch_npu_mock = MagicMock()
-        sys.modules['torch_npu'] = self.torch_npu_mock
+        self.torch_npu_patcher = patch.dict('sys.modules', {'torch_npu': self.torch_npu_mock})
+        self.torch_npu_patcher.start()
         
         # Mock vllm dependencies
+        self.vllm_mock = MagicMock()
         self.vllm_logger_mock = MagicMock()
-        sys.modules['vllm'] = MagicMock()
-        sys.modules['vllm.logger'] = MagicMock()
-        sys.modules['vllm.logger'].init_logger = MagicMock(return_value=self.vllm_logger_mock)
+        self.vllm_patcher = patch.dict('sys.modules', {
+            'vllm': self.vllm_mock,
+            'vllm.logger': self.vllm_logger_mock,
+        })
+        self.vllm_patcher.start()
+        self.vllm_mock.logger.init_logger = MagicMock(return_value=self.vllm_logger_mock)
         
         # Mock features module
         self.features_mock = MagicMock()
-        sys.modules['omni_npu.v1.models.config_loader.features'] = self.features_mock
-
+        self.features_patcher = patch.dict('sys.modules', {
+            'omni_npu.v1.models.config_loader.features': self.features_mock
+        })
+        self.features_patcher.start()
+        
     def tearDown(self):
         """Clean up after tests"""
-        # Remove mocked modules
-        modules_to_remove = [
-            'torch_npu',
-            'vllm',
-            'vllm.logger',
-            'omni_npu.v1.models.config_loader.features',
-        ]
-        for module in modules_to_remove:
-            if module in sys.modules:
-                del sys.modules[module]
+        # stop all patchers
+        if hasattr(self, 'torch_npu_patcher'):
+            self.torch_npu_patcher.stop()
+        if hasattr(self, 'vllm_patcher'):
+            self.vllm_patcher.stop()
+        if hasattr(self, 'features_patcher'):
+            self.features_patcher.stop()
 
     def test_model_operator_opt_config_post_init_enable_prefetch_true(self):
         """Test ModelOperatorOptConfig __post_init__ when enable_prefetch is True"""

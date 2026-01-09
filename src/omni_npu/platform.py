@@ -106,8 +106,6 @@ class NPUPlatform(Platform):
         For example, the out-of-tree quantization config can be imported and
         registered here dynamically.
         """
-        from omni_npu import layers
-        from omni_npu.distributed.eplb_state import EplbState
         if "omni_models_v0" in os.environ.get("VLLM_PLUGINS", ""):
             from omni_npu.v0.patches.model_patch import patch_all
             patch_all()

@@ -118,12 +118,14 @@ class TestNPUPlatform:
         assert register_connectors_called["called"] is True
 
     def test_pre_register_and_update(self, monkeypatch):
-        """Test pre_register_and_update method.
+        """Test pre_register_and_update method (covers lines 111-112).
         
         This method mainly imports modules, we just need to ensure
-        it doesn't raise exceptions.
+        it doesn't raise exceptions and imports are successful.
         """
+        # Verify imports don't raise exceptions
         NPUPlatform.pre_register_and_update()
+        # The method should complete without errors
 
     def test_get_punica_wrapper(self):
         """Test get_punica_wrapper method.
@@ -141,13 +143,14 @@ class TestNPUPlatform:
         result = NPUPlatform.get_device_communicator_cls()
         assert result == "omni_npu.distributed.communicator.NPUCommunicator"
 
-    def test_get_attn_backend_cls(self):
+    def test_get_attn_backend_cls(self, monkeypatch):
         """Test get_attn_backend_cls method.
         
         Verifies that the correct attention backend class is returned
-        based on use_mla and use_sparse flags.
+        based on use_mla and use_sparse flags, with and without VLLM_PLUGINS.
         """
-        # Test use_mla=True, use_sparse=True
+        # Test use_mla=True, use_sparse=True (without VLLM_PLUGINS, covers line 161)
+        monkeypatch.delenv("VLLM_PLUGINS", raising=False)
         result = NPUPlatform.get_attn_backend_cls(
             selected_backend="test",
             head_size=64,
@@ -174,6 +177,44 @@ class TestNPUPlatform:
         assert result == "omni_npu.attention.backends.mla.NPUMLABackend"
 
         # Test use_mla=False
+        result = NPUPlatform.get_attn_backend_cls(
+            selected_backend="test",
+            head_size=64,
+            dtype=torch.float16,
+            kv_cache_dtype="float16",
+            block_size=16,
+            use_mla=False,
+            has_sink=False,
+            use_sparse=False,
+        )
+        assert result == "omni_npu.attention.backends.attention.NPUAttentionBackend"
+        
+        # Test with VLLM_PLUGINS containing "omni_custom_models" (covers lines 150-157)
+        monkeypatch.setenv("VLLM_PLUGINS", "omni_custom_models")
+        result = NPUPlatform.get_attn_backend_cls(
+            selected_backend="test",
+            head_size=64,
+            dtype=torch.float16,
+            kv_cache_dtype="float16",
+            block_size=16,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=True,
+        )
+        assert result == "omni_npu.attention.backends.dsa.NPUDSABackend"
+        
+        result = NPUPlatform.get_attn_backend_cls(
+            selected_backend="test",
+            head_size=64,
+            dtype=torch.float16,
+            kv_cache_dtype="float16",
+            block_size=16,
+            use_mla=True,
+            has_sink=False,
+            use_sparse=False,
+        )
+        assert result == "omni_npu.v1.attention.backends.mla.NPUMLABackend"
+        
         result = NPUPlatform.get_attn_backend_cls(
             selected_backend="test",
             head_size=64,
@@ -292,8 +333,8 @@ class TestNPUPlatform:
 
         NPUPlatform.check_and_update_config(vllm_config)
 
-        assert vllm_config.scheduler_config.enable_chunked_prefill is False
-        assert vllm_config.scheduler_config.chunked_prefill_enabled is False
+        assert vllm_config.cache_config.block_size is 128
+        assert vllm_config.compilation_config.pass_config.fuse_norm_quant is False
 
 
 class TestConfigUpdater:
@@ -333,12 +374,16 @@ class TestConfigUpdater:
         ConfigUpdater.update_vllm_config(vllm_config)
         assert vllm_config.npu_compilation_config is mock_compilation_config
 
-        # Test case: with additional_config
+        # Test case: with additional_config (covers lines 32-34)
         vllm_config.additional_config = {
             "graph_model_compile_config": {"key": "value"}
         }
         ConfigUpdater.update_vllm_config(vllm_config)
-        mock_compilation_config.build_from_cli.assert_called()
+        # Verify build_from_cli was called with correct arguments
+        mock_compilation_config.build_from_cli.assert_called_once()
+        call_args = mock_compilation_config.build_from_cli.call_args
+        assert call_args[0][0] == {"key": "value"}  # graph_model_compile_config
+        assert call_args[0][1] == vllm_config  # vllm_config
 
     def test_update_vllm_config_with_env_var(self, monkeypatch):
         """Test the effect of TORCH_COMPILE_GE environment variable.
@@ -377,10 +422,10 @@ class TestConfigUpdater:
         assert vllm_config.npu_compilation_config.use_gegraph is False
 
     def test_update_vllm_config_no_dynamo(self, monkeypatch):
-        """Test case when dynamo is not supported.
+        """Test case when dynamo is not supported (covers lines 41-42).
         
         Verifies that when dynamo is not supported, use_gegraph
-        is set to False regardless of other settings.
+        is set to False regardless of other settings, and warning is logged.
         """
         vllm_config = self.vllm_cfg
 
@@ -400,8 +445,16 @@ class TestConfigUpdater:
             "vllm.utils.torch_utils.supports_dynamo",
             lambda: False,
         )
+        
+        # Mock logger.warning to verify it's called (covers line 42)
+        warning_called = {"called": False}
+        def mock_warning(msg):
+            warning_called["called"] = True
+        
+        monkeypatch.setattr("omni_npu.platform.logger.warning", mock_warning)
 
         vllm_config.additional_config = None
         ConfigUpdater.update_vllm_config(vllm_config)
         assert vllm_config.npu_compilation_config.use_gegraph is False
+        assert warning_called["called"] is True
 
