@@ -10,6 +10,7 @@ from vllm.model_executor.layers.rotary_embedding.common import (
     yarn_linear_ramp_mask,
 )
 
+from .common import get_cos_sin
 
 @DeepseekScalingRotaryEmbedding.register_oot
 class NPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
@@ -76,7 +77,6 @@ class NPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         t = torch.arange(seq_len * self.scaling_factor, device=device, dtype=torch.float32)
 
         freqs = torch.outer(t, inv_freq)
-
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer(
             "cos_cached", (emb.cos() * self.mscale).to(dtype), persistent=False
@@ -86,7 +86,4 @@ class NPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         )
 
     def get_cos_sin(self, positions: torch.Tensor, offsets: Optional[torch.Tensor] = None):
-        positions = torch.add(positions, offsets) if offsets is not None else positions
-        cos = self.cos_cached[positions].view(-1, 1, 1, self.cos_cached.shape[-1])
-        sin = self.sin_cached[positions].view(-1, 1, 1, self.sin_cached.shape[-1])
-        return cos, sin
+        return get_cos_sin(self.cos_cached, self.sin_cached, positions, offsets)
