@@ -274,3 +274,9 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
 
         output.copy_(attn_output)
         return output
+
+class AscendAttentionState(Enum):
+    PrefillNoCache = 0
+    PrefillCacheHit = 1
+    DecodeOnly = 2
+    ChunkedPrefill = 3

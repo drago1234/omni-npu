@@ -134,6 +134,8 @@ class ModelOperatorOptConfig:
     prefill_enable_mla_alltoall: bool = False
     prefill_enable_mla_alltoall_local: bool = False
     fa_quant: bool = False
+    use_omni_cache: bool = False
+    enable_dsa: bool=True
 
 
     def __post_init__(self):
@@ -149,7 +151,8 @@ class ModelOperatorOptConfig:
             self.shared_expert_down_prefetch = 0
             logger.warning(f"[WARNING] When enable_prefetch is false, prefetch_Mb must be set to 0.")
 
-            
+        if os.getenv("ENABLE_OMNI_CACHE", "0") == "1":
+            self.use_omni_cache = True
 
         # Check for mutually exclusive configuration options
         if self.enable_pipeline_comm and \

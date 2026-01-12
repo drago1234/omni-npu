@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from typing import TYPE_CHECKING, Optional, Union, Any, cast, TypeAlias
 
 import torch
@@ -12,6 +13,7 @@ from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
 )
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, prepare_communication_buffer_for_model
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -26,6 +28,7 @@ from vllm.attention.backends.abstract import (
 from vllm.forward_context import set_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.sequence import IntermediateTensors
@@ -87,6 +90,28 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.speculative_config and get_pp_group().is_last_rank:
             self.rejection_sampler = NPURejectionSampler(self.sampler)
+
+        if vllm_config.additional_config is not None:
+            self.use_rejection_sampler = vllm_config.additional_config.get("use_rejection_sampler", False)
+            self.use_penalty = vllm_config.additional_config.get("use_penalty", False)
+            self.total_step = vllm_config.additional_config.get("multi_step", 1)
+            self.combine_block = vllm_config.additional_config.get("combine_block", 1)
+            self.use_process_before_sample = vllm_config.additional_config.get("use_process_before_sample", False)
+        else:
+            self.use_rejection_sampler = False
+            self.use_penalty = False
+            self.total_step = 1
+            self.combine_block = 1
+            self.use_process_before_sample = False
+        self.use_spec_decode = False
+        num_tokens_per_reqs_decode = 1 if not self.use_spec_decode else (1 + self.speculative_config.num_speculative_tokens)
+        self.block_size = vllm_config.cache_config.block_size
+        self.max_num_blocks_per_req = cdiv(self.model_config.max_model_len,
+                                           self.block_size*self.combine_block)*self.combine_block
+        self.graph_block_tables = np.zeros(
+            (self.max_num_reqs * num_tokens_per_reqs_decode,
+             self.max_num_blocks_per_req),
+            dtype=np.int32)
 
     def _reshape_kv_cache_tensors(
         self,
@@ -487,3 +512,43 @@ class NPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         return hidden_states, hidden_states[logit_indices_device]
+
+    def initialize_omni_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        kv_cache_config = deepcopy(kv_cache_config)
+        self.kv_cache_config = kv_cache_config
+        self.may_add_encoder_only_layers_to_kv_cache_config()
+        self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        self.initialize_attn_backend(kv_cache_config)
+        # The kernel block size for all KV cache groups. For example, if
+        # kv_cache_manager uses block_size 256 for a given group, but the attention
+        # backends for that group only supports block_size 64, we will return
+        # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
+        # tokens each.
+        kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
+
+        # create metadata builders
+        self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+
+        # Reinitialize need to after initialize_attn_backend
+        self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+
+        if self.speculative_config and self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, EagleProposer)
+            # validate all draft model layers belong to the same kv cache
+            # group
+            self.drafter.validate_same_kv_cache_group(kv_cache_config)
+
+        from omni_cache.cache.omni_cache_define import create_omni_cache
+        create_omni_cache(
+            kv_cache_config=self.kv_cache_config,
+            vllm_config=self.vllm_config,
+            runner=self,
+        )
+        from omni_cache.cache import omni_cache
+        get_kv_transfer_group().register_kv_caches(
+            omni_cache.MEMMAP_PATH,
+            omni_cache.dtype,
+            block_len_dtype=omni_cache.block_len_dtype,
+            omni_cache=omni_cache
+        )
+        self.omni_cache = omni_cache

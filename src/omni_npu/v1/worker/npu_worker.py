@@ -2,7 +2,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import os
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import torch
 import torch_npu
@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.tasks import SupportedTask
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
@@ -27,7 +28,8 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
-
+from ..models.config_loader.loader import  model_extra_config
+from ...platform import NPUPlatform
 
 logger = init_logger(__name__)
 
@@ -85,7 +87,6 @@ class NPUWorker(WorkerBase):
                 self.local_rank,
                 backend,
             )
-
             # Only initialize the custom layer-parallel communication domain when
             # explicitly enabled by the high-performance launcher script.
             if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
@@ -93,12 +94,15 @@ class NPUWorker(WorkerBase):
                     ensure_layer_parallel_initialized,
                 )
 
+                # Initialize the model best practice configs.
+                # self.init_model_best_practice_configs()
+
                 ensure_layer_parallel_initialized(backend=backend)
 
                 # Initialize the model best practice configs.
                 from omni_npu.v1.models.config_loader.loader import load_model_extra_config
                 load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
-                
+
             # Set random seed
             set_random_seed(self.model_config.seed)
             # Snapshot available memory
@@ -160,10 +164,23 @@ class NPUWorker(WorkerBase):
     def get_kv_cache_spec(self):
         return self.model_runner.get_kv_cache_spec()
 
-    def initialize_from_config(self, kv_cache_config) -> None:
-        # Allocate KV cache on NPU according to provided config
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        """Allocate NPU KV cache with the specified kv_cache_config."""
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
-        self.model_runner.initialize_kv_cache(kv_cache_config)
+        from vllm.platforms import current_platform
+        if current_platform.is_sleep_mode_available():
+            from .npu_mem_pool import NpuMemAllocator
+            allocator = NpuMemAllocator.get_instance()
+            context = allocator.use_memory_pool(tag="kv_cache")
+        else:
+            from contextlib import nullcontext
+            context = nullcontext()
+        with context:
+            if model_extra_config.operator_opt_config.use_omni_cache:
+                self.model_runner.initialize_omni_kv_cache(kv_cache_config)
+            else:
+                self.model_runner.initialize_kv_cache(kv_cache_config)
+
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         # NOP: KV caches are fully initialized in initialize_from_config.
