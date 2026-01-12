@@ -3,84 +3,33 @@
 Unit tests for layer parallel helper utilities.
 """
 
-import sys
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import torch
 
-VLLM_MODULES_TO_MOCK = {
-    "vllm",
-    "vllm.distributed",
-    "vllm.distributed.parallel_state",
-    "vllm.distributed.device_communicators",
-    "vllm.distributed.device_communicators.cuda_communicator"
-}
+from omni_npu.v1.distributed import (
+    communication_op_ext,
+    parallel_state_ext,
+)
 
 
 class TestCommunicationOpExtensions(unittest.TestCase):
-    def setUp(self):
-        """Set up test fixtures"""
-        # Mock torch_npu availability
-        self.torch_npu_mock = MagicMock()
-        sys.modules['torch_npu'] = self.torch_npu_mock
-        
-        # Mock all required vLLM modules
-        for module_name in VLLM_MODULES_TO_MOCK:
-            if module_name not in sys.modules:
-                sys.modules[module_name] = MagicMock()
+    """Verify communication helpers guard against missing groups and delegate correctly."""
 
-        # Ensure vllm.distributed and submodules exist as packages
-        if 'vllm.distributed' not in sys.modules:
-            sys.modules['vllm.distributed'] = MagicMock()
-        if 'vllm.distributed.parallel_state' not in sys.modules:
-            sys.modules['vllm.distributed.parallel_state'] = MagicMock()
-        if 'vllm.distributed.device_communicators.cuda_communicator' not in sys.modules:
-            sys.modules['vllm.distributed.device_communicators.cuda_communicator'] = MagicMock()
-
-        # Import the actual extensions and bind to self
-        from omni_npu.v1.distributed import (
-            communication_op_ext,
-            parallel_state_ext,
-        )
-        self.communication_op_ext = communication_op_ext
-        self.parallel_state_ext = parallel_state_ext
-
-        # Define a mock CudaCommunicator class
-        class MockCudaCommunicator:
-            def __init__(self, cpu_group, device=None, device_group=None, unique_name=""):
-                self.cpu_group = cpu_group
-                self.device = device
-                self.device_group = device_group
-                self.unique_name = unique_name
-                self.world_size = 1
-                self.rank_in_group = 0
-                self.ranks = [0]
-
-        # Patch it into the mocked module
-        sys.modules['vllm.distributed.device_communicators.cuda_communicator'].CudaCommunicator = MockCudaCommunicator
-
-    def tearDown(self):
-        """Clean up after tests"""
-        modules_to_remove = {
-            'torch_npu',
-            'omni_npu.distributed.communicator',
-        } | VLLM_MODULES_TO_MOCK
-        for module in modules_to_remove:
-            if module in sys.modules:
-                del sys.modules[module]
-
-    @patch("omni_npu.v1.distributed.communication_op_ext.get_layer_parallel_group")
+    @patch(
+        "omni_npu.v1.distributed.communication_op_ext.get_layer_parallel_group",
+    )
     def test_get_group_returns_none_when_world_size_le_one(self, mock_get_layer_group):
         group = Mock()
         group.world_size = 1
         mock_get_layer_group.return_value = group
-        self.assertIsNone(self.communication_op_ext._get_group("layer"))
+        self.assertIsNone(communication_op_ext._get_group("layer"))
 
     @patch("omni_npu.v1.distributed.communication_op_ext._get_group", return_value=None)
     def test_all_reduce_returns_input_without_group(self, _):
         tensor = torch.ones(2, 2)
-        result = self.communication_op_ext.layer_parallel_all_reduce(tensor, "layer")
+        result = communication_op_ext.layer_parallel_all_reduce(tensor, "layer")
         self.assertIs(result, tensor)
 
     @patch("omni_npu.v1.distributed.communication_op_ext._get_group")
@@ -90,7 +39,7 @@ class TestCommunicationOpExtensions(unittest.TestCase):
         group.all_reduce.return_value = torch.full((2, 2), 7.0)
         mock_get_group.return_value = group
 
-        result = self.communication_op_ext.layer_parallel_all_reduce(tensor, "layer")
+        result = communication_op_ext.layer_parallel_all_reduce(tensor, "layer")
 
         group.all_reduce.assert_called_once_with(tensor)
         torch.testing.assert_close(result, torch.full((2, 2), 7.0))
@@ -102,7 +51,7 @@ class TestCommunicationOpExtensions(unittest.TestCase):
         group.all_gather.return_value = "out"
         mock_get_group.return_value = group
 
-        result = self.communication_op_ext.layer_parallel_all_gather(
+        result = communication_op_ext.layer_parallel_all_gather(
             tensor, "layer", dim=1
         )
 
@@ -116,7 +65,7 @@ class TestCommunicationOpExtensions(unittest.TestCase):
         group.reduce_scatter.return_value = "out"
         mock_get_group.return_value = group
 
-        result = self.communication_op_ext.layer_parallel_reduce_scatter(
+        result = communication_op_ext.layer_parallel_reduce_scatter(
             tensor, "layer", dim=0
         )
 
@@ -125,10 +74,7 @@ class TestCommunicationOpExtensions(unittest.TestCase):
 
 
 class TestParallelStateExtensions(unittest.TestCase):
-    def setUp(self):
-        """Import parallel_state_ext and bind to self"""
-        from omni_npu.v1.distributed import parallel_state_ext
-        self.parallel_state_ext = parallel_state_ext
+    """Unit tests for parallel_state helper functions."""
 
     def test_normalize_comm_op_type_aliases_and_canonical(self):
         mapping = {
@@ -148,7 +94,7 @@ class TestParallelStateExtensions(unittest.TestCase):
 
         for raw, expected in mapping.items():
             self.assertEqual(
-                self.parallel_state_ext._normalize_comm_op_type(raw),
+                parallel_state_ext._normalize_comm_op_type(raw),
                 expected,
                 msg=f"{raw} -> {expected}",
             )
@@ -159,7 +105,7 @@ class TestParallelStateExtensions(unittest.TestCase):
         self, mock_is_initialized, mock_get_world
     ):
         spec = [[0, 1], [2, 3]]
-        result = self.parallel_state_ext._tp_size_or_ranks_to_group_ranks(spec, "layer")
+        result = parallel_state_ext._tp_size_or_ranks_to_group_ranks(spec, "layer")
         self.assertEqual(result, spec)
         mock_is_initialized.assert_called_once()
 
@@ -168,7 +114,7 @@ class TestParallelStateExtensions(unittest.TestCase):
     def test_tp_size_or_ranks_list_requires_all_ranks(self, *_):
         spec = [[0, 1]]
         with self.assertRaises(RuntimeError) as context:
-            self.parallel_state_ext._tp_size_or_ranks_to_group_ranks(spec, "layer")
+            parallel_state_ext._tp_size_or_ranks_to_group_ranks(spec, "layer")
         self.assertIn("must cover all ranks", str(context.exception))
 
     @patch("omni_npu.v1.distributed.parallel_state_ext.dist.get_world_size", return_value=4)
@@ -176,13 +122,13 @@ class TestParallelStateExtensions(unittest.TestCase):
     def test_tp_size_or_ranks_list_detects_duplicates(self, *_):
         spec = [[0, 1], [1, 2]]
         with self.assertRaises(RuntimeError) as context:
-            self.parallel_state_ext._tp_size_or_ranks_to_group_ranks(spec, "layer")
+            parallel_state_ext._tp_size_or_ranks_to_group_ranks(spec, "layer")
         self.assertIn("duplicate ranks across groups", str(context.exception))
 
     def test_ensure_layer_parallel_initialized_uses_passed_backend(self):
         # Force re-init within this test.
-        self.parallel_state_ext._LAYER_COMM_DICT = None
-        self.parallel_state_ext._LAYER_PARALLEL_GLOBAL_CFG = None
+        parallel_state_ext._LAYER_COMM_DICT = None
+        parallel_state_ext._LAYER_PARALLEL_GLOBAL_CFG = None
 
         vllm_config = Mock()
         vllm_config.parallel_config = Mock(local_rank=0)
@@ -201,6 +147,7 @@ class TestParallelStateExtensions(unittest.TestCase):
             "omni_npu.v1.distributed.parallel_state_ext._create_group_from_tp_size_or_ranks",
             return_value=Mock(),
         ) as mock_create_group:
-            self.parallel_state_ext.ensure_layer_parallel_initialized(backend="hccl")
+            parallel_state_ext.ensure_layer_parallel_initialized(backend="hccl")
             mock_create_group.assert_called()
             self.assertEqual(mock_create_group.call_args.args[2], "hccl")
+
