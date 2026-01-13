@@ -117,14 +117,6 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             if not self.vllm_config.speculative_config
             else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
-        self.batch_size = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
-        self.mc2_mask = torch.zeros(self.batch_size, dtype=torch.bool, device=current_platform.device_type)
-
-        self.uniform_decode_query_len = (
-            1
-            if not self.vllm_config.speculative_config
-            else 1 + self.vllm_config.speculative_config.num_speculative_tokens
-        )
         max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
         self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
 
@@ -156,9 +148,6 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             # for pd-mixed, TP is used, no need to use mc2_mask
             metadata.decode.mc2_mask = self._generate_activate_mask(metadata.num_actual_tokens)
             metadata.slot_mapping = self._align_slot_mapping(metadata.slot_mapping, metadata.num_reqs)
-        if metadata.prefill is None and self.vllm_config.kv_transfer_config is not None:
-            # for pd-mixed, TP is used, no need to use mc2_mask
-            metadata.decode.mc2_mask = self.mc2_mask
         if metadata.prefill is not None:
             metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1]
             metadata.prefill.seq_lens = metadata.prefill.query_cumlens
