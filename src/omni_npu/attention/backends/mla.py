@@ -209,13 +209,13 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             )
             NPUMLAImpl.DECORE_ATTN_MASK = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
 
-    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
+    def _v_up_proj(self, x: torch.Tensor):
         x = x.view(self.num_heads, -1, self.kv_lora_rank)
 
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
         out2 = torch.bmm(x, self.W_UV)
         out_new = out2.transpose(0, 1).contiguous().view(-1, self.num_heads * self.v_head_dim)
-        out.copy_(out_new)  # Copy result
+        return out_new
 
     def _compute_prefill_context(
         self,
@@ -370,7 +370,6 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
                 sparse_mode = 3
             else:
-                assert T == batch_size
                 attn_mask = None
                 sparse_mode = 0
 
@@ -393,6 +392,9 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             )[0]
             o = o.view(-1, N, D).transpose(0, 1).contiguous()
         else:
+            num_tokens = attn_metadata.decode.query_cumlens[-1]
+            decode_ql_nope = decode_ql_nope[:num_tokens]
+            decode_q_pe = decode_q_pe[:num_tokens]
             o = torch.ops.npu.npu_fused_infer_attention_score(
                 decode_ql_nope, kv_cache[0], kv_cache[0],
                 query_rope=decode_q_pe,
@@ -461,11 +463,6 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
         # logger.debug(f"<<< {output.shape=}, {q.shape=}, {k_c_normed.shape=}, {k_pe.shape=}")
-        output = output[:num_actual_toks, ...]
-        q = q[:num_actual_toks, ...]
-        k_c_normed = k_c_normed[:num_actual_toks, ...]
-        k_pe = k_pe[:num_actual_toks, ...]
-
         assert (
             attn_metadata.num_decodes is not None
             and attn_metadata.num_prefills is not None
@@ -475,12 +472,8 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.num_decode_tokens
-
-        decode_q = q[:num_decode_tokens]
-
-        prefill_q = q[num_decode_tokens:]
-        prefill_k_pe = k_pe[num_decode_tokens:]
-        prefill_k_c_normed = k_c_normed[num_decode_tokens:]
+        
+        decode_q = q
 
         # write the latent and rope to kv cache
         if k_nope.numel() > 0:
@@ -489,6 +482,13 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             torch_npu.npu_scatter_nd_update_(k_rope.view(-1, k_rope.shape[-1]), slots, k_pe.squeeze(1))
 
         if has_prefill:
+            output = output[:num_actual_toks, ...]
+            q = q[:num_actual_toks, ...]
+            k_c_normed = k_c_normed[:num_actual_toks, ...]
+            k_pe = k_pe[:num_actual_toks, ...]
+            prefill_q = q[num_decode_tokens:]
+            prefill_k_pe = k_pe[num_decode_tokens:]
+            prefill_k_c_normed = k_c_normed[num_decode_tokens:]
             output[num_decode_tokens:] = self._forward_prefill(
                 prefill_q,
                 prefill_k_c_normed,
@@ -507,10 +507,8 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             decode_q_nope = decode_q_nope.transpose(0, 1)
             N, B, P = decode_q_nope.shape
             _, _, L = self.W_UK_T.shape
-            decode_ql_nope = decode_q_nope.new_empty((N, B, L))
-
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-            torch.bmm(decode_q_nope, self.W_UK_T, out=decode_ql_nope)
+            decode_ql_nope = torch.bmm(decode_q_nope, self.W_UK_T)
             # Convert from (N, B, L) to (B, N, L)
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
 
@@ -520,5 +518,6 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             )
 
             # v_up projection
-            self._v_up_proj(attn_out, out=output[:num_decode_tokens])
+            out_proj = self._v_up_proj(attn_out)
+            output[:out_proj.shape[0]].copy_(out_proj)
         return output_padded

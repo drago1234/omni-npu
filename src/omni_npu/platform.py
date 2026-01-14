@@ -186,3 +186,10 @@ class NPUPlatform(Platform):
         Get piecewise backend class for piecewise graph.
         """
         return "omni_npu.compilation.acl_graph.ACLGraphWrapper"
+
+    @classmethod
+    def get_compile_backend(cls) -> str:
+        """
+        Get the custom compile backend for current platform.
+        """
+        return "omni_npu.compilation.npugraph_ex.NpuGraphExAdaptor"

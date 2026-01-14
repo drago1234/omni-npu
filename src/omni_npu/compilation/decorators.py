@@ -66,9 +66,17 @@ def _wrap_call(original_call):
         if hit:
             return retval
         logger.debug(f"<<< {hit=}, {retval=}, use original_call")
-        return original_call(self, *args, **kwargs)
+        model_output = original_call(self, *args, **kwargs)
+        if isinstance(model_output, (tuple, list)) and len(model_output) == 1:
+            hidden_states = model_output[0]
+            if isinstance(hidden_states, list) and \
+                    len(hidden_states) == 1 and \
+                    isinstance(hidden_states[0], torch.Tensor):
+                    hidden_states = hidden_states[0]
+            return hidden_states
+        else:
+            return model_output
     return _new_call
-
 
 def patch_compile_decorators():
     import os
@@ -87,3 +95,4 @@ def patch_compile_decorators():
 
         _dec_mododule._support_torch_compile = _patched_support_torch_compile
         logger.debug("<<< _patched_support_torch_compile applied!")
+
