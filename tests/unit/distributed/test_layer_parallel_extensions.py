@@ -144,6 +144,9 @@ class TestParallelStateExtensions(unittest.TestCase):
             "omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized",
             return_value=True,
         ), patch(
+            "omni_npu.v1.distributed.parallel_state_ext.initialize_local_world_group",
+            return_value=None,
+        ), patch(
             "omni_npu.v1.distributed.parallel_state_ext._create_group_from_tp_size_or_ranks",
             return_value=Mock(),
         ) as mock_create_group:

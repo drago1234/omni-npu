@@ -18,17 +18,67 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from .parallel_state_ext import get_layer_parallel_group
+from .parallel_state_ext import get_layer_parallel_group, get_local_world_group
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
 
 __all__ = [
+    "all_gather_local",
+    "reduce_scatter_local",
+    "all_to_all_local",
     "layer_parallel_all_reduce",
     "layer_parallel_all_gather",
     "layer_parallel_reduce_scatter",
     "layer_parallel_all2all_single",
 ]
+
+
+def all_gather_local(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    group = get_local_world_group()
+    if group.world_size <= 1:
+        return input_
+    return group.all_gather(input_, dim)
+
+
+def reduce_scatter_local(input_: torch.Tensor) -> torch.Tensor:
+    group = get_local_world_group()
+    if group.world_size <= 1:
+        return input_
+    return group.reduce_scatter(input_)
+
+
+def all_to_all_local(
+    input_: torch.Tensor,
+    scatter_dim: int = 0,
+    gather_dim: int = -1,
+) -> torch.Tensor:
+    group = get_local_world_group()
+    if group.world_size <= 1:
+        return input_
+
+    communicator = getattr(group, "device_communicator", None)
+    if communicator is None or not hasattr(communicator, "all_to_all"):
+        raise RuntimeError("local world group has no device communicator")
+
+    ndim = input_.dim()
+    scatter_dim = scatter_dim + ndim if scatter_dim < 0 else scatter_dim
+    gather_dim = gather_dim + ndim if gather_dim < 0 else gather_dim
+    if scatter_dim < 0 or scatter_dim >= ndim:
+        raise ValueError(f"Invalid scatter_dim={scatter_dim} for input with dim={ndim}.")
+    if gather_dim < 0 or gather_dim >= ndim:
+        raise ValueError(f"Invalid gather_dim={gather_dim} for input with dim={ndim}.")
+
+    split_size = input_.size(scatter_dim)
+    if split_size % group.world_size != 0:
+        raise ValueError(
+            f"Input size along scatter_dim={scatter_dim} must be divisible by "
+            f"world_size={group.world_size}, got {split_size}."
+        )
+
+    return communicator.all_to_all(
+        input_, scatter_dim=scatter_dim, gather_dim=gather_dim
+    )
 
 
 def _get_group(

@@ -68,15 +68,18 @@ def check_class_methods(cls, base_cls):
         ...
     AssertionError
     """
-    sub_methods = {k: v for k, v in cls.__dict__.items() if not k.startswith("_") and callable(v)}
-    print(f"cls={cls} base_cls={base_cls} sub_methods={sub_methods}")
+    base_methods = {
+        k: v for k, v in base_cls.__dict__.items()
+        if not k.startswith("_") and callable(v)
+    }
+    print(f"cls={cls} base_cls={base_cls} base_methods={base_methods}")
 
-    for method_name, sub_method in sub_methods.items():
-        print(f">>>> method_name={method_name} sub_method={sub_method}")
-        assert hasattr(base_cls, method_name) and callable(getattr(base_cls, method_name))
+    for method_name, base_method in base_methods.items():
+        print(f">>>> method_name={method_name} base_method={base_method}")
+        assert hasattr(cls, method_name) and callable(getattr(cls, method_name))
 
-        sub_method_params = inspect.signature(sub_method).parameters
-        base_method_params = inspect.signature(getattr(base_cls, method_name)).parameters
+        sub_method_params = inspect.signature(getattr(cls, method_name)).parameters
+        base_method_params = inspect.signature(base_method).parameters
         print(f"sub_params={list(sub_method_params.items())} base_params={list(base_method_params.items())}")
         assert len(sub_method_params) >= len(base_method_params)
 

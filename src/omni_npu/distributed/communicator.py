@@ -164,6 +164,86 @@ class NPUCommunicator(CudaCommunicator):
             return torch.cat(gather_list, dim=dim)  # type: ignore[arg-type]
         return None
 
+    def all_to_all(
+        self,
+        input_: torch.Tensor,
+        scatter_dim: int = 0,
+        gather_dim: int = -1,
+        scatter_sizes: Optional[list[int]] = None,
+        gather_sizes: Optional[list[int]] = None,
+    ) -> torch.Tensor:
+        def _normalize_dim(dim: int, tensor_dim: int) -> int:
+            if dim < -tensor_dim or dim >= tensor_dim:
+                raise ValueError(
+                    f"Dimension {dim} is out of bounds for tensor with {tensor_dim} dimensions"
+                )
+            return dim if dim >= 0 else dim + tensor_dim
+
+        def _validate_inputs(
+            input_: torch.Tensor,
+            scatter_dim: int,
+            gather_sizes: Optional[list[int]],
+            scatter_sizes: Optional[list[int]],
+        ) -> None:
+            if scatter_sizes is not None and gather_sizes is not None:
+                if len(scatter_sizes) != self.world_size or len(gather_sizes) != self.world_size:
+                    raise ValueError(
+                        f"scatter_sizes and gather_sizes must have length {self.world_size}, "
+                        f"got {len(scatter_sizes)} and {len(gather_sizes)}"
+                    )
+                if sum(scatter_sizes) != input_.size(scatter_dim):
+                    raise ValueError(
+                        f"Sum of scatter_sizes ({sum(scatter_sizes)}) does not match "
+                        f"input size at scatter_dim ({input_.size(scatter_dim)})"
+                    )
+            elif scatter_sizes is not None or gather_sizes is not None:
+                raise ValueError("Both scatter_sizes and gather_sizes must be provided or neither")
+
+        scatter_dim = _normalize_dim(scatter_dim, input_.dim())
+        gather_dim = _normalize_dim(gather_dim, input_.dim())
+        _validate_inputs(input_, scatter_dim, gather_sizes, scatter_sizes)
+        input_list = self._prepare_input_list(input_, scatter_dim, scatter_sizes)
+        output_list = self._prepare_output_list(input_list, gather_dim, gather_sizes)
+        self.dist_module.all_to_all(output_list, input_list, group=self.device_group)
+        return torch.cat(output_list, dim=gather_dim).contiguous()
+
+    def _prepare_input_list(
+        self,
+        input_: torch.Tensor,
+        scatter_dim: int,
+        scatter_sizes: Optional[list[int]],
+    ) -> list[torch.Tensor]:
+        if scatter_sizes is not None:
+            return [
+                t.contiguous() for t in torch.split(input_, scatter_sizes, scatter_dim)
+            ]
+        return [
+            t.contiguous()
+            for t in torch.tensor_split(input_, self.world_size, scatter_dim)
+        ]
+
+    def _prepare_output_list(
+        self,
+        input_list: list[torch.Tensor],
+        gather_dim: int,
+        gather_sizes: Optional[list[int]],
+    ) -> list[torch.Tensor]:
+        if gather_sizes is not None:
+            tensor_shape_base = input_list[self.rank].size()
+            output_list = []
+            for size in gather_sizes:
+                tensor_shape = list(tensor_shape_base)
+                tensor_shape[gather_dim] = size
+                output_list.append(
+                    torch.empty(
+                        tensor_shape,
+                        dtype=input_list[0].dtype,
+                        device=input_list[0].device,
+                    )
+                )
+            return output_list
+        return [torch.empty_like(t) for t in input_list]
+
     def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:  # type: ignore[override]
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size

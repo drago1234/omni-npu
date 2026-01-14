@@ -24,11 +24,29 @@ from vllm.platforms import current_platform
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     get_tp_group,
+    get_world_group as _get_world_group,
     init_model_parallel_group,
 )
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+__all__ = [
+    "ensure_layer_parallel_initialized",
+    "initialize_local_world_group",
+    "get_local_world_group",
+    "get_world_group",
+    "get_layer_parallel_group",
+    "get_layer_transform_type",
+    "get_layer_dim",
+    "get_layer_parallel_world_size",
+    "get_layer_parallel_rank",
+    "is_layer_parallel_input_split_enabled",
+    "maybe_pad_and_slice",
+    "maybe_unpad_and_all_gather",
+]
+
+_LOCAL_WORLD = None
 
 # Layer-parallel communication registry (fixed name: _LAYER_COMM_DICT).
 # key: layer name inside a block in layer_parallel_config (e.g., "self_attn.q_proj")
@@ -46,24 +64,71 @@ _LAYER_PARALLEL_GLOBAL_CFG: dict[str, Any] | None = None
 # Supported tensor transform keys.
 _TENSOR_TRANSFORM_KEYS = ("x_transform", "y_transform")
 
-__all__ = [
-    "ensure_layer_parallel_initialized",
-    "get_layer_parallel_group",
-    "get_layer_transform_type",
-    "get_layer_dim",
-    "get_layer_parallel_world_size",
-    "get_layer_parallel_rank",
-    "is_layer_parallel_input_split_enabled",
-    "maybe_pad_and_slice",
-    "maybe_unpad_and_all_gather",
-]
-
 
 def is_layer_parallel_input_split_enabled() -> bool:
     """Return global input_split flag under layer_parallel_config (default: False)."""
     if _LAYER_PARALLEL_GLOBAL_CFG is None:
         return False
     return bool(_LAYER_PARALLEL_GLOBAL_CFG.get("input_split", False))
+
+
+def get_world_group():
+    return _get_world_group()
+
+
+def calculate_effective_local_size(local_size: int, world_size: int) -> int:
+    effective_local_size = min(local_size, world_size)
+    if effective_local_size < local_size:
+        logger.info(
+            "Note: Using only %s of %s available NPU devices",
+            effective_local_size,
+            local_size,
+        )
+    if world_size % effective_local_size != 0:
+        raise AssertionError(
+            f"world_size ({world_size}) must be divisible by "
+            f"effective_local_size ({effective_local_size})"
+        )
+    return effective_local_size
+
+
+def initialize_local_world_group(backend: str | None = None) -> None:
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("torch.distributed must be initialized")
+
+    global _LOCAL_WORLD
+    if _LOCAL_WORLD is not None:
+        return
+
+    world_size: int = dist.get_world_size()
+    if int(os.getenv("NO_NPU_MOCK", "0")):
+        visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
+        local_size = len(visible.split(",")) if visible else 1
+    else:
+        local_size = torch.npu.device_count()
+    local_size = calculate_effective_local_size(local_size, world_size)
+
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    num_local_groups: int = world_size // local_size
+    group_ranks = []
+    for i in range(num_local_groups):
+        ranks = list(range(i * local_size, (i + 1) * local_size))
+        group_ranks.append(ranks)
+
+    _LOCAL_WORLD = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="world_local",
+    )
+
+
+def get_local_world_group():
+    if _LOCAL_WORLD is None:
+        raise RuntimeError("local world group is not initialized")
+    return _LOCAL_WORLD
 
 
 def ensure_layer_parallel_initialized(
@@ -78,6 +143,17 @@ def ensure_layer_parallel_initialized(
     if _LAYER_COMM_DICT is not None:
         return
 
+    if not dist.is_initialized():
+        logger.warning(
+            "Distributed is not initialized, skipping layer parallel initialization"
+        )
+        # Mark as initialized to avoid repeated warnings and repeated attempts.
+        _LAYER_COMM_DICT = {}
+        _LAYER_PARALLEL_GLOBAL_CFG = {"input_split": False}
+        return
+
+    initialize_local_world_group(backend=backend)
+
     vllm_config, layer_parallel_config = _load_layer_parallel_config_from_vllm()
     if vllm_config is None:
         logger.debug("vllm_config is None, layer parallel skip initialization")
@@ -86,15 +162,6 @@ def ensure_layer_parallel_initialized(
         return
 
     if not layer_parallel_config:
-        _LAYER_COMM_DICT = {}
-        _LAYER_PARALLEL_GLOBAL_CFG = {"input_split": False}
-        return
-
-    if not dist.is_initialized():
-        logger.warning(
-            "Distributed is not initialized, skipping layer parallel initialization"
-        )
-        # Mark as initialized to avoid repeated warnings and repeated attempts.
         _LAYER_COMM_DICT = {}
         _LAYER_PARALLEL_GLOBAL_CFG = {"input_split": False}
         return
