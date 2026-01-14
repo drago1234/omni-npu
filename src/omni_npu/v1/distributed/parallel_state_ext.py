@@ -530,37 +530,23 @@ def _tp_size_or_ranks_to_group_ranks(
         return group_ranks
 
     if isinstance(spec, int):
-        cfg = get_current_vllm_config()
-        if cfg is None:
+        if not dist.is_initialized():
             raise RuntimeError(
-                "tp_size_or_ranks=int requires vllm_config to be available "
-                "via get_current_vllm_config()."
+                "torch.distributed must be initialized before parsing tp_size_or_ranks."
             )
-        pc = cfg.parallel_config
-        dp = int(getattr(pc, "data_parallel_size", 1))
-        pp = int(getattr(pc, "pipeline_parallel_size", 1))
-        tp = int(getattr(pc, "tensor_parallel_size", 1))
+        tp_size = spec
+        if tp_size <= 0:
+            raise RuntimeError(
+                f"Invalid tp_size_or_ranks={spec!r} for {group_name}: "
+                "tp_size must be a positive integer."
+            )
         world = dist.get_world_size()
-
-        denom = dp * pp * tp
-        if denom <= 0 or world % denom != 0:
+        if world % tp_size != 0:
             raise RuntimeError(
-                f"Invalid parallel layout for subgroup derivation: "
-                f"world_size={world}, dp={dp}, pp={pp}, tp={tp}."
+                f"Invalid tp_size_or_ranks={tp_size} for {group_name}: "
+                f"world_size({world}) must be divisible by tp_size({tp_size})."
             )
-        if tp % spec != 0:
-            raise RuntimeError(
-                f"tp_size_or_ranks={spec} must divide tensor_parallel_size={tp}."
-            )
-
-        external_dp = world // denom
-        tp_groups: list[list[int]] = (
-            torch.arange(world)
-            .reshape(external_dp, dp, pp, tp)
-            .reshape(-1, tp)
-            .tolist()
-        )
-        return [g[i:i + spec] for g in tp_groups for i in range(0, tp, spec)]
+        return torch.arange(world).reshape(-1, tp_size).tolist()
 
     logger.warning(f"Unsupported tp_size_or_ranks type: {type(spec)} for {group_name}")
     return None

@@ -55,7 +55,7 @@ def _logic_column_parallel_flash_comm_linear(device, local_rank, world_size, dty
 def _logic_column_parallel_flash_comm_linear_quant(device, local_rank, world_size, dtype):
     from omni_npu.v1.layers.linear import ColumnParallelFlashCommLinear
     from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import NPUCompressedTensorsConfig
-    from omni_npu.v1.quantization.compressed_tensors import W8A8Int8FCLinearMethod
+    from omni_npu.v1.layers.quantization.compressed_tensors import W8A8Int8FCLinearMethod
 
     quant_config = NPUCompressedTensorsConfig(None, None, None, None, None)
 

@@ -23,7 +23,10 @@ from omni_npu.layers.quantization.compressed_tensors.schemes.compressed_tensors_
     NPUCompressedTensorsW8A8Int8
 from omni_npu.v1.fused_mlp.layer import FusedMLP
 from omni_npu.v1.layers.linear import FlashCommLinearBase, UnquantizedFlashCommLinearMethod
-from omni_npu.v1.quantization.compressed_tensors import W8A8Int8FCLinearMethod, W8A8Int8MlpMethod
+from omni_npu.v1.layers.quantization.compressed_tensors.compressed_tensors import (
+    W8A8Int8FCLinearMethod,
+    W8A8Int8MlpMethod,
+)
 
 NPU_COMPRESSED_TENSORS = "npu-compressed-tensors"
 

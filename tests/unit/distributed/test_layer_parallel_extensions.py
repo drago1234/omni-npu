@@ -125,6 +125,21 @@ class TestParallelStateExtensions(unittest.TestCase):
             parallel_state_ext._tp_size_or_ranks_to_group_ranks(spec, "layer")
         self.assertIn("duplicate ranks across groups", str(context.exception))
 
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.get_world_size", return_value=8)
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=True)
+    def test_tp_size_or_ranks_int_is_tp_group_size(self, *_):
+        # int spec means tp_size (same semantics as vLLM's tensor_parallel_size).
+        spec = 4
+        result = parallel_state_ext._tp_size_or_ranks_to_group_ranks(spec, "layer")
+        self.assertEqual(result, [[0, 1, 2, 3], [4, 5, 6, 7]])
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.get_world_size", return_value=6)
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=True)
+    def test_tp_size_or_ranks_int_requires_divisible_world(self, *_):
+        with self.assertRaises(RuntimeError) as context:
+            parallel_state_ext._tp_size_or_ranks_to_group_ranks(4, "layer")
+        self.assertIn("must be divisible", str(context.exception))
+
     def test_ensure_layer_parallel_initialized_uses_passed_backend(self):
         # Force re-init within this test.
         parallel_state_ext._LAYER_COMM_DICT = None

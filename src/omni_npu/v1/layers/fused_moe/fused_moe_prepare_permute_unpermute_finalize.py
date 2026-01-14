@@ -187,7 +187,9 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
             attn_metadata = attn_metadata[next(iter(attn_metadata))]
 
         if hasattr(attn_metadata, 'decode') and attn_metadata.decode is not None:
-            mc2_mask = attn_metadata.decode.mc2_mask[:num_tokens]
+            mc2_mask = getattr(attn_metadata.decode, 'mc2_mask', None)
+            if mc2_mask is not None:
+                mc2_mask = mc2_mask[:num_tokens]
         else:
             mc2_mask = None
         return mc2_mask

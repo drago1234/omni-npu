@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Union
 
 import torch
 import torch_npu
@@ -68,6 +68,13 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
+        weight_offset = ChannelQuantScaleParameter(
+            data=torch.empty(sum(output_partition_sizes), dtype=params_dtype),
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_offset", weight_offset)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_data = torch_npu.npu_format_cast(
             layer.weight.data.t().contiguous(), ACL_FORMAT_FRACTAL_NZ
@@ -76,18 +83,25 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
         layer.weight_scale = torch.nn.Parameter(
             layer.weight_scale.data.view(-1), requires_grad=False
         )
+        if hasattr(layer, 'weight_offset'):
+            layer.weight_offset = torch.nn.Parameter(
+                layer.weight_offset.data.view(-1).float(), requires_grad=False
+            )
 
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, Dict[str, torch.Tensor]],
         bias: Optional[torch.Tensor] = None,
         x_transform: Optional[str] = None,
         x_dim: Optional[int] = 0,
         is_prefill: Optional[bool] = True,
     ) -> torch.Tensor:
-        x, x_scale = torch_npu.npu_dynamic_quant(x, smooth_scales=None)
-
+        if isinstance(x, Dict):
+            x = x.getattr('x_int8',None)
+            x_scale = x.getattr('pertoken_scale',None)
+        else:
+            x, x_scale = torch_npu.npu_dynamic_quant(x)
         # TODO scale_parallel is not supported yet. scale_parallel = model_extra_config.operator_opt_config.enable_scale_parallel
         if x_transform == "AllGather":
             x_scale = layer_parallel_all_gather(
