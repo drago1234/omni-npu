@@ -17,3 +17,18 @@ def register_models():
     ModelRegistry.register_model(
         "PanguUltraMoEForCausalLM",
         "omni_npu.v1.models.pangu.pangu_ultra_moe:PanguUltraMoEForCausalLM")
+
+    import os
+
+    if (
+        int(os.getenv("RANDOM_MODE", default='0'))
+        or int(os.getenv("CAPTURE_MODE", default='0'))
+        or int(os.getenv("REPLAY_MODE", default='0'))
+    ):
+        from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
+        from omni_npu.v1.models.mock.mock import mock_model_class_factory
+        
+        ModelRegistry.register_model(
+            "Qwen2ForCausalLM", 
+            mock_model_class_factory(Qwen2ForCausalLM))
+            
