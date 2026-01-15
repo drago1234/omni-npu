@@ -53,7 +53,7 @@ def _bypass_prefill(self, *args, **kwargs):
     batch_descriptor = get_forward_context().batch_descriptor
     uniform = batch_descriptor.uniform if batch_descriptor is not None else False
     has_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-    if has_prefill or not uniform or get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE:
+    if has_prefill or not uniform:
         logger.debug(f"<<< use original forward")
         return True, self.forward(*args, **kwargs)
     return False, None
