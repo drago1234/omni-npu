@@ -79,7 +79,8 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
     ) -> All2AllPreparePermuteResult:
         x = x.view(-1, x.shape[-1])
         topk_ids = topk_ids.int()
-        expert_range = [0, self.num_experts]
+        max_num_deployed_expert = layer.w13_weight.shape[0] * get_ep_group().world_size
+        expert_range = [0, max_num_deployed_expert]
         quant_mode = 1 if layer.quant_config is not None else -1
 
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(

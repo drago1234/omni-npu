@@ -111,6 +111,18 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
             e_score_correction_bias=e_score_correction_bias,
         )
 
+        if enable_eplb:
+            _, topk_ids, _ = self.planner.plan(
+                layer_idx_moe=self.moe_layer_idx,
+                tokens=x,
+                token_expert_ids=topk_ids,
+                token_expert_scores=topk_weights,
+                top_k=top_k,
+                expert_mapping=self.expert_mapping,
+            )
+            layer.planner = self.planner
+            layer.moe_layer_idx = self.moe_layer_idx
+
         attn_metadata = get_forward_context().attn_metadata
         is_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
 
@@ -122,6 +134,9 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
         prepare_permute_result = self.apply_prepare_permute(
             prepare_permute_and_unpermute_finalize, layer, x, topk_ids
         )
+
+        if enable_eplb:
+            self.planner.record_activation(self.moe_layer_idx, prepare_permute_result.expert_tokens, support_multi_stream=False)
 
         hidden_states = self.apply_experts(layer, prepare_permute_result)
 
