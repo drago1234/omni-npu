@@ -79,8 +79,11 @@ def _persistent_worker_loop(device: int, rank: int, world_size: int, temp_file_p
         vllm_config.parallel_config = Mock(local_rank=rank)
 
         with patch(
-            "omni_npu.v1.distributed.parallel_state_ext._load_layer_parallel_config_from_vllm",
-            return_value=(vllm_config, layer_parallel_config),
+            "omni_npu.v1.distributed.parallel_state_ext._load_layer_parallel_config_from_model_extra_config",
+            return_value={"layer_parallel_config": layer_parallel_config},
+        ),patch(
+            "omni_npu.v1.distributed.parallel_state_ext.get_current_vllm_config",
+            return_value=vllm_config,
         ):
             ensure_layer_parallel_initialized(backend="hccl")
         

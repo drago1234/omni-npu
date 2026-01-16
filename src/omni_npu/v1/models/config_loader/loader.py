@@ -2,6 +2,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from dataclasses import dataclass, field, fields, asdict
+from typing import Any
 import json
 import os
 import torch
@@ -96,6 +97,8 @@ class ModelParallelConfig:
     attn_dies: int = 0
     enable_share_expert_tp: bool = False
     eh_proj_tp_size: int = 1
+    layer_parallel_config: dict[str, Any] = field(default_factory=dict)
+    input_split: bool = False
 
  
 @dataclass

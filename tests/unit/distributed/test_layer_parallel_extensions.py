@@ -143,18 +143,19 @@ class TestParallelStateExtensions(unittest.TestCase):
     def test_ensure_layer_parallel_initialized_uses_passed_backend(self):
         # Force re-init within this test.
         parallel_state_ext._LAYER_COMM_DICT = None
-        parallel_state_ext._LAYER_PARALLEL_GLOBAL_CFG = None
 
         vllm_config = Mock()
         vllm_config.parallel_config = Mock(local_rank=0)
         layer_parallel_config = {
-            "input_split": False,
             "self_attn.q_proj": {"tp_size_or_ranks": [[0]]},
         }
 
         with patch(
-            "omni_npu.v1.distributed.parallel_state_ext._load_layer_parallel_config_from_vllm",
-            return_value=(vllm_config, layer_parallel_config),
+            "omni_npu.v1.distributed.parallel_state_ext._load_layer_parallel_config_from_model_extra_config",
+            return_value={"layer_parallel_config": layer_parallel_config},
+        ), patch(
+            "omni_npu.v1.distributed.parallel_state_ext.get_current_vllm_config",
+            return_value=vllm_config,
         ), patch(
             "omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized",
             return_value=True,
@@ -168,4 +169,52 @@ class TestParallelStateExtensions(unittest.TestCase):
             parallel_state_ext.ensure_layer_parallel_initialized(backend="hccl")
             mock_create_group.assert_called()
             self.assertEqual(mock_create_group.call_args.args[2], "hccl")
+
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.is_layer_parallel_input_split_enabled",
+        return_value=True,
+    )
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.get_layer_parallel_world_size",
+        return_value=2,
+    )
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.get_layer_parallel_rank",
+        return_value=1,
+    )
+    def test_maybe_pad_and_slice_pads_and_slices(
+        self, mock_get_rank, mock_get_world_size, mock_input_split
+    ):
+        tensor = torch.tensor([1.0, 2.0, 3.0])
+        result, original = parallel_state_ext.maybe_pad_and_slice(
+            tensor, dim=0, layer_name_inside_block="self_attn.q_proj"
+        )
+
+        self.assertEqual(original, 3)
+        torch.testing.assert_close(result, torch.tensor([3.0, 0.0]))
+        mock_input_split.assert_called_once()
+        mock_get_world_size.assert_called_once()
+        mock_get_rank.assert_called_once()
+
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.is_layer_parallel_input_split_enabled",
+        return_value=True,
+    )
+    @patch("omni_npu.v1.distributed.parallel_state_ext.get_layer_parallel_group")
+    def test_maybe_unpad_and_all_gather_trims_padding(
+        self, mock_get_group, mock_input_split
+    ):
+        group = Mock()
+        group.world_size = 2
+        group.all_gather.return_value = torch.tensor([1.0, 2.0, 3.0, 0.0])
+        mock_get_group.return_value = group
+
+        local = torch.tensor([1.0, 2.0])
+        result = parallel_state_ext.maybe_unpad_and_all_gather(
+            local, actual_length=3, dim=0, layer_name_inside_block="self_attn.q_proj"
+        )
+
+        group.all_gather.assert_called_once_with(local, dim=0)
+        torch.testing.assert_close(result, torch.tensor([1.0, 2.0, 3.0]))
+        mock_input_split.assert_called_once()
 

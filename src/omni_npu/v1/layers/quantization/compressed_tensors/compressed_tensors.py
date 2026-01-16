@@ -98,8 +98,8 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
         is_prefill: Optional[bool] = True,
     ) -> torch.Tensor:
         if isinstance(x, Dict):
-            x = x.getattr('x_int8',None)
-            x_scale = x.getattr('pertoken_scale',None)
+            x_scale = x.get('pertoken_scale',None)
+            x = x.get('x_int8',None)
         else:
             x, x_scale = torch_npu.npu_dynamic_quant(x)
         # TODO scale_parallel is not supported yet. scale_parallel = model_extra_config.operator_opt_config.enable_scale_parallel

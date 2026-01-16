@@ -41,7 +41,6 @@ __all__ = [
     "get_layer_dim",
     "get_layer_parallel_world_size",
     "get_layer_parallel_rank",
-    "is_layer_parallel_input_split_enabled",
     "maybe_pad_and_slice",
     "maybe_unpad_and_all_gather",
 ]
@@ -58,18 +57,8 @@ _LOCAL_WORLD = None
 #   }
 _LAYER_COMM_DICT: dict[str, dict[str, Any]] | None = None
 
-# Global keys under layer_parallel_config (currently only input_split).
-_LAYER_PARALLEL_GLOBAL_CFG: dict[str, Any] | None = None
-
 # Supported tensor transform keys.
 _TENSOR_TRANSFORM_KEYS = ("x_transform", "y_transform")
-
-
-def is_layer_parallel_input_split_enabled() -> bool:
-    """Return global input_split flag under layer_parallel_config (default: False)."""
-    if _LAYER_PARALLEL_GLOBAL_CFG is None:
-        return False
-    return bool(_LAYER_PARALLEL_GLOBAL_CFG.get("input_split", False))
 
 
 def get_world_group():
@@ -139,7 +128,7 @@ def ensure_layer_parallel_initialized(
     Safe to call multiple times. If the vLLM config or `layer_parallel_config`
     is missing, initialization becomes a no-op and defaults are used.
     """
-    global _LAYER_COMM_DICT, _LAYER_PARALLEL_GLOBAL_CFG
+    global _LAYER_COMM_DICT
     if _LAYER_COMM_DICT is not None:
         return
 
@@ -149,29 +138,29 @@ def ensure_layer_parallel_initialized(
         )
         # Mark as initialized to avoid repeated warnings and repeated attempts.
         _LAYER_COMM_DICT = {}
-        _LAYER_PARALLEL_GLOBAL_CFG = {"input_split": False}
         return
 
     initialize_local_world_group(backend=backend)
 
-    vllm_config, layer_parallel_config = _load_layer_parallel_config_from_vllm()
-    if vllm_config is None:
-        logger.debug("vllm_config is None, layer parallel skip initialization")
+    model_parallel_config = _load_layer_parallel_config_from_model_extra_config()
+    if model_parallel_config is None:
+        logger.debug("model_parallel_config is None, layer parallel skip initialization")
         _LAYER_COMM_DICT = {}
-        _LAYER_PARALLEL_GLOBAL_CFG = {"input_split": False}
         return
 
+    layer_parallel_config = model_parallel_config.get("layer_parallel_config") or {}
     if not layer_parallel_config:
         _LAYER_COMM_DICT = {}
-        _LAYER_PARALLEL_GLOBAL_CFG = {"input_split": False}
         return
 
     _LAYER_COMM_DICT = {}
-    _LAYER_PARALLEL_GLOBAL_CFG = {
-        "input_split": bool(layer_parallel_config.get("input_split", False)),
-    }
 
-    parallel_config = getattr(vllm_config, "parallel_config", None)
+    vllm_config = None
+    try:
+        vllm_config = get_current_vllm_config()
+    except Exception as e:
+        logger.debug(f"Failed to get vllm_config from framework: {e}")
+    parallel_config = getattr(vllm_config, "parallel_config", None) if vllm_config else None
     local_rank = getattr(parallel_config, "local_rank", 0)
     if local_rank is None:
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -179,9 +168,6 @@ def ensure_layer_parallel_initialized(
     backend = backend or getattr(current_platform, "dist_backend", "hccl")
 
     for layer_name_inside_block, config in layer_parallel_config.items():
-        # Skip global fields under layer_parallel_config.
-        if layer_name_inside_block == "input_split":
-            continue
         if not isinstance(config, dict):
             continue
 
@@ -305,7 +291,7 @@ def maybe_pad_and_slice(
         dim += input.dim()
     if dim < 0 or dim >= input.dim():
         raise ValueError(f"Invalid dim={dim} for tensor with dim={input.dim()}")
-    if layer_name_inside_block is None:
+    if layer_name_inside_block is None or not is_layer_parallel_input_split_enabled():
         return input, input.shape[dim]
 
     world_size = get_layer_parallel_world_size(layer_name_inside_block)
@@ -345,7 +331,7 @@ def maybe_unpad_and_all_gather(
         dim += input.dim()
     if dim < 0 or dim >= input.dim():
         raise ValueError(f"Invalid dim={dim} for tensor with dim={input.dim()}")
-    if layer_name_inside_block is None:
+    if layer_name_inside_block is None or not is_layer_parallel_input_split_enabled():
         return input
 
     group = get_layer_parallel_group(layer_name_inside_block)
@@ -362,26 +348,33 @@ def maybe_unpad_and_all_gather(
     return output
 
 
-def _load_layer_parallel_config_from_vllm() -> tuple[Any | None, dict[str, Any]]:
-    """Fetch vllm_config from framework context and extract layer_parallel_config."""
-    vllm_config = None
+def _load_layer_parallel_config_from_model_extra_config() -> dict[str, Any] | None:
+    """Load model_parallel_config from model_extra_config (config_loader)."""
+    parallel_cfg = _get_model_parallel_config()
+    if parallel_cfg is None:
+        return None
+
+    layer_parallel_config = getattr(parallel_cfg, "layer_parallel_config", {}) or {}
+    return {
+        "layer_parallel_config": layer_parallel_config,
+    }
+
+
+def is_layer_parallel_input_split_enabled() -> bool:
+    """Read input_split from model_extra_config (config_loader)."""
+    return bool(getattr(_get_model_parallel_config(), "input_split", False))
+
+
+def _get_model_parallel_config() -> Any | None:
+    """Return model parallel config from model_extra_config, if available."""
     try:
-        vllm_config = get_current_vllm_config()
+        from omni_npu.v1.models.config_loader.loader import model_extra_config
     except Exception as e:
-        logger.debug(f"Failed to get vllm_config from framework: {e}")
+        logger.debug(f"Failed to import model_extra_config: {e}")
+        return None
 
-    if vllm_config is None:
-        return None, {}
-
-    additional_config = getattr(vllm_config, "additional_config", {})
-    if not isinstance(additional_config, dict):
-        additional_config = {}
-
-    layer_parallel_config = additional_config.get("layer_parallel_config", {})
-    if not isinstance(layer_parallel_config, dict):
-        layer_parallel_config = {}
-
-    return vllm_config, layer_parallel_config
+    parallel_cfg = getattr(model_extra_config, "parall_config", None)
+    return parallel_cfg
 
 
 _CANONICAL_COMM_OP_TYPE_ALIASES: dict[str, str] = {
