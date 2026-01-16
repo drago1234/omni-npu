@@ -261,6 +261,12 @@ class TestNPUModelRunner:
         def mock_super_load_model(self, eep_scale_up=False):
             super_called.setdefault("args", eep_scale_up)
             # Don't actually call super, just record the call
+            if not hasattr(self, "model"):
+                self.model = SimpleNamespace()
+            if not hasattr(self.model, "model"):
+                self.model.model = SimpleNamespace()
+            if not hasattr(self.model.model, "prefetch_post_load"):
+                self.model.model.prefetch_post_load = lambda: None
             return None
         
         monkeypatch.setattr(
@@ -278,7 +284,9 @@ class TestNPUModelRunner:
         # Ensure no drafter attribute to avoid EagleProposer branch
         if hasattr(self.runner, "drafter"):
             delattr(self.runner, "drafter")
-        
+
+
+
         self.runner.load_model(eep_scale_up=False)
         assert super_called.get("args") is False
         
@@ -319,6 +327,31 @@ class TestNPUModelRunner:
         self.runner.load_model(eep_scale_up=False)
         assert prepare_called["called"] is True
 
+    def test_load_model_calls_prefetch_post_load_hook(self, monkeypatch):
+        """Test load_model calls model.prefetch_post_load() if present."""
+        monkeypatch.setattr(GPUModelRunner, "load_model", lambda self, eep_scale_up=False: None)
+
+        # Ensure we don't enter ACLGraphWrapper branch.
+        self.runner.compilation_config = SimpleNamespace(
+            cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False),
+            cudagraph_capture_sizes=None,
+        )
+
+        prefetch_called = {"called": False}
+
+        def prefetch_post_load():
+            prefetch_called["called"] = True
+
+        # In normal runtime, vLLM may wrap torch module as `self.model.model`.
+        raw_model = SimpleNamespace(prefetch_post_load=prefetch_post_load)
+        self.runner.model = SimpleNamespace(model=raw_model)
+
+        # Avoid EagleProposer branch.
+        if hasattr(self.runner, "drafter"):
+            delattr(self.runner, "drafter")
+
+        self.runner.load_model(eep_scale_up=False)
+        assert prefetch_called["called"] is True
 
     def test_load_model_with_cudagraph(self, monkeypatch):
         """Test load_model creates ACLGraphWrapper when cudagraph is enabled.
@@ -354,11 +387,17 @@ class TestNPUModelRunner:
             cudagraph_capture_sizes=[1, 2, 3],
         )
 
-        # Ensure model has runnable attribute
+        # Ensure model has model/runnable attributes for load_model hook access.
         if not hasattr(self.runner, "model"):
-            self.runner.model = SimpleNamespace(runnable=SimpleNamespace())
-        elif not hasattr(self.runner.model, "runnable"):
-            self.runner.model.runnable = self.runner.model
+            self.runner.model = SimpleNamespace(
+                model=SimpleNamespace(),
+                runnable=SimpleNamespace(),
+            )
+        else:
+            if not hasattr(self.runner.model, "model"):
+                self.runner.model.model = SimpleNamespace()
+            if not hasattr(self.runner.model, "runnable"):
+                self.runner.model.runnable = self.runner.model
         
         self.runner.load_model()
         

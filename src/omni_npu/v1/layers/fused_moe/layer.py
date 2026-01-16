@@ -8,15 +8,18 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank
 )
 from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
+from omni_npu.v1.layers.prefetch import PrefetcherBase
+from omni_npu.v1.models.config_loader.loader import model_extra_config
 from omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize import (
     DispatchCombinePrepPmtAndUnpmtFinal,
     All2AllPrepPmtAndUnpmtFinal
 )
 
 
-class NPUFusedMoEV1(NPUSharedFusedMoE):
+class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        PrefetcherBase.__init__(self)
         self.ensure_moe_quant_config_init()
         self.make_prepare_permute_and_unpermute_finalize()
 
@@ -33,6 +36,14 @@ class NPUFusedMoEV1(NPUSharedFusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ):
+
+        if model_extra_config.operator_opt_config.enable_prefetch and self.shared_experts is not None:
+            prefetch_moe_fn = getattr(self, "prefetch_moe", None)
+            if callable(prefetch_moe_fn):
+                prefetch_moe_fn(trigger=hidden_states,
+                                prefetch_experts=False,
+                                prefetch_shared_experts=True)
+
         router_logits, _ = self.gate(hidden_states)
         if self.shared_experts is not None:
             share_expert_output = self.shared_experts(hidden_states)
@@ -53,6 +64,13 @@ class NPUFusedMoEV1(NPUSharedFusedMoE):
             # deduplicate
             x = x[tp_rank * t_local: (tp_rank + 1) * t_local]
             router_logits = router_logits[tp_rank * t_local: (tp_rank + 1) * t_local]
+
+        if model_extra_config.operator_opt_config.enable_prefetch:
+            prefetch_moe_fn = getattr(self, "prefetch_moe", None)
+            if callable(prefetch_moe_fn):
+                prefetch_moe_fn(trigger=x,
+                                prefetch_experts=True,
+                                prefetch_shared_experts=False)
 
         route_expert_output = self.quant_method.apply(
             layer=self,
@@ -80,4 +98,7 @@ class NPUFusedMoEV1(NPUSharedFusedMoE):
         if tp_size > 1:
             route_expert_output = tensor_model_parallel_all_gather(route_expert_output, dim=0)[:t_ori]
 
+        if model_extra_config.operator_opt_config.enable_prefetch:
+            self.prefetch_attention(trigger=hidden_states)
+            
         return share_expert_output, route_expert_output

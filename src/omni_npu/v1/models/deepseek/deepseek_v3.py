@@ -50,6 +50,7 @@ from omni_npu.v1.fused_mlp.layer import FusedMLP
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+from omni_npu.v1.models.config_loader.loader import model_extra_config
 
 
 logger = init_logger(__name__)
@@ -162,6 +163,62 @@ class DeepseekV2MoE(nn.Module):
             if self.is_fusion_moe_shared_experts_enabled
             else None,
         )
+        self._bind_prefetch_moe_to_experts()
+
+    def _bind_prefetch_moe_to_experts(self):
+        if not hasattr(self, "experts"):
+            return
+        if not model_extra_config.operator_opt_config.enable_prefetch:
+            return
+        # Bind the function to the experts instance to avoid the 
+        # function being garbage collected
+        self.experts.prefetch_moe = self.prefetch_moe.__func__.__get__(
+            self.experts, type(self.experts)
+        )
+
+    def prefetch_moe(
+        self,
+        trigger: torch.Tensor,
+        prefetch_experts: bool = True,
+        prefetch_shared_experts: bool = True,
+    ) -> None:
+        """Prefetch DeepSeek-MoE weights using `trigger` as dependency.
+
+        Supports selectively prefetching:
+        - experts weights only
+        - shared_experts weights only
+        - both (default)
+        """
+        if prefetch_experts:
+            # experts weights
+            self.prefetch_weight(
+                getattr(self, "w13_weight", None),
+                trigger,
+                getattr(self, "expert_gate_up_prefetch", self.min_prefetch_size),
+            )
+            self.prefetch_weight(
+                getattr(self, "w2_weight", None),
+                trigger,
+                getattr(self, "expert_down_prefetch", self.min_prefetch_size),
+            )
+
+        if prefetch_shared_experts:
+            shared_experts = getattr(self, "shared_experts", None)
+            if shared_experts is None:
+                return
+
+            shared_gate_up = getattr(shared_experts, "gate_up_proj", None)
+            shared_down = getattr(shared_experts, "down_proj", None)
+            self.prefetch_weight(
+                shared_gate_up.weight if shared_gate_up is not None else None,
+                trigger,
+                getattr(self, "shared_expert_gate_up_prefetch", self.min_prefetch_size),
+            )
+            self.prefetch_weight(
+                shared_down.weight if shared_down is not None else None,
+                trigger,
+                getattr(self, "shared_expert_down_prefetch", self.min_prefetch_size),
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -251,7 +308,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-
+        self.is_moe = False
         if (
             config.n_routed_experts is not None
             and layer_idx >= config.first_k_dense_replace
@@ -263,6 +320,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
+            self.is_moe = True
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -342,6 +400,37 @@ class DeepseekV2Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def prefetch_post_load(self) -> None:
+        config = model_extra_config.operator_opt_config
+        if not config.enable_prefetch:
+            return
+        for idx in range(self.start_layer, self.end_layer - 1):
+            if not self.layers[idx].is_moe:
+                continue
+            next_attn = self.layers[idx + 1].self_attn
+            selected_moe = self.layers[idx].mlp.experts
+
+            # update default prefetch size
+            selected_moe.attn_prefetch = config.attn_prefetch
+            if selected_moe.ep_size > 64:
+                selected_moe.expert_down_prefetch = config.expert_down_prefetch
+            selected_moe.expert_gate_up_prefetch = config.expert_gate_up_prefetch
+            # if shared_experts is not None, update prefetch size for shared experts
+            if selected_moe.shared_experts:
+                selected_moe.shared_expert_down_prefetch = config.shared_expert_down_prefetch
+                selected_moe.shared_expert_gate_up_prefetch = config.shared_expert_gate_up_prefetch
+
+            # update attention preftech tensors map
+            selected_moe.prefetch_tensors_map = {}
+            selected_moe.prefetch_tensors_map["q_a_proj_weight"] = (next_attn.q_a_proj.weight,
+                                                                    selected_moe.attn_prefetch)
+            selected_moe.prefetch_tensors_map["q_b_proj_weight"] = (next_attn.q_b_proj.weight, 
+                                                                    selected_moe.attn_prefetch)
+            selected_moe.prefetch_tensors_map["W_UK_T"] = (next_attn.attn.impl.W_UK_T, 
+                                                           selected_moe.attn_prefetch)
+            if selected_moe.quant_config:
+                selected_moe.prefetch_tensors_map["kv_a_proj_with_mqa_weight"] = (next_attn.kv_a_proj_with_mqa.weight, 
+                                                                                  selected_moe.attn_prefetch)
     def forward(
         self,
         input_ids: torch.Tensor,
