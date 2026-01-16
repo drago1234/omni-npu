@@ -104,12 +104,12 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
 
-        uniform_decode_query_len = (
+        self.uniform_decode_query_len = (
             1
             if not self.vllm_config.speculative_config
             else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
-        max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * uniform_decode_query_len
+        max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
         self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
 
     def _build_decode(
@@ -188,6 +188,10 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             )
         )
 
+        self.sink_k_pe = None
+        self.sink_compressed_kv = None
+        self.sink_len = 0
+
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
             raise NotImplementedError(
@@ -208,6 +212,11 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 torch.ones((2048, 2048), dtype=torch.bool, device="npu")
             )
             NPUMLAImpl.DECORE_ATTN_MASK = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
+
+    def update_sink_kv(self, sink_k_pe: torch.Tensor, sink_compressed_kv: torch.Tensor) -> None:
+        self.sink_k_pe = sink_k_pe.unsqueeze(1)
+        self.sink_compressed_kv = sink_compressed_kv
+        self.sink_len = sink_compressed_kv.shape[0]
 
     def _v_up_proj(self, x: torch.Tensor):
         x = x.view(self.num_heads, -1, self.kv_lora_rank)
@@ -302,6 +311,20 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         k_scale: torch.Tensor,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
+
+        # When sink tokens are used, we need to insert cached sink tokens at the beginning of each sequence
+        if self.sink_len > 0:
+            k_pe = self._insert_tensor_by_start_loc(
+                k_pe,
+                self.sink_k_pe,
+                attn_metadata.prefill.query_start_loc,
+            )
+            kv_c_normed = self._insert_tensor_by_start_loc(
+                kv_c_normed,
+                self.sink_compressed_kv,
+                attn_metadata.prefill.query_start_loc,
+            )
+
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
@@ -310,6 +333,12 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         tnd_cumlens = attn_metadata.prefill.query_start_loc[1:]
+
+        # When sink tokens are used, the actual sequence lengths for key and value are different.
+        num_prefills = len(tnd_cumlens)
+        sink_len_offset = [self.sink_len * (i + 1) for i in range(num_prefills)]
+        kv_cumlens = [x + y for x, y in zip(tnd_cumlens, sink_len_offset)]
+
         output, output_lse = torch.ops.npu.npu_fused_infer_attention_score(
             q_nope,
             k_nope,
@@ -322,7 +351,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
             sparse_mode=3,
             actual_seq_lengths=tnd_cumlens,
-            actual_seq_lengths_kv=tnd_cumlens,
+            actual_seq_lengths_kv=kv_cumlens,
             scale=self.scale,
             next_tokens=0,
             softmax_lse_flag=has_context,
@@ -359,6 +388,16 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert attn_metadata.decode is not None
 
+        if self.sink_len > 0:
+            query_heads = 1 << (self.num_heads - 1).bit_length()
+            pad_len = query_heads - self.num_heads
+            ql_nope_pad = decode_ql_nope.new_empty((decode_ql_nope.shape[0], pad_len, decode_ql_nope.shape[-1]))
+            decode_ql_nope = torch.cat([decode_ql_nope, ql_nope_pad], dim=1)
+            q_pe_pad = decode_q_pe.new_empty((decode_q_pe.shape[0], pad_len, decode_q_pe.shape[-1]))
+            decode_q_pe = torch.cat([decode_q_pe, q_pe_pad], dim=1)
+        else:
+            query_heads = self.num_heads
+
         ## TODO: TND_NTD layout bug. Currently graph mode only support BSND.
         # output shape: (N, T, D)
         batch_descriptor = get_forward_context().batch_descriptor
@@ -377,7 +416,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 decode_ql_nope.view(-1, S, N, D), kv_cache[0], kv_cache[0],
                 query_rope=decode_q_pe.view(-1, S, N, self.qk_rope_head_dim),
                 key_rope=kv_cache[1],
-                num_heads=self.num_heads,
+                num_heads=query_heads,
                 num_key_value_heads=1,
                 input_layout="BSND",
                 scale=self.scale,
@@ -399,7 +438,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 decode_ql_nope, kv_cache[0], kv_cache[0],
                 query_rope=decode_q_pe,
                 key_rope=kv_cache[1],
-                num_heads=self.num_heads,
+                num_heads=query_heads,
                 num_key_value_heads=1,
                 input_layout="TND_NTD",
                 scale=self.scale,
@@ -410,6 +449,9 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 actual_seq_lengths=attn_metadata.decode.query_cumlens,
                 actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
             )[0]
+
+        if self.sink_len > 0:
+            o = o[:self.num_heads]
 
         return o
 
@@ -521,3 +563,26 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             out_proj = self._v_up_proj(attn_out)
             output[:out_proj.shape[0]].copy_(out_proj)
         return output_padded
+
+    @staticmethod
+    def _insert_tensor_by_start_loc(
+        raw_tensor: torch.Tensor, insert_segment: torch.Tensor, start_loc: list[int]
+    ) -> torch.Tensor:
+        segment_len = insert_segment.shape[0]
+        num_inserts = len(start_loc) - 1
+        total_len = segment_len * num_inserts + raw_tensor.shape[0]
+        offset = 0
+        # allocate result tensor
+        result = torch.empty(total_len, *raw_tensor.shape[1:], device=raw_tensor.device, dtype=raw_tensor.dtype)
+
+        for i in range(num_inserts):
+            # write insert segment to result
+            result[offset:offset+segment_len] = insert_segment
+            offset += segment_len
+            # write raw tensor to result
+            seg_len = start_loc[i + 1] - start_loc[i]
+            result[offset:offset+seg_len] = raw_tensor[start_loc[i]:start_loc[i+1]]
+            offset += seg_len
+
+        return result
+
