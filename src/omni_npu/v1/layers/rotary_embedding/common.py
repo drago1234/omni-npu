@@ -52,6 +52,8 @@ def get_cos_sin(
     Returns:
         Tuple of (cos, sin) tensors with shape [batch, 1, 1, rotary_dim]
     """
+    if not isinstance(positions, torch.Tensor):
+        raise ValueError("positions must be a torch.Tensor.")
     positions = torch.add(positions, offsets) if offsets is not None else positions
     cos = cos[positions].view(-1, 1, 1, cos.shape[-1])
     sin = sin[positions].view(-1, 1, 1, sin.shape[-1])
