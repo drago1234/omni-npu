@@ -50,7 +50,13 @@ class EngineConfigPatch(VLLMPatch):
 
         current_platform.is_cuda_alike = _npu_temp_cuda_alike_true
         try:
-            return _orig_create_engine_config(self, usage_context, headless)
+            vllm_config: VllmConfig = _orig_create_engine_config(self, usage_context, headless)
+            # adapter reasoning_config
+            self_reasoning_config = getattr(self, "reasoning_config", None)
+            if self_reasoning_config is not None and vllm_config.model_config is not None:
+                self_reasoning_config.initialize_token_ids(vllm_config.model_config)
+                vllm_config.reasoning_config = self_reasoning_config
+            return vllm_config
         finally:
             current_platform.is_cuda_alike = _orig_is_cuda_alike
 
