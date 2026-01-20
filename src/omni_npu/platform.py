@@ -117,7 +117,7 @@ class NPUPlatform(Platform):
         ConfigUpdater.update_vllm_config(vllm_config)
         # Minimal defaults to match vLLM expectations.
         parallel_config = vllm_config.parallel_config
-        parallel_config.worker_cls = "omni_npu.v1.worker.npu_worker.NPUWorker"
+        parallel_config.worker_cls = "omni_npu.worker.npu_worker.NPUWorker"
 
         cache_config = vllm_config.cache_config
         if cache_config and cache_config.block_size is None:

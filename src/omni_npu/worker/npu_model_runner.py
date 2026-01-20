@@ -13,7 +13,7 @@ from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
 )
-from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, prepare_communication_buffer_for_model
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -28,17 +28,15 @@ from vllm.attention.backends.abstract import (
 from vllm.forward_context import set_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
-from omni_npu.v1.sample.sampler import NPUSamplerV1
-from omni_npu.v1.sample.rejection_sampler import NPURejectionSampler
+from omni_npu.sample.sampler import NPUSamplerV1
+from omni_npu.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import ACLGraphWrapper, set_graph_params
 
 if TYPE_CHECKING:

@@ -8,19 +8,17 @@ import torch_npu
 from vllm.logger import init_logger
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.rejection_sampler import (
     RejectionSampler,
     GREEDY_TEMPERATURE,
-    PLACEHOLDER_TOKEN_ID,
     MAX_SPEC_LEN,
 )
 
 logger = init_logger(__name__)
 
-from omni_npu.v1.sample.sampler import apply_top_k_top_p
+from omni_npu.sample.sampler import apply_top_k_top_p
 
 
 class NPURejectionSampler(RejectionSampler):

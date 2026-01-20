@@ -28,8 +28,8 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
-from ..models.config_loader.loader import  model_extra_config
-from ...platform import NPUPlatform
+from omni_npu.v1.models.config_loader.loader import  model_extra_config
+from omni_npu.platform import NPUPlatform
 
 logger = init_logger(__name__)
 

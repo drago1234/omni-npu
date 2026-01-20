@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import torch
 import pytest
-from omni_npu.v1.worker.npu_worker import NPUWorker
+from omni_npu.worker.npu_worker import NPUWorker
 from tests.unit.platform.utils import create_vllm_config, DeviceConfig
 
 class TestNpuWorker:
@@ -25,7 +25,7 @@ class TestNpuWorker:
             set_device=lambda device: None,
             dist_backend="hccl",
         )
-        monkeypatch.setattr("omni_npu.v1.worker.npu_worker.current_platform", mock_platform)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.current_platform", mock_platform)
 
         # Mock torch.npu related operations
         monkeypatch.setattr("torch.npu.empty_cache", lambda: None)
@@ -35,15 +35,15 @@ class TestNpuWorker:
 
         # Mock distributed initialization
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_worker.init_worker_distributed_environment",
+            "omni_npu.worker.npu_worker.init_worker_distributed_environment",
             lambda *args, **kwargs: None,
         )
-        monkeypatch.setattr("omni_npu.v1.worker.npu_worker.set_random_seed", lambda seed: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.set_random_seed", lambda seed: None)
 
         # Mock NPUModelRunner
         mock_model_runner = MagicMock()
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_worker.NPUModelRunner",
+            "omni_npu.worker.npu_worker.NPUModelRunner",
             lambda *args, **kwargs: mock_model_runner,
         )
 
@@ -75,20 +75,20 @@ class TestNpuWorker:
 
         # Test case: no kv_transfer_group available
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_worker.has_kv_transfer_group",
+            "omni_npu.worker.npu_worker.has_kv_transfer_group",
             lambda: False,
         )
         assert worker.get_kv_connector_handshake_metadata() is None
 
         # Test case: kv_transfer_group exists but has no metadata
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_worker.has_kv_transfer_group",
+            "omni_npu.worker.npu_worker.has_kv_transfer_group",
             lambda: True,
         )
         mock_connector = MagicMock()
         mock_connector.get_handshake_metadata.return_value = None
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_worker.get_kv_transfer_group",
+            "omni_npu.worker.npu_worker.get_kv_transfer_group",
             lambda: mock_connector,
         )
         assert worker.get_kv_connector_handshake_metadata() is None
@@ -98,7 +98,7 @@ class TestNpuWorker:
         mock_connector.get_handshake_metadata.return_value = mock_metadata
         mock_tp_group = SimpleNamespace(rank_in_group=0)
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_worker.get_tp_group",
+            "omni_npu.worker.npu_worker.get_tp_group",
             lambda: mock_tp_group,
         )
         result = worker.get_kv_connector_handshake_metadata()
@@ -456,7 +456,7 @@ class TestNpuWorker:
             ensure_kv_initialized_called["args"] = (vllm_config, kv_cache_config)
 
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_worker.ensure_kv_transfer_initialized",
+            "omni_npu.worker.npu_worker.ensure_kv_transfer_initialized",
             mock_ensure_kv_initialized,
         )
 

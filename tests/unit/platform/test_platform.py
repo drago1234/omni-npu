@@ -292,7 +292,7 @@ class TestNPUPlatform:
         NPUPlatform.check_and_update_config(vllm_config)
 
         assert update_called["called"] is True
-        assert vllm_config.parallel_config.worker_cls == "omni_npu.v1.worker.npu_worker.NPUWorker"
+        assert vllm_config.parallel_config.worker_cls == "omni_npu.worker.npu_worker.NPUWorker"
         assert vllm_config.cache_config.block_size == 128
         assert vllm_config.compilation_config.pass_config.fuse_norm_quant is False
         assert vllm_config.compilation_config.pass_config.fuse_act_quant is False

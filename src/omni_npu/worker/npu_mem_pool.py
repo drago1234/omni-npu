@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional, Union
 import torch
 from vllm.logger import logger
 
-from ...platform import NPUPlatform
+from omni_npu.platform import NPUPlatform
 
 
 def find_loaded_library(lib_name) -> Optional[str]:

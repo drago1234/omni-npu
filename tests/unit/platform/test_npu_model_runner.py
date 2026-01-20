@@ -1,20 +1,17 @@
-import types
 from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
 import pytest
 from types import SimpleNamespace
-from omni_npu.v1.sample.sampler import NPUSamplerV1
-from omni_npu.v1.sample.rejection_sampler import NPURejectionSampler
-from omni_npu.v1.worker.npu_model_runner import (
+from omni_npu.sample.sampler import NPUSamplerV1
+from omni_npu.sample.rejection_sampler import NPURejectionSampler
+from omni_npu.worker.npu_model_runner import (
     NPUModelRunner,
     switch_torch_device,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    KVCacheSpec,
-    KVCacheConfig,
     MambaSpec,
     MLAAttentionSpec,
 )
@@ -72,7 +69,7 @@ class TestNPUModelRunner:
         # Also mock the function in the npu_model_runner module where it's imported
         # Since get_pp_group is imported via "from ... import get_pp_group", 
         # we need to mock it in the target module
-        from omni_npu.v1.worker import npu_model_runner
+        from omni_npu.worker import npu_model_runner
         monkeypatch.setattr(npu_model_runner, "get_pp_group", lambda: mock_pp_group)
         
         # Set up speculative_config with required attributes
@@ -185,7 +182,7 @@ class TestNPUModelRunner:
 
         # Mock kv_cache_dtype_str_to_dtype to avoid dependency on real implementation
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_model_runner.kv_cache_dtype_str_to_dtype",
+            "omni_npu.worker.npu_model_runner.kv_cache_dtype_str_to_dtype",
             lambda cache_dtype_str, mcfg: torch.float16,
         )
 
@@ -201,7 +198,7 @@ class TestNPUModelRunner:
 
         # Mock get_layers_from_vllm_config to return our constructed attn_layers
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_model_runner.get_layers_from_vllm_config",
+            "omni_npu.worker.npu_model_runner.get_layers_from_vllm_config",
             lambda vllm_cfg, layer_type: attn_layers,
         )
 
@@ -299,7 +296,7 @@ class TestNPUModelRunner:
         
         # Mock prepare_communication_buffer_for_model in both locations
         monkeypatch.setattr("vllm.distributed.parallel_state.prepare_communication_buffer_for_model", mock_prepare)
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.prepare_communication_buffer_for_model", mock_prepare)
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.prepare_communication_buffer_for_model", mock_prepare)
         
         # Set up drafter as EagleProposer
         self.runner.vllm_config.speculative_config = SimpleNamespace(
@@ -369,11 +366,11 @@ class TestNPUModelRunner:
         # Mock ACLGraphWrapper and set_graph_params
         wrapped_model = SimpleNamespace(unwrap=lambda: self.runner.model)
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_model_runner.ACLGraphWrapper",
+            "omni_npu.worker.npu_model_runner.ACLGraphWrapper",
             lambda model, vllm_config, runtime_mode: wrapped_model,
         )
         monkeypatch.setattr(
-            "omni_npu.v1.worker.npu_model_runner.set_graph_params",
+            "omni_npu.worker.npu_model_runner.set_graph_params",
             lambda sizes: None,
         )
         
@@ -414,7 +411,7 @@ class TestNPUModelRunner:
             enter_flag["entered"] = True
             yield
 
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.switch_torch_device", fake_switch)
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.switch_torch_device", fake_switch)
 
         super_called = {}
         monkeypatch.setattr(
@@ -438,7 +435,7 @@ class TestNPUModelRunner:
             enter_flag["entered"] = True
             yield
 
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.switch_torch_device", fake_switch)
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.switch_torch_device", fake_switch)
 
         monkeypatch.setattr(
             GPUModelRunner,
@@ -777,8 +774,8 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "_init_model_kwargs", lambda x: {})
         monkeypatch.setattr(self.runner, "maybe_randomize_inputs", lambda x: nullcontext())
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
         
         hidden_states, logits = self.runner._dummy_run(
             num_tokens=10, create_mixed_batch=True, uniform_decode=False, skip_eplb=True
@@ -855,8 +852,8 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "_init_model_kwargs", lambda x: {})
         monkeypatch.setattr(self.runner, "maybe_randomize_inputs", lambda x: nullcontext())
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
         
         hidden_states, logits = self.runner._dummy_run(
             num_tokens=10, uniform_decode=True, skip_eplb=True
@@ -919,8 +916,8 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "_init_model_kwargs", lambda x: {})
         monkeypatch.setattr(self.runner, "maybe_randomize_inputs", lambda x: nullcontext())
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
         
         # Test line 317: when cudagraph_runtime_mode is None, it uses _cudagraph_mode
         hidden_states1, logits1 = self.runner._dummy_run(
@@ -976,8 +973,8 @@ class TestNPUModelRunner:
         # When input_ids is None, maybe_randomize_inputs may receive None
         monkeypatch.setattr(self.runner, "maybe_randomize_inputs", lambda x: nullcontext())
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
         
         hidden_states, logits = self.runner._dummy_run(
             num_tokens=10, skip_eplb=True
@@ -1006,7 +1003,7 @@ class TestNPUModelRunner:
         assert hidden_states4 is not None
         
         # Test line 392-401: not is_first_rank branch
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
         self.runner.intermediate_tensors = None
         self.runner.model.make_empty_intermediate_tensors = MagicMock(return_value=MagicMock())
         self.runner.sync_and_slice_intermediate_tensors = MagicMock(return_value=MagicMock())
@@ -1030,7 +1027,7 @@ class TestNPUModelRunner:
         def mock_model_aux(*args, **kwargs):
             return (torch.zeros(10, 10).to(self.runner.device), MagicMock())
         self.runner.model = MagicMock(side_effect=mock_model_aux)
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
         hidden_states7, logits7 = self.runner._dummy_run(num_tokens=10, skip_eplb=True)
         assert hidden_states7 is not None
 
@@ -1092,15 +1089,14 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "_init_model_kwargs", lambda x: {})
         monkeypatch.setattr(self.runner, "maybe_randomize_inputs", lambda x: nullcontext())
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
         
         # Mock CUDAGraphMode
-        from omni_npu.v1.worker.npu_model_runner import CUDAGraphMode
         mock_cudagraph_mode = MagicMock()
         mock_cudagraph_mode.has_mode = lambda mode: True  # PIECEWISE mode
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.CUDAGraphMode", MagicMock())
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.CUDAGraphMode.PIECEWISE", MagicMock())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.CUDAGraphMode", MagicMock())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.CUDAGraphMode.PIECEWISE", MagicMock())
         
         hidden_states, logits = self.runner._dummy_run(
             num_tokens=10, skip_eplb=True
@@ -1155,8 +1151,8 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "_init_model_kwargs", lambda x: {})
         monkeypatch.setattr(self.runner, "maybe_randomize_inputs", lambda x: nullcontext())
         monkeypatch.setattr(self.runner, "eplb_step", mock_eplb_step)
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr("omni_npu.v1.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.set_forward_context", lambda *args, **kwargs: nullcontext())
         
         # Test skip_eplb=True
         self.runner._dummy_run(num_tokens=10, skip_eplb=True)
