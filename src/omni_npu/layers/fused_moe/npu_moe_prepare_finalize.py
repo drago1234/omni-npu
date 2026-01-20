@@ -62,6 +62,7 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
             quant_mode = 0  # No quantization
 
         self.num_experts = num_experts
+
         kwargs = {
             "x": a1,
             "expert_ids": topk_ids,  # [n*topk]

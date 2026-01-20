@@ -218,7 +218,7 @@ class NPUFusedMoE(FusedMoE):
                             .transpose(0, 1)
             return topk_weights, topk_ids, row_idx
 
-        if use_grouped_topk and num_expert_group != 1:
+        if use_grouped_topk:
             if topk_group is None:
                 raise ValueError(f"Unsupported topk_group is None")
             if num_expert_group is None:

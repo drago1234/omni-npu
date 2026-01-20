@@ -140,15 +140,21 @@ class NPUAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         dtype: torch.dtype = torch.bfloat16,
+        head_size_v: int | None = None,
     ) -> Tuple[torch.Tensor, ...]:
         raw_tensor = raw_tensor.view(dtype=dtype)
         shape = NPUAttentionBackend.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
-        sizes = [math.prod(shape), ] * 2
+        if head_size_v is None or head_size == head_size_v:
+            kv_shapes = [shape, shape]
+        else:
+            val_shape = NPUAttentionBackend.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size_v)
+            kv_shapes = [shape, val_shape]
+        sizes = [math.prod(tensor_shape) for tensor_shape in kv_shapes]
         if raw_tensor.numel() != sum(sizes):
             raise RuntimeError(f"Raw tensor has {raw_tensor.numel()} elements, while"
                                f" the expected sizes for KV cache are {sizes}.")
         tensors = torch.split(raw_tensor, sizes)
-        return tuple(t.view(shape) for t in tensors)
+        return tuple(t.view(tensor_shape) for t, tensor_shape in zip(tensors, kv_shapes))
 
 
 class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
@@ -216,61 +222,29 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
 
         # View q to TND, kv to TH.
         query = query.view(-1, self.num_heads, self.head_size).contiguous()
-        key = key.view(-1, self.num_kv_heads*self.head_size).contiguous()
-        value = value.view(-1, self.num_kv_heads*self.head_size).contiguous()
+        key = key.view(-1, key.shape[-1]).contiguous()
+        value = value.view(-1, value.shape[-1]).contiguous()
 
         # update kv cache
         slots = attn_metadata.slot_mapping.view(-1, 1)
         torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
         torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
-        batch_descriptor = get_forward_context().batch_descriptor
-
-        use_bsnd = (attn_metadata.num_prefills == 0
-                    and batch_descriptor is not None
-                    and batch_descriptor.uniform)
-        if use_bsnd:
-            batch_size = attn_metadata.block_tables.shape[0]
-            T, N, D = query.shape
-            assert attn_metadata.num_decode_tokens % attn_metadata.num_decodes == 0
-            S = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
-            if T > batch_size:
-                atten_mask = NPUAttentionBackendImpl.DECORE_ATTN_MASK
-                sparse_mode = 3
-            else:
-                assert T == batch_size
-                atten_mask = None
-                sparse_mode = 0
-            attn_output = torch_npu.npu_fused_infer_attention_score(
-                query.view(-1, S, N, D),
-                kv_cache[0],
-                kv_cache[1],
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="BSND",
-                scale=self.scale,
-                block_table=attn_metadata.block_tables,
-                block_size=kv_cache[0].shape[1],
-                actual_seq_lengths_kv=attn_metadata.seq_lens,
-                atten_mask=atten_mask,
-                sparse_mode=sparse_mode,
-            )[0].view(-1, N, D)
-        else:
-            attn_output = torch_npu.npu_fused_infer_attention_score_v2(
-                query,
-                kv_cache[0],
-                kv_cache[1],
-                num_query_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="TND",
-                softmax_scale=self.scale,
-                block_table=attn_metadata.block_tables,
-                block_size=kv_cache[0].shape[1],
-                sparse_mode=3,
-                atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
-                actual_seq_qlen=attn_metadata.query_cumlens,
-                actual_seq_kvlen=attn_metadata.seq_lens,
-            )[0]
+        attn_output = torch_npu.npu_fused_infer_attention_score_v2(
+            query,
+            kv_cache[0],
+            kv_cache[1],
+            num_query_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="TND",
+            softmax_scale=self.scale,
+            block_table=attn_metadata.block_tables,
+            block_size=kv_cache[0].shape[1],
+            sparse_mode=3,
+            atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
+            actual_seq_qlen=attn_metadata.query_cumlens,
+            actual_seq_kvlen=attn_metadata.seq_lens,
+        )[0]
 
         output.copy_(attn_output)
         return output

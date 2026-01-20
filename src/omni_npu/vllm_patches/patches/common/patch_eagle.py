@@ -176,7 +176,6 @@ class EagleProposerPatch(VLLMPatch):
         num_tokens: int,
         use_cudagraphs=True,
         is_graph_capturing=False,
-        batch_descriptor=None,
     ) -> None:
         # Adapt: new param attn_metadata and batch_descriptor
         # Determine if CUDA graphs should be used for this run.
@@ -214,7 +213,6 @@ class EagleProposerPatch(VLLMPatch):
                 cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE
                 if cudagraphs_enabled
                 else CUDAGraphMode.NONE,
-                batch_descriptor=batch_descriptor,
             ):
                 if self.supports_mm_inputs:
                     input_ids = None

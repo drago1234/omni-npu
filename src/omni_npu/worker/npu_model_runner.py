@@ -131,6 +131,12 @@ class NPUModelRunner(GPUModelRunner):
                               kv_cache_spec.page_size_bytes)
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
+                    kwargs = {}
+                    if (hasattr(kv_cache_spec, "head_size_v")
+                        and kv_cache_spec.head_size_v is not None
+                        and kv_cache_spec.head_size_v != kv_cache_spec.head_size
+                    ):
+                        kwargs = {"head_size_v": kv_cache_spec.head_size_v}
                     kv_cache_tensors = attn_backend.reshape_kv_cache(
                         raw_tensor,
                         num_blocks,
@@ -138,6 +144,7 @@ class NPUModelRunner(GPUModelRunner):
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         dtype=kv_cache_spec.dtype,
+                        **kwargs,
                     )
                     kv_caches[layer_name] = kv_cache_tensors
                 elif isinstance(kv_cache_spec, MambaSpec):
@@ -495,7 +502,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_padded,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
-                    batch_descriptor=batch_desc,
                 )
                 # Adapt end : to pass attn_metadata and batch_desc
 
