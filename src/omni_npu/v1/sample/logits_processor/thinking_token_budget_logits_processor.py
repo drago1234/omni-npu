@@ -21,7 +21,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
     def __init__(
             self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool
     ):
-        reasoning_config = vllm_config.reasoning_config
+        reasoning_config = getattr(vllm_config, "reasoning_config", None)
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
 
         # Check if thinking is enabled
