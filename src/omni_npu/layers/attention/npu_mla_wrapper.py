@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 import torch
+
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
-from omni_npu.v1.layers.attention.npu_dsa import Indexer
+
 
 @MultiHeadLatentAttentionWrapper.register_oot
 class NPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):

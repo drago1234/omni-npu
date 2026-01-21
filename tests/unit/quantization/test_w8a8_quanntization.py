@@ -80,16 +80,16 @@ def mock_layer_parallel_communication_op(tensor, transform, layer_name, tensor_n
 @pytest.fixture
 def mock_dependencies():
     with patch(
-        "omni_npu.v1.layers.quantization.compressed_tensors.compressed_tensors.torch_npu"
+        "omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear.torch_npu"
     ) as mock_torch_npu, \
          patch(
-             "omni_npu.v1.layers.quantization.compressed_tensors.compressed_tensors.get_npu_execution_type",
+             "omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear.get_npu_execution_type",
                mock_get_npu_execution_type), \
          patch(
-             "omni_npu.v1.layers.quantization.compressed_tensors.compressed_tensors.layer_parallel_all_gather",
+             "omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear.layer_parallel_all_gather",
                mock_layer_parallel_all_gather), \
          patch(
-             "omni_npu.v1.layers.quantization.compressed_tensors.compressed_tensors.layer_parallel_communication_op",
+             "omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear.layer_parallel_communication_op",
                mock_layer_parallel_communication_op):
         mock_torch_npu.npu_dynamic_quant = mock_npu_dynamic_quant
         mock_torch_npu.npu_quant_matmul = mock_npu_quant_matmul

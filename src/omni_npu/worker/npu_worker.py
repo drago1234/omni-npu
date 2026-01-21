@@ -2,34 +2,35 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import os
-from typing import Optional, Union, List
+from typing import Optional, Union
 
 import torch
 import torch_npu
+
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.tasks import SupportedTask
-from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.outputs import (
-    AsyncModelRunnerOutput,
-    DraftTokenIds,
-    ModelRunnerOutput,
-)
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
-from omni_npu.v1.models.config_loader.loader import  model_extra_config
-from omni_npu.platform import NPUPlatform
+from omni_npu.v1.models.config_loader.loader import model_extra_config
+
 
 logger = init_logger(__name__)
 
@@ -93,7 +94,7 @@ class NPUWorker(WorkerBase):
                 # Initialize the model best practice configs.
                 from omni_npu.v1.models.config_loader.loader import load_model_extra_config
                 load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
-                from ..distributed.parallel_state_ext import ( 
+                from omni_npu.v1.distributed.parallel_state_ext import ( 
                     ensure_layer_parallel_initialized,
                 )
 

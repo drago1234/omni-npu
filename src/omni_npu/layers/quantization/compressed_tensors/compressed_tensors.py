@@ -6,16 +6,22 @@ from typing import Any, List, Optional
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
+
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-    QUANTIZATION_SCHEME_MAP_TYPE, CompressedTensorsConfig, CompressedTensorsLinearMethod)
+    QUANTIZATION_SCHEME_MAP_TYPE,
+    CompressedTensorsConfig,
+    CompressedTensorsLinearMethod
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import CompressedTensorsScheme
-from vllm.model_executor.layers.quantization.compressed_tensors.utils import (find_matched_target,
-                                                                              is_activation_quantization_format,
-                                                                              should_ignore_layer)
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    find_matched_target,
+    is_activation_quantization_format,
+    should_ignore_layer
+)
 
 from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import \
     NPUCompressedTensorsW8A8Int8MoEMethod
@@ -23,10 +29,11 @@ from omni_npu.layers.quantization.compressed_tensors.schemes.compressed_tensors_
     NPUCompressedTensorsW8A8Int8
 from omni_npu.v1.fused_mlp.layer import FusedMLP
 from omni_npu.v1.layers.linear import FlashCommLinearBase, UnquantizedFlashCommLinearMethod
-from omni_npu.v1.layers.quantization.compressed_tensors.compressed_tensors import (
+from omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear import (
     W8A8Int8FCLinearMethod,
     W8A8Int8MlpMethod,
 )
+
 
 NPU_COMPRESSED_TENSORS = "npu-compressed-tensors"
 

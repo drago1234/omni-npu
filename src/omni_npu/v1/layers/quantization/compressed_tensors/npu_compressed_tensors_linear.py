@@ -5,16 +5,20 @@ from typing import List, Optional, Tuple, Dict, Union
 
 import torch
 import torch_npu
+
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
 from vllm.model_executor.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 
 from omni_npu.v1.distributed.communication_op_ext import layer_parallel_all2all_single, layer_parallel_all_gather
 from omni_npu.v1.fused_mlp.layer import FusedMLPMethodBase
-from omni_npu.v1.layers.linear import (FlashCommLinearBase, FlashCommLinearMethodBase,
-                                       UnquantizedFlashCommLinearMethod, layer_parallel_communication_op)
+from omni_npu.v1.layers.linear import (
+    FlashCommLinearMethodBase,
+    layer_parallel_communication_op
+)
 from omni_npu.v1.layers.utils import get_npu_execution_type
 from omni_npu.v1.utils import ACL_FORMAT_FRACTAL_NZ
+
 
 logger = init_logger(__name__)
 

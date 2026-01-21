@@ -6,6 +6,7 @@ backend to remain fully self-contained and avoid external dependencies.
 It satisfies vLLM's backend interface so the platform selector can
 import and use it. We can iterate later with true MLA specialization.
 """
+
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
 import math
@@ -29,9 +30,9 @@ from vllm.v1.attention.backends.mla.common import (
 )
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.platforms import current_platform
 
 from omni_npu.v1.models.config_loader.loader import model_extra_config
+
 
 logger = init_logger(__name__)
 
@@ -148,12 +149,14 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             # for pd-mixed, TP is used, no need to use mc2_mask
             metadata.decode.mc2_mask = self._generate_activate_mask(metadata.num_actual_tokens)
             metadata.slot_mapping = self._align_slot_mapping(metadata.slot_mapping, metadata.num_reqs)
+
         if metadata.prefill is not None:
-            metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1]
-            metadata.prefill.seq_lens = metadata.prefill.query_cumlens
-            metadata.prefill.query_start_loc = metadata.prefill.query_start_loc.tolist()
+            metadata.prefill.seq_lens = metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1]
+            metadata.prefill.query_cumlens = torch.cumsum(metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1], dim=0)
+
         if metadata.prefill is not None and metadata.prefill.chunked_context is not None:
             raise RuntimeError(f"Chunked prefill is not enabled yet.")
+
         if model_extra_config.operator_opt_config.use_omni_cache:
             from omni_cache.cache import omni_cache
             from omni_cache.cache.omni_cache_define import PrefillOmniCache
