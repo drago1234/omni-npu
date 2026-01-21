@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
+    get_dcp_group,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -31,7 +32,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from .llmdatadist_manager_v1 import LLMDataDistConfig, LLMDataDistManager
-from .utils import get_config_from_dict_or_env
+from .utils import get_config_from_dict_or_env, TP_Convertor
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -60,6 +61,7 @@ class ReqMeta:
     spec_token_ids: Optional[list[int]]
     remote_dp_rank: Optional[int]
     remote_request_id: Optional[str]
+    token_num: int
 
 @dataclass
 class ReqMetaPrefill:
@@ -76,6 +78,7 @@ class DatadistConnectorMetadata(KVConnectorMetadata):
         request_id: str,
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
+        token_num: int = None, # for DCP
     ):
         self.requests[request_id] = ReqMeta(
             local_block_ids=local_block_ids,
@@ -85,6 +88,7 @@ class DatadistConnectorMetadata(KVConnectorMetadata):
             spec_token_ids=kv_transfer_params["spec_token_ids"],
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
             remote_request_id=kv_transfer_params.get("remote_request_id", None),
+            token_num=token_num,
         )
 
 class DatadistConnectorMetadataPrefill(KVConnectorMetadata):
@@ -544,6 +548,7 @@ class DecodeConnectorScheduler:
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    token_num=req.num_prompt_tokens,
                 )
             req.kv_transfer_params = None
         self._reqs_need_recv.clear()
@@ -692,6 +697,24 @@ class DecodeConnectorWorker:
                 if self.tp_rank == 0:
                     logger.info(f" ***** Request {req_id} has 0 local blocks, skip load kv.")
                 continue
+
+            manager = self.datadist_manager
+            cluster_ids = manager.get_real_remote_cluster_ids(meta)
+
+            tp_cvt = None
+            if get_dcp_group().world_size > 1:
+                tp_cvt = TP_Convertor(
+                    remote_tp_size=manager.cluster_id_to_ip_port(cluster_ids[0])[1]
+                )
+                assert meta.token_num is not None
+                meta.remote_block_ids = tp_cvt.scheme_reorg(
+                    token_num=meta.token_num,
+                    tail_blk=meta.local_block_ids[-1],
+                    kv_group=manager.registered_kv_caches_tensor,
+                    local_block_ids=meta.local_block_ids,
+                    remote_block_ids=meta.remote_block_ids,
+                )
+
             # If local_block_ids is a flat list of int, omni-attention is not used
             # and we can directly use the local_block_ids and remote_block_ids
             if isinstance(meta.local_block_ids[0], int):
@@ -744,7 +767,6 @@ class DecodeConnectorWorker:
             else:
                 logger.error(f"Unexpected type for meta.local_block_ids[0]: {type(meta.local_block_ids[0])}")
                 raise RuntimeError(f"Unexpected type for meta.local_block_ids[0]: {type(meta.local_block_ids[0])}")
-            cluster_ids = self.datadist_manager.get_real_remote_cluster_ids(meta)
             # TODO: multi_thread_pull_kv and multi_rank_pull_kv are not supported yet
             # Use ThreadPoolExecutor to handle the task
             future = self.executor.submit(
@@ -756,6 +778,7 @@ class DecodeConnectorWorker:
                 remote_request_id=meta.remote_request_id,
                 remote_host_ip=meta.remote_host,
                 prefill_dp_rank=meta.remote_dp_rank,
+                tp_cvt=tp_cvt,
             )
             futures.append(future)
 
@@ -771,9 +794,13 @@ class DecodeConnectorWorker:
         remote_request_id: str,
         remote_host_ip: str,
         prefill_dp_rank: int,
+        tp_cvt: TP_Convertor = None,
     ):
         start = time.time()
         self.datadist_manager.pull_kv(remote_block_ids, local_block_ids, dst_cluster_id, prefill_dp_rank)
+
+        if tp_cvt is not None:
+            tp_cvt.transfer_done = True
 
         if self.vllm_config.parallel_config.tensor_parallel_size == 1:
             # tp=1, send to prefill tp rank0 directly.
@@ -781,6 +808,7 @@ class DecodeConnectorWorker:
             with self._transfer_lock:
                 self._recving_transfers.append(request_id)
         else:
+            # TODO: barrier() is dangerous for multi-thread
             torch.distributed.barrier(group=get_tp_group().cpu_group)
             if get_tensor_model_parallel_rank() == 0:
                 self._send_pulled_kv_req_list(remote_host_ip, [remote_request_id])
@@ -820,11 +848,12 @@ class DecodeConnectorWorker:
 
         return all_done_sending, all_done_recving
 
-    def _pop_done_transfers(self, transfers: list) -> set[str]:
+    @staticmethod
+    def _pop_done_transfers(transfers: list) -> set[str]:
         done_req_ids: set[str] = set()
         for req_id in transfers:
             done_req_ids.add(req_id)
-        self._recving_transfers.clear()
+        transfers.clear()
         return done_req_ids
 
 def handle_exception(future):

@@ -25,6 +25,8 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonBaseImpl,
     QueryLenSupport,
 )
+from vllm.distributed.parallel_state import get_tp_group
+from omni_npu.connector.utils import TP_Convertor
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.platforms import current_platform
@@ -99,8 +101,8 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             raise ValueError("Flashinfer should not be enabled.")
         if self._use_cudnn_prefill:
             raise ValueError("CUDNN should not be enabled.")
-        if self.dcp_world_size > 1:
-            raise ValueError("DCP should not be enabled.")
+        if self.dcp_local_block_size != 1:
+            raise ValueError("DCP only support cp_kv_cache_interleave_size == 1.")
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
 
@@ -140,7 +142,12 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             # for pd-mixed, TP is used, no need to use mc2_mask
             metadata.decode.mc2_mask = self.generate_activate_mask(common_attn_metadata.num_actual_tokens)
         if metadata.prefill is not None:
-            metadata.prefill.query_start_loc = metadata.prefill.query_start_loc.tolist()
+            metadata.prefill.query_start_loc_list = metadata.prefill.query_start_loc.tolist()
+        if self.dcp_world_size > 1:
+            self.prepare_dcp_slots(metadata)
+            self.prepare_dcp_ag_reorg(metadata)
+            # for D node in PD-seperate(D-TP >= P-TP) mode
+            TP_Convertor.do_scheduled_kv_reorg()
         return metadata
 
     def generate_activate_mask(self, actual_seqs_num):
@@ -148,9 +155,77 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         self.mc2_mask[:actual_seqs_num].fill_(True)
         return self.mc2_mask
 
+    # @staticmethod
+    # def determine_chunked_prefill_workspace_size(_):
+    #     return 512
+
+    def prepare_dcp_slots(self, metadata):
+        slots = metadata.slot_mapping
+        cfg = {"dtype": torch.int32, "device": slots.device}
+        kv_idx = torch.arange(slots.size(0), **cfg)[slots != -1]
+
+        metadata.dcp_local_kv_idx = kv_idx
+        metadata.dcp_local_slots = slots[kv_idx].to(**cfg)
+
+    def prepare_dcp_ag_reorg(self, metadata, pg = 128):
+        prefill_meta = metadata.prefill
+        if prefill_meta is None:
+            return
+        chunk_ctx = prefill_meta.chunked_context
+        if chunk_ctx is None:
+            return
+
+        starts = chunk_ctx.starts                    # npu.int32[chk, seq]   start_pos of dcp chunks
+        cu_lens = chunk_ctx.padded_local_cu_seq_lens # npu.int32[chk, seq+1] token_num of dcp chunks
+        g_cu_lens = chunk_ctx.cu_seq_lens            # npu.int32[chk, seq+1] token_num of chunks
+        blk_table = prefill_meta.block_table         # npu.int32[seq, *]     kv_cache slot mapping
+
+        chunk_ctx.dcp_local_idx = [ # kv gather idx for dcp_chunk[i]
+            self.paged_index(cu_lens_i, starts_i, blk_table, pg)
+            for cu_lens_i, starts_i in zip(cu_lens, starts)
+        ]
+        chunk_ctx.dcp_reorg_order = [ # reorg after all-gather
+            self.reorg_index(cu_lens_i, g_cu_lens_i, self.dcp_world_size)
+            for cu_lens_i, g_cu_lens_i in zip(cu_lens, g_cu_lens)
+        ]
+
+    @staticmethod
+    def paged_index(
+        cu_lens:torch.Tensor, # int32[seq+1]
+        starts:torch.Tensor,  # int32[seq]
+        table:torch.Tensor,   # int32[seq, *]
+        pg:int = 128,
+    ):
+        assert cu_lens.dim() == 1
+        assert starts.dim() == 1
+        assert table.dim() == 2
+        assert starts.size(0) + 1 == cu_lens.size(0)
+        assert starts.size(0) == table.size(0)
+        seq_lens = cu_lens.diff()
+        cfg = {"dtype":torch.int32, "device":starts.device}
+        serial = torch.arange(cu_lens[-1], **cfg)
+        token_seq = torch.arange(seq_lens.size(0), **cfg).repeat_interleave(seq_lens, dim=0)
+        token_pos = serial + (starts - cu_lens[:-1]).repeat_interleave(seq_lens, dim=0)
+        return table[token_seq, token_pos // pg] * pg + token_pos % pg
+
+    @staticmethod
+    def reorg_index(
+        local_cu_lens:torch.Tensor,  # int32[seq+1]
+        global_cu_lens:torch.Tensor, # int32[seq+1]
+        dcp:int = 16,
+    ):
+        assert local_cu_lens.dim() == 1
+        assert global_cu_lens.dim() == 1
+        assert local_cu_lens.size(0) == global_cu_lens.size(0)
+        global_lens = global_cu_lens.diff()
+        serial = torch.arange(global_cu_lens[-1], dtype=torch.int32, device=global_lens.device)
+        token_pos = serial - global_cu_lens[:-1].repeat_interleave(global_lens, dim=0)
+        offset = local_cu_lens[:-1].repeat_interleave(global_lens, dim=0)
+        return offset + (token_pos // dcp) + (token_pos % dcp * local_cu_lens[-1])
+
 
 class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
-    can_return_lse_for_decode: bool = False
+    can_return_lse_for_decode: bool = True
     SHARE_MASK_TRIL_SPARSE = None
 
     def __init__(
@@ -226,6 +301,66 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         out_new = out2.transpose(0, 1).contiguous().view(-1, self.num_heads * self.v_head_dim)
         return out_new
 
+    def _compute_prefill_context_dcp(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        attn_meta: MLACommonMetadata,
+    ):
+        prefill_meta = attn_meta.prefill
+        assert prefill_meta is not None
+        chunk_ctx = prefill_meta.chunked_context
+        assert chunk_ctx is not None
+
+        for i, toks in enumerate(chunk_ctx.seq_tot): # for each chunk
+            def kv_ag_reorg(cache):
+                cache = cache.flatten(end_dim=-2)                # [*, 128, D] -> [*, D]
+                cache = cache[chunk_ctx.dcp_local_idx[i]]        # prepare local
+                cache = get_tp_group().all_gather(cache, dim=0) # all_gather
+                return cache[chunk_ctx.dcp_reorg_order[i]]       # reorg
+
+            kv_c_normed, k_pe = (kv_ag_reorg(it) for it in kv_cache)
+
+            kv_nope = self.kv_b_proj(kv_c_normed)[0]
+            kv_nope = kv_nope.view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1)
+            cu_q_lens = prefill_meta.query_start_loc_list[1:]
+            cu_kv_lens = chunk_ctx.cu_seq_lens[i, 1:]
+
+            suffix_out, suffix_lse = torch_npu.npu_fused_infer_attention_score(
+                q_nope, k_nope, v,
+                query_rope=q_pe,
+                key_rope=k_pe,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_heads,
+                input_layout="TND",
+                actual_seq_lengths=cu_q_lens,
+                actual_seq_lengths_kv=cu_kv_lens,
+                scale=self.scale,
+                softmax_lse_flag=True,
+            )
+
+            if i == 0:
+                out = suffix_out
+                lse = suffix_lse
+            else:
+                prefix_out=out
+                prefix_lse=lse
+                out = torch.empty_like(prefix_out, dtype=torch.float32)
+                lse = torch.empty_like(prefix_lse, dtype=torch.float32)
+                ops.merge_attn_states(
+                    output=out,
+                    output_lse=lse,
+                    prefix_output=prefix_out,
+                    prefix_lse=prefix_lse,
+                    suffix_output=suffix_out,
+                    suffix_lse=suffix_lse,
+                )
+
+        return out, lse
+
     def _compute_prefill_context(
         self,
         q_nope: torch.Tensor,
@@ -275,7 +410,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 input_layout="TND",
                 atten_mask=None,
                 sparse_mode=0,  # for prefix, no mask on attention matrix
-                actual_seq_lengths=prefill_metadata.query_start_loc[1:],
+                actual_seq_lengths=prefill_metadata.query_start_loc_list[1:],
                 actual_seq_lengths_kv=prefill_metadata.chunked_context.cu_seq_lens[i, 1:],
                 scale=self.scale,
                 next_tokens=0,
@@ -332,7 +467,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         has_context = attn_metadata.prefill.chunked_context is not None
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        tnd_cumlens = attn_metadata.prefill.query_start_loc[1:]
+        tnd_cumlens = attn_metadata.prefill.query_start_loc_list[1:]
 
         # When sink tokens are used, the actual sequence lengths for key and value are different.
         num_prefills = len(tnd_cumlens)
@@ -358,15 +493,20 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         )
 
         if has_context:
-            context_output, context_lse = self._compute_prefill_context(
-                q_nope=q_nope,
-                q_pe=q_pe,
-                kv_c_cache=kv_cache[0],
-                k_pe_cache=kv_cache[1],
-                attn_metadata=attn_metadata,
-                k_scale=k_scale,
-            )
-            merged_output = torch.empty_like(output)
+            if self.dcp_world_size > 1:
+                context_output, context_lse = self._compute_prefill_context_dcp(
+                    q_nope, q_pe, kv_cache, attn_metadata,
+                ) # DCP not support scaled kvcache now
+            else:
+                context_output, context_lse = self._compute_prefill_context(
+                    q_nope=q_nope,
+                    q_pe=q_pe,
+                    kv_c_cache=kv_cache[0],
+                    k_pe_cache=kv_cache[1],
+                    attn_metadata=attn_metadata,
+                    k_scale=k_scale,
+                )
+            merged_output = torch.empty_like(output, dtype=torch.float32)
             ops.merge_attn_states(
                 output=merged_output,
                 prefix_output=context_output,
@@ -376,7 +516,84 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             )
             output = merged_output
 
-        return output.flatten(start_dim=-2)
+        return output.to(torch.bfloat16).flatten(start_dim=-2)
+
+    def _forward_decode_dcp(
+        self,
+        ql_nope: torch.Tensor,                        # [bs, 8, 512]
+        q_pe: torch.Tensor,                           # [bs, 8, 512]
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],  # [*, pg, 512], [*, pg, 64]
+        attn_meta: NPUMLAMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        decode_meta = attn_meta.decode
+        assert decode_meta is not None
+
+        blk_table = decode_meta.block_table
+        cu_q_lens = decode_meta.query_cumlens
+        cu_kv_lens = decode_meta.seq_lens
+
+        tp_group = get_tp_group().device_group
+        tp_size = get_tp_group().world_size
+        D = self.kv_lora_rank        # only support D=512
+        N = self.num_heads * tp_size # only support head=128
+
+        def gather_head(q, N, D):
+            assert q.dim() == 3
+            q = q.transpose(0, 1).flatten() # TND -> NTD
+            q = get_tp_group().all_gather(q)
+            return q.view(N, -1, D).transpose(0, 1) # NTD -> TND
+
+        # DCP does not yet support graph mode or sink attn
+        num_tokens = decode_meta.query_cumlens[-1]
+        ql_nope = ql_nope[:num_tokens]
+        q_pe = q_pe[:num_tokens]
+
+        full_q_nope = gather_head(ql_nope, N, D) # TND
+        full_q_rope = gather_head(q_pe, N, 64)   # TND
+
+        out, lse = torch.ops.npu.npu_fused_infer_attention_score(
+            full_q_nope,            # [T, N, D]
+            kv_cache[0],            # [*, pg, D]
+            kv_cache[0],            # [*, pg, D]
+            query_rope=full_q_rope, # [T, N, 64]
+            key_rope=kv_cache[1],   # [*, pg, 64]
+            num_heads=N,
+            num_key_value_heads=1,
+            input_layout="TND_NTD",
+            scale=self.scale,
+            sparse_mode=3,
+            atten_mask=NPUMLAImpl.DECORE_ATTN_MASK,
+            block_size=128,
+            block_table=blk_table,
+            actual_seq_lengths=cu_q_lens,
+            actual_seq_lengths_kv=cu_kv_lens,
+            softmax_lse_flag=True,
+        ) # -> out[N, T, D], lse[T, N, 1]
+
+        cp_out = out.view(N, -1)                 # bf16[N, TD]
+        cp_lse = lse.view(-1, N).transpose(0, 1) # fp32[N, T]
+        tp_out = torch.empty_like(cp_out)        # bf16[N, TD]
+        tp_lse = torch.empty_like(cp_lse)        # fp32[N, T]
+
+        torch.distributed.all_to_all_single(tp_out.flatten(), cp_out.flatten(), group=tp_group)
+        torch.distributed.all_to_all_single(tp_lse.flatten(), cp_lse.flatten(), group=tp_group)
+
+        sect = [self.num_heads] * tp_size # head split pattern
+
+        # TODO: "npu_attention_update" does not yet support tp > 16
+        if tp_size <= 16:
+            merged, _ = torch_npu.npu_attention_update(
+                lse=[it.flatten() for it in tp_lse.split(sect, dim=0)],
+                local_out=[it.view(-1, D) for it in tp_out.float().split(sect, dim=0)],
+                update_type=0,
+            )
+        else:
+            merged, _ = ops.attention_update_torch(
+                outs=[it.view(-1, D) for it in tp_out.float().split(sect, dim=0)],
+                lses=[it.flatten() for it in tp_lse.split(sect, dim=0)],
+            )
+        return merged.to(torch.bfloat16).view(self.num_heads, -1, D) # NTD
 
     def _forward_decode(
         self,
@@ -514,14 +731,23 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.num_decode_tokens
-        
+
         decode_q = q
 
+        def store_kv(cache, kv):
+            if self.dcp_world_size == 1:
+                slots = attn_metadata.slot_mapping
+            else:
+                # TODO: DCP not yet support graph mode
+                slots = attn_metadata.dcp_local_slots
+                kv = kv[attn_metadata.dcp_local_kv_idx]
+            cache = cache.flatten(end_dim=-2)
+            slots = slots.view(-1, 1)
+            torch_npu.npu_scatter_nd_update_(cache, slots, kv)
+
         # write the latent and rope to kv cache
-        if k_nope.numel() > 0:
-            slots = attn_metadata.slot_mapping.view(-1, 1)
-            torch_npu.npu_scatter_nd_update_(k_nope.view(-1, k_nope.shape[-1]), slots, k_c_normed)
-            torch_npu.npu_scatter_nd_update_(k_rope.view(-1, k_rope.shape[-1]), slots, k_pe.squeeze(1))
+        store_kv(kv_cache[0], k_c_normed)
+        store_kv(kv_cache[1], k_pe.squeeze(1))
 
         if has_prefill:
             output = output[:num_actual_toks, ...]
@@ -555,9 +781,14 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
 
             # call decode attn
-            attn_out = self._forward_decode(
-                decode_ql_nope, decode_q_pe, kv_cache, attn_metadata, layer
-            )
+            if self.dcp_world_size == 1:
+                attn_out = self._forward_decode(
+                    decode_ql_nope, decode_q_pe, kv_cache, attn_metadata, layer
+                )
+            else:
+                attn_out = self._forward_decode_dcp(
+                    decode_ql_nope, decode_q_pe, kv_cache, attn_metadata, layer
+                )
 
             # v_up projection
             out_proj = self._v_up_proj(attn_out)

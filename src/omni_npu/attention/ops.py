@@ -60,6 +60,9 @@ def merge_attn_states(
     assert prefix_lse.dim() == 3 and prefix_lse.size(-1) == 1, \
         f"LSE should have 3 dimensions and the last should be 1, but got shape {prefix_lse.shape}."
 
+    prefix_output = prefix_output.float()
+    suffix_output = suffix_output.float()
+
     # map inf to -inf
     prefix_lse = torch.where(prefix_lse == float('inf'),
                              torch.tensor(float('-inf'), device=prefix_lse.device),
@@ -101,3 +104,38 @@ def merge_attn_states(
     # merge attention outputs by scale
     merged_output = prefix_output * prefix_scale + suffix_output * suffix_scale
     output.copy_(merged_output)
+
+
+def attention_update_torch(
+    outs: torch.Tensor, # [N, T, D] or list
+    lses: torch.Tensor, # [N, T] or list
+):
+    if type(outs) is list:
+        assert type(lses) is list and len(outs) == len(lses)
+        outs = torch.stack(outs, dim=0) # [N, T, D]
+        lses = torch.stack(lses, dim=0) # [N, T]
+
+    assert outs.dim() == 3 and lses.dim() == 2
+    assert outs.size(0) == lses.size(0)
+    assert outs.size(1) == lses.size(1)
+    outs = outs.transpose(0, 1).float() # fp32[T, N, D]
+    lses = lses.transpose(0, 1).float() # fp32[T, N]
+
+    # inf -> -inf
+    _inf = torch.tensor(float("-inf"), device=lses.device)
+    lses = torch.where(lses == float("inf"), _inf, lses)
+
+    max_lses = lses.max(dim=-1)[0]               # [T]
+    ses = torch.exp(lses - max_lses.view(-1, 1)) # [T, N]
+    se = ses.sum(dim=-1)                         # [T]
+    valid = se > 0                               # [T]
+
+    lse = torch.where( # [T]
+        valid, torch.log(se) + max_lses, _inf
+    )
+    sc = torch.where(
+        valid.view(-1, 1), ses / se.view(-1, 1), torch.zeros_like(ses)
+    ).unsqueeze(2) # [T, N, 1]
+    out = (outs * sc).sum(1) # sum dim-N
+
+    return out, lse # fp32[T, D], fp32[T]

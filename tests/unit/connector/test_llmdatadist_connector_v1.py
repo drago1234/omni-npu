@@ -122,6 +122,8 @@ class TestLLMDataDistConnectorV1LifeCycle:
             from llm_datadist import LLMStatusCode
             mock3.return_value.link_clusters.return_value = (LLMStatusCode.LLM_SUCCESS, None)
             mock4 = stack.enter_context(patch("omni_npu.connector.llmdatadist_manager_v1.BlocksCacheKey"))
+            mock_dcp = stack.enter_context(patch("omni_npu.connector.llmdatadist_connector_v1.get_dcp_group"))
+            mock_dcp.return_value.world_size = 0
 
             connector_p = LLMDataDistConnector(vllm_config_p, KVConnectorRole.WORKER)
             connector_d = LLMDataDistConnector(vllm_config_d, KVConnectorRole.WORKER)
@@ -239,6 +241,15 @@ def mock_get_tp_group():
 
 
 @pytest.fixture
+def mock_get_dcp_group():
+    mock_group = MagicMock()
+    mock_group.world_size = 1
+    mock_group.rank_in_group = 0
+    with patch(f"{PARALLEL_STATE_PATH}.get_dcp_group", return_value=mock_group) as mock:
+        yield mock
+
+
+@pytest.fixture
 def mock_utils_get_config():
     with patch(f"{UTILS_PATH}.get_config_from_dict_or_env", return_value=5568) as mock:
         yield mock
@@ -286,7 +297,8 @@ class TestReqMeta:
             remote_cluster_id="cluster_1",
             spec_token_ids=None,
             remote_dp_rank=0,
-            remote_request_id="req_1"
+            remote_request_id="req_1",
+            token_num=None, # only used in DCP
         )
         assert meta.local_block_ids == [1, 2, 3]
         assert meta.remote_block_ids == [4, 5, 6]
@@ -843,7 +855,7 @@ class TestDecodeConnectorWorker:
         ([], [4, 5]), # This case might be handled differently in the actual loop, but the slicing logic holds
         ([[]], [])
     ])
-    def test_start_load_kv_block_slicing(self, mock_vllm_config, mock_datadist_manager, mock_get_tp_rank, mock_get_tp_group, mock_threading_thread, local_blocks, remote_blocks, tp):
+    def test_start_load_kv_block_slicing(self, mock_vllm_config, mock_datadist_manager, mock_get_tp_rank, mock_get_tp_group, mock_get_dcp_group, mock_threading_thread, local_blocks, remote_blocks, tp):
         def fun_submit(*arg, **kwarg):
             worker._read_blocks(**kwarg)
             return MagicMock()

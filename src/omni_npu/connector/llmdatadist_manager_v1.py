@@ -189,6 +189,7 @@ class LLMDataDistManager:
         self.data_dist_engine = self._init_llm_data_dist()
 
         self.registered_kv_caches = []
+        self.registered_kv_caches_tensor = []
         self.rank_link_info_map = {}
         # the look-up table for pull kv, managed by each dp process
         # { key: (host_cluster_id, prefill_dp_rank, d_rank), value:[prompt_cluster_id_list] }
@@ -437,6 +438,7 @@ class LLMDataDistManager:
 
             cache = self.data_dist_engine.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
             self.registered_kv_caches.append(cache)
+            self.registered_kv_caches_tensor.append(sub_kv_caches)
         logger.debug(f" ***** registered_kv_caches num:{len(self.registered_kv_caches)}")
 
     def cluster_id_to_ip_port(self, cluster_id):
