@@ -234,12 +234,12 @@ def parse_hf_config(hf_config):
         weights_type = hf_config.quantization_config["config_groups"]["group_0"]["weights"]["num_bits"]
         if isinstance(weights_type, dict):
             num_bits_values = weights_type.values()
-            weights_type = f"w{min(num_bits_values)}"
+            weights_type = f"{min(num_bits_values)}"
 
         input_activations_type = hf_config.quantization_config["config_groups"]["group_0"]["input_activations"]["num_bits"]
         if isinstance(input_activations_type, dict):
             num_bits_values = input_activations_type.values()
-            input_activations_type = f"a{min(num_bits_values)}"
+            input_activations_type = f"{min(num_bits_values)}"
         
         kv_cache_scheme_type = hf_config.quantization_config["kv_cache_scheme"]
         quant_type = f"w{weights_type}a{input_activations_type}"
