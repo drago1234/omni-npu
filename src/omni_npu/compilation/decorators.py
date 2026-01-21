@@ -1,11 +1,14 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 import functools
 from typing import TypeVar, Union
 
+import torch
 import torch.nn as nn
 
 import vllm.compilation.decorators as _dec_mododule
 from vllm.forward_context import get_forward_context
-from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 
 

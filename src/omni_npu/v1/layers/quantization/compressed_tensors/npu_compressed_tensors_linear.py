@@ -18,6 +18,7 @@ from omni_npu.v1.layers.linear import (
 )
 from omni_npu.v1.layers.utils import get_npu_execution_type
 from omni_npu.v1.utils import ACL_FORMAT_FRACTAL_NZ
+from omni_npu.v1.models.config_loader.loader import model_extra_config
 
 
 logger = init_logger(__name__)
@@ -87,6 +88,11 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
         layer.weight_scale = torch.nn.Parameter(
             layer.weight_scale.data.view(-1), requires_grad=False
         )
+
+        # NOTE(Daylight): mlaprolog need q_b_proj weight scale in float dtype
+        if model_extra_config.operator_opt_config.enable_mlaprolog and "q_b_proj" in layer.prefix:
+            layer.weight_scale.data = layer.weight_scale.data.float()
+
         if hasattr(layer, 'weight_offset'):
             layer.weight_offset = torch.nn.Parameter(
                 layer.weight_offset.data.view(-1).float(), requires_grad=False
@@ -128,6 +134,7 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
             output_dtype=layer.orig_dtype,
         )
         return y
+
 
 class W8A8Int8MlpMethod(FusedMLPMethodBase):
     """Apply dequant_swiglu_quant fused kernel.

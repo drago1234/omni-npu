@@ -25,14 +25,13 @@ from omni_npu.v1.distributed.communication_op_ext import (
     layer_parallel_reduce_scatter,
     layer_parallel_all2all_single
 )
-
 from omni_npu.v1.distributed.parallel_state_ext import (
     get_layer_transform_type,
     get_layer_dim,
     get_layer_parallel_world_size,
     get_layer_parallel_rank
 )
-
+from omni_npu.v1.models.config_loader.loader import model_extra_config
 from omni_npu.v1.utils import (get_last_two_parts, ACL_FORMAT_FRACTAL_NZ)
 
 logger = init_logger(__name__)
@@ -77,6 +76,7 @@ class FlashCommLinearMethodBase(QuantizeMethodBase):
               is_prefill: Optional[bool] = True) -> torch.Tensor: 
         raise NotImplementedError
 
+
 class UnquantizedFlashCommLinearMethod(FlashCommLinearMethodBase):
     """Linear method without quantization."""
 
@@ -95,18 +95,23 @@ class UnquantizedFlashCommLinearMethod(FlashCommLinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
-        weight_data = torch_npu.npu_format_cast(layer.weight.data.t().contiguous(), ACL_FORMAT_FRACTAL_NZ)
-        layer.weight.data = weight_data
+        if model_extra_config.operator_opt_config.enable_mlaprolog and "kv_b_proj" in layer.prefix:
+            layer.weight.data = layer.weight.data.t().contiguous()
+        else:
+            weight_data = torch_npu.npu_format_cast(layer.weight.data.t().contiguous(), ACL_FORMAT_FRACTAL_NZ)
+            layer.weight.data = weight_data
         if not hasattr(layer.weight, "is_weight_transposed"):
             set_weight_attrs(layer.weight, {"is_weight_transposed": True})
 
-    def apply(self,
-              layer: torch.nn.Module,
-              x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None,
-              x_transform: Optional[str] = None,
-              x_dim: Optional[int] = 0,
-              is_prefill: Optional[bool] = True) -> torch.Tensor:
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        x_transform: Optional[str] = None,
+        x_dim: Optional[int] = 0,
+        is_prefill: Optional[bool] = True
+    ) -> torch.Tensor:
         input_parallel = layer_parallel_communication_op(x, x_transform, layer.layer_name_inside_block, "x", x_dim)
         if bias is not None:
             if input_parallel.ndim == 3:
@@ -165,6 +170,100 @@ class FlashCommLinearBase(torch.nn.Module):
             if isinstance(param, BasevLLMParameter):
                 param.tp_rank = self.tp_rank
                 param.tp_size = self.tp_size
+
+
+class ReplicatedFlashCommLinear(FlashCommLinearBase):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        *,
+        return_bias: bool = True
+    ):
+        if hasattr(self, "output_sizes"):
+            self.output_partition_sizes = self.output_sizes
+        else:
+            self.output_partition_sizes = [output_size]
+
+        super().__init__(
+            input_size,
+            output_size,
+            skip_bias_add,
+            params_dtype,
+            quant_config,
+            prefix=prefix,
+            return_bias=return_bias,
+            disable_tp=True,
+        )
+
+        assert self.quant_method is not None
+        self.quant_method.create_weights(
+            self,
+            self.input_size,
+            self.output_partition_sizes,
+            self.input_size,
+            self.output_size,
+            self.params_dtype,
+            weight_loader=self.weight_loader,
+        )
+
+        if bias:
+            self.bias = Parameter(
+                torch.empty(self.output_size, dtype=self.params_dtype)
+            )
+            set_weight_attrs(
+                self.bias,
+                {
+                    "output_dim": 0,
+                    "weight_loader": self.weight_loader,
+                },
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        # veRL special case: transpose the weight back to original shape
+        is_weight_transposed = getattr(param, "is_weight_transposed", False)
+        if is_weight_transposed:
+            param.data = param.data.t_()
+
+        param_data = param.data
+        is_2_dims = getattr(param, "is_2_dims", False)
+        if not is_2_dims:
+            loaded_weight = torch.squeeze(loaded_weight)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
+        # veRL special case: transpose the weight to use torch npu operator
+        if is_weight_transposed:
+            param.data = torch_npu.npu_format_cast(param.data.t_(), ACL_FORMAT_FRACTAL_NZ)
+
+    def forward(
+        self,
+        input_: torch.Tensor,
+        is_prefill: bool = True
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+
+        output = self.quant_method.apply(self, input_, bias, self.x_transform, self.x_dim, is_prefill=is_prefill)
+        output_bias = self.bias if self.skip_bias_add else None
+
+        if not self.return_bias:
+            return output
+        return output, output_bias
+
+    def extra_repr(self) -> str:
+        s = f"in_features={self.input_size}"
+        s += f", output_features={self.output_size}"
+        s += f", bias={self.bias is not None}"
+        return s
 
 
 class ColumnParallelFlashCommLinear(FlashCommLinearBase):

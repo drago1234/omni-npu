@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import Optional, Dict, Tuple
+from typing import Optional
 
 import torch
 import torch_npu
 from transformers import DeepseekV2Config, DeepseekV3Config
-
 try:
     import custom_ops
 except:
@@ -18,7 +17,6 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.config import VllmConfig, CacheConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.attention.layer import MLAAttention
@@ -27,11 +25,11 @@ from omni_npu.attention.backends.dsa import NPUDSAMetadata
 from omni_npu.v1.layers.utils import yarn_get_mscale
 from omni_npu.v1.layers.linear import (
     RowParallelFlashCommLinear,
-    ColumnParallelFlashCommLinear
+    ColumnParallelFlashCommLinear,
+    ReplicatedFlashCommLinear
 )
 from omni_npu.v1.models.config_loader.loader import  model_extra_config
 from omni_npu.v1.utils import current_stream
-
 
 
 class Indexer(torch.nn.Module):
@@ -55,14 +53,14 @@ class Indexer(torch.nn.Module):
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
         # no tensor parallel, just replicated
-        self.wq_b = ReplicatedLinear(
+        self.wq_b = ReplicatedFlashCommLinear(
             self.q_lora_rank,
             self.head_dim * self.n_head,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        self.wk = ReplicatedLinear(
+        self.wk = ReplicatedFlashCommLinear(
             hidden_size,
             self.head_dim,
             bias=False,
@@ -70,7 +68,7 @@ class Indexer(torch.nn.Module):
             prefix=f"{prefix}.wk",
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
-        self.weights_proj = ReplicatedLinear(
+        self.weights_proj = ReplicatedFlashCommLinear(
             hidden_size, self.n_head, quant_config=None, prefix=f"{prefix}.weights_proj"
         )
 
@@ -179,14 +177,14 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         self.quant_symbol = quant_config is not None
 
         if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(
+            self.q_a_proj = ReplicatedFlashCommLinear(
                 self.hidden_size,
                 self.q_lora_rank,
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_a_proj",
             )
-            self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.kv_a_proj_with_mqa = ReplicatedFlashCommLinear(
                 self.hidden_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=False,
@@ -194,7 +192,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 prefix=f"{prefix}.kv_a_proj_with_mqa",
             )
         else:
-            self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.kv_a_proj_with_mqa = ReplicatedFlashCommLinear(
                 self.hidden_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=False,
@@ -456,16 +454,16 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         bs, _ = hidden_states.view(-1, hidden_states.shape[-1]).shape
         q_nope, q_pe, dequant_scale_q_nope, q_norm, dequant_scale_q_norm = torch.ops.custom.npu_mla_prolog_v3(
             token_x=hidden_states.view(bs, 1, -1),
-            weight_dq=self.q_a_proj.weight,
-            weight_uq_qr=self.q_b_proj.weight,
-            weight_uk=self.attn.impl.W_UK_T,
-            weight_dkv_kr=self.kv_a_proj_with_mqa.weight,
+            weight_dq=self.q_a_proj.weight,                 # BF16, NZ
+            weight_uq_qr=self.q_b_proj.weight,              # BF16, NZ
+            weight_uk=self.attn.impl.W_UK_T,                # BF16, ND
+            weight_dkv_kr=self.kv_a_proj_with_mqa.weight,   # BF16, NZ
             rmsnorm_gamma_cq=self.q_a_layernorm.weight,
             rmsnorm_gamma_ckv=self.kv_a_layernorm.weight,
             rope_sin=sin.squeeze(1),
             rope_cos=cos.squeeze(1),
-            kv_cache=kv_cache[1],
-            kr_cache=kv_cache[0],
+            kv_cache=kv_cache[0],
+            kr_cache=kv_cache[1],
             cache_index=attn_metadata.slot_mapping.view(bs, -1),
             dequant_scale_x=None,
             dequant_scale_w_dq=None,
@@ -497,7 +495,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
         if self.use_mlaprolog:
             q_nope, q_pe, q_norm, k_nope, k_pe, dequant_scale_q_nope, dequant_scale_q_norm = \
-                self._forward_mlaprolog(hidden_states, cos, sin, attn_metadata, kv_cache)
+                self._forward_mlaprolog(hidden_states, cos, sin, kv_cache, attn_metadata)
         else:
             if self.q_lora_rank is not None:
                 q_lora = self.q_a_proj(hidden_states)[0]

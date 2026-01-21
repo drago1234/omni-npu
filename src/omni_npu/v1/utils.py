@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 import torch
 
+
+ACL_FORMAT_ND = 2
 ACL_FORMAT_FRACTAL_NZ = 29
 _current_stream = None
+
+
 def get_nth_last_sep_pos(s: str, sep: str = '.', n: int = 2) -> int:
     if n < 1 or not sep:
         return -1
@@ -15,6 +20,7 @@ def get_nth_last_sep_pos(s: str, sep: str = '.', n: int = 2) -> int:
             return -1
     return current_pos
 
+
 def get_last_two_parts(s: str, sep: str = '.') -> str:
     second_last_sep_pos = get_nth_last_sep_pos(s, sep=sep, n=2)
 
@@ -22,6 +28,7 @@ def get_last_two_parts(s: str, sep: str = '.') -> str:
         return s
     
     return s[second_last_sep_pos + 1:]
+
 
 def current_stream() -> torch.npu.Stream:
     """
