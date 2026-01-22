@@ -242,13 +242,12 @@ class TestNPUAttentionBackendMLAUtilsFunc(unittest.TestCase):
 
             B = 2
             x = torch.randn(num_heads * B, kv_lora_rank, dtype=dtype, device=device)
-            out = torch.empty(B, hidden_size, dtype=dtype, device=device)
 
             impl.W_UV = torch.zeros(num_heads, kv_lora_rank, v_head_dim, dtype=dtype, device=device)
             for h in range(num_heads):
                 impl.W_UV[h, :v_head_dim, :] = torch.eye(v_head_dim, dtype=dtype, device=device)
 
-            impl._v_up_proj(x, out)
+            out = impl._v_up_proj(x)
 
             expected = torch.zeros(B, hidden_size, dtype=dtype, device=device)
             for b in range(B):
