@@ -1,172 +1,158 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-import sys
-from importlib import import_module
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
+
+import unittest
 from unittest.mock import MagicMock
-
-import pytest
-from omni_npu.v1.parsers import register_lazy_parsers
-from vllm.reasoning import ReasoningParser, ReasoningParserManager
-from .utils import run_reasoning_extraction
-
-register_lazy_parsers()
-
-parser_name = "pangu"
-start_token = "<think>"
-end_token = "</think>"
+from omni_npu.v1.parsers import PanguReasoningParser
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.protocol import DeltaMessage
 
 
-@pytest.fixture(scope="module")
-def pangu_tokenizer():
-    tokenizer = MagicMock()
-    mock_vocab = {
-        "[PAD]": 0,
-        "[CLS]": 1,
-        "[SEP]": 2,
-        "hello": 102,
-        "world": 103,
-        "<think>": 45981,
-        "This": 39334,
-        "is": 41824,
-        "a": 45509,
-        "reasoning": 5755,
-        "section": 12206,
-        "</think>": 45982,
-        "the": 35740,
-        "rest": 25719,
-    }
+class TestPanguReasoningParserExtractReasoning(unittest.TestCase):
+    def setUp(self):
+        self.mock_tokenizer = MagicMock()
+        self.mock_tokenizer.get_vocab.return_value = {
+            "<think>": 100,
+            "</think>": 101,
+            "[unused16]": 102,
+            "[unused17]": 103,
+        }
+        self.mock_tokenizer.tokenizer = self.mock_tokenizer
 
-    tokenizer.get_vocab.return_value = mock_vocab
-    tokenizer.vocab = mock_vocab
+    def test_extract_reasoning_with_think_tags(self):
+        """case: special token is <think> and </think>"""
+        parser = PanguReasoningParser(self.mock_tokenizer)
+        request = MagicMock(spec=ChatCompletionRequest)
 
-    return tokenizer
+        model_output = "<think>正在思考如何写代码...</think>这是你的代码：print('hello')"
+        reasoning, content = parser.extract_reasoning(model_output, request)
+
+        self.assertEqual(reasoning, "正在思考如何写代码...")
+        self.assertEqual(content, "这是你的代码：print('hello')")
+
+    def test_extract_reasoning_with_unused_tags(self):
+        """case: special token is [unused16] and [unused17]"""
+        self.mock_tokenizer.get_vocab.return_value = {
+            "[unused16]": 102,
+            "[unused17]": 103
+        }
+
+        parser = PanguReasoningParser(self.mock_tokenizer)
+        request = MagicMock(spec=ChatCompletionRequest)
+
+        model_output = "[unused16]分析用户需求中...[unused17]完成提取。"
+        reasoning, content = parser.extract_reasoning(model_output, request)
+
+        self.assertEqual(reasoning, "分析用户需求中...")
+        self.assertEqual(content, "完成提取。")
+
+    def test_extract_reasoning_with_only_reasoning(self):
+        """case: only reasoning"""
+        parser = PanguReasoningParser(self.mock_tokenizer)
+        request = MagicMock(spec=ChatCompletionRequest)
+
+        model_output = "<think>思考到一半"
+        reasoning, content = parser.extract_reasoning(model_output, request)
+
+        self.assertEqual(reasoning, "思考到一半")
+        self.assertIsNone(content)
+
+    def test_extract_reasoning_with_empty_content(self):
+        """case: content is empty"""
+        parser = PanguReasoningParser(self.mock_tokenizer)
+        request = MagicMock(spec=ChatCompletionRequest)
+
+        model_output = "<think>思考完了</think>"
+        reasoning, content = parser.extract_reasoning(model_output, request)
+
+        self.assertEqual(reasoning, "思考完了")
+        self.assertIsNone(content)
 
 
-EMPTY = {
-    "output": "",
-    "reasoning": "",
-    "content": None,
-    "is_reasoning_end": False,
-}
-EMPTY_STREAMING = {
-    "output": "",
-    "reasoning": None,
-    "content": None,
-    "is_reasoning_end": False,
-}
+class TestPanguReasoningParserExtractReasoningStreaming(unittest.TestCase):
+    def setUp(self):
+        self.mock_tokenizer = MagicMock()
+        self.vocab = {
+            "<think>": 10,
+            "</think>": 11,
+            "Hello": 20,
+            "World": 21
+        }
+        self.mock_tokenizer.get_vocab.return_value = self.vocab
+        self.mock_tokenizer.tokenizer = self.mock_tokenizer
 
-TEST_CASES = [
-    pytest.param(
-        False,
-        EMPTY,
-        id="empty",
-    ),
-    pytest.param(
-        True,
-        EMPTY_STREAMING,
-        id="empty_streaming",
-    ),
-]
+        self.parser = PanguReasoningParser(self.mock_tokenizer)
 
+    def test_is_reasoning_end(self):
+        """测试推理结束标记的计数逻辑"""
+        self.parser.delta_token_ids = [11]  # 模拟当前 delta 包含结束符
 
-@pytest.mark.parametrize("streaming, param_dict", TEST_CASES)
-def test_reasoning(
-        streaming: bool,
-        param_dict: dict,
-        pangu_tokenizer,
-):
-    output = pangu_tokenizer.tokenize(param_dict["output"])
-    # decode everything to tokens
-    output_tokens: list[str] = [
-        pangu_tokenizer.convert_tokens_to_string([token]) for token in output
-    ]
-    parser: ReasoningParser = ReasoningParserManager.get_reasoning_parser(parser_name)(
-        pangu_tokenizer
-    )
+        # 第一次检测到结束符，应该返回 True
+        input_ids = [10, 20, 11]
+        self.assertTrue(self.parser.is_reasoning_end(input_ids))
+        self.assertEqual(self.parser.is_reasoning_end_count, 1)
 
-    reasoning, content = run_reasoning_extraction(
-        parser, output_tokens, streaming=streaming
-    )
+        # 第二次调用（模拟重复触发或其他逻辑），计数器变为 2，应返回 False
+        self.assertFalse(self.parser.is_reasoning_end(input_ids))
+        self.assertEqual(self.parser.is_reasoning_end_count, 2)
 
-    assert reasoning == param_dict["reasoning"]
-    assert content == param_dict["content"]
+    def test_extract_reasoning_streaming_with_multi_token(self):
+        """测试起始标签和推理文本在同一个 chunk 中的场景: '<think>Hello'"""
+        # 模拟输入参数
+        # previous: 空
+        # delta: '<think>Hello' (假设对应 token IDs [10, 20])
+        previous_text = ""
+        current_text = "<think>Hello"
+        delta_text = "<think>Hello"
+        previous_token_ids = []
+        current_token_ids = [10, 20]
+        delta_token_ids = [10, 20]
 
-    # Test is_reasoning_end
-    output_ids = pangu_tokenizer.convert_tokens_to_ids(output)
-    parser.delta_token_ids = output_ids
-    is_reasoning_end = parser.is_reasoning_end(output_ids)
-    assert is_reasoning_end == param_dict["is_reasoning_end"]
-
-    # Test extract_content
-    if param_dict["content"] is not None:
-        content = parser.extract_content_ids(output_ids)
-        assert content == pangu_tokenizer.convert_tokens_to_ids(
-            pangu_tokenizer.tokenize(param_dict["content"])
+        result = self.parser.extract_reasoning_streaming(
+            previous_text, current_text, delta_text,
+            previous_token_ids, current_token_ids, delta_token_ids
         )
-    else:
-        content = parser.extract_content_ids(output)
-        assert content == []
 
+        self.assertIsInstance(result, DeltaMessage)
+        self.assertEqual(result.reasoning, "Hello")
+        self.assertIsNone(result.content)
 
-single_token_output = [
-    "<think>",
-    "Some ",
-    "reasoning ",
-    "content",
-    "</think>",
-    "Final ",
-    "answer",
-]
-mutil_tokens_output = [
-    "<think>This ",
-    "is a ",
-    "reasoning process ",
-    "section</think>",
-    "This is ",
-    "the rest",
-]
+    def test_extract_reasoning_streaming_with_normal_reasoning(self):
+        """测试正常的推理过程流（标签已在之前出现过）"""
+        # 模拟之前已经有了 <think>
+        previous_text = "<think>"
+        current_text = "<think>Thinking..."
+        delta_text = "Thinking..."
+        previous_token_ids = [10]
+        current_token_ids = [10, 25, 26]  # 假设 25, 26 是 Thinking...
+        delta_token_ids = [25, 26]
 
-SIMPLE_REASONING = {
-    "output": single_token_output,
-    "reasoning": "Some reasoning content",
-    "content": "Final answer",
-    "is_reasoning_end": True,
-}
-
-MUTIL_TOKENS_REASONING = {
-    "output": mutil_tokens_output,
-    "reasoning": "This is a reasoning process section",
-    "content": "This is the rest",
-    "is_reasoning_end": True,
-}
-
-TEST_CASES = [
-    pytest.param(
-        False,
-        SIMPLE_REASONING,
-        id="simple_reasoning",
-    ),
-    pytest.param(
-        False,
-        MUTIL_TOKENS_REASONING,
-        id="mutil_tokens_reasoning",
-    ),
-]
-
-
-class TestPanguReasoningParserStreaming:
-    """Test streaming functionality of PanguReasoningParser."""
-
-    @pytest.mark.parametrize("streaming, param_dict", TEST_CASES)
-    def test_pangu_reasoning_extraction(self, pangu_tokenizer, streaming, param_dict):
-        """
-        Test basic reasoning extraction in streaming modes.
-        """
-        parser: ReasoningParser = ReasoningParserManager.get_reasoning_parser(parser_name)(pangu_tokenizer)
-
-        reasoning, content = run_reasoning_extraction(
-            parser, param_dict["output"], streaming=streaming
+        result = self.parser.extract_reasoning_streaming(
+            previous_text, current_text, delta_text,
+            previous_token_ids, current_token_ids, delta_token_ids
         )
-        assert reasoning == param_dict["reasoning"]
-        assert content == param_dict["content"]
+
+        self.assertEqual(result.reasoning, "Thinking...")
+
+    def test_extract_reasoning_streaming_whit_end(self):
+        """测试推理结束的流场景"""
+        previous_text = "<think>Done"
+        current_text = "<think>Done</think>Answer"
+        delta_text = "</think>Answer"
+        previous_token_ids = [10, 30]
+        current_token_ids = [10, 30, 11, 40]
+        delta_token_ids = [11, 40]
+
+        result = self.parser.extract_reasoning_streaming(
+            previous_text, current_text, delta_text,
+            previous_token_ids, current_token_ids, delta_token_ids
+        )
+
+        # 此时应分别提取出最后一段推理和起始正文
+        self.assertEqual(result.reasoning, "")  # </think> 前面没有新推理
+        self.assertEqual(result.content, "Answer")
+
+
+if __name__ == '__main__':
+    unittest.main()

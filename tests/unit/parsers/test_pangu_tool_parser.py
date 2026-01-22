@@ -1,362 +1,202 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 
 import json
-
-import pytest
-
-from omni_npu.v1.parsers.pangu_tool_parser import PanguToolParser
-from vllm.entrypoints.openai.protocol import FunctionCall, ToolCall
-
+import unittest
 from unittest.mock import MagicMock
 
-
-@pytest.fixture(scope="module")
-def pangu_tokenizer():
-    tokenizer = MagicMock()
-    mock_vocab = {
-        "[unused11]": 101,
-        "[unused12]": 102
-    }
-
-    tokenizer.get_vocab.return_value = mock_vocab
-    tokenizer.vocab = mock_vocab
-
-    return tokenizer
+from omni_npu.v1.parsers import PanguToolParser
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest
 
 
-@pytest.fixture
-def pangu_tool_parser(pangu_tokenizer):
-    return PanguToolParser(pangu_tokenizer)
+class TestPanguToolParserExtractToolCalls(unittest.TestCase):
+    """非流式提取测试"""
+
+    def setUp(self):
+        self.mock_tokenizer = MagicMock()
+        self.mock_tokenizer.get_vocab.return_value = {
+            "<|tool_call_start|>": 104,
+            "<|tool_call_end|>": 105
+        }
+        self.mock_tokenizer.tokenizer = self.mock_tokenizer
+        self.parser = PanguToolParser(self.mock_tokenizer)
+        self.request = MagicMock(spec=ChatCompletionRequest)
+
+    def test_extract_tool_calls_with_no_tool_call(self):
+        """测试没有工具调用的普通文本"""
+        model_output = "Hello, I am an AI assistant."
+        res = self.parser.extract_tool_calls(model_output, self.request)
+        self.assertFalse(res.tools_called)
+        self.assertEqual(res.content, model_output)
+
+    def test_extract_tool_calls_with_standard_tool_call(self):
+        """测试标准单工具调用"""
+        model_output = (
+            "Thought: I need to check weather."
+            "<|tool_call_start|>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Beijing\"}}]<|tool_call_end|>"
+        )
+        res = self.parser.extract_tool_calls(model_output, self.request)
+
+        self.assertTrue(res.tools_called)
+        self.assertEqual(res.content, "Thought: I need to check weather.")
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.tool_calls[0].function.name, "get_weather")
+        self.assertEqual(json.loads(res.tool_calls[0].function.arguments), {"city": "Beijing"})
+
+    def test_extract_tool_calls_whit_exception(self):
+        """测试 JSON 格式错误时的降级处理"""
+        model_output = "<|tool_call_start|>[{\"name\":: \"error\"}]<|tool_call_end|>"
+        res = self.parser.extract_tool_calls(model_output, self.request)
+        print(f"res:{res}")
+        self.assertFalse(res.tools_called)
+        self.assertEqual(model_output, res.content)
 
 
-def assert_tool_calls(
-        actual_tool_calls: list[ToolCall], expected_tool_calls: list[ToolCall]
-):
-    assert len(actual_tool_calls) == len(expected_tool_calls)
+class TestPanguToolParserExtractToolCallsStreaming(unittest.TestCase):
+    """流式提取测试"""
 
-    for actual_tool_call, expected_tool_call in zip(
-            actual_tool_calls, expected_tool_calls
-    ):
-        assert isinstance(actual_tool_call.id, str)
-        assert len(actual_tool_call.id) > 0
+    def setUp(self):
+        self.mock_tokenizer = MagicMock()
+        self.mock_tokenizer.get_vocab.return_value = {
+            "<|tool_call_start|>": 104,
+            "<|tool_call_end|>": 105
+        }
+        self.mock_tokenizer.tokenizer = self.mock_tokenizer
+        self.parser = PanguToolParser(self.mock_tokenizer)
+        self.request = MagicMock(spec=ChatCompletionRequest)
 
-        assert actual_tool_call.type == "function"
-        assert actual_tool_call.function.name == expected_tool_call.function.name
-        # Compare arguments as JSON objects to handle formatting differences
-        actual_args = json.loads(actual_tool_call.function.arguments)
-        expected_args = json.loads(expected_tool_call.function.arguments)
-        assert actual_args == expected_args
+    def test_extract_tool_calls_streaming_whit_basic_returns(self):
+        # case1:只有结束 Token ID
+        res1 = self.parser.extract_tool_calls_streaming(
+            "", "", "", [], [], [105], self.request)
+        self.assertIsNone(res1)
 
+        # case2:文本中还没有开始 Token
+        res3 = self.parser.extract_tool_calls_streaming(
+            "", "Hello", "Hello", [], [], [1], self.request)
+        self.assertEqual(res3.content, "Hello")
 
-def test_extract_tool_calls_no_tools(pangu_tool_parser):
-    model_output = "This is a test"
-    extracted_tool_calls = pangu_tool_parser.extract_tool_calls(
-        model_output, request=None
-    )  # type: ignore[arg-type]
-    assert not extracted_tool_calls.tools_called
-    assert extracted_tool_calls.tool_calls == []
-    assert extracted_tool_calls.content == model_output
+        # case3:只有开始 Token ID
+        res5 = self.parser.extract_tool_calls_streaming(
+            "", "<|tool_call_start|>", "<|tool_call_start|>", [], [], [104], self.request)
+        self.assertIsNone(res5)
 
+    def test_extract_tool_calls_streaming_whit_text_before_start_token(self):
+        """case:包含普通文本和开始 Token"""
+        delta = "Thought: I should use a tool.<|tool_call_start|>"
+        res = self.parser.extract_tool_calls_streaming(
+            "", delta, delta, [], [], [1, 104], self.request)
 
-@pytest.mark.parametrize(
-    ids=[
-        "single_tool_call",
-        "multiple_tool_calls",
-        "tool_call_with_content_before",
-        "tool_call_with_mixed_args",
-        "tool_call_with_chinese_content",
-    ],
-    argnames=["model_output", "expected_tool_calls", "expected_content"],
-    argvalues=[
-        (
-                """[unused11]
-        [{"name": "get_current_weather", "arguments": {"city": "Dallas", "state": "TX", "unit": "fahrenheit"}}]
-        [unused12]""",
-                [
-                    ToolCall(
-                        function=FunctionCall(
-                            name="get_current_weather",
-                            arguments=json.dumps(
-                                {
-                                    "city": "Dallas",
-                                    "state": "TX",
-                                    "unit": "fahrenheit",
-                                }
-                            ),
-                        )
-                    )
-                ],
-                None,
-        ),
-        (
-                """[unused11]
-        [{"name": "get_current_weather", "arguments": {"city": "Dallas", "state": "TX", "unit": "fahrenheit"}}]
-        [unused12]
-        [unused11]
-        [{"name": "get_current_weather", "arguments": {"city": "Orlando", "state": "FL", "unit": "fahrenheit"}}]
-        [unused12]""",
-                [
-                    ToolCall(
-                        function=FunctionCall(
-                            name="get_current_weather",
-                            arguments=json.dumps(
-                                {
-                                    "city": "Dallas",
-                                    "state": "TX",
-                                    "unit": "fahrenheit",
-                                }
-                            ),
-                        )
-                    ),
-                    ToolCall(
-                        function=FunctionCall(
-                            name="get_current_weather",
-                            arguments=json.dumps(
-                                {
-                                    "city": "Orlando",
-                                    "state": "FL",
-                                    "unit": "fahrenheit",
-                                }
-                            ),
-                        )
-                    ),
-                ],
-                None,
-        ),
-        (
-                """I'll help you check the weather.[unused11]
-        [{"name": "get_current_weather", "arguments": {"city": "Seattle", "state": "WA", "unit": "celsius"}}]
-        [unused12]""",
-                [
-                    ToolCall(
-                        function=FunctionCall(
-                            name="get_current_weather",
-                            arguments=json.dumps(
-                                {
-                                    "city": "Seattle",
-                                    "state": "WA",
-                                    "unit": "celsius",
-                                }
-                            ),
-                        )
-                    )
-                ],
-                "I'll help you check the weather.",
-        ),
-        (
-                """[unused11]
-        [{"name": "get_current_weather", "arguments": {"city": "New York", "state": "NY", "unit": "celsius"}}]
-        [unused12]""",
-                [
-                    ToolCall(
-                        function=FunctionCall(
-                            name="get_current_weather",
-                            arguments=json.dumps(
-                                {
-                                    "city": "New York",
-                                    "state": "NY",
-                                    "unit": "celsius",
-                                }
-                            ),
-                        )
-                    )
-                ],
-                None,
-        ),
-        (
-                """I will help you get the weather.[unused11]
-        [{"name": "get_weather", "arguments": {"city": "Beijing", "date": "2025-08-01"}}]
-        [unused12]""",
-                [
-                    ToolCall(
-                        function=FunctionCall(
-                            name="get_weather",
-                            arguments=json.dumps(
-                                {
-                                    "city": "Beijing",
-                                    "date": "2025-08-01",
-                                }
-                            ),
-                        )
-                    )
-                ],
-                "I will help you get the weather.",
-        ),
-    ],
-)
-def test_extract_tool_calls(
-        pangu_tool_parser, model_output, expected_tool_calls, expected_content
-):
-    extracted_tool_calls = pangu_tool_parser.extract_tool_calls(
-        model_output, request=None
-    )  # type: ignore[arg-type]
-    print(f"extracted_tool_calls: {extracted_tool_calls}")
-    assert extracted_tool_calls.tools_called
-    assert_tool_calls(extracted_tool_calls.tool_calls, expected_tool_calls)
+        self.assertEqual(res.content, "Thought: I should use a tool.")
 
-    assert extracted_tool_calls.content == expected_content
+    def test_extract_tool_calls_streaming_whit_tool_arguments(self):
+        """case: 假设name已发送，现在发送city片段"""
+        self.parser.current_tool_id = 0
+        self.parser.current_tool_name_sent = True
+        self.parser.streamed_args_for_tool = [""]
+        self.parser.prev_tool_call_arr = [{"name": "get_weather"}]
+
+        curr = '<|tool_call_start|>[{"name": "get_weather", "arguments": {"city": "Beijing"}}]'
+        res = self.parser.extract_tool_calls_streaming(
+            "", curr, '{"city": "Beijing"}}', [], [], [], self.request)
+
+        self.assertIn("Beijing", res.tool_calls[0].function.arguments)
+        self.assertIn("Beijing", self.parser.streamed_args_for_tool[0])
+
+    def test_extract_tool_calls_streaming_whit_end_token(self):
+        """case:tool end"""
+        curr = "<|tool_call_start|>[...]<|tool_call_end|> End text"
+        delta = " End text"
+        res = self.parser.extract_tool_calls_streaming(
+            "", curr, delta, [], [], [], self.request)
+        print(f"res: {res}")
+        self.assertEqual(res.content, " End text")
+
+    def test_extract_tool_calls_streaming_whit_exception(self):
+        """case:发送了部分 JSON"""
+        # [{"name": "get_weather"
+        curr = "<|tool_call_start|>[{\"name\": \"get_weather\""
+        res = self.parser.extract_tool_calls_streaming(
+            "<|tool_call_start|>", curr, "[{\"name\": \"get_weather\"",
+            [104], [104, 2], [2], self.request)
+
+        self.assertIsNone(res)
+
+    def test_extract_tool_calls_streaming_with_new_tool_registration(self):
+        """
+        case：流式场景下新工具的识别与名称发送逻辑。
+        逻辑链条：
+        1. 初始状态为 -1，当解析到第一个工具时，状态应切换到 0。
+        2. 状态切换后，第二次调用应识别出工具名并发送 DeltaMessage。
+        """
+        # 0. 初始化 parser 状态，模拟刚发现开始标签后的状态
+        self.parser.current_tool_id = -1
+        self.parser.current_tool_name_sent = False
+        self.parser.streamed_args_for_tool = []
+
+        # 1. 构造一个能被 partial_json_parser 解析的片段
+        curr = '<|tool_call_start|>[{"name": "get_weather"'
+
+        # 2. 调用流式提取
+        # current_tool_id 从 -1 变为 0
+        res = self.parser.extract_tool_calls_streaming(
+            previous_text="<|tool_call_start|>",
+            current_text=curr,
+            delta_text='[{"name": "get_weather"',
+            previous_token_ids=[104],
+            current_token_ids=[104, 1],
+            delta_token_ids=[1],
+            request=self.request
+        )
+
+        self.assertEqual(self.parser.current_tool_id, 0)
+
+        # 3. 第二次调用，模拟状态已更新，发送名称
+        res_name = self.parser.extract_tool_calls_streaming(
+            previous_text=curr,
+            current_text=curr,  # 文本没变，但状态变了
+            delta_text="",
+            previous_token_ids=[104, 1],
+            current_token_ids=[104, 1],
+            delta_token_ids=[],
+            request=self.request
+        )
+
+        self.assertTrue(self.parser.current_tool_name_sent)
+        self.assertIsNotNone(res_name)
+        self.assertEqual(res_name.tool_calls[0].function.name, "get_weather")
+        self.assertEqual(res_name.tool_calls[0].index, 0)
+
+    def test_extract_tool_calls_streaming_whit_multiple_tools_transition(self):
+        """case:多工具切换"""
+        prev_args = {"city": "BJ"}
+        full_args_json = json.dumps(prev_args, ensure_ascii=False)
+
+        self.parser.current_tool_id = 0
+        self.parser.current_tool_name_sent = True
+        self.parser.streamed_args_for_tool = [full_args_json]
+        self.parser.prev_tool_call_arr = [{"name": "t1", "arguments": prev_args}]
+
+        # 包含两个工具
+        curr = '<|tool_call_start|>[{"name": "t1", "arguments": {"city": "BJ"}}, {"name": "t2"}]'
+
+        res = self.parser.extract_tool_calls_streaming(
+            "", curr, ', {"name": "t2"}]', [], [], [], self.request)
+
+        # 验证状态切换
+        self.assertEqual(self.parser.current_tool_id, 1)
+        self.assertFalse(self.parser.current_tool_name_sent)
+        # res DeltaToolCall id 应该为 None
+        self.assertIsNone(res.tool_calls[0].id)
+
+        res_next = self.parser.extract_tool_calls_streaming(
+            curr, curr, "", [], [], [], self.request)
+
+        self.assertIsNotNone(res_next)
+        self.assertEqual(res_next.tool_calls[0].function.name, "t2")
+        self.assertTrue(self.parser.current_tool_name_sent)
 
 
-def test_extract_tool_calls_with_thinking_tags(pangu_tool_parser):
-    """Test tool extraction when thinking tags are present."""
-    model_output = """<think>I want to get the weather.</think>
-
-I will help you get the weather.[unused11]
-[{"name": "check_sports_event", "arguments": {"matchCategory": "足球", "leagueName": "英超", "round": "第二轮"}}]
-[unused12]"""
-
-    extracted_tool_calls = pangu_tool_parser.extract_tool_calls(
-        model_output, request=None
-    )  # type: ignore[arg-type]
-    print(f"extracted_tool_calls:{extracted_tool_calls}")
-    assert extracted_tool_calls.tools_called
-    assert len(extracted_tool_calls.tool_calls) == 1
-    assert extracted_tool_calls.tool_calls[0].function.name == "check_sports_event"
-
-    expected_content = """<think>I want to get the weather.</think>
-
-I will help you get the weather."""
-    assert extracted_tool_calls.content == expected_content
-
-
-def test_extract_tool_calls_malformed_xml(pangu_tool_parser):
-    """Test that malformed XML is handled gracefully."""
-    model_output = '[unused11][{"name": "get_weather", "arguments": {"city": "Seattle", "incomplete_arg": "value"}}][unused12]'
-
-    extracted_tool_calls = pangu_tool_parser.extract_tool_calls(
-        model_output, request=None
-    )  # type: ignore[arg-type]
-
-    # Should handle malformed XML gracefully
-    # The parser should either extract what it can or return no tool calls
-    # depending on how robust we want the parsing to be
-    assert isinstance(extracted_tool_calls.tools_called, bool)
-    assert isinstance(extracted_tool_calls.tool_calls, list)
-
-
-def test_extract_tool_calls_empty_arguments(pangu_tool_parser):
-    """Test tool calls with no arguments."""
-    model_output = """[unused11]get_current_time[unused12]"""
-
-    extracted_tool_calls = pangu_tool_parser.extract_tool_calls(
-        model_output, request=None
-    )  # type: ignore[arg-type]
-    print(f"extracted_tool_calls: {extracted_tool_calls}")
-    assert not extracted_tool_calls.tools_called
-    assert len(extracted_tool_calls.tool_calls) == 0
-    assert extracted_tool_calls.content == "[unused11]get_current_time[unused12]"
-
-
-def test_extract_tool_calls_mixed_content(pangu_tool_parser):
-    """Test extraction with mixed content and multiple tool calls."""
-    model_output = """I plan to go to the UK to watch the Premier League.[unused11]
-[{"name": "check_sports_event", "arguments": {"matchCategory": "足球", "leagueName": "英超", "round": "第二轮"}}]
-[unused12]
-
-meaningwhile, I will also check the weather in Shanghai.
-
-[unused11]
-[{"name": "search_restaurants", "arguments": {"city": "上海", "cuisine": "本帮菜", "price_range": "300-500", "reservation": true}}]
-[unused12]"""
-
-    extracted_tool_calls = pangu_tool_parser.extract_tool_calls(
-        model_output, request=None
-    )  # type: ignore[arg-type]
-    print(f"extracted_tool_calls: {extracted_tool_calls}")
-    assert extracted_tool_calls.tools_called
-    assert len(extracted_tool_calls.tool_calls) == 2
-
-    # Check first tool call
-    assert extracted_tool_calls.tool_calls[0].function.name == "check_sports_event"
-    args1 = json.loads(extracted_tool_calls.tool_calls[0].function.arguments)
-    assert args1["matchCategory"] == "足球"
-    assert args1["leagueName"] == "英超"
-    assert args1["round"] == "第二轮"
-
-    # Check second tool call
-    assert extracted_tool_calls.tool_calls[1].function.name == "search_restaurants"
-    args2 = json.loads(extracted_tool_calls.tool_calls[1].function.arguments)
-    assert args2["city"] == "上海"
-    assert args2["cuisine"] == "本帮菜"
-    assert args2["price_range"] == "300-500"
-    assert args2["reservation"]
-
-    # Content should be everything before the first tool call
-    assert extracted_tool_calls.content == "I plan to go to the UK to watch the Premier League."
-
-
-def test_streaming_basic_functionality(pangu_tool_parser):
-    """Test basic streaming functionality."""
-    # Reset streaming state
-    pangu_tool_parser.current_tool_name_sent = False
-    pangu_tool_parser.prev_tool_call_arr = []
-    pangu_tool_parser.current_tool_id = -1
-    pangu_tool_parser.streamed_args_for_tool = []
-
-    # Test with a simple tool call
-    current_text = """[unused11][{"name": "get_weather", "arguments": {"city": "Beijing"}}][unused12]"""
-
-    # Mock token IDs for testing
-    tool_call_start_id = pangu_tool_parser.tool_call_start_token_id or 12345
-    tool_call_end_id = pangu_tool_parser.tool_call_end_token_id or 12346
-
-    result = pangu_tool_parser.extract_tool_calls_streaming(
-        previous_text="",
-        current_text=current_text,
-        delta_text="[unused12]",
-        previous_token_ids=[],
-        current_token_ids=[tool_call_start_id, tool_call_end_id],
-        delta_token_ids=[tool_call_end_id],
-        request=None,
-    )
-
-    # The result behavior depends on the streaming state
-    # This test mainly ensures no exceptions are thrown
-    assert result is None or hasattr(result, "tool_calls") or hasattr(result, "content")
-
-
-def test_streaming_no_tool_calls(pangu_tool_parser):
-    """Test streaming when there are no tool calls."""
-    current_text = "This is just regular text without any tool calls."
-
-    result = pangu_tool_parser.extract_tool_calls_streaming(
-        previous_text="This is just regular text",
-        current_text=current_text,
-        delta_text=" without any tool calls.",
-        previous_token_ids=[],
-        current_token_ids=[],
-        delta_token_ids=[],
-        request=None,
-    )
-
-    # Should return the delta text as content
-    assert result is not None
-    assert hasattr(result, "content")
-    assert result.content == " without any tool calls."
-
-
-def test_streaming_with_content_before_tool_calls(pangu_tool_parser):
-    """Test streaming when there's content before tool calls."""
-    # Reset streaming state
-    pangu_tool_parser.current_tool_name_sent = False
-    pangu_tool_parser.prev_tool_call_arr = []
-    pangu_tool_parser.current_tool_id = -1
-    pangu_tool_parser.streamed_args_for_tool = []
-
-    current_text = "I will help you get the weather[unused11]"
-
-    result = pangu_tool_parser.extract_tool_calls_streaming(
-        previous_text="I will help you",
-        current_text=current_text,
-        delta_text="get the weather.[unused11]",
-        previous_token_ids=[],
-        current_token_ids=[],
-        delta_token_ids=[],
-        request=None,
-    )
-    # Should return content when no tool call tokens are detected
-    assert result is not None
-    assert hasattr(result, "content")
-    assert result.content == "get the weather."
+if __name__ == '__main__':
+    unittest.main()
