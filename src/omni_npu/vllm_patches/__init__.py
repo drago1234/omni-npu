@@ -19,8 +19,10 @@ def auto_import_patches():
 
     root = Path(patches.__file__).parent
     base_pkg = patches.__name__
+    files = list(root.rglob("*.py"))
+    files.sort()
 
-    for py_file in root.rglob("*.py"):
+    for py_file in files:
         if py_file.name == "__init__.py":
             continue
 

@@ -1,0 +1,309 @@
+from collections.abc import Iterable
+
+import torch
+import torch.nn as nn
+
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import VllmConfig
+
+from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
+from vllm.model_executor.models.deepseek_mtp import (
+    DeepSeekMultiTokenPredictor,
+    DeepSeekMultiTokenPredictorLayer,
+    SharedHead,
+)
+from vllm.model_executor.models.utils import maybe_prefix
+from vllm.sequence import IntermediateTensors
+
+from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.openpangu import OpenPanguDecoderLayer
+from omni_npu.vllm_patches.core import VLLMPatch, register_patch
+from vllm.model_executor import models
+import types
+import sys
+
+dynamic_module = types.ModuleType("openpangu_vl_mtp")
+sys.modules[models.__name__+".openpangu_vl_mtp"] = dynamic_module
+models.openpangu_vl_mtp = dynamic_module
+
+@register_patch("OpenPanguVLMultiTokenPredictorLayerPatch", models)
+class OpenPanguVLMultiTokenPredictorLayerPatch(VLLMPatch):
+    _attr_names_to_apply = ['OpenPanguVLMultiTokenPredictorLayer']
+
+    
+    class OpenPanguVLMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
+        def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+            nn.Module.__init__(self)
+
+            config = vllm_config.speculative_config.draft_model_config.hf_config
+            self.config = config
+            quant_config = vllm_config.quant_config
+
+            self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+            self.shared_head = SharedHead(
+                config=config,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "shared_head"),
+            )
+            self.mtp_block = OpenPanguDecoderLayer(config, prefix, vllm_config)
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            previous_hidden_states: torch.Tensor,
+            inputs_embeds: torch.Tensor | None = None,
+            spec_step_index: int = 0,
+        ) -> torch.Tensor:
+            assert inputs_embeds is not None
+            inputs_embeds = torch.where(positions[0].unsqueeze(-1) == 0, 0, inputs_embeds)
+            inputs_embeds = self.enorm(inputs_embeds)
+            previous_hidden_states = self.hnorm(previous_hidden_states)
+
+            hidden_states = self.eh_proj(
+                torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
+            )
+            hidden_states, residual = self.mtp_block(
+                positions=positions, hidden_states=hidden_states, residual=None
+            )
+
+            hidden_states = residual + hidden_states
+            return hidden_states
+    models.openpangu_vl_mtp.OpenPanguVLMultiTokenPredictorLayer = OpenPanguVLMultiTokenPredictorLayer
+
+@register_patch("OpenPanguVLMultiTokenPredictorPatch", models)
+class OpenPanguVLMultiTokenPredictorPatch(VLLMPatch):
+    _attr_names_to_apply = ['OpenPanguVLMultiTokenPredictor']
+
+    class OpenPanguVLMultiTokenPredictor(DeepSeekMultiTokenPredictor):
+
+        def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+            nn.Module.__init__(self)
+            config = vllm_config.model_config.hf_config
+            self.mtp_start_layer_idx = config.num_hidden_layers
+            self.num_mtp_layers = config.num_nextn_predict_layers
+            # to map the exact layer index from weights
+            self.layers = torch.nn.ModuleDict(
+                {
+                    str(idx): models.openpangu_vl_mtp.OpenPanguVLMultiTokenPredictorLayer(
+                        vllm_config, f"{prefix}.layers.{idx}"
+                    )
+                    for idx in range(
+                        self.mtp_start_layer_idx,
+                        self.mtp_start_layer_idx + self.num_mtp_layers,
+                    )
+                }
+            )
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+            self.logits_processor = LogitsProcessor(config.vocab_size)
+    
+    models.openpangu_vl_mtp.OpenPanguVLMultiTokenPredictor = OpenPanguVLMultiTokenPredictor
+
+@register_patch("OpenPanguVLMTPPatch", models)
+class OpenPanguVLMTPPatch(VLLMPatch):
+    _attr_names_to_apply = ['OpenPanguVLMTP']
+
+    class OpenPanguVLMTP(nn.Module, SupportsPP):
+        def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+            super().__init__()
+            self.config = vllm_config.model_config.hf_config
+            self.model = models.openpangu_vl_mtp.OpenPanguVLMultiTokenPredictor(
+                vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            )
+
+        def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return self.model.embed_input_ids(input_ids)
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            intermediate_tensors: IntermediateTensors | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            spec_step_idx: int = 0,
+        ) -> torch.Tensor:
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                hidden_states,
+                inputs_embeds,
+                spec_step_idx,
+            )
+            return hidden_states
+
+        def compute_logits(
+            self,
+            hidden_states: torch.Tensor,
+            spec_step_idx: int = 0,
+        ) -> torch.Tensor | None:
+            return self.model.compute_logits(hidden_states, spec_step_idx)
+
+        def get_spec_layer(self, name):
+            if (
+                "layers" in name
+                and hasattr(self.config, "num_nextn_predict_layers")
+                and self.config.num_nextn_predict_layers > 0
+            ):
+                layer_idx = int(name.split("layers.")[-1].split(".")[0])
+                mtp_idx = layer_idx - self.config.num_hidden_layers
+                if mtp_idx >= 0 and mtp_idx < self.config.num_nextn_predict_layers:
+                    return layer_idx
+            return None
+
+        def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+            stacked_params_mapping = [
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+                ("fused_qkv_a_proj", "q_a_proj", 0),
+                ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+            ]
+
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.n_routed_experts,
+            )
+
+            params_dict = dict(self.named_parameters())
+            loaded_params: set[str] = set()
+            for name, loaded_weight in weights:
+                if "rotary_emb.inv_freq" in name:
+                    continue
+                spec_layer = self.get_spec_layer(name)
+                if spec_layer is None:
+                    continue
+
+                name = self._rewrite_spec_layer_name(spec_layer, name)
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    # Skip non-stacked layers and experts (experts handled below).
+                    if weight_name not in name:
+                        continue
+                    # We have mlp.experts[0].gate_proj in the checkpoint.
+                    # Since we handle the experts below in expert_params_mapping,
+                    # we need to skip here BEFORE we update the name, otherwise
+                    # name will be updated to mlp.experts[0].gate_up_proj, which
+                    # will then be updated below in expert_params_mapping
+                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                    if ("mlp.experts." in name) and name not in params_dict:
+                        continue
+                    name_mapped = name.replace(weight_name, param_name)
+
+                    # QKV fusion is optional, fall back to normal
+                    # weight loading if it's not enabled
+                    if (
+                        param_name == "fused_qkv_a_proj"
+                    ) and name_mapped not in params_dict:
+                        continue
+                    else:
+                        name = name_mapped
+
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
+                else:
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        break
+                    else:
+                        if "e_score_correction_bias" in name:
+                            name = name.replace(
+                                "e_score_correction_bias", "gate.e_score_correction_bias"
+                            )
+                        
+                        name = maybe_remap_kv_scale_name(name, params_dict)
+                        if name is None:
+                            continue
+
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+
+                        if name not in params_dict:
+                            continue
+
+                        if (
+                            spec_layer != self.model.mtp_start_layer_idx
+                            and ".layers" not in name
+                        ):
+                            continue
+
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+            self.post_weight_load()
+            return loaded_params
+ 
+        def post_weight_load(self) -> None:
+            for name, module in self.named_modules():
+                if module is self:
+                    continue
+                if hasattr(module, "post_weight_load"):
+                    module.post_weight_load()
+
+        def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
+            """
+            Rewrite the weight name to match the format of the original model.
+            Add .mtp_block for modules in transformer layer block for spec layer
+            and rename shared layer weights to be top level.
+            """
+            spec_layer_weight_names = [
+                "embed_tokens",
+                "enorm",
+                "hnorm",
+                "eh_proj",
+                "shared_head",
+            ]
+            shared_weight_names = ["embed_tokens"]
+            spec_layer_weight = False
+            shared_weight = False
+            for weight_name in spec_layer_weight_names:
+                if weight_name in name:
+                    spec_layer_weight = True
+                    if weight_name in shared_weight_names:
+                        shared_weight = True
+                    break
+            if not spec_layer_weight:
+                # treat rest weights as weights for transformer layer block
+                name = name.replace(
+                    f"model.layers.{spec_layer}.", f"model.layers.{spec_layer}.mtp_block."
+                )
+            elif shared_weight:
+                # treat shared weights as top level weights
+                name = name.replace(f"model.layers.{spec_layer}.", "model.")
+            return name
+
+    models.openpangu_vl_mtp.OpenPanguVLMTP = OpenPanguVLMTP
