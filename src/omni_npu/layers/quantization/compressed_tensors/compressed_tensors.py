@@ -274,7 +274,7 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         if isinstance(layer, FusedMoE):
             return self.get_moe_method(layer)
         if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
-            from omni_npu.v1.fused_mlp.layer import FusedMLP
+            from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
             from omni_npu.v1.layers.linear import FlashCommLinearBase
             from omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear import W8A8Int8MlpMethod
             if isinstance(layer, FlashCommLinearBase):

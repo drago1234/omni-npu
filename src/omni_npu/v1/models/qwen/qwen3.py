@@ -48,16 +48,15 @@ from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
 from vllm.distributed import (
     get_pp_group,
-    get_tp_group,
     get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    tensor_model_parallel_all_reduce,
 )
 
-from omni_npu.v1.fused_mlp.layer import FusedMLP
+from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
 
 class Qwen3MLP(FusedMLP):
     pass
+
+
 class Qwen3Attention(nn.Module):
     def __init__(
         self,

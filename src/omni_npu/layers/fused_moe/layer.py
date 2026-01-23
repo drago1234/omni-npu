@@ -2,7 +2,9 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from typing import Optional, Callable
+
 import torch, torch_npu
+
 from vllm.logger import init_logger
 from vllm.distributed import (
     get_ep_group,
@@ -11,7 +13,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
 )
-from vllm.platforms import current_platform
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
@@ -25,9 +26,12 @@ from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+
 from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp, moe_infer_fusion
 from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
+
+
 torch.npu.config.allow_internal_format = True
 logger = init_logger(__name__)
 
@@ -72,7 +76,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             hidden_states = hidden_states[tp_rank * t_local: (tp_rank + 1) * t_local]
             router_logits = router_logits[tp_rank * t_local: (tp_rank + 1) * t_local]
 
-        topk_weights, topk_ids, _ = NPUFusedMoE.select_experts(
+        topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -211,12 +215,7 @@ class NPUFusedMoE(FusedMoE):
                 device=router_logits.device,
             ).view(num_tokens, top_k) % global_num_experts
             topk_weights = torch.rand_like(topk_ids, dtype=router_logits.dtype)
-            row_idx = torch.arange(topk_ids.numel(),
-                                   device=topk_ids.device,
-                                   dtype=torch.int32) \
-                            .view(-1, num_tokens) \
-                            .transpose(0, 1)
-            return topk_weights, topk_ids, row_idx
+            return topk_weights, topk_ids
 
         if use_grouped_topk:
             if topk_group is None:
@@ -235,22 +234,17 @@ class NPUFusedMoE(FusedMoE):
                 routed_scaling_factor=routed_scaling_factor,
                 eps=1e-20,
             )
-            row_idx = torch.arange(topk_ids.numel(),
-                                   device=current_platform.device_type,
-                                   dtype=torch.int32) \
-                            .view(-1, router_logits.shape[0]) \
-                            .transpose(0, 1)
         elif custom_routing_function is None:
-            topk_weights, topk_ids, row_idx = torch_npu.npu_moe_gating_top_k_softmax(router_logits, k=top_k)
+            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(router_logits, k=top_k)
             if renormalize:
                 topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
         else:
-            topk_weights, topk_ids, row_idx = custom_routing_function(
+            topk_weights, topk_ids = custom_routing_function(
                 gating_output=router_logits,
                 topk=top_k,
                 renormalize=renormalize)
 
-        return topk_weights, topk_ids, row_idx
+        return topk_weights, topk_ids
 
 @SharedFusedMoE.register_oot
 class NPUSharedFusedMoE(SharedFusedMoE, NPUFusedMoE):

@@ -155,16 +155,16 @@ def _logic_vocab_parallel_embedding_reduce_scatter_padding(
         ]
     layer.weight.data.copy_(local_weight)
 
-    input_full = torch.tensor([0, 8, 9], device=device, dtype=torch.long)
+    input_full = torch.tensor([0, 1, 8, 9], device=device, dtype=torch.long)
 
     output = layer.forward_vocab(input_full, reduce=1)
 
     full_vocab_weight = torch.cat([base_weight, added_weight], dim=0)
     full_out = F.embedding(input_full, full_vocab_weight)
-    shard_size = embedding_dim // world_size
+    shard_size = input_full.shape[0] // world_size
     start = local_rank * shard_size
     end = start + shard_size
-    expected = full_out[..., start:end]
+    expected = full_out[start:end]
 
     if local_rank == 0:
         print("reduce_scatter_padding debug:")

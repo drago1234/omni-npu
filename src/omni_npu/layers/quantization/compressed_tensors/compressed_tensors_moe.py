@@ -2,6 +2,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from typing import Optional, Callable, Union
+
 import torch
 import torch_npu
 
@@ -28,6 +29,7 @@ from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndF
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
 from omni_npu.layers.fused_moe.fused_moe import moe_infer_fusion, fused_experts_tp
+
 
 torch.npu.config.allow_internal_format = True
 logger = init_logger(__name__)
@@ -208,7 +210,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
             hidden_states = hidden_states[tp_rank * t_local: (tp_rank + 1) * t_local]
             router_logits = router_logits[tp_rank * t_local: (tp_rank + 1) * t_local]
 
-        topk_weights, topk_ids, _ = NPUFusedMoE.select_experts(
+        topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,

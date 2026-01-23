@@ -1,27 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from typing import Optional, Tuple
+
 import torch
 import torch_npu
 from torch.nn.parameter import Parameter
-from typing import Optional, Tuple
+
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod, 
     pad_vocab_size, 
-    VocabParallelEmbedding as VocabParallelEmbeddingGPU
+    VocabParallelEmbedding
 )
 from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig, QuantizeMethodBase, method_has_implemented_embedding)
-
+    QuantizationConfig,
+    QuantizeMethodBase,
+    method_has_implemented_embedding
+)
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.distributed import (
+    divide,
+    tensor_model_parallel_all_gather,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter
+)
 
-from vllm.distributed import (divide,
-                              get_dp_group,
-                              tensor_model_parallel_all_gather,
-                              get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce,
-                              tensor_model_parallel_reduce_scatter)
 from omni_npu.v1.distributed.parallel_state_ext import (
     get_local_world_group,
     get_world_group,
@@ -32,14 +37,18 @@ from omni_npu.v1.distributed.communication_op_ext import (
     reduce_scatter_local,
 )
 
+
 DEFAULT_VOCAB_PADDING_SIZE = 64
- 
+
 
 def get_masked_input_and_mask(
-        input_: torch.Tensor, org_vocab_start_index: int,
-        org_vocab_end_index: int, num_org_vocab_padding: int,
-        added_vocab_start_index: int,
-        added_vocab_end_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    input_: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # torch.jit.script will fuse all of the pointwise ops below
     # into a single kernel, making it very fast
     org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ <
@@ -60,21 +69,23 @@ def get_masked_input_and_mask(
     # Adapt end.
     input_ = vocab_mask * (input_ - valid_offset)
     return input_, ~vocab_mask
- 
- 
-class NPUVocabParallelEmbedding(VocabParallelEmbeddingGPU):
-    def __init__(self,
-                 num_embeddings: int,
-                 embedding_dim: int,
-                 params_dtype: Optional[torch.dtype] = None,
-                 org_num_embeddings: Optional[int] = None,
-                 padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "",
-                 parallel_lmhead: bool = False):
- 
+
+
+class NPUVocabParallelEmbedding(VocabParallelEmbedding):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        params_dtype: Optional[torch.dtype] = None,
+        org_num_embeddings: Optional[int] = None,
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        parallel_lmhead: bool = False
+    ):
+
         torch.nn.Module.__init__(self)
- 
+
         # Keep the input dimensions.
         # adapt: lm_head use local tp
         self.parallel_lmhead = parallel_lmhead
@@ -84,7 +95,7 @@ class NPUVocabParallelEmbedding(VocabParallelEmbeddingGPU):
         else:
             tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
- 
+
         # adapt end.
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
@@ -97,20 +108,20 @@ class NPUVocabParallelEmbedding(VocabParallelEmbeddingGPU):
             self.padding_size)
         if self.org_vocab_size_padded > self.num_embeddings_padded:
             raise RuntimeError("self.org_vocab_size_padded > self.num_embeddings_padded")
- 
+
         self.shard_indices = self._get_indices(self.num_embeddings_padded,
                                                self.org_vocab_size_padded,
                                                self.num_embeddings,
                                                self.org_vocab_size, tp_rank,
                                                self.tp_size)
         self.embedding_dim = embedding_dim
- 
+
         quant_method = None
         if quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
- 
+
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another
         # layer type like ParallelLMHead, this is not important.
@@ -121,9 +132,9 @@ class NPUVocabParallelEmbedding(VocabParallelEmbeddingGPU):
             raise NotImplementedError(
                 f"The class {type(quant_method).__name__} must implement "
                 "the 'embedding' method, see UnquantizedEmbeddingMethod.")
- 
+
         self.quant_method: QuantizeMethodBase = quant_method
- 
+
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         # Divide the weight matrix along the vocaburaly dimension.
@@ -138,7 +149,7 @@ class NPUVocabParallelEmbedding(VocabParallelEmbeddingGPU):
         self.num_added_embeddings_per_partition = (
             self.shard_indices.added_vocab_end_index -
             self.shard_indices.added_vocab_start_index)
- 
+
         self.quant_method.create_weights(self,
                                          self.embedding_dim,
                                          [self.num_embeddings_per_partition],
@@ -146,7 +157,7 @@ class NPUVocabParallelEmbedding(VocabParallelEmbeddingGPU):
                                          self.num_embeddings_padded,
                                          params_dtype=params_dtype,
                                          weight_loader=self.weight_loader)
- 
+
     def forward_vocab(self, input_, reduce = 0):
         if self.tp_size > 1:
             # Build the mask.
@@ -161,7 +172,7 @@ class NPUVocabParallelEmbedding(VocabParallelEmbeddingGPU):
                 self.shard_indices.added_vocab_end_index)
         else:
             masked_input = input_
- 
+
         if masked_input.dtype != torch.long:
             masked_input = masked_input.long()
         # Get the embeddings.
@@ -176,16 +187,17 @@ class NPUVocabParallelEmbedding(VocabParallelEmbeddingGPU):
             output = reduce_scatter_local(output_parallel)
         else:
             # Reduce across all the model parallel GPUs.
-            output = tensor_model_parallel_reduce_scatter(output_parallel)
+            output = tensor_model_parallel_reduce_scatter(output_parallel, dim=0)
         return output
- 
+
+
 class NPUParallelLMHead(NPUVocabParallelEmbedding):
     """Parallelized LM head.
- 
+
     Output logits weight matrices used in the Sampler. The weight and bias
     tensors are padded to make sure they are divisible by the number of
     model parallel GPUs.
- 
+
     Args:
         num_embeddings: vocabulary size.
         embedding_dim: size of hidden state.
@@ -194,17 +206,19 @@ class NPUParallelLMHead(NPUVocabParallelEmbedding):
         org_num_embeddings: original vocabulary size (without LoRA).
         padding_size: padding size for the vocabulary.
     """
- 
-    def __init__(self,
-                 num_embeddings: int,
-                 embedding_dim: int,
-                 bias: bool = False,
-                 params_dtype: Optional[torch.dtype] = None,
-                 org_num_embeddings: Optional[int] = None,
-                 padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "",
-                 parallel_lmhead: bool = True):
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        bias: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        org_num_embeddings: Optional[int] = None,
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        parallel_lmhead: bool = True
+    ):
         super().__init__(num_embeddings, embedding_dim, params_dtype,
                          org_num_embeddings, padding_size, quant_config,
                          prefix, parallel_lmhead)
@@ -229,7 +243,11 @@ class NPUParallelLMHead(NPUVocabParallelEmbedding):
             self.weight = embed_tokens.weight
             return self
 
-    def forward(self, hidden_states, embedding_bias):
+    def forward(
+        self,
+        hidden_states,
+        embedding_bias
+    ):
         if self.parallel_lmhead:
             hidden_states = get_local_world_group().all_gather(hidden_states, dim=0)
 

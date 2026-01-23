@@ -46,7 +46,8 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from omni_npu.v1.fused_mlp.layer import FusedMLP
+
+from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
@@ -55,9 +56,9 @@ from omni_npu.v1.models.config_loader.loader import model_extra_config
 
 logger = init_logger(__name__)
 
+
 class DeepseekV2MLP(FusedMLP):
     pass
-
 
 
 class DeepseekV2MoE(nn.Module):
@@ -344,7 +345,7 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
-            residual = hidden_states.clone()
+            residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)

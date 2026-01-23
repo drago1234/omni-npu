@@ -3,11 +3,14 @@
 
 from typing import Optional, Callable, Union
 from abc import ABC
+
 import torch
 import torch_npu
+
 from vllm.platforms import current_platform
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config, FusedMoEQuantConfig
+
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
 from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethod
 from omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize import (
@@ -98,7 +101,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        topk_weights, topk_ids, _ = NPUFusedMoE.select_experts(
+        topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,

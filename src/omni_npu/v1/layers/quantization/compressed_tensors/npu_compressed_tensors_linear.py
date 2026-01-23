@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 
 from omni_npu.v1.distributed.communication_op_ext import layer_parallel_all2all_single, layer_parallel_all_gather
-from omni_npu.v1.fused_mlp.layer import FusedMLPMethodBase
+from omni_npu.v1.layers.fused_mlp.layer import FusedMLPMethodBase
 from omni_npu.v1.layers.linear import (
     FlashCommLinearMethodBase,
     layer_parallel_communication_op
@@ -259,7 +259,7 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
     ) -> torch.Tensor:
         x, x_scale = self.apply_quant(x, layer.gate_up_proj.x_transform, stream_label)
         x, x_scale = self._layer_parallel_apply_x_transform(
-            layer, x, x_scale, layer.gate_up_proj.x_transform, layer.gate_up_proj.x_dim,layer.gate_up_proj.layer_name_inside_block
+            layer.gate_up_proj, x, x_scale, layer.gate_up_proj.x_transform, layer.gate_up_proj.x_dim,layer.gate_up_proj.layer_name_inside_block
         )
         y_gate_up_int32 = self.apply_part1_gate_up_on_stream(
             layer, x, x_scale, stream_label
@@ -275,7 +275,7 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
             layer, y_gate_up_int32, x_scale, stream_label
         )
         int_int32,int_scale = self._layer_parallel_apply_x_transform(
-            layer,
+            layer.down_proj,
             int_int32,
             int_scale,
             layer.down_proj.x_transform,

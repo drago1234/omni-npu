@@ -13,7 +13,9 @@ except:
 
 from vllm.platforms import current_platform
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+)
 from vllm.config import VllmConfig, CacheConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.forward_context import get_forward_context
@@ -497,17 +499,11 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             q_nope, q_pe, q_norm, k_nope, k_pe, dequant_scale_q_nope, dequant_scale_q_norm = \
                 self._forward_mlaprolog(hidden_states, cos, sin, kv_cache, attn_metadata)
         else:
-            if self.q_lora_rank is not None:
-                q_lora = self.q_a_proj(hidden_states)[0]
-            else:
-                q_lora = self.q_proj(hidden_states)[0]
+            q_lora = self.q_a_proj(hidden_states)[0]
             kv = self.kv_a_proj_with_mqa(hidden_states)[0]
 
-            if self.q_lora_rank is not None:
-                q_norm = self.q_a_layernorm(q_lora)
-                q = self.q_b_proj(q_norm)[0]
-            else:
-                q = q_lora
+            q_norm = self.q_a_layernorm(q_lora)
+            q = self.q_b_proj(q_norm)[0]
 
             bsz, _ = q.shape
             q = q.view(bsz, self.num_local_heads, 1, self.qk_head_dim)

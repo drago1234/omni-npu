@@ -12,7 +12,7 @@
         "gmm_nz": true,
         "decode_moe_dispatch_combine": true,
         "enable_super_kernel": false,
-        "enable_mlaprolog": false,
+        "enable_mlaprolog": true,
         "cast_w2_scale_f32": true,
         "control_accept_rate": -1,
         "enable_prefetch": true,

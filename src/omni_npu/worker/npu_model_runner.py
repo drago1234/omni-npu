@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
+import os
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import TYPE_CHECKING, Optional, Union, Any, cast, TypeAlias
@@ -7,6 +9,7 @@ from typing import TYPE_CHECKING, Optional, Union, Any, cast, TypeAlias
 import torch
 import numpy as np
 import torch.nn as nn
+
 from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
@@ -14,7 +17,22 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.distributed.kv_transfer import get_kv_transfer_group
-from vllm.distributed.parallel_state import get_pp_group, prepare_communication_buffer_for_model
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    prepare_communication_buffer_for_model,
+)
+from vllm.attention.backends.abstract import (
+    AttentionMetadata,
+)
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.forward_context import set_forward_context
+from vllm.logger import logger
+from vllm.sequence import IntermediateTensors
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -22,29 +40,20 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
 )
-from vllm.attention.backends.abstract import (
-    AttentionMetadata,
-)
-from vllm.forward_context import set_forward_context
-from vllm.logger import logger
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.sequence import IntermediateTensors
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import ACLGraphWrapper, set_graph_params
 
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
 
 @contextmanager
 def switch_torch_device():

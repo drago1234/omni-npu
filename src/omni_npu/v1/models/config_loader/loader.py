@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, fields, asdict
 from typing import Any
 import json
 import os
+
 import torch
 import torch_npu
 
@@ -13,8 +14,8 @@ from vllm.logger import init_logger
 
 from .features import apply_eager_mode_config, apply_omni_cache
 
-logger = init_logger(__name__)
 
+logger = init_logger(__name__)
 default_config_path = os.path.normpath(os.path.join(os.path.abspath(__file__), '../../configs'))
 
 
@@ -70,6 +71,7 @@ def load_model_extra_config(model_config, vllm_config, scheduler_config):
     )
     _validate_config(vllm_config.additional_config)
     _print_model_config()
+
 
 @dataclass
 class TaskConfig:
@@ -170,6 +172,7 @@ class ModelOperatorOptConfig:
             # if use weight nz, this config must be True
             torch.npu.config.allow_internal_format = True
 
+
 @dataclass 
 class ModelExtraConfig:
     parall_config: ModelParallelConfig = field(default_factory = ModelParallelConfig)
@@ -179,9 +182,11 @@ class ModelExtraConfig:
 
 model_extra_config = ModelExtraConfig()
 
+
 def filter_dict_by_dataclass(dataclass_type, data_dict):
     valid_keys = {f.name for f in fields(dataclass_type)}
     return {k: v for k, v in data_dict.items() if k in valid_keys}
+
 
 def update_task_config(**kwargs):
     global model_extra_config
@@ -255,6 +260,7 @@ def parse_hf_config(hf_config):
 
     return model_name, quant_type
 
+
 def _init_model_extra_config(task_config):
 
     config_data = _get_best_practice_config(task_config)
@@ -273,7 +279,6 @@ def _init_model_extra_config(task_config):
         # Set default configs if no config data found
         setattr(model_extra_config, 'parall_config', ModelParallelConfig())
         setattr(model_extra_config, 'operator_opt_config', ModelOperatorOptConfig())
-
 
 
 def _loader_configs_data(file_path):
@@ -355,6 +360,7 @@ def _validate_config(additional_config):
     apply_eager_mode_config(model_extra_config)
     apply_omni_cache(additional_config)
 
+
 def _print_model_config():
     try:
         model_info = json.dumps(asdict(model_extra_config), indent=2, default=str, ensure_ascii=False)
@@ -362,12 +368,3 @@ def _print_model_config():
         model_info = repr(model_extra_config)
         logger.warning(f"Failed to JSON-serialize model_extra_config: {e}")
     logger.info(f"ModelExtraConfig: {model_info}")
-    
-
-
-    
-
-
-
-
-

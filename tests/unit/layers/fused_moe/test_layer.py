@@ -218,7 +218,7 @@ def test_forward_oot_uses_all2all_path(layer_module):
         side_effect=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim)
     )
     module.NPUFusedMoE.select_experts = MagicMock(
-        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32), None)
+        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32))
     )
     module.moe_infer_fusion = MagicMock(return_value=torch.ones(1, 3))
     stubs.context_holder.attn_metadata = None
@@ -255,7 +255,7 @@ def test_forward_oot_returns_shared_output_and_reduces(layer_module):
     )
     module.tensor_model_parallel_all_reduce = MagicMock(side_effect=lambda tensor: tensor + 1)
     module.NPUFusedMoE.select_experts = MagicMock(
-        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32), None)
+        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32))
     )
     stubs.context_holder.attn_metadata = {0: SimpleNamespace(num_prefills=0)}
 
@@ -278,7 +278,7 @@ def test_forward_oot_uses_fused_experts_tp_when_not_ep(layer_module):
 
     layer = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=False))
     module.NPUFusedMoE.select_experts = MagicMock(
-        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32), None)
+        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32))
     )
     stubs.context_holder.attn_metadata = {}
     stubs.fused_experts_tp.reset_mock()
@@ -370,7 +370,7 @@ def test_select_experts_profile_mode(layer_module):
     module.get_ep_group = MagicMock(return_value=SimpleNamespace(rank=1))
     logits = torch.zeros(2, 4, dtype=torch.float32)
 
-    topk_weights, topk_ids, row_idx = module.NPUFusedMoE.select_experts(
+    topk_weights, topk_ids = module.NPUFusedMoE.select_experts(
         router_logits=logits,
         top_k=2,
         use_grouped_topk=False,
@@ -379,7 +379,6 @@ def test_select_experts_profile_mode(layer_module):
 
     assert topk_weights.shape == (2, 2)
     assert topk_ids.shape == (2, 2)
-    assert row_idx.shape == (2, 2)
     assert torch.all(topk_ids < logits.shape[1])
 
 
@@ -409,9 +408,9 @@ def test_select_experts_custom_routing(layer_module):
     logits = torch.zeros(1, 2)
 
     def custom_route(gating_output, topk, renormalize):
-        return torch.full((1, topk), 0.5), torch.ones((1, topk), dtype=torch.int32), torch.zeros((1, topk), dtype=torch.int32)
+        return torch.full((1, topk), 0.5), torch.ones((1, topk), dtype=torch.int32)
 
-    topk_weights, topk_ids, row_idx = module.NPUFusedMoE.select_experts(
+    topk_weights, topk_ids = module.NPUFusedMoE.select_experts(
         router_logits=logits,
         top_k=1,
         use_grouped_topk=False,
@@ -421,7 +420,6 @@ def test_select_experts_custom_routing(layer_module):
 
     assert torch.equal(topk_weights, torch.full((1, 1), 0.5))
     assert torch.equal(topk_ids, torch.ones((1, 1), dtype=torch.int32))
-    assert torch.equal(row_idx, torch.zeros((1, 1), dtype=torch.int32))
 
 
 @pytest.mark.unit
