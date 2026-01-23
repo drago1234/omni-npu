@@ -103,7 +103,6 @@ class TestLLMDataDistConnectorV1LifeCycle:
             schedule_output = scheduler.schedule()
             assert request.request_id in schedule_output.num_scheduled_tokens
 
-    @run_in_process
     def test_all_worker(self):
         vllm_config_p = create_vllm_config(kv_role="kv_producer")
         vllm_config_p.model_config.is_deepseek_mla = True
