@@ -227,8 +227,8 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
 
         # update kv cache
         slots = attn_metadata.slot_mapping.view(-1, 1)
-        torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
-        torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
+        torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, self.num_kv_heads*key.shape[-1]), slots, key)
+        torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, self.num_kv_heads*value.shape[-1]), slots, value)
 
         attn_output = torch_npu.npu_fused_infer_attention_score_v2(
             query,

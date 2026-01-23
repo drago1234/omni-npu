@@ -247,8 +247,7 @@ class ACLGraphWrapper:
             # entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
             if not isinstance(aslkv, torch.Tensor):
                 aslkv = self._pad_list(aslkv, batch_descriptor.num_reqs) # padding  aslkv to match gear
-                asl = self._pad_list(asl, batch_descriptor.num_reqs) # padding  asl to match gear
-                entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
+                entry.aclgraph.update(cpu_update_input=[{"actual_seq_kvlen": aslkv, "actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
         return entry.output
