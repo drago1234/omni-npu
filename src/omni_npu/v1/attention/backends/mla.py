@@ -133,6 +133,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if metadata.prefill is not None:
             metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1]
             metadata.prefill.seq_lens = metadata.prefill.query_cumlens
+            metadata.prefill.actual_seq_cumlens = metadata.prefill.query_start_loc[1:]
             metadata.prefill.query_start_loc = metadata.prefill.query_start_loc.tolist()
         if metadata.prefill is not None and metadata.prefill.chunked_context is not None:
             raise RuntimeError(f"Chunked prefill is not enabled yet.")
