@@ -30,7 +30,6 @@ Features:
 """
 
 import inspect
-
 from typing import Any, Dict, Optional, Union, List
 from filelock import FileLock
 import json
@@ -43,7 +42,6 @@ import ast
 import torch
 from torch import nn
 
-# from vllm.attention import AttentionMetadata
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.distributed import (
     get_dp_group,
@@ -54,7 +52,6 @@ from vllm.distributed import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.forward_context import ForwardContext, get_forward_context
-
 from vllm.logger import logger
 
 
@@ -116,26 +113,52 @@ def mock_model_class_factory(base_class: type) -> type:
             prefix: Optional prefix for model components (passed to base_class).
         """
         self.no_npu = int(os.getenv("NO_NPU_MOCK", default="0"))
-        logger.error(f"######## NO_NPU_MOCK {self.no_npu}")
+        logger.debug(f"######## NO_NPU_MOCK {self.no_npu}")
+
         if self.no_npu:
-            # If NO_NPU_MOCK is set, initialize as a standard nn.Module
-            # and extract necessary config details.
-            nn.Module.__init__(self)
+            served_model_name = vllm_config.model_config.served_model_name
+            if served_model_name == "qwen":
+                nn.Module.__init__(self)
 
-            config = vllm_config.model_config.hf_config
-            self.config = config
+                _orig_empty = torch.empty
+                def cpu_empty(*args, **kwargs):
+                    kwargs.pop("device", None)
+                    kwargs.pop("device_id", None)
+                    return _orig_empty(*args, device="cpu", **kwargs)
+                torch.empty = cpu_empty
 
-            self.vocab_size = config.vocab_size
+                self.config = vllm_config.model_config.hf_config.get_text_config()
+                self.quant_config = vllm_config.quant_config
 
-            from vllm.model_executor.models.utils import (
-                make_empty_intermediate_tensors_factory,
-            )
+                from vllm.model_executor.models.qwen2 import Qwen2Model
+                from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
+                from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-            self.make_empty_intermediate_tensors = (
-                make_empty_intermediate_tensors_factory(
-                    ["hidden_states", "residual"], config.hidden_size
+                self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+                if get_pp_group().is_last_rank:
+                    if self.config.tie_word_embeddings:
+                        self.lm_head = self.model.embed_tokens
+                    else:
+                        self.lm_head = ParallelLMHead(
+                            self.config.vocab_size,
+                            self.config.hidden_size,
+                            quant_config=self.quant_config,
+                            prefix=maybe_prefix(prefix, "lm_head"),
+                        )
+                else:
+                    self.lm_head = PPMissingLayer()
+
+                torch.empty = _orig_empty
+
+                self.all_param_names = set()
+                for name, _ in self.named_parameters():
+                    full_name = maybe_prefix(prefix, name) if prefix else name
+                    self.all_param_names.add(full_name)
+            else:
+                raise NotImplementedError(
+                    f"Model {served_model_name} is not supported yet, only qwen model is supported currently."
                 )
-            )
+
         else:
             # Otherwise, initialize using the base class's __init__ method.
             base_class.__init__(self, vllm_config=vllm_config, prefix=prefix)
@@ -150,30 +173,17 @@ def mock_model_class_factory(base_class: type) -> type:
         self.capture_mode = int(os.getenv("CAPTURE_MODE", default="0"))
         self.replay_mode = int(os.getenv("REPLAY_MODE", default="0"))
         self.mock_capture_dir = os.getenv("MOCK_CAPTURE_DIR", default="./mock_capture")
-        self.mock_capture_file_lock = os.getenv(
-            "MOCK_CAPTURE_FILE_LOCK", default=".lock"
-        )
-        self.mock_capture_file = os.getenv(
-            "MOCK_CAPTURE_FILE", default="mock_cache"
-        ) + (
-            "p" if self.prefill_process else ""
-        )  # Append 'p' for prefill process
-        self.simulate_elapsed_time = int(
-            os.getenv("SIMULATE_ELAPSED_TIME", default="0")
-        )
+        self.mock_capture_file_lock = os.getenv("MOCK_CAPTURE_FILE_LOCK", default=".lock")
+        self.mock_capture_file = os.getenv("MOCK_CAPTURE_FILE", default="mock_cache") + ("p" if self.prefill_process else "")  # Append 'p' for prefill process
+        self.simulate_elapsed_time = int(os.getenv("SIMULATE_ELAPSED_TIME", default="0"))
         self.random_mode = int(os.getenv("RANDOM_MODE", default="0"))
-        self.forward_time = int(
-            os.getenv("FORWARD_TIME", "0")
-        )  # Simulated forward time in ms
-        self.mock_compute_logits = int(
-            os.getenv("MOCK_COMPUTE_LOGITS", default=self.random_mode)
-        )
+        self.forward_time = int(os.getenv("FORWARD_TIME", "0"))  # Simulated forward time in ms
+        self.mock_compute_logits = int(os.getenv("MOCK_COMPUTE_LOGITS", default=self.random_mode))
 
         # Create capture directory if it doesn't exist
         if not os.path.exists(self.mock_capture_dir):
             logger.debug(f">>>Creating {self.mock_capture_dir}.")
             import pathlib
-
             pathlib.Path(self.mock_capture_dir).mkdir(parents=True, exist_ok=True)
         else:
             logger.debug(f">>>{self.mock_capture_dir} already exists.")
@@ -1326,17 +1336,19 @@ def mock_model_class_factory(base_class: type) -> type:
 
     def load_weights(self, weights):
         """
-        Loads model weights. If `NO_NPU_MOCK` is set, it returns an empty set,
+        Loads model weights. If `NO_NPU_MOCK` is set, it mocks weight loading by
+        returning all parameter names to make vLLM recognize all params are loaded,
         otherwise, it delegates to the base class's `load_weights` method.
 
         Args:
             weights: Weights to load.
 
         Returns:
-            A set of loaded weights or an empty set.
+            A set of loaded weight names for mocked or physical NPU.
         """
         if self.no_npu:
-            return set()
+            # return all pre-collected param names to pass vLLM's weight validation
+            return self.all_param_names
         else:
             # load full model. If want to save memory, either use No-NPU version,
             # or add code from model here and ignore unused parameters
@@ -1355,4 +1367,3 @@ def mock_model_class_factory(base_class: type) -> type:
         },
     )
     return mock_model_class
-    
