@@ -17,14 +17,9 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_gather,
 )
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -53,6 +48,7 @@ from vllm.sequence import IntermediateTensors
 
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
+from omni_npu.v1.fused_mlp.layer import FusedMLP
 
 
 def check_ffn_act_fn(act_fn: str) -> None:
@@ -98,47 +94,9 @@ def _has_mla_config(config: PretrainedConfig) -> bool:
         and hasattr(config, "kv_lora_rank")
     )
 
-
-class OpenPanguMLP(nn.Module):
+class OpenPanguMLP(FusedMLP):
     """Dense FFN block used by Pangu layers (and shared experts)."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: QuantizationConfig | None = None,
-        bias: bool = False,
-        reduce_results: bool = True,
-        disable_tp: bool = False,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=bias,
-            quant_config=quant_config,
-            disable_tp=disable_tp,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=bias,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            disable_tp=disable_tp,
-            prefix=f"{prefix}.down_proj",
-        )
-
-        check_ffn_act_fn(hidden_act)
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        out, _ = self.down_proj(self.act_fn(gate_up))
-        return out
+    pass
 
 
 class OpenPanguMoE(nn.Module):
@@ -319,7 +277,6 @@ class OpenPanguDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                bias=getattr(config, "mlp_bias", False),
                 prefix=f"{prefix}.mlp",
             )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)

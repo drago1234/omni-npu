@@ -24,5 +24,23 @@
                 "decode_config_file": "deepseek/ds_r1_w8a8c16_a3_1p1d_d.json"
             }
         }
+    },
+    {
+        "model": "pangu_ultra_moe",
+        "hardware": "A3",
+        "precision": "w8a8c16",
+        "configs":{
+            "1P1D": {
+                "prefill_config_file": "pangu_ultra_moe/pangu_ultra_moe_w8a8c16_a3_1p1d_p.json",
+                "decode_config_file": "pangu_ultra_moe/pangu_ultra_moe_w8a8c16_a3_1p1d_d.json"
+            },
+            "4P1D":{
+                "prefill_config_file": "pangu_ultra_moe/pangu_ultra_moe_w8a8c16_a3_4p1d_p.json",
+                "decode_config_file": "pangu_ultra_moe/pangu_ultra_moe_w8a8c16_a3_4p1d_d.json"
+            },
+            "hybrid":{
+                "config_file":"pangu_ultra_moe/pangu_ultra_moe_a3_hybrid.json"
+            }
+        }
     }
 ]

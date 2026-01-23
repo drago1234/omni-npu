@@ -17,6 +17,9 @@ def register_models():
     ModelRegistry.register_model(
         "PanguUltraMoEForCausalLM",
         "omni_npu.v1.models.pangu.pangu_ultra_moe:PanguUltraMoEForCausalLM")
+    ModelRegistry.register_model(
+        "OpenPanguMTPModel",
+        "omni_npu.v1.models.pangu.pangu_ultra_moe_mtp:OpenPanguMTP")
 
     import os
 
