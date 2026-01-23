@@ -27,13 +27,7 @@ from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe impo
     NPUCompressedTensorsW8A8Int8MoEMethod
 from omni_npu.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import \
     NPUCompressedTensorsW8A8Int8
-from omni_npu.v1.fused_mlp.layer import FusedMLP
-from omni_npu.v1.layers.linear import FlashCommLinearBase, UnquantizedFlashCommLinearMethod
-from omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear import (
-    W8A8Int8FCLinearMethod,
-    W8A8Int8MlpMethod,
-)
-
+    
 
 NPU_COMPRESSED_TENSORS = "npu-compressed-tensors"
 
@@ -230,7 +224,10 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
             )
 
-    def get_fc_method(self, layer: FlashCommLinearBase, layer_name: Optional[str] = None) -> Optional[QuantizeMethodBase]:
+    def get_fc_method(self, layer, layer_name: Optional[str] = None) -> Optional[QuantizeMethodBase]:
+        from omni_npu.v1.layers.linear import UnquantizedFlashCommLinearMethod
+        from omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear import W8A8Int8FCLinearMethod
+
         if should_ignore_layer(
             layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
@@ -264,6 +261,7 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
+
         if isinstance(layer, LinearBase):
             # collect schemes
             quant_scheme = self.get_scheme(layer=layer, layer_name=prefix)
@@ -275,8 +273,12 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
             return quant_method
         if isinstance(layer, FusedMoE):
             return self.get_moe_method(layer)
-        if isinstance(layer, FlashCommLinearBase):
-            return self.get_fc_method(layer, prefix)
-        if isinstance(layer, FusedMLP):
-            return W8A8Int8MlpMethod(self)
+        if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
+            from omni_npu.v1.fused_mlp.layer import FusedMLP
+            from omni_npu.v1.layers.linear import FlashCommLinearBase
+            from omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_linear import W8A8Int8MlpMethod
+            if isinstance(layer, FlashCommLinearBase):
+                return self.get_fc_method(layer, prefix)
+            if isinstance(layer, FusedMLP):
+                return W8A8Int8MlpMethod(self)
         return None

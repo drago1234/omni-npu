@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import os
 import pytest
 import torch
 import torch_npu
@@ -64,22 +65,23 @@ def _logic_column_parallel_flash_comm_linear_quant(device, local_rank, world_siz
     output_size = 10
     batch_size = 2
 
-    with patch(
-        "omni_npu.layers.quantization.compressed_tensors.compressed_tensors.NPUCompressedTensorsConfig.get_fc_method",
-        return_value=W8A8Int8FCLinearMethod(quant_config)
-    ):
-        layer = ColumnParallelFlashCommLinear(
-            input_size=input_size,
-            output_size=output_size,
-            bias=True,
-            skip_bias_add=False,
-            params_dtype=dtype,
-            quant_config=quant_config,
-            output_sizes=None,
-            prefix="model.layers.4.self_attn.o_proj",
-            return_bias=True,
-            disable_tp=False
-        ).to(device)
+    with patch.dict(os.environ, {"VLLM_PLUGINS": "omni_custom_models"}):
+        with patch(
+            "omni_npu.layers.quantization.compressed_tensors.compressed_tensors.NPUCompressedTensorsConfig.get_fc_method",
+            return_value=W8A8Int8FCLinearMethod(quant_config)
+        ):
+            layer = ColumnParallelFlashCommLinear(
+                input_size=input_size,
+                output_size=output_size,
+                bias=True,
+                skip_bias_add=False,
+                params_dtype=dtype,
+                quant_config=quant_config,
+                output_sizes=None,
+                prefix="model.layers.4.self_attn.o_proj",
+                return_bias=True,
+                disable_tp=False
+            ).to(device)
     full_weight = torch.randn(output_size, input_size, dtype=torch.int8, device=device)
     full_bias = torch.randn(output_size, dtype=dtype, device=device)
     shard_size = output_size // world_size

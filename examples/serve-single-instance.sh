@@ -122,6 +122,7 @@ VLLM_CMD=(
     --max-num-seqs "$BSZ"
     --no-enable-chunked-prefill
     --no-enable-prefix-caching
+    --allowed-local-media-path /
     --distributed-executor-backend "$DIST_BACKEND"
     --gpu-memory-utilization 0.88
     --trust-remote-code

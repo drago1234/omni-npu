@@ -198,9 +198,10 @@ class NPUModelRunner(GPUModelRunner):
             return
         super().load_model(eep_scale_up)
 
-        prefetch_post_load_hook = getattr(self.model.model, "prefetch_post_load", None)
-        if callable(prefetch_post_load_hook):
-            prefetch_post_load_hook()
+        if hasattr(self.model, "model"):
+            prefetch_post_load_hook = getattr(self.model.model, "prefetch_post_load", None)
+            if callable(prefetch_post_load_hook):
+                prefetch_post_load_hook()
 
         if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
             prepare_communication_buffer_for_model(self.drafter.model)
