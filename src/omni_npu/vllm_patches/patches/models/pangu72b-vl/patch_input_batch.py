@@ -12,10 +12,10 @@ from vllm.v1.sample.logits_processor import (
     LogitsProcessors,
 )
 from vllm.v1.worker.block_table import MultiGroupBlockTable
-
+from vllm.v1.worker.gpu_input_batch import InputBatch 
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from vllm.v1.worker.gpu_input_batch import InputBatch 
+
 
 @register_patch("InputBatchPatch", InputBatch)
 class InputBatchPatch(VLLMPatch):
@@ -37,7 +37,11 @@ class InputBatchPatch(VLLMPatch):
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
         num_speculative_tokens: int = 0,
+
+        #####patch start: for pangu72B-VL
         sink_len: int = 0,
+        #####patch end
+
         cp_kv_cache_interleave_size: int = 1,
     ):
         self.is_pooling_model = is_pooling_model
@@ -92,7 +96,11 @@ class InputBatchPatch(VLLMPatch):
             block_sizes=block_sizes,
             kernel_block_sizes=kernel_block_sizes,
             num_speculative_tokens=num_speculative_tokens,
+
+            #####patch start: for pangu72B-VL
             sink_len=sink_len,
+            #####patch end
+
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 

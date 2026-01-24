@@ -1,12 +1,13 @@
+from vllm.config import ModelConfig
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from vllm.config import ModelConfig
 
 @register_patch("ModelConfigPatch", ModelConfig)
 class ModelConfigPatch(VLLMPatch):
     _attr_names_to_apply = ['get_total_num_hidden_layers']
 
     
+    #####patch start: for pangu72B-VL
     def get_total_num_hidden_layers(self) -> int:
         if (
             self.hf_text_config.model_type == "deepseek_mtp"
@@ -29,3 +30,4 @@ class ModelConfigPatch(VLLMPatch):
                 self.hf_text_config, "num_hidden_layers", 0
             )
         return total_num_hidden_layers
+    #####patch end

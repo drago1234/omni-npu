@@ -1,4 +1,7 @@
+from contextlib import nullcontext
+
 import torch
+
 from vllm.forward_context import get_forward_context
 from vllm.distributed import (
     get_ep_group,
@@ -8,12 +11,10 @@ from vllm.platforms import current_platform
 from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
-from contextlib import nullcontext
 from vllm.utils.torch_utils import current_stream
-
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
 
 @register_patch("FusedMoEPatch", FusedMoE)
@@ -46,7 +47,11 @@ class FusedMoEPatch(VLLMPatch):
             return states
 
         if self.shared_experts is None:
+
+            #####patch start: for pangu72B-VL
             if current_platform.is_tpu() or current_platform.is_out_of_tree():
+            #####patch end
+
                 # TODO: Once the OOM issue for the TPU backend is resolved, we
                 # will switch to using the moe_forward custom op.
                 fused_output = self.forward_impl(hidden_states, router_logits)
@@ -64,7 +69,11 @@ class FusedMoEPatch(VLLMPatch):
             else:
                 return reduce_output(fused_output)[..., :og_hidden_states]
         else:
+
+            #####patch start: for pangu72B-VL
             if current_platform.is_tpu() or current_platform.is_out_of_tree():
+            #####patch end
+
                 # TODO: Once the OOM issue for the TPU backend is resolved, we
                 # will switch to using the moe_forward custom op.
                 shared_output, fused_output = self.forward_impl(
@@ -213,6 +222,8 @@ class FusedMoEPatch(VLLMPatch):
                 return states
 
             if self.shared_experts is not None:
+
+                #####patch start: for pangu72B-VL
                 if isinstance(final_hidden_states, tuple):
                     return (
                         final_hidden_states[0],
@@ -224,6 +235,8 @@ class FusedMoEPatch(VLLMPatch):
                         shared_output,
                         combine_output(final_hidden_states),
                     )
+                #####patch end
+
             elif self.zero_expert_num is not None and self.zero_expert_num > 0:
                 assert isinstance(final_hidden_states, torch.Tensor)
                 return (combine_output(final_hidden_states), zero_expert_result)

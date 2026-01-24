@@ -1,8 +1,6 @@
-from vllm.config import CacheConfig, get_current_vllm_config
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-from vllm.attention.selector import get_attn_backend
 import torch
 import torch.nn as nn
+
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.platforms import current_platform
 from vllm.attention.utils.kv_sharing_utils import validate_kv_sharing_target
@@ -16,15 +14,17 @@ from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionType,
 )
+from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.attention.selector import get_attn_backend
+from vllm.attention.layer import Attention, _init_kv_cache_quant
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from vllm.attention.layer import Attention, _init_kv_cache_quant
 
 @register_patch("AttentionPatch", Attention)
 class AttentionPatch(VLLMPatch):
     _attr_names_to_apply = ['__init__', 'forward']
 
-    
     def __init__(
         self,
         num_heads: int,
@@ -40,15 +40,23 @@ class AttentionPatch(VLLMPatch):
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
         attn_backend: type[AttentionBackend] | None = None,
+
+        #####patch start: for pangu72B-VL
         head_size_v: int | None = None,
+        #####patch end
+
         **extra_impl_args,
     ) -> None:
         """
         The KV cache is stored inside this class and is accessed via
         `self.kv_cache`.
         """
+
+        #####patch start: for pangu72B-VL
         nn.Module.__init__(self)
         AttentionLayerBase.__init__(self)
+        #####patch end
+
         if per_layer_sliding_window is not None:
             # per-layer sliding window
             sliding_window = per_layer_sliding_window
@@ -83,7 +91,11 @@ class AttentionPatch(VLLMPatch):
 
         self.num_heads = num_heads
         self.head_size = head_size
+
+        #####patch start: for pangu72B-VL
         self.head_size_v = self.head_size if head_size_v is None else head_size_v
+        #####patch end
+
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
         self.has_sink = extra_impl_args.get("sinks") is not None
@@ -200,6 +212,8 @@ class AttentionPatch(VLLMPatch):
                 query, _ = self.query_quant(query, self._q_scale)
 
         if self.use_output:
+
+            #####patch start: for pangu72B-VL
             if output_shape is None:
                 output_shape = torch.Size(
                     (*query.shape[:-1], self.num_heads * self.head_size_v)
@@ -209,16 +223,22 @@ class AttentionPatch(VLLMPatch):
             output = torch.zeros(output_shape,
                                  dtype=output_dtype,
                                  device=query.device)
+            #####patch end
+
             hidden_size = output_shape[-1]
             # Reshape the query, key, and value tensors.
             # NOTE(woosuk): We do this outside the custom op to minimize the
             # CPU overheads from the non-CUDA-graph regions.
             query = query.view(-1, self.num_heads, self.head_size)
+
+            #####patch start: for pangu72B-VL
             output = output.view(-1, self.num_heads, self.head_size_v)
             if key is not None:
                 key = key.view(-1, self.num_kv_heads, self.head_size)
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size_v)
+            #####patch end
+
             if self.use_direct_call:
                 forward_context: ForwardContext = get_forward_context()
                 attn_metadata = forward_context.attn_metadata

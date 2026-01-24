@@ -1,11 +1,11 @@
+import types
+import sys
 from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -20,23 +20,23 @@ from vllm.model_executor.models.deepseek_mtp import (
 )
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
-
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.openpangu import OpenPanguDecoderLayer
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from vllm.model_executor import models
-import types
-import sys
+
 
 dynamic_module = types.ModuleType("openpangu_vl_mtp")
 sys.modules[models.__name__+".openpangu_vl_mtp"] = dynamic_module
 models.openpangu_vl_mtp = dynamic_module
+
 
 @register_patch("OpenPanguVLMultiTokenPredictorLayerPatch", models)
 class OpenPanguVLMultiTokenPredictorLayerPatch(VLLMPatch):
     _attr_names_to_apply = ['OpenPanguVLMultiTokenPredictorLayer']
 
     
+    #####patch start: for pangu72B-VL
     class OpenPanguVLMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
         def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
             nn.Module.__init__(self)
@@ -77,12 +77,17 @@ class OpenPanguVLMultiTokenPredictorLayerPatch(VLLMPatch):
 
             hidden_states = residual + hidden_states
             return hidden_states
+    #####patch end
+
     models.openpangu_vl_mtp.OpenPanguVLMultiTokenPredictorLayer = OpenPanguVLMultiTokenPredictorLayer
+
 
 @register_patch("OpenPanguVLMultiTokenPredictorPatch", models)
 class OpenPanguVLMultiTokenPredictorPatch(VLLMPatch):
     _attr_names_to_apply = ['OpenPanguVLMultiTokenPredictor']
 
+
+    #####patch start: for pangu72B-VL
     class OpenPanguVLMultiTokenPredictor(DeepSeekMultiTokenPredictor):
 
         def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -107,13 +112,17 @@ class OpenPanguVLMultiTokenPredictorPatch(VLLMPatch):
                 config.hidden_size,
             )
             self.logits_processor = LogitsProcessor(config.vocab_size)
-    
+    #####patch end
+
     models.openpangu_vl_mtp.OpenPanguVLMultiTokenPredictor = OpenPanguVLMultiTokenPredictor
+
 
 @register_patch("OpenPanguVLMTPPatch", models)
 class OpenPanguVLMTPPatch(VLLMPatch):
     _attr_names_to_apply = ['OpenPanguVLMTP']
 
+
+    #####patch start: for pangu72B-VL
     class OpenPanguVLMTP(nn.Module, SupportsPP):
         def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
             super().__init__()
@@ -305,5 +314,6 @@ class OpenPanguVLMTPPatch(VLLMPatch):
                 # treat shared weights as top level weights
                 name = name.replace(f"model.layers.{spec_layer}.", "model.")
             return name
+    #####patch end
 
     models.openpangu_vl_mtp.OpenPanguVLMTP = OpenPanguVLMTP

@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+
 import numpy as np
 import torch
 
@@ -25,11 +26,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
-
-
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-import torch
-
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -47,12 +44,12 @@ from vllm.v1.worker.utils import (
     MultiModalBudget,
     bind_kv_cache,
 )
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner, ExecuteModelState
 from vllm.logger import init_logger
-logger = init_logger(__name__)
-
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner, ExecuteModelState
+logger = init_logger(__name__)
+
 
 @register_patch("GPUModelRunnerPatch", GPUModelRunner)
 class GPUModelRunnerPatch(VLLMPatch):
@@ -119,10 +116,14 @@ class GPUModelRunnerPatch(VLLMPatch):
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
         self.attention_chunk_size = model_config.attention_chunk_size
+
+        #####patch start: for pangu72B-VL
         self.sink_len = getattr(
             self.vllm_config.model_config.hf_config, "param_sink_number", 0
         )
         assert self.sink_len % self.cache_config.block_size == 0
+        #####patch end
+
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = model_config.uses_alibi
 
@@ -244,7 +245,11 @@ class GPUModelRunnerPatch(VLLMPatch):
             # uses output token ids so we set this conservatively.
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
+
+            #####patch start: for pangu72B-VL
             sink_len=self.sink_len,
+            #####patch end
+
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
@@ -440,7 +445,11 @@ class GPUModelRunnerPatch(VLLMPatch):
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
                 num_speculative_tokens=self.num_spec_tokens,
+
+                #####patch start: for pangu72B-VL
                 sink_len=self.sink_len
+                #####patch end
+
             )
 
     def _reshape_kv_cache_tensors(
@@ -478,6 +487,8 @@ class GPUModelRunnerPatch(VLLMPatch):
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
+
+                    #####patch start: for pangu72B-VL
                     if (
                         hasattr(kv_cache_spec, "head_size_v")
                         and kv_cache_spec.head_size_v is not None
@@ -488,6 +499,8 @@ class GPUModelRunnerPatch(VLLMPatch):
                     else:
                         kwargs = {}
                         stride_kwargs = {}
+                    #####patch end
+
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
                     )
@@ -499,11 +512,19 @@ class GPUModelRunnerPatch(VLLMPatch):
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
+
+                        #####patch start: for pangu72B-VL
                         **kwargs
+                        #####patch end
+
                     )
                     dtype = kv_cache_spec.dtype
                     try:
+
+                        #####patch start: for pangu72B-VL
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(**stride_kwargs)
+                        #####patch end
+
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)
                     except (AttributeError, NotImplementedError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
@@ -556,59 +577,4 @@ class GPUModelRunnerPatch(VLLMPatch):
         if has_attn and has_mamba:
             self._update_hybrid_attention_mamba_layout(kv_caches)
 
-        return kv_caches
-
-    def initialize_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
-    ) -> dict[str, torch.Tensor]:
-        """
-        Initialize the memory buffer for KV cache.
-
-        Args:
-            kv_cache_config: The KV cache config
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
-
-        Returns:
-            Dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
-        """
-
-        # Try creating KV caches optimized for kv-connector transfers
-        cache_dtype = self.cache_config.cache_dtype
-        if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
-            kv_caches, cross_layers_kv_cache, attn_backend = (
-                self.allocate_uniform_kv_caches(
-                    kv_cache_config,
-                    self.attn_groups,
-                    cache_dtype,
-                    self.device,
-                    kernel_block_sizes,
-                )
-            )
-            self.cross_layers_kv_cache = cross_layers_kv_cache
-            self.cross_layers_attn_backend = attn_backend
-        else:
-            # Fallback to the general case
-            # Initialize the memory buffer for KV cache
-            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
-
-            # Change the memory buffer to the desired shape
-            kv_caches = self._reshape_kv_cache_tensors(
-                kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
-            )
-
-        # Set up cross-layer KV cache sharing
-        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
-            logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
-            kv_caches[layer_name] = kv_caches[target_layer_name]
-
-        num_attn_module = (
-            2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
-        )
-        bind_kv_cache(
-            kv_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_caches,
-            num_attn_module,
-        )
         return kv_caches

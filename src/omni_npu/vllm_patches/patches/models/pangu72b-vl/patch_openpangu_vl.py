@@ -18,17 +18,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
-from typing import Callable, Literal, Optional, TypedDict, Union
+from functools import partial, lru_cache
+from typing import Callable, Literal, Optional, TypedDict, Union, List, Union, Tuple
 from collections.abc import Iterable, Mapping, Sequence
 import math
 import itertools
+import types
+import sys
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
 from einops import rearrange
+from transformers.utils import logging
+from transformers.utils import logging
+from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor, Qwen2_5_VLProcessorKwargs
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_utils import ImageInput
+from transformers.processing_utils import Unpack
+from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.video_utils import VideoInput
 
 from vllm.config import VllmConfig
 from vllm.distributed import parallel_state, tensor_model_parallel_all_gather
@@ -48,8 +59,6 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear,
                                                MergedColumnParallelLinear)
-
-    
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader 
 from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
                     init_vllm_registered_model, maybe_prefix,
@@ -60,30 +69,13 @@ from vllm.multimodal.inputs import MultiModalKwargs, MultiModalFeatureSpec
 from vllm.multimodal.processing import PromptUpdate, PromptReplacement, PromptUpdateDetails
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-
-from transformers.utils import logging
-
-
 from vllm.model_executor import models
 from torchvision.transforms.v2 import functional as tvF
-from functools import partial, lru_cache
 from vllm import ModelRegistry
-from typing import List, Optional, Union, Tuple
-from transformers.utils import logging
-from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor, Qwen2_5_VLProcessorKwargs
-from transformers.feature_extraction_utils import BatchFeature
-from transformers.image_utils import ImageInput
-from transformers.processing_utils import Unpack
-from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
-from transformers.video_utils import VideoInput
-
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-
-import types
-import sys
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
@@ -94,6 +86,8 @@ models.openpangu_72b_vl = dynamic_module
 
 logger = logging.get_logger(__name__)
 
+
+#####patch start: for pangu72B-VL
 def rescale(image, scale):
     return image * scale
 
@@ -148,7 +142,11 @@ def rescale_and_normalize(
     images = images.to(torch.bfloat16)
 
     return images
+#####patch end
 
+
+
+#####patch start: for pangu72B-VL
 class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
     tokenizer_class = ("AutoTokenizer")
 
@@ -293,8 +291,10 @@ class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
                 text[i] = text[i].replace(vision_token, placeholder_string, 1)
                 index += 1
             text[i] = text[i].replace("<|vision_placeholder|>", vision_token)
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class NPURMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -310,7 +310,10 @@ class NPURMSNorm(nn.Module):
             return x, residual
         else:
             return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
+#####patch end
 
+
+#####patch start: for pangu72B-VL
 def forward_W8A8Dynamic_FusedMLP(layer,x):
     def _apply_W8A8DynamicFusedMLPMethod(layer, x: torch.Tensor, x_scale: torch.Tensor, original_dtype):
         bias = layer.gate_up_proj.bias
@@ -347,7 +350,10 @@ def forward_W8A8Dynamic_FusedMLP(layer,x):
     if layer.down_proj.tp_size>1:
         x = tensor_model_parallel_all_reduce(x)
     return x
+#####patch end
 
+
+#####patch start: for pangu72B-VL
 class OpenPanguVisionAttention(nn.Module):
 
     def __init__(
@@ -438,8 +444,10 @@ class OpenPanguVisionAttention(nn.Module):
         if bias is not None:
             output = output + bias
         return output
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVisionMLP(nn.Module):
 
     def __init__(self,
@@ -500,8 +508,10 @@ class OpenPanguVisionMLP(nn.Module):
         if bias is not None:
             x = x + bias
         return x
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVisionBlock(nn.Module):
 
     def __init__(
@@ -539,8 +549,10 @@ class OpenPanguVisionBlock(nn.Module):
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states), cu_seqlens=cu_seqlens, cos=cos, sin=sin)
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVisionRotaryEmbedding(nn.Module):
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
@@ -561,8 +573,10 @@ class OpenPanguVisionRotaryEmbedding(nn.Module):
     def forward(self, seqlen: int) -> torch.Tensor:
         self.update_freqs_cache(seqlen)
         return self._freqs_cached[:seqlen]
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVisionPatchEmbed(nn.Module):
 
     def __init__(
@@ -592,8 +606,10 @@ class OpenPanguVisionPatchEmbed(nn.Module):
         x = x.matmul(
             self.proj.weight.data.view(self.hidden_size, -1).transpose(0, 1))
         return x
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVisionPatchMerger(nn.Module):
 
     def __init__(
@@ -628,8 +644,10 @@ class OpenPanguVisionPatchMerger(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.ln_q(x).view(-1, self.hidden_size))
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVisionTransformer(nn.Module):
     packed_modules_mapping = {
         "qkv_proj" : ["q_proj", "k_proj", "v_proj"],
@@ -933,8 +951,10 @@ class OpenPanguVisionTransformer(nn.Module):
         local_rank = parallel_state.get_world_group().local_rank
         tp_backend = torch.distributed.get_backend(parallel_state.get_tp_group().device_group)
         return parallel_state.init_model_parallel_group(group_ranks, local_rank, tp_backend)
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class ProjectionSingle(nn.Module):
     def __init__(self, i_hidden_size: int, t_hidden_size: int):
         super().__init__()
@@ -944,8 +964,10 @@ class ProjectionSingle(nn.Module):
     def forward(self, hidden_states):
         x = self.act(hidden_states)
         return self.fc1(x)
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVLProcessingInfo(Qwen2_5_VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.model_config.hf_config
@@ -978,8 +1000,10 @@ class OpenPanguVLProcessingInfo(Qwen2_5_VLProcessingInfo):
             ),
             **kwargs,
         )
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 def get_load_balance_assignment(
     sizes: list[int],
     num_gpus: int = 2,
@@ -1151,8 +1175,10 @@ def run_dp_sharded_mrope_vision_model(
         raise ValueError("Found unassigned embeddings")
 
     return torch.concat(out_embeddings)
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVLImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]
     pixel_values: torch.Tensor
@@ -1176,8 +1202,10 @@ class OpenPanguVLVideoEmbeddingInputs(TypedDict):
     type: Literal["video_embeds"]
     video_embeds: torch.Tensor
     video_grid_thw: torch.Tensor
+#####patch start: for pangu72B-VL
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVLMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
 
     def _get_prompt_updates(
@@ -1237,15 +1265,21 @@ class OpenPanguVLMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
                                     modality=modality),
             ) for modality in ("image", "video")
         ]
+#####patch end
 
 
+#####patch start: for pangu72B-VL
 class OpenPanguVLDummyInputsBuilder(Qwen2_5_VLDummyInputsBuilder):
     pass
+#####patch end
+
 
 @register_patch("openpangu_vlPatch", models)
 class openpangu_vlPatch(VLLMPatch):
     _attr_names_to_apply = ['OpenPanguVLForConditionalGeneration']
     
+
+    #####patch start: for pangu72B-VL
     @MULTIMODAL_REGISTRY.register_processor(
         OpenPanguVLMultiModalProcessor,
         info=OpenPanguVLProcessingInfo,
@@ -1705,6 +1739,8 @@ class openpangu_vlPatch(VLLMPatch):
             # llm_positions = llm_positions[:, context_len:seq_len]
 
             return llm_positions, mrope_position_delta
+    #####patch end
+
 
     models.openpangu_72b_vl.OpenPanguVLForConditionalGeneration = OpenPanguVLForConditionalGeneration
 

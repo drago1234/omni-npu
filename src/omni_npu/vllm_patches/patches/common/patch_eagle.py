@@ -294,7 +294,7 @@ class EagleProposerPatch(VLLMPatch):
                 "Qwen3VLForConditionalGeneration",
                 #####patch start: for pangu72B-VL
                 "OpenPanguVLForConditionalGeneration"
-                #####patch end:
+                #####patch end
             ]:
                 self.model.config.image_token_index = target_model.config.image_token_id
             elif self.get_model_name(target_model) == "PixtralForConditionalGeneration":

@@ -1,20 +1,21 @@
+from typing import TYPE_CHECKING, Any, Literal
 
-from typing import TYPE_CHECKING, Any, Literal, get_args
-from vllm.utils.import_utils import LazyLoader
 from vllm.config import SpeculativeConfig
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 else:
     PretrainedConfig = Any
+from vllm.config import speculative
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from vllm.config import speculative
+
 
 @register_patch("SpeculativePatch", speculative)
 class SpeculativePatch(VLLMPatch):
     _attr_names_to_apply = ['MTPModelTypes', 'EagleModelTypes']
 
     
+    #####patch start: for pangu72B-VL
     MTPModelTypes = Literal[
         "deepseek_mtp",
         "mimo_mtp",
@@ -27,12 +28,15 @@ class SpeculativePatch(VLLMPatch):
         "openpangu_vl_mtp",
     ]
     EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
+    #####patch end
 
 
 @register_patch("SpeculativeConfigPatch", SpeculativeConfig)
 class SpeculativeConfigPatch(VLLMPatch):
     _attr_names_to_apply = ['hf_config_override']
 
+
+    #####patch start: for pangu72B-VL
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
         if hf_config.model_type in ("deepseek_v3", "deepseek_v32"):
@@ -111,3 +115,4 @@ class SpeculativeConfigPatch(VLLMPatch):
             hf_config.update({"architectures": ["EagleMistralLarge3ForCausalLM"]})
 
         return hf_config
+    #####patch end

@@ -1,8 +1,12 @@
-from vllm.attention.selector import get_attn_backend
+import functools
+import types
+import sys
+
 import torch
 import torch_npu
+
+from vllm.attention.selector import get_attn_backend
 from vllm.forward_context import ForwardContext, get_forward_context
-import functools
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionMetadata,
@@ -23,12 +27,11 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     SinkFullAttentionSpec,
 )
-
-from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from vllm.attention import layers
 from vllm.platforms import current_platform
-import types
-import sys
+
+from omni_npu.vllm_patches.core import VLLMPatch, register_patch
+
 
 logger = init_logger(__name__)
 
@@ -37,12 +40,13 @@ sys.modules[layers.__name__+".static_sink_attention"] = dynamic_module
 layers.static_sink_attention = dynamic_module
 
 
- 
 @register_patch("create_static_sink_attention_backendPatch", layers)
 class create_static_sink_attention_backendPatch(VLLMPatch):
     _attr_names_to_apply = ['create_static_sink_attention_backend']
 
 
+
+    #####patch start: for pangu72B-VL
     @functools.lru_cache
     def create_static_sink_attention_backend(
         underlying_attn_backend: type[AttentionBackend],
@@ -102,6 +106,7 @@ class create_static_sink_attention_backendPatch(VLLMPatch):
         )
 
         return attn_backend
+    #####patch start: for pangu72B-VL
     
     layers.static_sink_attention.create_static_sink_attention_backend = create_static_sink_attention_backend
 
@@ -111,6 +116,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
     _attr_names_to_apply = ['StaticSinkAttention']
 
 
+    #####patch start: for pangu72B-VL
     class StaticSinkAttention(Attention):
         """
         Attention with static sink tokens
@@ -214,15 +220,17 @@ class StaticSinkAttentionPatch(VLLMPatch):
             attentionSpec.set_head_size_v(self.head_size_v)
 
             return attentionSpec
+    #####patch end
     
     layers.static_sink_attention.StaticSinkAttention = StaticSinkAttention
-
 
 
 @register_patch("maybe_populate_sinkPatch", layers)
 class maybe_populate_sinkPatch(VLLMPatch):
     _attr_names_to_apply = ['maybe_populate_sink', 'maybe_populate_sink_fake']
 
+
+    #####patch start: for pangu72B-VL
     def maybe_populate_sink(
         self_k_cache: torch.Tensor,
         self_v_cache: torch.Tensor,
@@ -249,6 +257,7 @@ class maybe_populate_sinkPatch(VLLMPatch):
         mutates_args=["self_k_cache", "self_v_cache"],
         fake_impl=maybe_populate_sink_fake,
     )
+    #####patch end
 
     layers.static_sink_attention.maybe_populate_sink = maybe_populate_sink
     layers.static_sink_attention.maybe_populate_sink_fake = maybe_populate_sink_fake

@@ -3,9 +3,9 @@ import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.utils.math_utils import cdiv
+from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
 
 
 @register_patch("BlockTablePath", BlockTable)
@@ -22,7 +22,10 @@ class BlockTablePath(VLLMPatch):
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+
+        #####patch start: for pangu72B-VL
         sink_len: int = 0,
+        #####patch end
     ):
         """"
         Args:
@@ -63,8 +66,11 @@ class BlockTablePath(VLLMPatch):
             self.use_hybrid_blocks = True
 
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
+
+        #####patch start: for pangu72B-VL
         self.sink_block_len = sink_len // self.block_size
         self.max_num_blocks_per_req = self.max_num_blocks_per_req + self.sink_block_len
+        #####patch end
 
         self.block_table = self._make_buffer(
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
@@ -117,10 +123,13 @@ class BlockTablePath(VLLMPatch):
             # Use a "virtual block" which equals to world_size * block_size
             # for block_table_indices calculation.
             virtual_block_size = self.block_size * total_cp_world_size
+
+            #####patch start: for pangu72B-VL
             block_table_indices = (
                 req_indices * self.max_num_blocks_per_req
                 + positions // virtual_block_size
             ) + self.sink_block_len
+            #####patch end
 
             block_numbers = self.block_table.np.ravel()[block_table_indices]
             # Use virtual_block_size for mask calculation, which marks local
@@ -146,9 +155,12 @@ class BlockTablePath(VLLMPatch):
                 mask, slot_mapping, -1
             )
         else:
+
+            #####patch start: for pangu72B-VL
             block_table_indices = (
                 req_indices * self.max_num_blocks_per_req + positions // self.block_size
             ) + self.sink_block_len
+            #####patch end
 
             block_numbers = self.block_table.np.ravel()[block_table_indices]
             block_offsets = positions % self.block_size
@@ -173,7 +185,11 @@ class MultiGroupBlockTablePatch(VLLMPatch):
         block_sizes: list[int],
         kernel_block_sizes: list[int],
         num_speculative_tokens: int = 0,
+
+        #####patch start: for pangu72B-VL
         sink_len: int = 0,
+        #####patch end
+
         cp_kv_cache_interleave_size: int = 1,
     ) -> None:
         # Note(hc): each dcp rank only store
@@ -212,7 +228,10 @@ class MultiGroupBlockTablePatch(VLLMPatch):
                 device,
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
+
+                #####patch start: for pangu72B-VL
                 sink_len=sink_len,
+                #####patch end
             )
             for block_size, kernel_block_size in zip(block_sizes, kernel_block_sizes)
         ]

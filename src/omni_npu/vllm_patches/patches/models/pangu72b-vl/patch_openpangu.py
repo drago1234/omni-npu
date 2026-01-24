@@ -1,12 +1,12 @@
 from collections.abc import Iterable
 from typing import Any
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.attention.layer import AttentionType
 from vllm.attention.layers.static_sink_attention import StaticSinkAttention
-
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
@@ -49,6 +50,7 @@ from vllm.model_executor.models.openpangu import (
     check_ffn_act_fn,
 ) 
 
+
 @register_patch("OpenPanguMoEPatch", OpenPanguMoE)
 class OpenPanguMoEPatch(VLLMPatch):
     _attr_names_to_apply = ['__init__']
@@ -61,7 +63,10 @@ class OpenPanguMoEPatch(VLLMPatch):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
+        #####patch start: for pangu72B-VL
         nn.Module.__init__(self)
+        #####patch end
+
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tp_group().rank_in_group
 
@@ -82,6 +87,8 @@ class OpenPanguMoEPatch(VLLMPatch):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
+
+        #####patch start: for pangu72B-VL
         if (
             hasattr(config, "router_enable_expert_bias")
             and config.router_enable_expert_bias
@@ -91,6 +98,7 @@ class OpenPanguMoEPatch(VLLMPatch):
             )
         else:
             self.gate.e_score_correction_bias = None
+        #####patch end
 
         # Load balancing settings.
         eplb_config = parallel_config.eplb_config
@@ -246,14 +254,13 @@ class OpenPanguMLAAttentionPatch(VLLMPatch):
             "type": "yarn",
             "rope_type": "deepseek_yarn",
         }
-        from vllm.model_executor.layers.rotary_embedding import get_rope_wrapper
-        self.rotary_emb = get_rope_wrapper(
+
+        self.rotary_emb = get_rope(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
             rope_parameters=rope_parameters,
             is_neox_style=False,
-            num_hidden_layers_cache=config.num_hidden_layers
         )
 
         mla_modules = MLAModules(
@@ -271,6 +278,11 @@ class OpenPanguMLAAttentionPatch(VLLMPatch):
             q_b_proj=self.q_b_proj if self.q_lora_rank is not None else None,
             q_proj=self.q_proj if self.q_lora_rank is None else None,
             indexer=None,
+
+            #####patch start: for pangu718B
+            indexer_rotary_emb=None,
+            #####patch end
+
             is_sparse=False,
             topk_indices_buffer=None,
         )
@@ -295,6 +307,8 @@ class OpenPanguMLAAttentionPatch(VLLMPatch):
 class openpanguPatch(VLLMPatch):
     _attr_names_to_apply = ['OpenPanguSinkAttention', 'PanguProMoEV2ForCausalLM']
 
+
+    #####patch start: for pangu72B-VL
     class OpenPanguSinkAttention(nn.Module):
         def __init__(
             self,
@@ -551,10 +565,16 @@ class openpanguPatch(VLLMPatch):
                 param_sink_key = self.param_sink_key
 
             self.attn.update_sink_kv(param_sink_key, self.param_sink_value)
+    #####patch end
+
     openpangu.OpenPanguSinkAttention = OpenPanguSinkAttention
 
+
+    #####patch start: for pangu72B-VL
     class PanguProMoEV2ForCausalLM(OpenPanguMoEModel):
         pass
+    #####patch end
+
 
 @register_patch("OpenPanguDecoderLayerPatch", OpenPanguDecoderLayer)
 class OpenPanguDecoderLayerPatch(VLLMPatch):
@@ -566,7 +586,9 @@ class OpenPanguDecoderLayerPatch(VLLMPatch):
         prefix: str,
         vllm_config: VllmConfig,
     ) -> None:
+        #####patch start: for pangu72B-VL
         nn.Module.__init__(self)
+        #####patch end
 
         if config is None:
             config = vllm_config.model_config.hf_config
@@ -586,9 +608,13 @@ class OpenPanguDecoderLayerPatch(VLLMPatch):
             and hasattr(config, "v_head_dim")
             and hasattr(config, "kv_lora_rank")
         )
+
+        #####patch start: for pangu72B-VL
         self.use_sink_attention = (
             hasattr(config, "param_sink_number") and config.param_sink_number > 0
         )
+        #####patch end
+
         if self.use_mla:
             self.self_attn = OpenPanguMLAAttention(
                 config=config,
@@ -606,6 +632,8 @@ class OpenPanguDecoderLayerPatch(VLLMPatch):
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
             )
+
+        #####patch start: for pangu72B-VL
         elif self.use_sink_attention:
             attention_bias = getattr(config, "attention_bias", False) or getattr(
                 config, "bias", False
@@ -642,6 +670,8 @@ class OpenPanguDecoderLayerPatch(VLLMPatch):
                 prefix=f"{prefix}.self_attn",
                 attn_type=attn_type,
             )
+        #####patch end
+
         else:
             attention_bias = getattr(config, "attention_bias", False) or getattr(
                 config, "bias", False
@@ -781,14 +811,22 @@ class OpenPanguModelPatch(VLLMPatch):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 name = maybe_remap_kv_scale_name(name, params_dict)
+
+                #####patch start: for pangu72B-VL
                 if name.endswith("e_score_correction_bias"):
                     name = name.replace(
                         "e_score_correction_bias", "gate.e_score_correction_bias"
                     )
+                #####patch end
+
                 if name is None:
                     continue
+
+                #####patch start: for pangu72B-VL
                 if name not in params_dict:
                     continue
+                #####patch end
+
                 if is_pp_missing_parameter(name, self):
                     continue
 
@@ -796,20 +834,29 @@ class OpenPanguModelPatch(VLLMPatch):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+
+        #####patch start: for pangu72B-VL
         self.post_weight_load()
+        #####patch end
+
         return loaded_params
 
+    #####patch start: for pangu72B-VL
     def post_weight_load(self) -> None:
         for name, module in self.named_modules():
             if module is self:
                 continue
             if hasattr(module, "post_weight_load"):
                 module.post_weight_load()
+    #####patch end
+
 
 @register_patch("OpenPanguMoEModelPatch", OpenPanguMoEModel)
 class OpenPanguMoEModelPatch(VLLMPatch):
     _attr_names_to_apply = ['set_eplb_state']
 
+
+    #####patch start: for pangu72B-VL
     def set_eplb_state(
         self,
         expert_load_view: torch.Tensor,
@@ -825,3 +872,4 @@ class OpenPanguMoEModelPatch(VLLMPatch):
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
             )
+    #####patch end

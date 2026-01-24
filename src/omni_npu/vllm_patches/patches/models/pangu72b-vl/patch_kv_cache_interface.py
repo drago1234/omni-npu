@@ -1,16 +1,19 @@
 from dataclasses import dataclass, fields
-
 from typing_extensions import Self
 
 from vllm.utils.torch_utils import get_dtype_size
-
-from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from vllm.v1 import kv_cache_interface
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, AttentionSpec
+
+from omni_npu.vllm_patches.core import VLLMPatch, register_patch
+
 
 @register_patch("FullAttentionSpecPatch", FullAttentionSpec)
 class FullAttentionSpecPatch(VLLMPatch):
     _attr_names_to_apply = ['__post_init__', 'merge', 'head_size_v', 'set_head_size_v', 'page_size_bytes']
+
+
+    #####patch start: for pangu72B-VL
     head_size_v: int | None = None
 
     def set_head_size_v(self, head_size_v : int):
@@ -19,6 +22,7 @@ class FullAttentionSpecPatch(VLLMPatch):
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
+    #####patch end
     
     def merge(cls, specs: list[Self]) -> Self:
         """
@@ -48,7 +52,11 @@ class FullAttentionSpecPatch(VLLMPatch):
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
+
+        #####patch start: for pangu72B-VL
         merged_spec.set_head_size_v(specs[0].head_size_v)
+        #####patch end
+
         for spec in specs:
             for f in fields(AttentionSpec):
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
@@ -63,6 +71,7 @@ class FullAttentionSpecPatch(VLLMPatch):
         )
         return merged_spec
 
+    #####patch start: for pangu72B-VL
     @property
     def page_size_bytes(self) -> int:
         return (
@@ -71,11 +80,14 @@ class FullAttentionSpecPatch(VLLMPatch):
             * (self.head_size + self.head_size_v)
             * get_dtype_size(self.dtype)
         )
+    #####patch end
 
 @register_patch("SinkFullAttentionSpecPatch", kv_cache_interface)
 class SinkFullAttentionSpecPatch(VLLMPatch):
     _attr_names_to_apply = ['SinkFullAttentionSpec']
 
+
+    #####patch start: for pangu72B-VL
     @dataclass(frozen=True)
     class SinkFullAttentionSpec(FullAttentionSpec):
         sink_len: int | None = None
@@ -124,4 +136,6 @@ class SinkFullAttentionSpecPatch(VLLMPatch):
                 "layers is not supported."
             )
             return merged_spec
+    #####patch end
+
     kv_cache_interface.SinkFullAttentionSpec = SinkFullAttentionSpec

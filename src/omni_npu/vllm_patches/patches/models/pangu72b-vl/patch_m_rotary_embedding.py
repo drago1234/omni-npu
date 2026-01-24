@@ -1,22 +1,24 @@
 from typing import Any, Dict, Optional, List, Literal
+
 import torch
 
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.model_executor.layers.rotary_embedding import DynamicNTKScalingRotaryEmbedding
-from vllm.model_executor.layers.rotary_embedding import YaRNScalingRotaryEmbedding as GPUYaRNScalingRotaryEmbedding
-from vllm.model_executor.layers.rotary_embedding import DeepseekScalingRotaryEmbedding as DeepseekScalingRotaryEmbeddingGPU
-
-from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT 
 import vllm.model_executor.layers.rotary_embedding as _rope_mod 
 from vllm.model_executor.layers import rotary_embedding
 
+from omni_npu.vllm_patches.core import VLLMPatch, register_patch
+
+
 _orig_get_rope = _rope_mod.get_rope
+
 @register_patch("rotary_embeddingPatch", rotary_embedding)
 class rotary_embeddingPatch(VLLMPatch):
     _attr_names_to_apply = ['get_rope_wrapper', 'MRotaryEmbeddingInterleaved']
 
+
+    #####patch start: for pangu72B-VL
     def get_rope_wrapper(
         head_size: int,
         rotary_dim: int,
@@ -93,11 +95,12 @@ class rotary_embeddingPatch(VLLMPatch):
             partial_rotary_factor,
             dual_chunk_attention_config,
         )
+    #####patch start: for pangu72B-VL
 
     rotary_embedding.get_rope_wrapper = get_rope_wrapper
 
 
-
+    #####patch start: for pangu72B-VL
     class MRotaryEmbeddingInterleaved(MRotaryEmbedding):
         """Rotary Embedding with Multimodal Sections and Interleaved Support."""
 
@@ -262,5 +265,6 @@ class rotary_embeddingPatch(VLLMPatch):
                 seq.append(0)
 
             return seq
+    #####patch end
 
     rotary_embedding.MRotaryEmbeddingInterleaved = MRotaryEmbeddingInterleaved

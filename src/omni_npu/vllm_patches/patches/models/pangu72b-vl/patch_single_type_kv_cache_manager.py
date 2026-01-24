@@ -1,4 +1,3 @@
-
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -13,7 +12,6 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
 )
 from vllm.v1.request import Request
-
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     CrossAttentionManager,
@@ -29,7 +27,7 @@ from vllm.v1.core import single_type_kv_cache_manager
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
-
+#####patch start: for pangu72B-VL
 class SinkFullAttentionManager(FullAttentionManager):
     def __init__(
         self,
@@ -181,12 +179,16 @@ class SinkFullAttentionManager(FullAttentionManager):
 
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
+#####patch end
+
 
 
 @register_patch("single_type_kv_cache_managerPatch", single_type_kv_cache_manager)
 class single_type_kv_cache_managerPatch(VLLMPatch):
     _attr_names_to_apply = ['spec_manager_map']
 
+
+    #####patch start: for pangu72B-VL
     spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
         FullAttentionSpec: FullAttentionManager,
         MLAAttentionSpec: FullAttentionManager,
@@ -196,3 +198,4 @@ class single_type_kv_cache_managerPatch(VLLMPatch):
         CrossAttentionSpec: CrossAttentionManager,
         SinkFullAttentionSpec: SinkFullAttentionManager,
     }
+    #####patch end
