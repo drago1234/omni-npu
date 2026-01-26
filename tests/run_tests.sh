@@ -31,6 +31,7 @@ case "$TEST_TYPE" in
                 --cov=omni_npu \
                 --cov-report=term-missing \
                 --cov-report=html \
+                --cov-config=./.coveragerc \
                 -v
         else
             pytest unit/ -v

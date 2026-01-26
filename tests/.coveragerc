@@ -1,0 +1,7 @@
+[run]
+source =
+    omni_npu
+
+omit =
+    */omni_npu/v0/*
+    */omni_npu/vllm_patches/*
