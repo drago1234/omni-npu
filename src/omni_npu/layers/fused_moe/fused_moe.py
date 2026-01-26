@@ -74,36 +74,59 @@ def fused_experts_allgather_ep_unquant(
 ):
     batch_size, hidden_size = x.shape
     x = x.view(-1, hidden_size)
-    n_total_expert = layer.global_num_experts
 
     experts_start_idx = layer.ep_rank * layer.local_num_experts  # ENABLE_OMNI_PLANNER
     experts_end_idx = experts_start_idx + layer.local_num_experts
     expert_range = [experts_start_idx, experts_end_idx]
-    sorted_tokens, expanded_x_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
-        x, topk_ids, active_num=topk_ids.numel(), expert_capacity=-1,
-        expert_num=n_total_expert, drop_pad_mode=0, expert_tokens_num_type=1, expert_tokens_num_flag=True,
-        quant_mode=-1, active_expert_range=expert_range, row_idx_type=1)
+
+    expanded_x, expanded_x_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
+        x, 
+        topk_ids, 
+        active_num=topk_ids.numel(), 
+        expert_capacity=-1,
+        expert_num=layer.global_num_experts, 
+        drop_pad_mode=0, 
+        expert_tokens_num_type=1, 
+        expert_tokens_num_flag=True,
+        quant_mode=-1, 
+        active_expert_range=expert_range, 
+        row_idx_type=1)
+
+
+    group_list_type = int(layer.moe_parallel_config.use_ep)
+    gate_up_proj = torch_npu.npu_grouped_matmul([expanded_x], 
+                                                [layer.w13_weight],
+                                                group_list=expert_tokens, 
+                                                split_item=3, 
+                                                group_type=0,
+                                                group_list_type=group_list_type)[0]
+    intermediate_h = torch_npu.npu_swiglu(gate_up_proj)
+    hidden_states_experts = torch_npu.npu_grouped_matmul(
+                                        [intermediate_h],
+                                        [layer.w2_weight],
+                                        bias=None,
+                                        group_list=expert_tokens,
+                                        split_item=3,
+                                        group_type=0,
+                                        group_list_type=group_list_type
+                                        )[0]
     token_sum = torch.sum(expert_tokens)
-
-    gmm_out = layer.quant_method.gmm_expert(
-        layer,
-        sorted_tokens,
-        expert_tokens,
-        None
-    )
-    gmm_out[token_sum:].zero_()
-    temp = torch.argsort(expanded_x_idx.to(torch.float), dim=-1).to(torch.int32)
-
+    rows = hidden_states_experts.shape[0]
+    valid_rows = torch.arange(rows,
+                              device=hidden_states_experts.device,
+                              dtype=torch.int32) < token_sum
+    hidden_states_experts.mul_(valid_rows.to(hidden_states_experts.dtype).unsqueeze(-1))
+    expanded_x_idx = torch.argsort(expanded_x_idx.to(torch.float), dim=-1).to(torch.int32)
     output = torch_npu.npu_moe_finalize_routing(
-        gmm_out,
-        skip1=None,
-        skip2=None,
-        bias=None,
-        scales=topk_weights,
-        expanded_src_to_dst_row=temp,
-        export_for_source_row=None,
-        drop_pad_mode=2
-    )
+                hidden_states_experts,
+                skip1=None,
+                skip2=None,
+                bias=None,
+                scales=topk_weights.to(hidden_states_experts.dtype),
+                expanded_src_to_dst_row=expanded_x_idx,
+                export_for_source_row=topk_ids,
+                drop_pad_mode=2
+                )
     return output
 
 

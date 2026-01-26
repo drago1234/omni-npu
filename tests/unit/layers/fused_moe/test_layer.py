@@ -15,6 +15,7 @@ def layer_module(monkeypatch):
     torch_npu = MagicMock()
     torch_npu.npu_format_cast.side_effect = lambda tensor, fmt: tensor
     torch_npu.npu_swiglu.side_effect = lambda tensor: tensor
+    torch_npu.npu = SimpleNamespace(get_device_name=MagicMock(return_value="FakeDevice"))
 
     def _grouped_matmul(inputs, weights, **kwargs):
         return [inputs[0]]
@@ -47,7 +48,10 @@ def layer_module(monkeypatch):
 
     distributed_module = types.ModuleType("vllm.distributed")
     distributed_module.get_ep_group = lambda: SimpleNamespace(rank=0)
-    distributed_module.get_tp_group = lambda: SimpleNamespace(all_gather=lambda x, dim=0: x)
+    distributed_module.get_tp_group = lambda: SimpleNamespace(
+        all_gather=lambda x, dim=0: x,
+        all_reduce=lambda x: x,
+    )
     distributed_module.tensor_model_parallel_all_reduce = MagicMock(side_effect=lambda tensor: tensor)
     distributed_module.tensor_model_parallel_all_gather = MagicMock(
         side_effect=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim)
@@ -138,8 +142,10 @@ def layer_module(monkeypatch):
     fused_moe_module = types.ModuleType("omni_npu.layers.fused_moe.fused_moe")
     fused_experts_tp = MagicMock(return_value=torch.tensor([42.0]))
     moe_infer_fusion = MagicMock(return_value=torch.tensor([24.0]))
+    fused_experts_allgather_ep_unquant = MagicMock(return_value=torch.tensor([12.0]))
     fused_moe_module.fused_experts_tp = fused_experts_tp
     fused_moe_module.moe_infer_fusion = moe_infer_fusion
+    fused_moe_module.fused_experts_allgather_ep_unquant = fused_experts_allgather_ep_unquant
 
     npu_prepare_module = types.ModuleType("omni_npu.layers.fused_moe.npu_moe_prepare_finalize")
 
@@ -197,6 +203,7 @@ def layer_module(monkeypatch):
         torch_npu=torch_npu,
         fused_experts_tp=fused_experts_tp,
         moe_infer_fusion=moe_infer_fusion,
+        fused_experts_allgather_ep_unquant=fused_experts_allgather_ep_unquant,
         distributed=distributed_module,
         context_holder=context_holder,
     )
@@ -258,6 +265,7 @@ def test_forward_oot_returns_shared_output_and_reduces(layer_module):
         return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32))
     )
     stubs.context_holder.attn_metadata = {0: SimpleNamespace(num_prefills=0)}
+    stubs.torch_npu.npu.get_device_name.return_value = "FakeDevice"
 
     hidden = torch.ones(2, 2)
     logits = torch.ones(2, 2)
@@ -267,6 +275,40 @@ def test_forward_oot_returns_shared_output_and_reduces(layer_module):
     assert expert_output.shape == (2, 2)
     module.tensor_model_parallel_all_reduce.assert_called_once()
     method.fused_experts.assert_called_once()
+
+
+@pytest.mark.unit
+def test_forward_oot_uses_allgather_ep_path(layer_module):
+    module, stubs = layer_module
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
+    method.moe_quant_config = MagicMock()
+    method.fused_experts = MagicMock()
+    layer = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=True), shared_experts=None)
+
+    module.get_tensor_model_parallel_world_size = MagicMock(return_value=2)
+    module.get_tensor_model_parallel_rank = MagicMock(return_value=0)
+    module.get_tp_group = MagicMock(
+        return_value=SimpleNamespace(all_reduce=MagicMock(side_effect=lambda tensor: tensor))
+    )
+    module.tensor_model_parallel_all_gather = MagicMock(
+        side_effect=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim)
+    )
+    module.NPUFusedMoE.select_experts = MagicMock(
+        return_value=(torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32))
+    )
+    stubs.context_holder.attn_metadata = {0: SimpleNamespace(num_prefills=0)}
+    stubs.torch_npu.npu.get_device_name.return_value = "Ascend910B"
+    stubs.fused_experts_allgather_ep_unquant.reset_mock()
+
+    output = method.forward_oot(
+        layer, torch.ones(2, 3), torch.ones(2, 2), top_k=1, renormalize=False
+    )
+
+    assert torch.equal(output, stubs.fused_experts_allgather_ep_unquant.return_value)
+    stubs.fused_experts_allgather_ep_unquant.assert_called_once()
+    module.get_tp_group.return_value.all_reduce.assert_called_once()
+    module.tensor_model_parallel_all_gather.assert_not_called()
 
 
 @pytest.mark.unit
@@ -280,7 +322,7 @@ def test_forward_oot_uses_fused_experts_tp_when_not_ep(layer_module):
     module.NPUFusedMoE.select_experts = MagicMock(
         return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32))
     )
-    stubs.context_holder.attn_metadata = {}
+    stubs.context_holder.attn_metadata = None
     stubs.fused_experts_tp.reset_mock()
 
     result = method.forward_oot(layer, torch.ones(1, 2), torch.ones(1, 2), top_k=1, renormalize=False)

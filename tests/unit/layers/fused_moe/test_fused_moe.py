@@ -19,6 +19,7 @@ def fused_module(monkeypatch):
     torch_npu.npu_moe_compute_expert_tokens = MagicMock()
     torch_npu.npu_dynamic_quant = MagicMock()
     torch_npu.npu_grouped_matmul = MagicMock(side_effect=lambda inputs, weights, **kwargs: [inputs[0]])
+    torch_npu.npu_swiglu = MagicMock(side_effect=lambda x, **kwargs: x)
     torch_npu.npu_dequant_swiglu_quant = MagicMock(
         side_effect=lambda gate_up_proj, **kwargs: (gate_up_proj, torch.ones(gate_up_proj.shape[0]))
     )
@@ -28,8 +29,17 @@ def fused_module(monkeypatch):
     platforms_module = types.ModuleType("vllm.platforms")
     platforms_module.current_platform = SimpleNamespace(device_type="cpu")
 
+    distributed_module = types.ModuleType("vllm.distributed")
+    distributed_module.get_ep_group = lambda: SimpleNamespace(world_size=1)
+    distributed_module.get_tp_group = lambda: SimpleNamespace(world_size=1)
+    distributed_module.tensor_model_parallel_all_reduce = lambda x, *args, **kwargs: x
+    distributed_module.tensor_model_parallel_all_gather = lambda x, *args, **kwargs: x
+    distributed_module.get_tensor_model_parallel_world_size = lambda: 1
+    distributed_module.get_tensor_model_parallel_rank = lambda: 0
+
     monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
 
     orig_arange = torch.arange
     orig_tensor = torch.tensor
@@ -217,6 +227,9 @@ def test_fused_experts_allgather_ep_unquant(fused_module):
         global_num_experts=4,
         ep_rank=0,
         local_num_experts=2,
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+        w13_weight=torch.ones(1, 2, 2),
+        w2_weight=torch.ones(1, 2, 2),
         quant_method=MagicMock(),
     )
     sorted_tokens = torch.ones(5, 2)
@@ -239,8 +252,6 @@ def test_fused_experts_allgather_ep_unquant(fused_module):
         topk_weights=torch.ones(5, 1),
         topk_ids=torch.zeros(5, 1, dtype=torch.int32),
     )
-
-    layer.quant_method.gmm_expert.assert_called_once()
     assert torch.equal(output, torch.full((5, 2), 7.0))
 
 
