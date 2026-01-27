@@ -318,14 +318,10 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             )
 
             prefill_metadata = attn_metadata.prefill
-            # FIA expects cumulative lengths; query_start_loc[1:] is cumulative.
-            actual_seq_cumlens = prefill_metadata.actual_seq_cumlens
-            if torch.is_tensor(actual_seq_cumlens):
-                total_tokens = int(actual_seq_cumlens[-1].item())
-            else:
-                total_tokens = int(actual_seq_cumlens[-1])
-            prefill_kv_a = kv_a[:total_tokens]
-            prefill_k_pe = k_pe[:total_tokens]
+            actual_seq_kvlen = prefill_metadata.seq_lens
+            actual_seq_qlen = prefill_metadata.query_cumlens
+            prefill_kv_a = kv_a[:actual_seq_kvlen[-1]]
+            prefill_k_pe = k_pe[:actual_seq_kvlen[-1]]
             kv = self.kv_b_proj.forward(prefill_kv_a)[0]
             kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -337,19 +333,19 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 sparse_mode = 0
             prefill_k_rope = prefill_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
 
-            attn_output[:total_tokens] = torch.ops.npu.npu_fused_infer_attention_score(
-                q_nope[:total_tokens],
+            attn_output[:actual_seq_qlen[-1]] = torch.ops.npu.npu_fused_infer_attention_score(
+                q_nope[:actual_seq_qlen[-1]],
                 k_nope,
                 v,
-                query_rope=q_pe[:total_tokens],
+                query_rope=q_pe[:actual_seq_qlen[-1]],
                 key_rope=prefill_k_rope,
                 num_heads=self.num_local_heads,
                 num_key_value_heads=self.num_local_heads,
                 input_layout="TND",
                 atten_mask=attn_mask,
                 sparse_mode=sparse_mode,
-                actual_seq_lengths=actual_seq_cumlens,
-                actual_seq_lengths_kv=actual_seq_cumlens,
+                actual_seq_lengths=actual_seq_qlen,
+                actual_seq_lengths_kv=actual_seq_kvlen,
                 scale=self.scaling,
                 next_tokens=0
             )[0]

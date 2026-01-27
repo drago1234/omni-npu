@@ -9,6 +9,7 @@ import and use it. We can iterate later with true MLA specialization.
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
 import math
+import os
 
 import torch
 import torch_npu
@@ -23,6 +24,7 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonMetadata,
     MLACommonMetadataBuilder,
     MLACommonBaseImpl,
+    MLACommonPrefillMetadata,
     QueryLenSupport,
 )
 from vllm.distributed.parallel_state import get_tp_group
@@ -63,7 +65,10 @@ class NPUMLABackend(MLACommonBackend):
         dtype: torch.dtype = torch.bfloat16,
     ) -> Tuple[torch.Tensor, ...]:
         raw_tensor = raw_tensor.view(dtype=dtype)
-        shapes = [(num_blocks, block_size, 512), (num_blocks, block_size, 64)]
+        if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
+            shapes = [(num_blocks, block_size, 1, 512), (num_blocks, block_size, 1, 64)]
+        else:
+            shapes = [(num_blocks, block_size, 512), (num_blocks, block_size, 64)]
         sizes = [math.prod(shape) for shape in shapes]
         if raw_tensor.numel() != sum(sizes):
             raise RuntimeError(f"Raw tensor has {raw_tensor.numel()} elements, while"
@@ -73,9 +78,16 @@ class NPUMLABackend(MLACommonBackend):
 
 
 @dataclass
+class NPUMLAPrefillMetadata(MLACommonPrefillMetadata):
+    query_cumlens: list[int] = None
+    seq_lens: list[int] = None
+
+
+@dataclass
 class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
     mc2_mask: torch.Tensor = None
+
 
 @dataclass
 class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
@@ -84,6 +96,7 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
 
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    supports_uniform_spec_as_decode: ClassVar[bool] = True
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
@@ -96,7 +109,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         super().__init__(
             kv_cache_spec, layer_names, vllm_config, device, NPUMLAMetadata
         )
-
+        self.prefill_metadata_cls = NPUMLAPrefillMetadata
         if self._use_fi_prefill:
             raise ValueError("Flashinfer should not be enabled.")
         if self._use_cudnn_prefill:
@@ -141,6 +154,8 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             metadata.decode.mc2_mask = self.generate_activate_mask(common_attn_metadata.num_actual_tokens)
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc_list = metadata.prefill.query_start_loc.tolist()
+            metadata.prefill.query_cumlens = common_attn_metadata.query_start_loc_cpu[1:].tolist()
+            metadata.prefill.seq_lens = metadata.prefill.query_cumlens
         if self.dcp_world_size > 1:
             self.prepare_dcp_slots(metadata)
             self.prepare_dcp_ag_reorg(metadata)
