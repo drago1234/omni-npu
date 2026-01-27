@@ -170,7 +170,9 @@ class OpenPanguMLAAttentionPatch(VLLMPatch):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        #####patch start: for pangu_ultra_moe
+        nn.Module.__init__(self)
+        #####patch end
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.qk_nope_head_dim = qk_nope_head_dim

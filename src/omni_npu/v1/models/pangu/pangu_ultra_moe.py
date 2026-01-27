@@ -48,7 +48,7 @@ from vllm.sequence import IntermediateTensors
 
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
-from omni_npu.v1.fused_mlp.layer import FusedMLP
+from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
 
 
 def check_ffn_act_fn(act_fn: str) -> None:
