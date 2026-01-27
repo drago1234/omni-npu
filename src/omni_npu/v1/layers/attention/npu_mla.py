@@ -18,7 +18,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.attention.layer import MLAAttention
 
 from omni_npu.attention.backends.mla import NPUMLAMetadata
-from omni_npu.v1.layers.utils import yarn_get_mscale
+from omni_npu.v1.layers.utils import yarn_get_mscale, named_stream
 from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
     RowParallelFlashCommLinear,
@@ -265,12 +265,26 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         attn_metadata: Optional['NPUMLAMetadata'] = None,
     ) -> torch.Tensor:
         if self.q_lora_rank is not None:
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-            q = self.q_a_proj(hidden_states)[0]
+            def dynamic_quant(x):
+                if not self.quant_symbol or type(x) is dict:
+                    return x
+                i8, sc = torch_npu.npu_dynamic_quant(x)
+                return {'x_int8':i8, 'pertoken_scale':sc}
+
+            x = dynamic_quant(hidden_states)
+            q = self.q_a_proj(x)[0]
+
+            cur_s = torch.npu.current_stream()
+            sub_s = named_stream("mla_sub_stream")
+
+            sub_s.wait_stream(cur_s)
+            with torch.npu.stream(sub_s):
+                latent_cache = self.kv_a_proj_with_mqa(x)[0]
+
             q = self.q_a_layernorm(q)
-            if self.quant_symbol:
-                q_quant, q_scale = torch_npu.npu_dynamic_quant(q)
-                q = {'x_int8':q_quant, 'pertoken_scale':q_scale}
+            q = dynamic_quant(q)
+
+            cur_s.wait_stream(sub_s)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(-1, self.num_local_heads, self.qk_head_dim)

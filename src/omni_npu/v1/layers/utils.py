@@ -24,3 +24,10 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+def named_stream(name): # not for graph
+    if name == "current":
+        return torch.npu.current_stream()
+    if not hasattr(named_stream, name):
+        setattr(named_stream, name, torch.npu.Stream())
+    return getattr(named_stream, name)
