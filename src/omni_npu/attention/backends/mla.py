@@ -83,7 +83,7 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
 
 
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
@@ -106,12 +106,10 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
 
-        self.uniform_decode_query_len = (
-            1
-            if not self.vllm_config.speculative_config
-            else 1 + self.vllm_config.speculative_config.num_speculative_tokens
-        )
-        max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
+        if self.compilation_config is not None:
+            self.reorder_batch_threshold = max(self.compilation_config.max_cudagraph_capture_size, self.reorder_batch_threshold)
+        # FIXME (zhao): since current the max length of input of mc2_mask only support 256, so we clamp it to 256
+        max_decode_tokens = min(256, self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold)
         self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
 
     def _build_decode(
@@ -615,57 +613,24 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         else:
             query_heads = self.num_heads
 
-        ## TODO: TND_NTD layout bug. Currently graph mode only support BSND.
         # output shape: (N, T, D)
-        batch_descriptor = get_forward_context().batch_descriptor
-        if batch_descriptor is not None and batch_descriptor.uniform:
-            batch_size = attn_metadata.decode.block_table.shape[0]
-            T, N, D = decode_ql_nope.shape
-            S = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
-            if T > batch_size:
-                attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
-                sparse_mode = 3
-            else:
-                attn_mask = None
-                sparse_mode = 0
-
-            o = torch.ops.npu.npu_fused_infer_attention_score(
-                decode_ql_nope.view(-1, S, N, D), kv_cache[0], kv_cache[0],
-                query_rope=decode_q_pe.view(-1, S, N, self.qk_rope_head_dim),
-                key_rope=kv_cache[1],
-                num_heads=query_heads,
-                num_key_value_heads=1,
-                input_layout="BSND",
-                scale=self.scale,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=attn_metadata.decode.block_table,
-                block_size=128,
-                # actual_seq_lengths=attn_metadata.decode.query_cumlens,
-                actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
-                atten_mask=attn_mask,
-                sparse_mode=sparse_mode,
-            )[0]
-            o = o.view(-1, N, D).transpose(0, 1).contiguous()
-        else:
-            num_tokens = attn_metadata.decode.query_cumlens[-1]
-            decode_ql_nope = decode_ql_nope[:num_tokens]
-            decode_q_pe = decode_q_pe[:num_tokens]
-            o = torch.ops.npu.npu_fused_infer_attention_score(
-                decode_ql_nope, kv_cache[0], kv_cache[0],
-                query_rope=decode_q_pe,
-                key_rope=kv_cache[1],
-                num_heads=query_heads,
-                num_key_value_heads=1,
-                input_layout="TND_NTD",
-                scale=self.scale,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=attn_metadata.decode.block_table,
-                block_size=128,
-                actual_seq_lengths=attn_metadata.decode.query_cumlens,
-                actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
-            )[0]
+        o = torch.ops.npu.npu_fused_infer_attention_score(
+            decode_ql_nope, kv_cache[0], kv_cache[0],
+            query_rope=decode_q_pe,
+            key_rope=kv_cache[1],
+            num_heads=query_heads,
+            num_key_value_heads=1,
+            input_layout="TND_NTD",
+            scale=self.scale,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            block_table=attn_metadata.decode.block_table,
+            block_size=128,
+            actual_seq_lengths=attn_metadata.decode.query_cumlens,
+            actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
+            atten_mask = NPUMLAImpl.DECORE_ATTN_MASK,
+            sparse_mode = 3
+        )[0]
 
         if self.sink_len > 0:
             o = o[:self.num_heads]
@@ -732,7 +697,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         has_prefill = attn_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.num_decode_tokens
 
-        decode_q = q
+        decode_q = q[:num_decode_tokens]
 
         def store_kv(cache, kv):
             if self.dcp_world_size == 1:

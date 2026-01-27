@@ -162,9 +162,6 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if not batch_descriptor.uniform:
-            raise RuntimeError(f"Currently only uniform decode supports graph mode. {self.runtime_mode=}, {aclgraph_runtime_mode=}.")
-
         if batch_descriptor not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
             self.concrete_aclgraph_entries[batch_descriptor] = \
@@ -246,8 +243,13 @@ class ACLGraphWrapper:
             ## NOTE: The parameter list should match.
             # entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
             if not isinstance(aslkv, torch.Tensor):
-                aslkv = self._pad_list(aslkv, batch_descriptor.num_reqs) # padding  aslkv to match gear
-                entry.aclgraph.update(cpu_update_input=[{"actual_seq_kvlen": aslkv, "actual_seq_lengths_kv": aslkv}])
+                padding_lens = batch_descriptor.num_reqs
+                if padding_lens is None:
+                    padding_lens = min(self.vllm_config.scheduler_config.max_num_seqs, batch_descriptor.num_tokens)
+                aslkv = self._pad_list(aslkv, padding_lens) # padding  aslkv to match gear
+                asl = self._pad_list(asl, padding_lens) # padding  asl to match gear
+                asl[-1] = batch_descriptor.num_tokens # FIXME: for TND FIA validation
+                entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
         return entry.output

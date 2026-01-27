@@ -50,7 +50,7 @@ class NPUMetadata:
 
 
 class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     supports_uniform_spec_as_decode: ClassVar[bool] = True
     reorder_batch_threshold: int = 1
 
@@ -67,6 +67,9 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
             self.reorder_batch_threshold,
             self.supports_uniform_spec_as_decode,
         )
+        self.compilation_config = vllm_config.compilation_config
+        if self.compilation_config is not None:
+            self.reorder_batch_threshold = max(self.compilation_config.max_cudagraph_capture_size, self.reorder_batch_threshold)
 
     def build(self,
               common_prefix_len: int,
