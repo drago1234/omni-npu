@@ -52,9 +52,44 @@ class GetKwargsHelloWorldPatch(VLLMPatch):
 `GetKwargsHelloWorldPatch`通过`_attr_names_to_apply`指明了需要新增或替换`vllm.engine.arg_utils`模块中的`get_kwargs`方法，实现原函数拓展，打印出Hello World。
 
 ## 2. 运行时指定执行补丁
-通过环境变量`OMNI_NPU_VLLM_PATCHES_ALL`及`OMNI_NPU_VLLM_PATCHES`指定具体被执行的补丁。
 
-当环境变量`OMNI_NPU_VLLM_PATCHES_ALL`为`"1"`时，将自动执行所有`src/omni_npu/vllm_patches/patches`目录中定义的补丁。
+补丁文件需要被注册以及执行两个环节：
+    通过补丁类中打上`@register_patch`以及对应文件可以被导入实现注册;
+    通过配置`OMNI_NPU_VLLM_PATCHES`参数实现代码被应用
+
+## 2.1 补丁文件注册
+
+`/patches` 文件夹中 `/patches/common` 用于存放公共的补丁文件；`/patches/modes/xxxmodel(qwen、deepseek、pangu)` 用于存放对应模型的补丁文件，目前并未显示的区分具体模型下具体版本的patch文件;
+服务启动时通过指定`omni_npu_patches` 会主动将`/patches/common` 以及`/patches/modes/xxxmodel` 下的补丁文件注册到`registered_patches`;其中`/patches/common`为默认注册，`/patches/modes/xxxmodel`通过`model_type`匹配文件夹名称进行注册。
+
+`patches/models/xxxmodel`注册逻辑：
+
+```python
+    try:
+        MODEL_PATH = Path(sys.argv[2])
+    except IndexError:
+        raise EnvironmentError("The model path must be passed as the second parameter through the command line.")
+    
+    model_type = get_model_type_from_config(MODEL_PATH)
+    models_root = patches_root / "models"
+    model_dir = find_patch_dir_for_model(model_type, models_root)
+```
+
+
+`model="/data/models/DeepSeek-V3.2-INT8"`
+上述例子中通过启动参数 `VLLM_PLUGINS="omni-npu,omni_npu_patches,omni_custom_models" vllm serve "$model" `， 获取model的配置路径，读取路径下`config.json`中 `model_type`，与`/patches/models/xxxmodel` 的文件夹名称匹配。
+
+
+`model_type` 与具体模型文件名称的匹配逻辑支持如下三种方式，按照 `- Mapping table - Prefix matching - containment match`顺序优先匹配返回:
+
+    - Mapping table     `src/omni_npu/vllm_patches/__init__.py` `MODEL_PATCH_MAP = {"deepseek_v3": "deepseek"}` 手动维护MAP，配置model_type 与`patches/models/`  下文件名称`xxxmodel`映射
+    - Prefix matching    支持`patches/models/`中 `xxxmodel` 是`model_type`的前缀匹配    
+    - containment match  支持`patches/models/`中 `xxxmodel` 是`model_type`的子串匹配
+
+# 2.2 补丁文件执行
+
+通过环境变量`OMNI_NPU_VLLM_PATCHES`指定具体被执行的补丁。
+当环境变量`OMNI_NPU_VLLM_PATCHES`为`"ALL"`时，将自动执行`src/omni_npu/vllm_patches/patches`目录中`/common` ;`/models/xxxmodel` 对应patch文件;
 
 否则，根据环境变量`OMNI_NPU_VLLM_PATCHES`执行指定补丁，补丁之间以`,`隔开，格式如下：
 
