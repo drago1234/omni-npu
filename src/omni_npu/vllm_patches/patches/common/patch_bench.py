@@ -1135,6 +1135,12 @@ class BenchServePatch(VLLMPatch):
             type=json.loads,
             default=None,
         )
+        parser.add_argument(
+            "--enable-kv-rmsnorm-rope-cache",
+            type=bool,
+            default=False,
+            help="enable_kv_rmsnorm_rope_cache",
+        )
 
     async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         print(args)
