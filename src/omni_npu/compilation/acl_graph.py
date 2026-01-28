@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import dataclasses
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -248,7 +249,9 @@ class ACLGraphWrapper:
                     padding_lens = min(self.vllm_config.scheduler_config.max_num_seqs, batch_descriptor.num_tokens)
                 aslkv = self._pad_list(aslkv, padding_lens) # padding  aslkv to match gear
                 asl = self._pad_list(asl, padding_lens) # padding  asl to match gear
-                asl[-1] = batch_descriptor.num_tokens # FIXME: for TND FIA validation
+                # FIXME: for TND FIA validation
+                aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
+                asl[-1] = batch_descriptor.num_tokens
                 entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
@@ -256,7 +259,7 @@ class ACLGraphWrapper:
 
     def _pad_list(self, lst, n):
         if not lst or len(lst) == n:
-            return lst
+            return copy.deepcopy(lst)
         return lst + [lst[-1]] * (n - len(lst)) if len(lst) < n else lst[:n]
 
 @dataclass
