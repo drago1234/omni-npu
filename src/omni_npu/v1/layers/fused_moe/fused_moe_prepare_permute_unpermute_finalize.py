@@ -44,7 +44,7 @@ class FusedMoEPreparePermuteAndUnpermuteFinalize(ABC):
     An abstract base class for the Fused MoE prepare + permute and unpermute + finalize.
     """
     def __init__(self, layer):
-        self.num_experts = layer.global_num_experts
+        self.num_experts = layer.global_num_experts + layer.quant_method.num_of_redundant_experts * get_ep_group().world_size
         self.num_local_experts = layer.local_num_experts
         self.ep_size = get_ep_group().world_size
         self.ep_rank = get_ep_group().rank
@@ -87,7 +87,7 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             x,
             expert_idx=topk_ids,
             scale=None,
-            expert_num=self.num_experts,
+            expert_num=max_num_deployed_expert,
             active_expert_range=expert_range,
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,

@@ -63,11 +63,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
     def __init__(self, parent, layer):
         NPUCompressedTensorsW8A8Int8MoEMethod.__init__(self, parent, layer)
         NPUFusedMoEMethodBase.__init__(self)
-        self.scale_2 = torch.ones(
-            (layer.local_num_experts, layer.intermediate_size_per_partition), 
-            dtype=torch.float32,
-            device=current_platform.device_type
-        )
+        
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> Optional[FusedMoEQuantConfig]:
         return int8_w8a8_moe_quant_config(
@@ -168,6 +164,11 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
             group_type=0,
             group_list_type=1)[0]
 
+        self.scale_2 = torch.ones(
+            (len(layer.w13_weight), layer.intermediate_size_per_partition), 
+            dtype=torch.float32,
+            device=current_platform.device_type
+        )
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             gate_up_proj,
             weight_scale=layer.w13_weight_scale,
