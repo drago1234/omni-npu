@@ -203,6 +203,14 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             )
             NPUAttentionBackendImpl.DECORE_ATTN_MASK = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
 
+    def set_kv_rmsnorm_rope_params(self, k_norm_weight, k_norm_eps, cos, sin, enable_kv_rmsnorm_rope_cache, head_size_v):
+            self.k_norm_weight = k_norm_weight
+            self.k_norm_eps = k_norm_eps
+            self.cos = cos
+            self.sin = sin
+            self.enable_kv_rmsnorm_rope_cache = enable_kv_rmsnorm_rope_cache
+            self.head_size_v = head_size_v
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -229,14 +237,31 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         value = value.view(-1, value.shape[-1]).contiguous()
 
         # update kv cache
-        slots = attn_metadata.slot_mapping.view(-1, 1)
-        torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, self.num_kv_heads*key.shape[-1]), slots, key)
-        torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, self.num_kv_heads*value.shape[-1]), slots, value)
+        key_cache, value_cache = kv_cache[0], kv_cache[1]
+        if hasattr(self, "enable_kv_rmsnorm_rope_cache") and self.enable_kv_rmsnorm_rope_cache:
+            actual_num_tokens = 1
+            slots = attn_metadata.slot_mapping
+            key_cache, value_cache, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
+                key[:num_tokens].view(actual_num_tokens, -1, self.num_kv_heads, self.head_size).transpose(1, 2),
+                self.k_norm_weight,
+                self.cos[:num_tokens].view(actual_num_tokens, -1, 64).unsqueeze(1).repeat(1, self.num_kv_heads, 1, 1),
+                self.sin[:num_tokens].view(actual_num_tokens, -1, 64).unsqueeze(1).repeat(1, self.num_kv_heads, 1, 1),
+                slots[:num_tokens].to(torch.int64),
+                key_cache,
+                value_cache,
+                v=value[:num_tokens].view(actual_num_tokens, -1, self.num_kv_heads, self.head_size_v).transpose(1, 2),
+                epsilon=self.k_norm_eps,
+                cache_mode="PA",
+            )
+        else:
+            slots = attn_metadata.slot_mapping.view(-1, 1)
+            torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, self.num_kv_heads*key.shape[-1]), slots, key)
+            torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, self.num_kv_heads*value.shape[-1]), slots, value)
 
         attn_output = torch_npu.npu_fused_infer_attention_score_v2(
             query,
-            kv_cache[0],
-            kv_cache[1],
+            key_cache,
+            value_cache,
             num_query_heads=self.num_heads,
             num_key_value_heads=self.num_kv_heads,
             input_layout="TND",
