@@ -7,6 +7,7 @@ These tests use mocking to verify the logic and API contracts.
 import unittest
 from unittest.mock import MagicMock, patch
 import sys
+import importlib
 import torch
 import pytest
 from typing import Generic, TypeVar, List, Any, Type
@@ -94,6 +95,10 @@ def setup_module():
             'vllm.forward_context': forward_ctx_mod
         })
         forward_context_mod_patcher.start()
+        import omni_npu.attention.backends.attention as attn_mod
+        import omni_npu.attention.backends as backends_mod
+        importlib.reload(attn_mod)
+        importlib.reload(backends_mod)
         # Now it's safe to import omni_npu — its backend will inherit from REAL base classes
         from omni_npu.attention.backends import (
             NPUAttentionBackendImpl as _impl,
