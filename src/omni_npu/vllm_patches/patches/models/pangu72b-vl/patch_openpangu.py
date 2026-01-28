@@ -395,8 +395,12 @@ class openpanguPatch(VLLMPatch):
             )
 
             self.k_layernorm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            cache_layer = config.num_hidden_layers
+            is_mtp_layer = getattr(config, "is_mtp_layer", False)
+            if is_mtp_layer:
+                cache_layer = config.num_nextn_predict_layers
             self._init_rotary_emb(
-                config, rope_parameters=rope_parameters, quant_config=quant_config)
+                config, cache_layer, rope_parameters=rope_parameters, quant_config=quant_config)
 
             if hasattr(config, "interleaved_sliding_window"):
                 interleaved_sliding_window = config.interleaved_sliding_window
@@ -543,6 +547,7 @@ class openpanguPatch(VLLMPatch):
         def _init_rotary_emb(
             self,
             config: PretrainedConfig,
+            cache_layer: int,
             rope_parameters: dict[str, Any] | None,
             quant_config: QuantizationConfig | None,
         ) -> None:
@@ -557,7 +562,7 @@ class openpanguPatch(VLLMPatch):
                 base=config.rope_theta,
                 rope_scaling=getattr(config, "rope_scaling", None),
                 is_neox_style=is_neox_style,
-                num_hidden_layers_cache=config.num_hidden_layers
+                num_hidden_layers_cache=cache_layer
             )
 
         def post_weight_load(self) -> None:

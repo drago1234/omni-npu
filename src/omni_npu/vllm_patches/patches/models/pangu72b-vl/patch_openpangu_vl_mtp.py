@@ -42,6 +42,7 @@ class OpenPanguVLMultiTokenPredictorLayerPatch(VLLMPatch):
             nn.Module.__init__(self)
 
             config = vllm_config.speculative_config.draft_model_config.hf_config
+            config.is_mtp_layer = True
             self.config = config
             quant_config = vllm_config.quant_config
 
@@ -64,7 +65,8 @@ class OpenPanguVLMultiTokenPredictorLayerPatch(VLLMPatch):
             spec_step_index: int = 0,
         ) -> torch.Tensor:
             assert inputs_embeds is not None
-            inputs_embeds = torch.where(positions[0].unsqueeze(-1) == 0, 0, inputs_embeds)
+            positions_to_use = positions[0] if positions.ndim == 2 else positions
+            inputs_embeds = torch.where((positions_to_use == 0).unsqueeze(-1), 0, inputs_embeds)
             inputs_embeds = self.enorm(inputs_embeds)
             previous_hidden_states = self.hnorm(previous_hidden_states)
 

@@ -52,6 +52,7 @@ class rotary_embeddingPatch(VLLMPatch):
                 rope_scaling_args,
                 None,
                 dtype,
+                num_hidden_layers_cache
             )
             if key in _ROPE_DICT:
                 return _ROPE_DICT[key]
@@ -173,31 +174,6 @@ class rotary_embeddingPatch(VLLMPatch):
                     for i, m in enumerate(cos_sin.split(mrope_section_3d, dim=-1))],
                 dim=-1,
             )
-            return cos_sin, torch.arange(cos_sin.shape[0], device=positions.device)
-
-        def forward(
-            self,
-            positions: torch.Tensor,
-            query: torch.Tensor,
-            key: Optional[torch.Tensor] = None
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            """Forward pass with interleaved rotary embedding."""
-            cos_sin, positions = self._rebuild_pos_emb(positions)
-
-            import torch_npu
-
-            mrope_section = [0, 0, 0] if positions.ndim == 1 else self.mrope_section
-
-            num_tokens = query.shape[0]
-
-            query = query.view(num_tokens, 1, -1, self.head_size)
-            query_rot = query[..., :self.rotary_dim]
-            query_pass = query[..., self.rotary_dim:]
-
-            key = key.view(num_tokens, 1, -1, self.head_size)
-            key_rot = key[..., :self.rotary_dim]
-            key_pass = key[..., self.rotary_dim:]
-
             cos, sin = cos_sin.chunk(2, dim=-1)
             from einops import rearrange
             if self.rotary_mode == 'half':
@@ -210,6 +186,35 @@ class rotary_embeddingPatch(VLLMPatch):
                 raise ValueError("only support half or interleave")
             cos = cos.reshape(-1, 1, 1, self.rotary_dim)
             sin = sin.reshape(-1, 1, 1, self.rotary_dim)
+
+            return cos, sin
+
+        def forward(
+            self,
+            positions: torch.Tensor,
+            query: torch.Tensor,
+            key: Optional[torch.Tensor] = None
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            """Forward pass with interleaved rotary embedding."""
+            if self.layer_counts % self.num_hidden_layers_cache == 0:
+                cos, sin = self._rebuild_pos_emb(positions)
+                self.layer_cache = (cos, sin)
+                self.layer_counts = 0
+            else:
+                cos, sin = self.layer_cache
+            self.layer_counts += 1
+
+            import torch_npu
+
+            num_tokens = query.shape[0]
+
+            query = query.view(num_tokens, 1, -1, self.head_size)
+            query_rot = query[..., :self.rotary_dim]
+            query_pass = query[..., self.rotary_dim:]
+
+            key = key.view(num_tokens, 1, -1, self.head_size)
+            key_rot = key[..., :self.rotary_dim]
+            key_pass = key[..., self.rotary_dim:]
 
             query_rot = torch_npu.npu_rotary_mul(query_rot.contiguous(), cos, sin, rotary_mode=self.rotary_mode)
             key_rot = torch_npu.npu_rotary_mul(key_rot.contiguous(), cos, sin, rotary_mode=self.rotary_mode)
