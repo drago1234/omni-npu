@@ -56,35 +56,44 @@ def layer_parallel_communication_op(data: torch.Tensor,
 class FlashCommLinearMethodBase(QuantizeMethodBase):
     
     @abstractmethod
-    def create_weights(self,
-                       layer: torch.nn.Module,
-                       input_size_per_partition: int,
-                       output_partition_sizes: list[int],
-                       input_size: int,
-                       output_size: int,
-                       params_dtype: torch.dtype,
-                       **extra_weight_attrs):
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs
+    ):
         raise NotImplementedError
 
     @abstractmethod
-    def apply(self,
-              layer: torch.nn.Module,
-              x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None,
-              x_transform: str = "NoOp",
-              x_dim: Optional[int] = 0,
-              is_prefill: Optional[bool] = True) -> torch.Tensor: 
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        x_transform: str = "NoOp",
+        x_dim: Optional[int] = 0,
+        throw_dequant: Optional[bool] = False
+    ) -> torch.Tensor: 
         raise NotImplementedError
 
 
 class UnquantizedFlashCommLinearMethod(FlashCommLinearMethodBase):
     """Linear method without quantization."""
 
-    def create_weights(self, layer: torch.nn.Module,
-                       input_size_per_partition: int,
-                       output_partition_sizes: list[int], input_size: int,
-                       output_size: int, params_dtype: torch.dtype,
-                       **extra_weight_attrs):
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs
+    ):
         weight = Parameter(torch.empty(sum(output_partition_sizes),
                                        input_size_per_partition,
                                        dtype=params_dtype),
@@ -110,7 +119,7 @@ class UnquantizedFlashCommLinearMethod(FlashCommLinearMethodBase):
         bias: Optional[torch.Tensor] = None,
         x_transform: Optional[str] = None,
         x_dim: Optional[int] = 0,
-        is_prefill: Optional[bool] = True
+        throw_dequant: Optional[bool] = False,
     ) -> torch.Tensor:
         input_parallel = layer_parallel_communication_op(x, x_transform, layer.layer_name_inside_block, "x", x_dim)
         if bias is not None:
@@ -246,13 +255,12 @@ class ReplicatedFlashCommLinear(FlashCommLinearBase):
 
     def forward(
         self,
-        input_: torch.Tensor,
-        is_prefill: bool = True
+        input_: torch.Tensor
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
 
-        output = self.quant_method.apply(self, input_, bias, self.x_transform, self.x_dim, is_prefill=is_prefill)
+        output = self.quant_method.apply(self, input_, bias, self.x_transform, self.x_dim)
         output_bias = self.bias if self.skip_bias_add else None
 
         if not self.return_bias:
@@ -356,15 +364,15 @@ class ColumnParallelFlashCommLinear(FlashCommLinearBase):
 
     def forward(
         self,
-        input_,
-        is_prefill=True
+        input_: torch.Tensor,
+        throw_dequant: Optional[bool] = False,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
 
-        output_parallel = self.quant_method.apply(self, input_, bias, self.x_transform, self.x_dim, is_prefill=is_prefill)
+        output_parallel = self.quant_method.apply(self, input_, bias, self.x_transform, self.x_dim, throw_dequant=throw_dequant)
         output = layer_parallel_communication_op(output_parallel, self.y_transform, self.layer_name_inside_block, "y", self.y_dim)
         output_bias = self.bias if self.skip_bias_add else None
 

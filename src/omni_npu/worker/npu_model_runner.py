@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-import os
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import TYPE_CHECKING, Optional, Union, Any, cast, TypeAlias
@@ -30,7 +29,6 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -266,9 +264,11 @@ class NPUModelRunner(GPUModelRunner):
                                          runtime_mode=CUDAGraphMode.FULL)
             logger.debug("<<< Wrapped original model with ACLGraphWrapper")
             if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
-                self.drafter.model = ACLGraphWrapper(self.drafter.model,
-                                            self.vllm_config,
-                                            runtime_mode=CUDAGraphMode.FULL)
+                self.drafter.model = ACLGraphWrapper(
+                    self.drafter.model,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL
+                )
                 logger.debug("<<< Wrapped drafter model with ACLGraphWrapper")
 
     def capture_model(self) -> int:

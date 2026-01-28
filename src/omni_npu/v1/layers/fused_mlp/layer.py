@@ -1,15 +1,16 @@
-import os
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
 from abc import abstractmethod
-from typing import Optional
+from typing import Optional, Union, Dict, Tuple
 
 import torch
+
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 from vllm.model_executor.layers.activation import SiluAndMul
 
 from omni_npu.v1.layers.linear import MergedColumnParallelFlashCommLinear, RowParallelFlashCommLinear
 from omni_npu.v1.layers.utils import get_npu_execution_type
-
-SCALE_PARALLEL = os.getenv("SCALE_PARALLEL", "False") == "true"
 
 
 class FusedMLPMethodBase(QuantizeMethodBase):
@@ -27,6 +28,33 @@ class FusedMLPMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
     @abstractmethod
+    def apply_part1_gate_up_on_stream(
+        self,
+        layer: torch.nn.Module,
+        x: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        stream_label: Optional[str | torch.npu.Stream] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_part2_activation_on_stream(
+        self,
+        layer: torch.nn.Module,
+        gate_up: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        stream_label: Optional[str | torch.npu.Stream] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_part3_down_on_stream(
+        self,
+        layer: torch.nn.Module,
+        x: Union[torch.Tensor, Dict[str, torch.Tensor]],
+        stream_label: Optional[str | torch.npu.Stream] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    @abstractmethod
     def apply(
         self,
         layer: torch.nn.Module,
@@ -40,8 +68,8 @@ class UnquantizedFusedMLPMethod(FusedMLPMethodBase):
 
     def apply_part1_gate_up_on_stream(
         self,
-        layer,
-        x,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
         stream_label: Optional[str | torch.npu.Stream] = None,
     ) -> torch.Tensor:
         with get_npu_execution_type(stream_label):
@@ -50,8 +78,8 @@ class UnquantizedFusedMLPMethod(FusedMLPMethodBase):
 
     def apply_part2_activation_on_stream(
         self,
-        layer,
-        gate_up,
+        layer: torch.nn.Module,
+        gate_up: torch.Tensor,
         stream_label: Optional[str | torch.npu.Stream] = None,
     ) -> torch.Tensor:
         with get_npu_execution_type(stream_label):
@@ -60,8 +88,8 @@ class UnquantizedFusedMLPMethod(FusedMLPMethodBase):
 
     def apply_part3_down_on_stream(
         self,
-        layer,
-        x,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
         stream_label: Optional[str | torch.npu.Stream] = None,
     ) -> torch.Tensor:
         with get_npu_execution_type(stream_label):
@@ -70,8 +98,8 @@ class UnquantizedFusedMLPMethod(FusedMLPMethodBase):
 
     def apply(
         self,
-        layer,
-        x,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
         stream_label: Optional[str | torch.npu.Stream] = None,
     ) -> torch.Tensor:
         gate_up = self.apply_part1_gate_up_on_stream(layer, x, stream_label)

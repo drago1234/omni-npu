@@ -11,17 +11,10 @@
                     "tp_size_or_ranks": 1
                 }
             },
-            "mlp.down_proj": {
-                "tp_size_or_ranks": 4,
-                "x_transform": {
-                    "type": "None"
-                },
-                "y_transform": {
-                    "type": "AllReduce",
-                    "tp_size_or_ranks": 4
-                }
-            },
             "mlp.gate_up_proj": {
+                "tp_size_or_ranks": 4
+            },
+            "mlp.down_proj": {
                 "tp_size_or_ranks": 4,
                 "x_transform": {
                     "type": "None"
@@ -45,7 +38,7 @@
         "enable_mlaprolog": false,
         "cast_w2_scale_f32": true,
         "control_accept_rate": -1,
-        "enable_prefetch": true,
+        "enable_prefetch": false,
         "expert_gate_up_prefetch": 50,
         "expert_down_prefetch": 0,
         "attn_prefetch": 96

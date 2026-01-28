@@ -2,15 +2,14 @@
 # Please use this patch by adding VLLM_PLUGINS="omni-npu,omni_npu_patches" OMNI_NPU_VLLM_PATCHES="EPLBParallelConfig,EPLBFusedMoE" before vllm serve
 
 from typing import Optional
+
 import torch
 import torch_npu
-
+from transformers import DeepseekV2Config, DeepseekV3Config
 try:
     import custom_ops
 except:
     print("custom_ops failed to import!!!")
-
-from transformers import DeepseekV2Config, DeepseekV3Config
 
 from vllm.config import VllmConfig, CacheConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -18,6 +17,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.models.deepseek_v2 import Indexer
 from vllm.v1.attention.backends.mla.common import MLACommonMetadata
+
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
@@ -143,4 +143,4 @@ class DSV32IndexerPatch(VLLMPatch):
             sparse_mode=3
         )
         self.topk_indices_buffer[:bs] = topk_indices.view(-1, self.topk_tokens)
-        return self.topk_indices_buffer      
+        return topk_indices      

@@ -105,11 +105,11 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
         bias: Optional[torch.Tensor] = None,
         x_transform: Optional[str] = None,
         x_dim: Optional[int] = 0,
-        is_prefill: Optional[bool] = True,
+        throw_dequant: Optional[bool] = False,
     ) -> torch.Tensor:
         if isinstance(x, Dict):
-            x_scale = x.get('pertoken_scale',None)
-            x = x.get('x_int8',None)
+            x_scale = x.get('pertoken_scale', None)
+            x = x.get('x_int8', None)
         else:
             x, x_scale = torch_npu.npu_dynamic_quant(x)
         # TODO scale_parallel is not supported yet. scale_parallel = model_extra_config.operator_opt_config.enable_scale_parallel
@@ -125,15 +125,25 @@ class W8A8Int8FCLinearMethod(FlashCommLinearMethodBase):
             x = layer_parallel_all2all_single(
                 x, layer.layer_name_inside_block, "x", x_dim
             )
-        y = torch_npu.npu_quant_matmul(
-            x1=x,
-            x2=layer.weight,
-            scale=layer.weight_scale,
-            pertoken_scale=x_scale,
-            bias=bias,
-            output_dtype=layer.orig_dtype,
-        )
-        return y
+        if throw_dequant and bias is None:
+            y = torch_npu.npu_quant_matmul(
+                x1=x,
+                x2=layer.weight,
+                scale=layer.weight_scale,
+                bias=None,
+                output_dtype=torch.int32,
+            )
+            return y, x_scale
+        else:
+            y = torch_npu.npu_quant_matmul(
+                x1=x,
+                x2=layer.weight,
+                scale=layer.weight_scale,
+                pertoken_scale=x_scale,
+                bias=bias,
+                output_dtype=layer.orig_dtype,
+            )
+            return y
 
 
 class W8A8Int8MlpMethod(FusedMLPMethodBase):
@@ -154,102 +164,49 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
     def apply_quant(
         self,
         x: torch.Tensor,
-        x_transform: str = None,
-        is_prefill: bool = True,
         stream_label: Optional[str | torch.npu.Stream] = None,
     ):
         with get_npu_execution_type(stream_label):
-            x, x_scale = torch_npu.npu_dynamic_quant(x, smooth_scales=None)
+            x, x_scale = torch_npu.npu_dynamic_quant(x)
         return x, x_scale
 
     def apply_part1_gate_up_on_stream(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        x_scale: torch.Tensor,
+        x: Dict[str, torch.Tensor],
         stream_label: Optional[str | torch.npu.Stream] = None,
     ) -> torch.Tensor:
-        # 多流设置
         with get_npu_execution_type(stream_label):
-            y_int32 = torch_npu.npu_quant_matmul(
-                x1=x,
-                x2=layer.gate_up_proj.weight,
-                scale=layer.gate_up_proj.weight_scale,
-                pertoken_scale=x_scale,
-                bias=None,
-                output_dtype=layer.gate_up_proj.orig_dtype,
-            )
+            gate_up, _ = layer.gate_up_proj(x, throw_dequant=True)
 
-        return y_int32
+        return gate_up
 
     def apply_part2_activation_on_stream(
         self,
         layer: torch.nn.Module,
-        y_int32: torch.Tensor,
-        x_scale: torch.Tensor,
+        gate_up: Tuple[torch.Tensor, torch.Tensor],
         stream_label: Optional[str | torch.npu.Stream] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        bias = layer.gate_up_proj.bias if not layer.gate_up_proj.skip_bias_add else None
-
         with get_npu_execution_type(stream_label):
-            int_int32, int_scale = torch_npu.npu_dequant_swiglu_quant(
-                y_int32,
-                weight_scale=layer.gate_up_proj.weight_scale,
-                activation_scale=x_scale,
-                bias=bias,
-                activate_left=True,
-                quant_mode=1,
-            )
+            x = {
+                'x_int8': gate_up[0],
+                'pertoken_scale': gate_up[1],
+                'out_scale': layer.gate_up_proj.weight_scale
+            }
+            x = layer.act_fn(x, quant_symbol=True)
 
-        return int_int32, int_scale
+        return x
 
     def apply_part3_down_on_stream(
         self,
         layer: torch.nn.Module,
-        int_int32: torch.Tensor,
-        int_scale: torch.Tensor,
+        x: Dict[str, torch.Tensor],
         stream_label: Optional[str | torch.npu.Stream] = None,
     ) -> torch.Tensor:
-        bias = (
-            None
-            if (layer.down_proj.tp_rank > 0 or layer.down_proj.skip_bias_add)
-            else layer.down_proj.bias
-        )
         with get_npu_execution_type(stream_label):
-            output = torch_npu.npu_quant_matmul(
-                x1=int_int32,
-                x2=layer.down_proj.weight,
-                scale=layer.down_proj.weight_scale,
-                pertoken_scale=int_scale,
-                bias=bias,
-                output_dtype=layer.down_proj.orig_dtype,
-            )
+            output, _ = layer.down_proj(x)
 
         return output
-
-    def _layer_parallel_apply_x_transform(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        x_scale: torch.Tensor,
-        x_transform: Optional[str] = None,
-        x_dim: Optional[int] = 0,
-        layer_name_inside_block: Optional[str] = None,
-    ):
-        # TODO scale_parallel is not supported yet. scale_parallel = model_extra_config.operator_opt_config.enable_scale_parallel
-        if x_transform == "AllGather":
-            x_scale = layer_parallel_all_gather(
-                x_scale, layer_name_inside_block, "x", x_dim
-            )
-            x = layer_parallel_all_gather(x, layer.layer_name_inside_block, "x", x_dim)
-        elif x_transform == "ALL2ALL":
-            x_scale = layer_parallel_all2all_single(
-                x_scale, layer_name_inside_block, "x", x_dim
-            )
-            x = layer_parallel_all2all_single(
-                x, layer_name_inside_block, "x", x_dim
-            )
-        return x, x_scale
 
     def apply(
         self,
@@ -257,38 +214,18 @@ class W8A8Int8MlpMethod(FusedMLPMethodBase):
         x: torch.Tensor,
         stream_label: Optional[str | torch.npu.Stream] = None,
     ) -> torch.Tensor:
-        x, x_scale = self.apply_quant(x, layer.gate_up_proj.x_transform, stream_label)
-        x, x_scale = self._layer_parallel_apply_x_transform(
-            layer.gate_up_proj, x, x_scale, layer.gate_up_proj.x_transform, layer.gate_up_proj.x_dim,layer.gate_up_proj.layer_name_inside_block
+        x, x_scale = self.apply_quant(x, stream_label)
+
+        x = {'x_int8': x, 'pertoken_scale': x_scale}
+        gate_up = self.apply_part1_gate_up_on_stream(
+            layer, x, stream_label
         )
-        y_gate_up_int32 = self.apply_part1_gate_up_on_stream(
-            layer, x, x_scale, stream_label
+
+        x = self.apply_part2_activation_on_stream(
+            layer, gate_up, stream_label
         )
-        y_gate_up_int32 = layer_parallel_communication_op(
-            y_gate_up_int32,
-            layer.gate_up_proj.y_transform,
-            layer.gate_up_proj.layer_name_inside_block,
-            "y",
-            layer.gate_up_proj.y_dim,
-        )
-        int_int32, int_scale = self.apply_part2_activation_on_stream(
-            layer, y_gate_up_int32, x_scale, stream_label
-        )
-        int_int32,int_scale = self._layer_parallel_apply_x_transform(
-            layer.down_proj,
-            int_int32,
-            int_scale,
-            layer.down_proj.x_transform,
-            layer.down_proj.x_dim,
-            layer.down_proj.layer_name_inside_block,
-        )
+
         output = self.apply_part3_down_on_stream(
-            layer, int_int32, int_scale, stream_label
+            layer, x, stream_label
         )
-        return layer_parallel_communication_op(
-            output,
-            layer.down_proj.y_transform,
-            layer.down_proj.layer_name_inside_block,
-            "y",
-            layer.down_proj.y_dim,
-        )
+        return output

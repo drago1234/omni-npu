@@ -6,18 +6,19 @@ backend to remain fully self-contained and avoid external dependencies.
 It satisfies vLLM's backend interface so the platform selector can
 import and use it. We can iterate later with true MLA specialization.
 """
+
+import math
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
-import math
-import os
 
 import torch
 import torch_npu
 
+from vllm.platforms import current_platform
 from vllm.attention.backends.abstract import AttentionLayer, AttentionType
-from vllm.forward_context import get_forward_context
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBackend,
     MLACommonDecodeMetadata,
@@ -27,11 +28,10 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonPrefillMetadata,
     QueryLenSupport,
 )
-from vllm.distributed.parallel_state import get_tp_group
-from omni_npu.connector.utils import TP_Convertor
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.platforms import current_platform
+
+from omni_npu.connector.utils import TP_Convertor
 from omni_npu.attention import ops
 
 
@@ -65,10 +65,7 @@ class NPUMLABackend(MLACommonBackend):
         dtype: torch.dtype = torch.bfloat16,
     ) -> Tuple[torch.Tensor, ...]:
         raw_tensor = raw_tensor.view(dtype=dtype)
-        if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
-            shapes = [(num_blocks, block_size, 1, 512), (num_blocks, block_size, 1, 64)]
-        else:
-            shapes = [(num_blocks, block_size, 512), (num_blocks, block_size, 64)]
+        shapes = [(num_blocks, block_size, 512), (num_blocks, block_size, 64)]
         sizes = [math.prod(shape) for shape in shapes]
         if raw_tensor.numel() != sum(sizes):
             raise RuntimeError(f"Raw tensor has {raw_tensor.numel()} elements, while"

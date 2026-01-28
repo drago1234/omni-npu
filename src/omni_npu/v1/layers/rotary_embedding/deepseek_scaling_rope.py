@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-import torch
 from typing import Optional
+
+import torch
+
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import DeepseekScalingRotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import (
@@ -11,6 +13,7 @@ from vllm.model_executor.layers.rotary_embedding.common import (
 )
 
 from .common import get_cos_sin
+
 
 @DeepseekScalingRotaryEmbedding.register_oot
 class NPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):

@@ -13,11 +13,18 @@
                     "tp_size_or_ranks": 16
                 }
             },
-            "mlp.down_proj": {
-                "tp_size_or_ranks": 1
-            },
             "mlp.gate_up_proj": {
-                "tp_size_or_ranks": 1
+                "tp_size_or_ranks": 4
+            },
+            "mlp.down_proj": {
+                "tp_size_or_ranks": 4,
+                "x_transform": {
+                    "type": "None"
+                },
+                "y_transform": {
+                    "type": "AllReduce",
+                    "tp_size_or_ranks": 4
+                }
             }
         },
         "input_split": true

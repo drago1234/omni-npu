@@ -17,7 +17,6 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.distributed.parallel_state import get_pp_group
-
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
@@ -28,6 +27,7 @@ from vllm.v1.attention.backends.tree_attn import TreeAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer, PADDING_SLOT_ID
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
+
 
 logger = init_logger(__name__)
 
@@ -722,5 +722,3 @@ class EagleProposerPatch(VLLMPatch):
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         return draft_token_ids
-
-
