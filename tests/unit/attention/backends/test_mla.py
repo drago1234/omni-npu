@@ -352,8 +352,8 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
 
             num_blocks = 10
             block_size = 128
-            nope_cache = torch.empty(num_blocks * block_size * 512, dtype=torch.uint8, device=device)
-            rope_cache = torch.empty(num_blocks * block_size * 64, dtype=torch.uint8, device=device)
+            nope_cache = torch.empty(num_blocks, block_size, 512, dtype=torch.uint8, device=device)
+            rope_cache = torch.empty(num_blocks, block_size, 64, dtype=torch.uint8, device=device)
             kv_cache = (nope_cache, rope_cache)
 
             layer = MagicMock()
@@ -367,7 +367,7 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 return torch.zeros(q_tensor.shape[0], hidden_size, dtype=dtype, device=device)
 
             def mock_v_up_proj(x, **kwargs):
-                return torch.zeros(x.shape[0], num_heads, v_head_dim, dtype=x.dtype, device=x.device)
+                return torch.zeros(x.shape[0], num_heads * v_head_dim, dtype=x.dtype, device=x.device)
 
             def fake_scatter_nd_update_(tensor, indices, updates):
                 idx = indices.squeeze(-1)  # [N]
