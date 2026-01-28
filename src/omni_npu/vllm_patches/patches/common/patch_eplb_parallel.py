@@ -56,6 +56,14 @@ class EngineConfigPatch(VLLMPatch):
             if self_reasoning_config is not None and vllm_config.model_config is not None:
                 self_reasoning_config.initialize_token_ids(vllm_config.model_config)
                 vllm_config.reasoning_config = self_reasoning_config
+
+            flag = bool(getattr(self, "enable_kv_rmsnorm_rope_cache", False))
+            object.__setattr__(vllm_config.cache_config, "enable_kv_rmsnorm_rope_cache", flag)
+
+            logger.info(f"[VLLMPatch] enable_kv_rmsnorm_rope_cache status: \
+                                vllm_config:{vllm_config.cache_config.enable_kv_rmsnorm_rope_cache} \
+                                engine_args_obj: {flag}")
+
             return vllm_config
         finally:
             current_platform.is_cuda_alike = _orig_is_cuda_alike

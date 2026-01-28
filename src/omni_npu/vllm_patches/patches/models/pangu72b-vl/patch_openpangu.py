@@ -49,7 +49,9 @@ from vllm.model_executor.models.openpangu import (
     OpenPanguMLP,
     check_ffn_act_fn,
 ) 
-
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+ 
 
 @register_patch("OpenPanguMoEPatch", OpenPanguMoE)
 class OpenPanguMoEPatch(VLLMPatch):
@@ -331,6 +333,20 @@ class openpanguPatch(VLLMPatch):
             self.tp_size = get_tensor_model_parallel_world_size()
             self.tp_rank = get_tensor_model_parallel_rank()
             self.total_num_heads = num_heads
+            self.enable_kv_rmsnorm_rope_cache = False
+
+            # 检查EnginerArgs && vllm_config.cache_config 里是否有该变量
+            from vllm.config import get_current_vllm_config
+            vllm_config = get_current_vllm_config()
+            is_fused_op_enabled = getattr(vllm_config.cache_config, "enable_kv_rmsnorm_rope_cache", False)
+            from vllm.engine.arg_utils import EngineArgs
+            logger.info(f"[openpanguPatch] enable_kv_rmsnorm_rope_cache status: \
+                                vllm_config_obj:{is_fused_op_enabled} \
+                                engine_args_obj: {getattr(EngineArgs, "enable_kv_rmsnorm_rope_cache", False)}")
+
+            # Set result as vllm_config value
+            self.enable_kv_rmsnorm_rope_cache = is_fused_op_enabled
+
             if self.total_num_heads % self.tp_size != 0:
                 raise ValueError(
                     f"total_num_heads {self.total_num_heads} "
@@ -521,11 +537,18 @@ class openpanguPatch(VLLMPatch):
         ) -> torch.Tensor:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-            k = self.k_layernorm(k.view(-1, self.num_kv_heads, self.head_dim))
-            q, k = self.rotary_emb(positions, q, k)
+            cos, sin = None, None
+            if self.enable_kv_rmsnorm_rope_cache:
+                q, _, cos, sin = self.rotary_emb(positions, q.contiguous(), output_cos_sin=True)
+            else:
+                k = self.k_layernorm(k.view(-1, self.num_kv_heads, self.head_dim))
+                q, k, _, _ = self.rotary_emb(positions, q.contiguous(), key=k)
 
             q = q.view(-1, self.q_size)
             k = k.view(-1, self.k_size)
+
+            if self.enable_kv_rmsnorm_rope_cache:
+                self.attn.impl.set_kv_rmsnorm_rope_params(self.k_layernorm.weight, self.k_layernorm.variance_epsilon, cos, sin, self.enable_kv_rmsnorm_rope_cache, self.v_channels)
 
             attn_output = self.attn(
                 q,
@@ -558,12 +581,24 @@ class openpanguPatch(VLLMPatch):
                 num_hidden_layers_cache=config.num_hidden_layers
             )
 
+        def sink_key_interleave(self, weight):
+            rope_dim = 64
+            key_rot = weight[..., :rope_dim]
+            key_pass = weight[..., rope_dim:]
+            o1 = key_rot[..., ::2]
+            o2 = key_rot[..., 1::2]
+        
+            key_rot = torch.cat((o1, o2), dim=-1)
+            return torch.cat((key_rot, key_pass), dim=-1)
+
         def post_weight_load(self) -> None:
             if hasattr(self, "k_layernorm") and self.k_layernorm is not None:
                 param_sink_key = self.k_layernorm(self.param_sink_key)
             else:
                 param_sink_key = self.param_sink_key
 
+            # K & Q 保持一致，都做interleave(奇偶交叉处理)
+            param_sink_key = self.sink_key_interleave(param_sink_key) 
             self.attn.update_sink_kv(param_sink_key, self.param_sink_value)
     #####patch end
 

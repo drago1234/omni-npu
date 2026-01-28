@@ -1,7 +1,7 @@
 from typing import Any, Dict, Optional, List, Literal
 
 import torch
-
+import torch_npu
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT 
@@ -15,8 +15,78 @@ _orig_get_rope = _rope_mod.get_rope
 
 @register_patch("rotary_embeddingPatch", rotary_embedding)
 class rotary_embeddingPatch(VLLMPatch):
-    _attr_names_to_apply = ['get_rope_wrapper', 'MRotaryEmbeddingInterleaved']
+    _attr_names_to_apply = ['forward_native', 'get_rope_wrapper', 'MRotaryEmbeddingInterleaved']
+    
+    def forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+        output_cos_sin: Optional[bool] = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """A PyTorch-native implementation of forward()."""
+        def _apply_rotary_emb_torch(
+            x: torch.Tensor,
+            cos: torch.Tensor,
+            sin: torch.Tensor,
+            is_neox_style: bool,
+        ) -> torch.Tensor:
+            cos = cos.unsqueeze(-2).to(x.dtype)
+            sin = sin.unsqueeze(-2).to(x.dtype)
+            if is_neox_style:
+                x1, x2 = torch.chunk(x, 2, dim=-1)
+            else:
+                x1 = x[..., ::2]
+                x2 = x[..., 1::2]
+                # 0 1 2 3 4 5
+                # x1 = 0 2 4, x2= 1  5
+            o1 = x1 * cos - x2 * sin
+            o2 = x2 * cos + x1 * sin
+            return torch.cat((o1, o2), dim=-1)
+        
+        if offsets is not None:
+            positions = positions + offsets
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # patch for kvrmsnormropecache which need cos and sin
+        if output_cos_sin:
+            cos_cache = torch.cat((cos, cos), dim=1)
+            sin_cache = torch.cat((sin, sin), dim=1)
+    
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        query_rot = query[..., :self.rotary_dim]
+        query_pass = query[..., self.rotary_dim:]
+        # patch for q use npu_interleave_rope
+        if output_cos_sin:
+            query_rot = torch_npu.npu_interleave_rope(query_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), \
+                sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
+        else:
+            query_rot = _apply_rotary_emb_torch(query_rot, cos, sin, self.is_neox_style)
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+     
+        # key may be None in some cases, e.g. cross-layer KV sharing
+        if key is not None:
+            key_shape = key.shape
+            key = key.view(num_tokens, -1, self.head_size)
+            key_rot = key[..., :self.rotary_dim]
+            key_pass = key[..., self.rotary_dim:]
+            # patch for k use npu_interleave_rope
+            if output_cos_sin:
+                key_rot = torch_npu.npu_interleave_rope(key_rot.unsqueeze(2), cos_cache.unsqueeze(1).unsqueeze(1), \
+                    sin_cache.unsqueeze(1).unsqueeze(1)).squeeze(2)
+            else:
+                key_rot = _apply_rotary_emb_torch(key_rot, cos, sin, self.is_neox_style)
+            key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        if output_cos_sin:
+            return query, key, cos_cache, sin_cache
+        else:
+            return query, key, None, None
 
+    rotary_embedding.RotaryEmbedding.forward_native = forward_native
 
     #####patch start: for pangu72B-VL
     def get_rope_wrapper(
@@ -64,7 +134,7 @@ class rotary_embeddingPatch(VLLMPatch):
                 head_size,
                 rotary_dim,
                 max_position,
-                base,
+                # base,
                 is_neox_style,
                 dtype,
                 mrope_section=mrope_section,
