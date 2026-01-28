@@ -93,9 +93,6 @@ class EnableKVRMSNormRoPECacheHashFactorsPatch(VLLMPatch):
 
 
 
-import vllm.engine.arg_utils as arg_utils
-from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-
 _orig_from_cli_args = arg_utils.AsyncEngineArgs.from_cli_args
 
 @register_patch("AsyncEngineArgsInjectFlagPatch", arg_utils.AsyncEngineArgs)
