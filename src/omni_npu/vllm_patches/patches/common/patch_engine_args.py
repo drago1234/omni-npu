@@ -48,6 +48,7 @@ class EnableKVRMSNormRoPECacheEngineArgsPatch(VLLMPatch):
         return parser
 
 
+
 # import vllm.config.cache as cache_mod
 from vllm.config.cache import CacheConfig
 @register_patch("EnableKVRMSNormRoPECacheHashFactorsPatch", CacheConfig)
@@ -93,6 +94,8 @@ class EnableKVRMSNormRoPECacheHashFactorsPatch(VLLMPatch):
 
         factors = get_hash_factors(self, ignored_factors)
         return hash_factors(factors)
+
+
 
 import vllm.engine.arg_utils as arg_utils
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
