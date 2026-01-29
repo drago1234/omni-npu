@@ -8,6 +8,7 @@ import torch, torch_npu
 
 from vllm.logger import init_logger
 from vllm.distributed import (
+    get_dp_group,
     get_tp_group,
     get_ep_group,
     tensor_model_parallel_all_reduce,
@@ -69,11 +70,21 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         # Attention metadata is used to decide whether we can use all-to-all for
         # MoE inference (prefill stage) or should fall back to other paths.
-        attn_metadata = get_forward_context().attn_metadata
-        use_all2all = (
-            attn_metadata is None
-            or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-        )
+        forward_ctx = get_forward_context()
+        attn_metadata = forward_ctx.attn_metadata
+        batch_descriptor = forward_ctx.batch_descriptor
+        if attn_metadata is None:
+            use_all2all = True
+        else:
+            # Use the first metadata entry and guard empty metadata.
+            attn_meta = next(iter(attn_metadata.values()), None)
+            decode_threshold = getattr(attn_meta, "decode_threshold", None)
+            if decode_threshold is not None and batch_descriptor is not None:
+                use_all2all = batch_descriptor.num_tokens > decode_threshold
+            else:
+                num_prefills = getattr(attn_meta, "num_prefills", 0)
+                use_all2all = num_prefills > 0
+
 
         # For Ascend910B in decode stage, use the allgather-based EP kernel.
         device_name = _get_npu_device_name(x.device.index)
@@ -137,6 +148,10 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 topk_ids=topk_ids,
             )
         elif use_allgather_ep:
+            if get_dp_group().world_size > 1:
+                hidden_states = get_ep_group().all_gather(hidden_states, dim=0)
+                topk_weights = get_ep_group().all_gather(topk_weights, dim=0)
+                topk_ids = get_ep_group().all_gather(topk_ids, dim=0)
             output = fused_experts_allgather_ep_unquant(
                 layer=layer,
                 x=hidden_states,
@@ -160,7 +175,10 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # TP post-processing (merge results from different TP ranks).
         if tp_size > 1:
             if use_allgather_ep:
-                output = get_tp_group().all_reduce(output)
+                if get_dp_group().world_size > 1:
+                    output = get_ep_group().reduce_scatter(output, dim=0) # [8,576]
+                else:
+                    output = get_tp_group().all_reduce(output)
             else:
                 output = tensor_model_parallel_all_gather(output, dim=0)
                 if did_tp_padding:
