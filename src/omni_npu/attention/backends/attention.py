@@ -14,7 +14,6 @@ from typing import List, Optional, Tuple, ClassVar
 import math
 
 import torch
-import torch_npu
 
 from vllm.attention.backends.abstract import (
     AttentionBackend,
@@ -32,6 +31,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+import torch_npu
 
 NZ_DIM = 16
 
@@ -204,12 +204,12 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             NPUAttentionBackendImpl.DECORE_ATTN_MASK = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
 
     def set_kv_rmsnorm_rope_params(self, k_norm_weight, k_norm_eps, cos, sin, enable_kv_rmsnorm_rope_cache, head_size_v):
-            self.k_norm_weight = k_norm_weight
-            self.k_norm_eps = k_norm_eps
-            self.cos = cos
-            self.sin = sin
-            self.enable_kv_rmsnorm_rope_cache = enable_kv_rmsnorm_rope_cache
-            self.head_size_v = head_size_v
+        self.k_norm_weight = k_norm_weight
+        self.k_norm_eps = k_norm_eps
+        self.cos = cos
+        self.sin = sin
+        self.enable_kv_rmsnorm_rope_cache = enable_kv_rmsnorm_rope_cache
+        self.head_size_v = head_size_v
 
     def forward(
         self,
