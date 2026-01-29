@@ -204,12 +204,12 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             NPUAttentionBackendImpl.DECORE_ATTN_MASK = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
 
     def set_kv_rmsnorm_rope_params(self, k_norm_weight, k_norm_eps, cos, sin, enable_kv_rmsnorm_rope_cache, head_size_v):
-            self.k_norm_weight = k_norm_weight
-            self.k_norm_eps = k_norm_eps
-            self.cos = cos
-            self.sin = sin
-            self.enable_kv_rmsnorm_rope_cache = enable_kv_rmsnorm_rope_cache
-            self.head_size_v = head_size_v
+        self.k_norm_weight = k_norm_weight
+        self.k_norm_eps = k_norm_eps
+        self.cos = cos
+        self.sin = sin
+        self.enable_kv_rmsnorm_rope_cache = enable_kv_rmsnorm_rope_cache
+        self.head_size_v = head_size_v
 
     def forward(
         self,
