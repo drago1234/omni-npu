@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple, ClassVar
 import math
 
 import torch
+import torch_npu
 
 from vllm.attention.backends.abstract import (
     AttentionBackend,
@@ -31,7 +32,6 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-import torch_npu
 
 NZ_DIM = 16
 
