@@ -247,20 +247,23 @@ class ACLGraphWrapper:
                 padding_lens = batch_descriptor.num_reqs
                 if padding_lens is None:
                     padding_lens = min(self.vllm_config.scheduler_config.max_num_seqs, batch_descriptor.num_tokens)
-                aslkv = self._pad_list(aslkv, padding_lens) # padding  aslkv to match gear
+                aslkv = self._pad_list(aslkv, padding_lens, 0) # padding  aslkv to match gear
                 asl = self._pad_list(asl, padding_lens) # padding  asl to match gear
                 # FIXME: for TND FIA validation
-                aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
+                if aslkv[-1] != 0:
+                    aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
                 asl[-1] = batch_descriptor.num_tokens
                 entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
         return entry.output
 
-    def _pad_list(self, lst, n):
+    def _pad_list(self, lst, n, v=None):
         if not lst or len(lst) == n:
             return copy.deepcopy(lst)
-        return lst + [lst[-1]] * (n - len(lst)) if len(lst) < n else lst[:n]
+        if v is None:
+            v = lst[-1]
+        return (lst + [v] * (n - len(lst))) if len(lst) < n else lst[:n]
 
 @dataclass
 class GraphParams:
