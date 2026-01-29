@@ -338,14 +338,9 @@ class openpanguPatch(VLLMPatch):
             self.enable_kv_rmsnorm_rope_cache = False
 
             from vllm.config import get_current_vllm_config
-            from vllm.engine.arg_utils import EngineArgs
             vllm_config = get_current_vllm_config()
             # Set result as vllm_config value
             self.enable_kv_rmsnorm_rope_cache = getattr(vllm_config.cache_config, "enable_kv_rmsnorm_rope_cache", False)
-            # 检查EnginerArgs && vllm_config.cache_config 里是否有该变量
-            logger.info(f"[openpanguPatch] enable_kv_rmsnorm_rope_cache status: \
-                                vllm_config_obj:{self.enable_kv_rmsnorm_rope_cache} \
-                                engine_args_obj: {getattr(EngineArgs, "enable_kv_rmsnorm_rope_cache", False)}")
 
             if self.total_num_heads % self.tp_size != 0:
                 raise ValueError(
