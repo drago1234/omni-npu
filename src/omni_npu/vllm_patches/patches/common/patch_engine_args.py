@@ -1,14 +1,16 @@
 import argparse
 from typing import Any
 
+import vllm.engine.arg_utils as arg_utils
+from vllm.config.cache import CacheConfig
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.logger import init_logger
 logger = init_logger(__name__)
 
-import vllm.engine.arg_utils as arg_utils
-from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from vllm.config.cache import CacheConfig
-from vllm.utils.argparse_utils import FlexibleArgumentParser
-
+from omni_npu.vllm_patches.core import (
+	VLLMPatch, 
+	register_patch,
+)
 
 # Different vLLM versions use different method names for building configs.
 _orig_add_cli_args = arg_utils.EngineArgs.add_cli_args

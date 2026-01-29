@@ -2,6 +2,7 @@ from typing import Any, Dict, Optional, List, Literal
 
 import torch
 import torch_npu
+
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT 
@@ -135,7 +136,7 @@ class rotary_embeddingPatch(VLLMPatch):
                 head_size,
                 rotary_dim,
                 max_position,
-                # base,
+                base,
                 is_neox_style,
                 dtype,
                 mrope_section=mrope_section,
