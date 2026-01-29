@@ -87,8 +87,6 @@ class rotary_embeddingPatch(VLLMPatch):
         else:
             return query, key, None, None
 
-    rotary_embedding.RotaryEmbedding.forward_native = forward_native
-
     #####patch start: for pangu72B-VL
     def get_rope_wrapper(
         head_size: int,
