@@ -135,7 +135,7 @@ class rotary_embeddingPatch(VLLMPatch):
                 head_size,
                 rotary_dim,
                 max_position,
-                # base,
+                base,
                 is_neox_style,
                 dtype,
                 mrope_section=mrope_section,
