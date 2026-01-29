@@ -47,8 +47,6 @@ class EnableKVRMSNormRoPECacheEngineArgsPatch(VLLMPatch):
 
 
 
-# import vllm.config.cache as cache_mod
-from vllm.config.cache import CacheConfig
 @register_patch("EnableKVRMSNormRoPECacheHashFactorsPatch", CacheConfig)
 class EnableKVRMSNormRoPECacheHashFactorsPatch(VLLMPatch):
     """
