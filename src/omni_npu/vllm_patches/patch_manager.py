@@ -64,8 +64,8 @@ class PatchManager:
             self.apply_patch(patch_name)
 
     def apply_patches(self):
-        apply_all_env = os.environ.get('OMNI_NPU_VLLM_PATCHES_ALL', '')
-        if apply_all_env == '1':
+        apply_all_env = os.environ.get('OMNI_NPU_VLLM_PATCHES', '')
+        if apply_all_env == 'ALL':
             self.apply_all_patches()
         else:
             self.apply_patches_from_env()

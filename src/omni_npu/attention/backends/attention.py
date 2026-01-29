@@ -47,6 +47,7 @@ class NPUMetadata:
     num_prefills: int = 0
     num_decodes: int = 0
     num_decode_tokens: int = 0
+    decode_threshold: int = 1
 
 
 class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
@@ -97,6 +98,7 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
                                        num_prefills=num_prefills,
                                        num_decodes=num_decodes,
                                        num_decode_tokens=num_decode_tokens,
+                                       decode_threshold = self.reorder_batch_threshold
                                     )
         return attn_metadata
 
@@ -258,8 +260,9 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, self.num_kv_heads*key.shape[-1]), slots, key)
             torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, self.num_kv_heads*value.shape[-1]), slots, value)
 
+        actual_seq_qlen = attn_metadata.query_cumlens
         attn_output = torch_npu.npu_fused_infer_attention_score_v2(
-            query,
+            query[:actual_seq_qlen[-1]],
             key_cache,
             value_cache,
             num_query_heads=self.num_heads,
@@ -270,11 +273,11 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             block_size=kv_cache[0].shape[1],
             sparse_mode=3,
             atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
-            actual_seq_qlen=attn_metadata.query_cumlens,
+            actual_seq_qlen=actual_seq_qlen,
             actual_seq_kvlen=attn_metadata.seq_lens,
         )[0]
 
-        output.copy_(attn_output)
+        output[:actual_seq_qlen[-1]].copy_(attn_output)
         return output
 
 class AscendAttentionState(Enum):

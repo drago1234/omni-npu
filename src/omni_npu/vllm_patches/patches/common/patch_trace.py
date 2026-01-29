@@ -35,16 +35,16 @@ class ProfilerDynamicPatch(VLLMPatch):
             logger.info("<<< ProfilerDynamicPatch: Trace disabled, PROFILING_NAMELIST environment variable is not set.")
             return
         
-        patches_all = os.getenv("OMNI_NPU_VLLM_PATCHES_ALL", "").strip()
+        patches_all = os.getenv("OMNI_NPU_VLLM_PATCHES", "").strip()
         enabled_patches = os.getenv("OMNI_NPU_VLLM_PATCHES", "")
         enabled_patch_list = [p.strip() for p in enabled_patches.split(",") if p.strip()]
         
-        if patches_all == "1":
-            logger.info("<<< ProfilerDynamicPatch: Trace enabled, OMNI_NPU_VLLM_PATCHES_ALL is set to 1.")
+        if patches_all == "ALL":
+            logger.info("<<< ProfilerDynamicPatch: Trace enabled, OMNI_NPU_VLLM_PATCHES is set to ALL.")
         elif "ProfilerDynamicPatch" in enabled_patch_list:
             logger.info("<<< ProfilerDynamicPatch: Trace enabled, found in OMNI_NPU_VLLM_PATCHES.")
         else:
-            logger.info("<<< ProfilerDynamicPatch: Trace disabled, not found in OMNI_NPU_VLLM_PATCHES and OMNI_NPU_VLLM_PATCHES_ALL is not 1.")
+            logger.info("<<< ProfilerDynamicPatch: Trace disabled, not found in OMNI_NPU_VLLM_PATCHES and OMNI_NPU_VLLM_PATCHES is not ALL.")
             return
         
         namelist_file = Path(namelist_path)

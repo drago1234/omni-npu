@@ -48,13 +48,14 @@ case "$TEST_TYPE" in
     all)
         echo "Running all tests..."
         if [ "$HAS_COV" = true ]; then
-            pytest unit/ \
+            pytest \
                 --cov=omni_npu \
                 --cov-report=term-missing \
                 --cov-report=html \
+                --cov-config=./.coveragerc \
                 -v
         else
-            pytest unit/ -v
+            pytest -v
         fi
         echo ""
         echo "Running integration tests (requires NPU hardware)..."
