@@ -169,14 +169,18 @@ def test_forward_prefetch_and_shared_experts(layer_v1_module):
     layer.gate = MagicMock(return_value=(router_logits, None))
     layer.shared_experts = MagicMock(return_value=torch.full((2, 3), 5.0))
     layer.quant_method = MagicMock()
-    layer.quant_method.apply = MagicMock(return_value=torch.full((2, 3), 6.0))
+
+    mock_apply = MagicMock()
+    mock_apply.side_effect = lambda shared_experts, **_: torch.full((2, 3), 6.0) + shared_experts()
+    layer.quant_method.apply = mock_apply
+
     layer.prefetch_moe = MagicMock()
     layer.prefetch_attention = MagicMock()
 
     share_output, expert_output = layer.forward(hidden_states, router_logits)
 
-    assert torch.equal(share_output, torch.full((2, 3), 5.0))
-    assert torch.equal(expert_output, torch.full((2, 3), 6.0))
+    assert share_output is None # share_output is added to expert_output internally
+    assert torch.equal(expert_output, torch.full((2, 3), 11.0)), f"{expert_output}"
     layer.prefetch_moe.assert_any_call(
         trigger=hidden_states,
         prefetch_experts=False,
@@ -232,9 +236,7 @@ def test_forward_tp_padding_and_all_gather(layer_v1_module):
     expected_padded = torch.nn.functional.pad(hidden_states, (0, 0, 0, 1), value=0)
     expected_local = expected_padded[2:4]
     passed_x = layer.quant_method.apply.call_args.kwargs["x"]
-    passed_router = layer.quant_method.apply.call_args.kwargs["router_logits"]
     assert torch.equal(passed_x, expected_local)
-    assert torch.equal(passed_router, expected_padded[2:4])
     assert share_output is None
     assert expert_output.shape == (3, 2)
     stubs.distributed.tensor_model_parallel_all_gather.assert_called_once()

@@ -244,8 +244,7 @@ class DeepseekV2MoE(nn.Module):
         if self.shared_experts is None:
             assert shared_output is None
 
-        if self.shared_experts is not None:
-            assert shared_output is not None
+        if shared_output is not None:
             final_hidden_states += shared_output
 
         if self.is_sequence_parallel:

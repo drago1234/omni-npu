@@ -249,34 +249,13 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         attn_metadata: Optional['NPUMLAMetadata'] = None,
     ) -> torch.Tensor:
         q = self.q_a_proj(hidden_states)[0]
-
-        cur_stream = torch.npu.current_stream()
-        sub_stream = named_stream("mla_sub_stream")
-
-        sub_stream.wait_stream(cur_stream)
-        with torch.npu.stream(sub_stream):
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-
-        q = self.q_a_layernorm(q)
-        q, pertoken_scale = torch_npu.npu_dynamic_quant(q)
-        q = {'x_int8': q, 'pertoken_scale': pertoken_scale}
-
-        cur_stream.wait_stream(sub_stream)
-        q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim],  dim=-1)
-        q_pe = q_pe.unsqueeze(2)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
-        q_pe = q_pe.squeeze(2) # BSH
-
-        attn_output = torch.empty(
+        attn_output = q.new_empty(
             q.shape[0],
             self.num_local_heads,
-            self.v_head_dim,
-            device=q_nope.device,
-            dtype=q_nope.dtype)
+            self.v_head_dim)
 
-        if attn_metadata is None:
+        if attn_metadata is None: # for memory usage recording in dummy_run
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             latent_cache = latent_cache.view(-1, 1, latent_cache.size(-1))
             kv_a, k_pe = torch.split(latent_cache, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             kv_a = self.kv_a_layernorm(kv_a)
@@ -284,7 +263,35 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
             k_pe = k_pe.squeeze(2)
             attn_output.fill_(0)
+            attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
+            output = self.o_proj.forward(attn_output)[0]
+            return output
+
+        prefill_metadata = attn_metadata.prefill
+        actual_seq_kvlen = prefill_metadata.seq_lens
+        actual_seq_qlen = prefill_metadata.query_cumlens
+        if prefill_metadata.max_query_len > 1:
+            attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE
+            sparse_mode = 3
         else:
+            attn_mask = None
+            sparse_mode = 0
+
+        cur_stream = torch.npu.current_stream()
+        sub_stream = named_stream("mla_sub_stream")
+        sub_stream.wait_stream(cur_stream)
+
+        q = self.q_a_layernorm(q)
+        q, pertoken_scale = torch_npu.npu_dynamic_quant(q)
+        q = {'x_int8': q, 'pertoken_scale': pertoken_scale}
+        with torch.npu.stream(sub_stream):
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+
+        cur_stream.wait_stream(sub_stream)
+        sub_stream.wait_stream(cur_stream)
+
+        q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        with torch.npu.stream(sub_stream):
             kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
             _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
                 latent_cache.view(-1, 1, 1, 576), # bnsd
@@ -301,39 +308,40 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 is_output_kv=True
             )
 
-            prefill_metadata = attn_metadata.prefill
-            actual_seq_kvlen = prefill_metadata.seq_lens
-            actual_seq_qlen = prefill_metadata.query_cumlens
+        cur_stream.wait_stream(sub_stream)
+        sub_stream.wait_stream(cur_stream)
+
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim],  dim=-1)
+        q_pe = q_pe.unsqueeze(2)
+        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
+        q_pe = q_pe.squeeze(2) # BSH
+        with torch.npu.stream(sub_stream):
             prefill_kv_a = kv_a[:actual_seq_kvlen[-1]]
             prefill_k_pe = k_pe[:actual_seq_kvlen[-1]]
             kv = self.kv_b_proj.forward(prefill_kv_a)[0]
-            kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            if prefill_metadata.max_query_len > 1:
-                attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE
-                sparse_mode = 3
-            else:
-                attn_mask = None
-                sparse_mode = 0
-            prefill_k_rope = prefill_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
 
-            attn_output[:actual_seq_qlen[-1]] = torch.ops.npu.npu_fused_infer_attention_score(
-                q_nope[:actual_seq_qlen[-1]],
-                k_nope,
-                v,
-                query_rope=q_pe[:actual_seq_qlen[-1]],
-                key_rope=prefill_k_rope,
-                num_heads=self.num_local_heads,
-                num_key_value_heads=self.num_local_heads,
-                input_layout="TND",
-                atten_mask=attn_mask,
-                sparse_mode=sparse_mode,
-                actual_seq_lengths=actual_seq_qlen,
-                actual_seq_lengths_kv=actual_seq_kvlen,
-                scale=self.scaling,
-                next_tokens=0
-            )[0]
+        cur_stream.wait_stream(sub_stream)
 
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        prefill_k_rope = prefill_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
+
+        attn_output[:actual_seq_qlen[-1]] = torch.ops.npu.npu_fused_infer_attention_score(
+            q_nope[:actual_seq_qlen[-1]],
+            k_nope,
+            v,
+            query_rope=q_pe[:actual_seq_qlen[-1]],
+            key_rope=prefill_k_rope,
+            num_heads=self.num_local_heads,
+            num_key_value_heads=self.num_local_heads,
+            input_layout="TND",
+            atten_mask=attn_mask,
+            sparse_mode=sparse_mode,
+            actual_seq_lengths=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_kvlen,
+            scale=self.scaling,
+            next_tokens=0
+        )[0]
 
         attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
         output = self.o_proj.forward(attn_output)[0]
