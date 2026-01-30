@@ -7,15 +7,16 @@ This module provides the linear scaling method for extending rotary
 positional embeddings. Credits to the Reddit user /u/kaiokendev.
 """
 
-from typing import Optional
 import torch
 import torch_npu
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.rotary_embedding.linear_scaling_rope import LinearScalingRotaryEmbedding
-from .common import apply_rotary_emb_full_dim, get_cos_sin
+from .common import CachedCosSinMixin, apply_rotary_emb_full_dim
 
 @LinearScalingRotaryEmbedding.register_oot
-class NPULinearScalingRotaryEmbedding(LinearScalingRotaryEmbedding):
+class NPULinearScalingRotaryEmbedding(
+    CachedCosSinMixin, LinearScalingRotaryEmbedding
+):
     """RotaryEmbedding extended with linear scaling.
 
     Linear scaling extends the context length by scaling the positions
@@ -115,10 +116,3 @@ class NPULinearScalingRotaryEmbedding(LinearScalingRotaryEmbedding):
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
-
-    def get_cos_sin(
-        self,
-        positions: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ):
-        return get_cos_sin(self.cos_cached, self.sin_cached, positions, offsets)

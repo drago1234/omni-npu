@@ -11,14 +11,14 @@ operations when available.
 import torch
 import torch_npu
 
-from .common import apply_rotary_emb_full_dim, get_cos_sin
+from .common import CachedCosSinMixin, apply_rotary_emb_full_dim
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 NEOX_ROTARY_COEFF = 2
 
 @RotaryEmbedding.register_oot
-class NPURotaryEmbedding(RotaryEmbedding):
+class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
     """Rotary positional embedding for NPU devices.
 
     This implementation provides optimized rotary embedding application for NPU
@@ -63,11 +63,6 @@ class NPURotaryEmbedding(RotaryEmbedding):
 
         self.register_buffer("cos_cached", torch.cos(emb).to(dtype=dtype), persistent=False)
         self.register_buffer("sin_cached", torch.sin(emb).to(dtype=dtype), persistent=False)
-
-    def get_cos_sin(
-        self, positions: torch.Tensor, offsets: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return get_cos_sin(self.cos_cached, self.sin_cached, positions, offsets)
 
     def _forward_ascend_ops_and_small_ops(
         self,

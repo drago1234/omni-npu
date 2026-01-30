@@ -16,21 +16,21 @@ from vllm.config import (
 torch.set_default_device('npu')
 platforms.current_platform = NPUPlatform()
 
-from omni_npu.v1.layers.rotary_embedding.common import apply_rotary_emb_full_dim
+from omni_npu.layers.rotary_embedding.common import apply_rotary_emb_full_dim
 from vllm.model_executor.layers.rotary_embedding.common import apply_rotary_emb_torch
-from omni_npu.v1.layers.rotary_embedding.deepseek_scaling_rope import (
+from omni_npu.layers.rotary_embedding.deepseek_scaling_rope import (
     NPUDeepseekScalingRotaryEmbedding,
 )
-from omni_npu.v1.layers.rotary_embedding.linear_scaling_rope import (
+from omni_npu.layers.rotary_embedding.linear_scaling_rope import (
     NPULinearScalingRotaryEmbedding,
 )
-from omni_npu.v1.layers.rotary_embedding.llama3_rope import (
+from omni_npu.layers.rotary_embedding.llama3_rope import (
     NPULlama3RotaryEmbedding,
 )
-from omni_npu.v1.layers.rotary_embedding.rotary_embedding_torch_npu import (
+from omni_npu.layers.rotary_embedding.rotary_embedding_torch_npu import (
     NPURotaryEmbedding,
 )
-from omni_npu.v1.layers.rotary_embedding.yarn_scaling_rope import (
+from omni_npu.layers.rotary_embedding.yarn_scaling_rope import (
     NPUYaRNScalingRotaryEmbedding,
 )
 
@@ -425,6 +425,26 @@ def test_forward_oot_small_ops_matches_reference():
     assert torch.allclose(out_q, exp_q, atol=1e-4, rtol=1e-4)
     assert torch.allclose(out_k, exp_k, atol=1e-4, rtol=1e-4)
 
+
+def test_cached_cos_sin_mixin_branches_shape():
+    device = _require_npu()
+    layer = NPURotaryEmbedding(
+        head_size=8,
+        rotary_dim=8,
+        max_position_embeddings=16,
+        base=10000,
+        is_neox_style=True,
+        dtype=torch.float32,
+    ).to(device)
+
+    cos_int, sin_int = layer.get_cos_sin(4)
+    positions = torch.tensor([0, 2, 3], device=device)
+    cos_pos, sin_pos = layer.get_cos_sin(positions)
+
+    assert cos_int.shape[-1] == layer.rotary_dim // 2
+    assert sin_int.shape[-1] == layer.rotary_dim // 2
+    assert cos_pos.shape[-1] == layer.rotary_dim
+    assert sin_pos.shape[-1] == layer.rotary_dim
 
 @pytest.mark.parametrize(
     "layer_factory",
