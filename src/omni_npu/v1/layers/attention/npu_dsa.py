@@ -360,11 +360,9 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         attn_output: torch.Tensor,
     ):
         attn_output = attn_output.transpose(0, 1)
-        attn_output = (
-            torch.matmul(attn_output, self.attn.impl.W_UV)
-            .transpose(1, 0)
-            .reshape(-1, self.num_local_heads * self.v_head_dim)
-        )
+        attn_output = torch_npu.npu_transpose_batchmatmul(attn_output, self.attn.impl.W_UV, perm_y=(1, 0, 2))
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        
         return self.o_proj(attn_output)[0]
 
     def _forward_prefill(
@@ -383,11 +381,8 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
         q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim).transpose(0, 1)
-        q_nope = (
-            torch.matmul(q_nope, self.attn.impl.W_UK_T)
-            .transpose(1, 0)
-            .view(-1, self.num_local_heads, self.kv_lora_rank)
-        )
+        q_nope = torch_npu.npu_transpose_batchmatmul(q_nope, self.attn.impl.W_UK_T, perm_y=(1, 0, 2))
+        q_nope = q_nope.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         q_pe = q_pe.unsqueeze(2)
         q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin)
@@ -509,11 +504,10 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             q = q.view(bsz, self.num_local_heads, 1, self.qk_head_dim)
             q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) # b,n,s,d
             q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim).transpose(0, 1) # n, bs, d
-            q_nope = (
-                torch.matmul(q_nope, self.attn.impl.W_UK_T)
-                .transpose(1, 0)
-                .view(bsz, 1, self.num_local_heads, -1)
-            )
+
+            q_nope = torch_npu.npu_transpose_batchmatmul(q_nope, self.attn.impl.W_UK_T, perm_y=(1, 0, 2))
+            q_nope = q_nope.view(bsz, 1, self.num_local_heads, -1)
+
             k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv.unsqueeze(1).unsqueeze(1),
                 self.kv_a_layernorm.weight,

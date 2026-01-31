@@ -388,7 +388,10 @@ class TestNPUDeepseekSparseAttentionCore(unittest.TestCase):
         m = self._make_core_stub()
         B = 6
         attn_output = torch.randn((B, m.num_local_heads, m.kv_lora_rank), dtype=torch.float32)
-        out = npu_dsa_mod.NPUDeepseekSparseAttention._mla_epilog(m, attn_output)
+
+        with patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UV, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UV.shape[2]), dtype=attn_output.dtype), create=True):
+            out = npu_dsa_mod.NPUDeepseekSparseAttention._mla_epilog(m, attn_output)
+        
         self.assertEqual(tuple(out.shape), (B, 8))
         self.assertTrue(m.o_proj.called)
         self.assertTrue(torch.all(out == 1))
@@ -484,6 +487,7 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True):
             out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=None)
 
@@ -516,6 +520,7 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
              patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True), \
              patch.object(npu_dsa_mod.torch.ops, "custom", create=True) as custom_ns:
             custom_ns.npu_sparse_flash_attention = MagicMock(side_effect=_fake_sparse_flash_attention)
@@ -563,6 +568,7 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
              patch.object(npu_dsa_mod, "current_stream", return_value=object(), create=True), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
              patch.object(torch, "npu", create=True) as torch_npu_ns, \
              patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
              patch.object(npu_dsa_mod.torch.ops, "custom", create=True) as custom_ns, \
@@ -588,6 +594,7 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
                 raise AssertionError("should not import omni_cache when attn_metadata is None")
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
              patch.dict(sys.modules, {"omni_cache.cache": _Boom("omni_cache.cache")}):
             out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=None)
@@ -620,9 +627,10 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
             return torch.zeros((B, N, m.kv_lora_rank), dtype=torch.float32)
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
-             patch.object(npu_dsa_mod.torch.ops, "custom", create=True) as custom_ns:
+            patch.object(npu_dsa_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True), \
+            patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
+            patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
+            patch.object(npu_dsa_mod.torch.ops, "custom", create=True) as custom_ns:
             custom_ns.npu_sparse_flash_attention = MagicMock(side_effect=_fake_sparse_flash_attention)
             out = m._forward_decode(hidden_states, cos, sin, attn_metadata=attn_metadata)
 
@@ -670,6 +678,7 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         m.indexer = MagicMock(side_effect=_indexer_assert_q_norm_dict)
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
              patch.object(npu_dsa_mod.torch.ops, "custom", create=True) as custom_ns:
             custom_ns.npu_mla_prolog_v3 = MagicMock(side_effect=_fake_mla_prolog_v3)
             custom_ns.npu_sparse_flash_attention = MagicMock(side_effect=_fake_sparse_flash_attention)
@@ -719,6 +728,7 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         m.indexer = MagicMock(side_effect=_indexer_assert_q_norm_tensor)
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
              patch.object(npu_dsa_mod.torch.ops, "custom", create=True) as custom_ns:
             custom_ns.npu_mla_prolog_v3 = MagicMock(side_effect=_fake_mla_prolog_v3)
             custom_ns.npu_sparse_flash_attention = MagicMock(side_effect=_fake_sparse_flash_attention)
