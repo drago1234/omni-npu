@@ -57,11 +57,23 @@ class GetKwargsHelloWorldPatch(VLLMPatch):
     通过补丁类中打上`@register_patch`以及对应文件可以被导入实现注册;
     通过配置`OMNI_NPU_VLLM_PATCHES`参数实现代码被应用
 
-## 2.1 补丁文件注册
+### 2.1 补丁文件注册
 
-`/patches` 文件夹中 `/patches/common` 用于存放公共的补丁文件；`/patches/modes/xxxmodel(qwen、deepseek、pangu)` 用于存放对应模型的补丁文件，目前并未显示的区分具体模型下具体版本的patch文件;
+`/patches` 文件夹中 `/patches/common` 用于存放公共的补丁文件；`/patches/modes/xxxmodel(qwen、deepseek、pangu)` 用于存放对应模型的补丁文件。
+模型补丁文件支持手动注册导入与自动注册导入两种途径，手动注册导入配置优先于自动注册导入。
+
+#### 2.1.1 手动注册
+
+通过环境变量 `OMNI_NPU_PATCHES_DIR`指定需要执行的模型补丁文件。
+当环境变量 `OMNI_NPU_PATCHES_DIR=xxxmodel` 会将`patches/models/xxxmodel`目录下的补丁文件进行注册。
+```commandline
+patches/models/pangu72b-vl
+OMNI_NPU_PATCHES_DIR="pangu72b-vl"
+```
+
+#### 2.1.2 自动注册
+
 服务启动时通过指定`omni_npu_patches` 会主动将`/patches/common` 以及`/patches/modes/xxxmodel` 下的补丁文件注册到`registered_patches`;其中`/patches/common`为默认注册，`/patches/modes/xxxmodel`通过`model_type`匹配文件夹名称进行注册。
-
 `patches/models/xxxmodel`注册逻辑：
 
 ```python
@@ -86,7 +98,7 @@ class GetKwargsHelloWorldPatch(VLLMPatch):
     - Prefix matching    支持`patches/models/`中 `xxxmodel` 是`model_type`的前缀匹配    
     - containment match  支持`patches/models/`中 `xxxmodel` 是`model_type`的子串匹配
 
-# 2.2 补丁文件执行
+### 2.2 补丁文件执行
 
 通过环境变量`OMNI_NPU_VLLM_PATCHES`指定具体被执行的补丁。
 当环境变量`OMNI_NPU_VLLM_PATCHES`为`"ALL"`时，将自动执行`src/omni_npu/vllm_patches/patches`目录中`/common` ;`/models/xxxmodel` 对应patch文件;
