@@ -140,6 +140,7 @@ class ACLGraphWrapper:
         attn_metadata =  get_forward_context().attn_metadata
         asl = None
         aslkv = None
+        seq_sink_lens = None
         if attn_metadata is not None:
             attn_metadata = attn_metadata[next(iter(attn_metadata))]
             if not hasattr(attn_metadata, "decode"):
@@ -150,6 +151,7 @@ class ACLGraphWrapper:
                 # MLA
                 asl = attn_metadata.decode.query_cumlens
                 aslkv = attn_metadata.decode.seq_lens
+                seq_sink_lens = getattr(attn_metadata.decode, "seq_sink_len", None)
 
         if (
             aclgraph_runtime_mode == CUDAGraphMode.NONE
@@ -253,7 +255,11 @@ class ACLGraphWrapper:
                 if aslkv[-1] != 0:
                     aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
                 asl[-1] = batch_descriptor.num_tokens
-                entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
+                if seq_sink_lens is not None:
+                    seq_sink_lens = self._pad_list(seq_sink_lens, padding_lens) # padding seq_sink_lens to match gear
+                    entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": seq_sink_lens, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
+                else:
+                    entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
         return entry.output
