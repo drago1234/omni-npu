@@ -53,7 +53,7 @@ logger = init_logger(__name__)
 
 @register_patch("GPUModelRunnerPatch", GPUModelRunner)
 class GPUModelRunnerPatch(VLLMPatch):
-    _attr_names_to_apply = ['__init__', 'may_reinitialize_input_batch', '_reshape_kv_cache_tensors', 'initialize_kv_cache_tensors']
+    _attr_names_to_apply = ['__init__', 'may_reinitialize_input_batch', '_reshape_kv_cache_tensors']
 
     
     def __init__(

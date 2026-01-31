@@ -227,13 +227,13 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
 
         # View q to TND, kv to TH.
         query = query.view(-1, self.num_heads, self.head_size).contiguous()
-        key = key.view(-1, key.shape[-1]).contiguous()
-        value = value.view(-1, value.shape[-1]).contiguous()
+        key = key.view(-1, self.num_kv_heads*key.shape[-1]).contiguous()
+        value = value.view(-1, self.num_kv_heads*value.shape[-1]).contiguous()
 
         # update kv cache
         slots = attn_metadata.slot_mapping.view(-1, 1)
-        torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, self.num_kv_heads*key.shape[-1]), slots, key)
-        torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, self.num_kv_heads*value.shape[-1]), slots, value)
+        torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
+        torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
         actual_seq_qlen = attn_metadata.query_cumlens
         # npu_fused_infer_attention_score_v2 does not support TND with dim 256, delete the branch when the operator supports it.

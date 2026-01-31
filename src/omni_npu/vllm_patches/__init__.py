@@ -94,6 +94,7 @@ def _find_patch_dir_fuzzy(model_type: str, models_root: Path) -> Path:
         "deepseek_v3": "deepseek",
         "deepseek_v32": "deepseek",
         "qwen3": "qwen",
+        "pangupromoe": "openpangu_vl",
     }
 
     patch_dir_name = MODEL_PATCH_MAP.get(model_type.lower())
