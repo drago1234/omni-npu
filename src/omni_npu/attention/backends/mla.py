@@ -148,7 +148,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
             # for pd-mixed, TP is used, no need to use mc2_mask
-            metadata.decode.mc2_mask = self.generate_activate_mask(common_attn_metadata.num_actual_tokens)
+            metadata.decode.mc2_mask = self.generate_activate_mask(metadata.decode.query_cumlens[-1])
         if metadata.decode is not None and hasattr(self.kv_cache_spec, "sink_len") and self.kv_cache_spec.sink_len > 0:
             metadata.decode.seq_sink_len = [self.kv_cache_spec.sink_len] * metadata.num_decodes
         if metadata.prefill is not None:
@@ -239,6 +239,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
 class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
     can_return_lse_for_decode: bool = True
     SHARE_MASK_TRIL_SPARSE = None
+    DECORE_ATTN_MASK = None
 
     def __init__(
         self,
@@ -295,12 +296,17 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 "NPUMLAImpl"
             )
 
-        if NPUMLAImpl.SHARE_MASK_TRIL_SPARSE is None:
-            NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
-                torch.ones((2048, 2048), dtype=torch.bool, device="npu")
-            )
-            NPUMLAImpl.DECORE_ATTN_MASK = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
+        self.ensure_decode_attn_mask()
 
+    @classmethod
+    def ensure_decode_attn_mask(cls) -> None:
+        if cls.DECORE_ATTN_MASK is None:
+            if cls.SHARE_MASK_TRIL_SPARSE is None:
+                cls.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
+                    torch.ones((2048, 2048), dtype=torch.bool, device="npu")
+                )
+            cls.DECORE_ATTN_MASK = cls.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
+            
     def update_sink_kv(self, sink_k_pe: torch.Tensor, sink_compressed_kv: torch.Tensor) -> None:
         self.sink_k_pe = sink_k_pe.unsqueeze(1)
         self.sink_compressed_kv = sink_compressed_kv

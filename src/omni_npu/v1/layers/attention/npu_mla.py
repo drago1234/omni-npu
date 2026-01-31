@@ -18,7 +18,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.attention.layer import MLAAttention
 
-from omni_npu.attention.backends.mla import NPUMLAMetadata
+from omni_npu.attention.backends.mla import NPUMLAImpl, NPUMLAMetadata
 from omni_npu.v1.layers.utils import yarn_get_mscale, named_stream
 from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
@@ -210,6 +210,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
         q_nope = q_nope.view(bsz, self.num_local_heads, self.kv_lora_rank)
         q_pe = q_pe.view(bsz, self.num_local_heads, -1)
+        NPUMLAImpl.ensure_decode_attn_mask()
         kwargs = {
             "query": q_nope,
             "key": k_nope,
@@ -219,8 +220,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             "num_heads": self.num_local_heads,
             "num_key_value_heads": 1,
             "input_layout": "TND_NTD",
-            "atten_mask": None,
-            "sparse_mode": 0,
+            "atten_mask": NPUMLAImpl.DECORE_ATTN_MASK,
+            "sparse_mode": 3,
             "scale": self.scaling,
             "antiquant_mode": 0,
             "antiquant_scale": None,
