@@ -9,6 +9,8 @@ EXPERT_PARALLEL=true
 MTP=false
 ENFORCE_EAGER=false
 MODEL=""
+USER_COMPILATION_CONFIG=""
+SERVED_MODEL_NAME="deepseek"
 LOG_DIR="$(dirname "$0")/logs"
 LOG_LEVEL=DEBUG
 PORT=8080
@@ -49,6 +51,10 @@ while [[ $# -gt 0 ]]; do
             MODEL="$2"
             shift 2
             ;;
+        --served-model-name)
+            SERVED_MODEL_NAME="$2"
+            shift 2
+            ;;
         --log-dir)
             LOG_DIR="$2"
             shift 2
@@ -65,6 +71,10 @@ while [[ $# -gt 0 ]]; do
             DIST_BACKEND="$2"
             shift 2
             ;;
+        --compilation-config)
+            USER_COMPILATION_CONFIG="$2"
+            shift 2
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -77,10 +87,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-ep                         Do not use expert parallelism (must set for dense models)"
             echo "  --mtp                           Use MTP (default: false)"
             echo "  --model PATH                    Model path (required)"
+            echo "  --served-model-name NAME        Served model name (default: deepseek)"
             echo "  --log-dir DIR                   Log directory (default: ./logs)"
             echo "  --log-level LEVEL               Logging level (default: DEBUG)"
             echo "  --port PORT                     Server port (default: 8080)"
             echo "  --dist-backend BACKEND          Distributed backend (default: mp)"
+            echo "  --compilation-config JSON       vLLM compilation config override"
             echo "  --help                          Show this help message"
             exit 0
             ;;
@@ -113,7 +125,7 @@ VLLM_CMD=(
     vllm
     serve
     "$MODEL"
-    --served-model-name deepseek
+    --served-model-name "$SERVED_MODEL_NAME"
     --host 0.0.0.0
     --port "$PORT"
     --dtype bfloat16
@@ -148,12 +160,15 @@ gen_arith_seq() {
 if [[ "$ENFORCE_EAGER" = true ]]; then
     VLLM_CMD+=(--enforce-eager)
 else
-    [[ "$MTP" = true ]] && interval=2 || interval=1
-    gear=$(gen_arith_seq $interval $BSZ 1)
-    COMPILATION_CONFIG=$(printf '{"level":3, "cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[%s], "backend":"eager", "compile_sizes":[1,2,8]}' "$gear")
-    VLLM_CMD+=(--compilation-config "$COMPILATION_CONFIG")
+    if [[ -n "$USER_COMPILATION_CONFIG" ]]; then
+        VLLM_CMD+=(--compilation-config "$USER_COMPILATION_CONFIG")
+    else
+        [[ "$MTP" = true ]] && interval=2 || interval=1
+        gear=$(gen_arith_seq $interval $BSZ 1)
+        COMPILATION_CONFIG=$(printf '{"level":3, "cudagraph_mode":"FULL_DECODE_ONLY", "cudagraph_capture_sizes":[%s], "backend":"eager", "compile_sizes":[1,2,8]}' "$gear")
+        VLLM_CMD+=(--compilation-config "$COMPILATION_CONFIG")
+    fi
 fi
-
 if [[ "$EXPERT_PARALLEL" = true ]]; then
     VLLM_CMD+=(--enable-expert-parallel)
 fi
