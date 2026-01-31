@@ -26,6 +26,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from .utils import get_p_start_rank
 
@@ -412,33 +413,38 @@ class LLMDataDistManager:
         return ip
 
     # reuse the existing code
-    def register_memory(self, kv_caches: dict[str, torch.Tensor]):
+    def register_memory(self, kv_caches: dict[str, torch.Tensor], kv_cache_config: KVCacheConfig = None):
         if len(self.registered_kv_caches) > 0:
             raise ValueError("Attr `registered_kv_caches` must be empty before register kv_caches.")
-        if isinstance(kv_caches, dict):
-            flatten_kv_caches = unzip_kv_cache_dict(kv_caches)
-        else:
-            flatten_kv_caches = unzip_kv_cache_list(kv_caches)
-
-        # dense model.
-        flatten_kv_caches = maybe_merge_kv_caches(flatten_kv_caches)
-        # spec model.
-        flatten_kv_caches = maybe_split_kv_caches_for_spec_layers(flatten_kv_caches)
-
-        for model_id, sub_kv_caches in enumerate(flatten_kv_caches):
-            cache_desc = CacheDesc(num_tensors=len(sub_kv_caches), shape=tuple(sub_kv_caches[0].shape),
-                                data_type=TORCH_DTYPE_TO_NPU_DTYPE[sub_kv_caches[0].dtype])
-
-            cache_addrs = [int(item.data_ptr()) for item in sub_kv_caches]
-
-            if self.data_dist_config.is_prefill:
-                cache_key = BlocksCacheKey(self.data_dist_engine.cluster_id, model_id=model_id)
+        model_id = 0
+        for group in kv_cache_config.kv_cache_groups:
+            if isinstance(kv_caches, dict):
+                kv_caches_of_group = {}
+                for layer_name in group.layer_names:
+                    kv_caches_of_group[layer_name] = kv_caches[layer_name]
+                flatten_kv_caches = unzip_kv_cache_dict(kv_caches_of_group)
             else:
-                cache_key = None
+                flatten_kv_caches = unzip_kv_cache_list(kv_caches)
 
-            cache = self.data_dist_engine.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
-            self.registered_kv_caches.append(cache)
-            self.registered_kv_caches_tensor.append(sub_kv_caches)
+            # dense model.
+            flatten_kv_caches = maybe_merge_kv_caches(flatten_kv_caches)
+            # spec model.
+            flatten_kv_caches = maybe_split_kv_caches_for_spec_layers(flatten_kv_caches)
+            for _, sub_kv_caches in enumerate(flatten_kv_caches):
+                cache_desc = CacheDesc(num_tensors=len(sub_kv_caches), shape=tuple(sub_kv_caches[0].shape),
+                                    data_type=TORCH_DTYPE_TO_NPU_DTYPE[sub_kv_caches[0].dtype])
+
+                cache_addrs = [int(item.data_ptr()) for item in sub_kv_caches]
+
+                if self.data_dist_config.is_prefill:
+                    cache_key = BlocksCacheKey(self.data_dist_engine.cluster_id, model_id=model_id)
+                else:
+                    cache_key = None
+
+                cache = self.data_dist_engine.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
+                self.registered_kv_caches.append(cache)
+                self.registered_kv_caches_tensor.append(sub_kv_caches)
+                model_id += 1
         logger.debug(f" ***** registered_kv_caches num:{len(self.registered_kv_caches)}")
 
     def cluster_id_to_ip_port(self, cluster_id):

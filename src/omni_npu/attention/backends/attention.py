@@ -236,6 +236,43 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, self.num_kv_heads*value.shape[-1]), slots, value)
 
         actual_seq_qlen = attn_metadata.query_cumlens
+        # npu_fused_infer_attention_score_v2 does not support TND with dim 256, delete the branch when the operator supports it.
+        use_bsnd = self.head_size == 256
+        if use_bsnd:
+            if attn_metadata.num_prefills == 0:
+                query = query.unsqueeze(1)
+                key_cache = kv_cache[0]
+                value_cache = kv_cache[1]
+                block_table = attn_metadata.block_tables
+                block_size = kv_cache[0].shape[1]
+                sparse_mode = 0
+                atten_mask = None
+            else:
+                query = query.unsqueeze(0)
+                key_cache = key.view(1, -1, self.num_kv_heads, self.head_size)
+                value_cache = value.view(1, -1, self.num_kv_heads, self.head_size)
+                block_table = None
+                block_size = 0
+                sparse_mode = 3
+                atten_mask = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE
+            attn_output = torch_npu.npu_fused_infer_attention_score(
+                query,
+                key_cache,
+                value_cache,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="BSND",
+                scale=self.scale,
+                block_table=block_table,
+                block_size=block_size,
+                sparse_mode=sparse_mode,
+                atten_mask=atten_mask,
+                actual_seq_lengths=attn_metadata.query_cumlens,
+                actual_seq_lengths_kv=attn_metadata.seq_lens,
+            )[0].view(-1, self.num_heads, self.head_size)
+            output.copy_(attn_output)
+            return output
+
         attn_output = torch_npu.npu_fused_infer_attention_score_v2(
             query[:actual_seq_qlen[-1]],
             kv_cache[0],

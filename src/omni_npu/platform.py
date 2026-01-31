@@ -185,3 +185,7 @@ class NPUPlatform(Platform):
         Get the custom compile backend for current platform.
         """
         return "omni_npu.compilation.npugraph_ex.NpuGraphExAdaptor"
+
+    @classmethod
+    def support_hybrid_kv_cache(cls) -> bool:
+        return True

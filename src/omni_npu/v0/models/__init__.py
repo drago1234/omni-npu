@@ -8,5 +8,6 @@ def register_model():
     ModelRegistry.register_model(
         "Qwen3MoeForCausalLM",
         "omni_npu.v0.models.qwen.qwen3_moe:Qwen3MoeForCausalLM")
-
-
+    ModelRegistry.register_model(
+        "Qwen3NextForCausalLM",
+        "omni_npu.v0.models.qwen.qwen3_next:Qwen3NextForCausalLM")

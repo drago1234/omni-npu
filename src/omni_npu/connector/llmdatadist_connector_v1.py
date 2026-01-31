@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -107,7 +108,7 @@ class DatadistConnectorMetadataPrefill(KVConnectorMetadata):
         )
 
 
-class LLMDataDistConnector(KVConnectorBase_V1):
+class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole,
                  kv_cache_config: Optional["KVCacheConfig"] = None):
         if vllm_config.kv_transfer_config is None:
@@ -139,9 +140,9 @@ class LLMDataDistConnector(KVConnectorBase_V1):
             self.connector_worker = None
         elif role == KVConnectorRole.WORKER:
             if self.is_prefill:
-                self.connector_worker = PrefillConnectorWorker(vllm_config, str(self.host_ip), str(self.host_port))
+                self.connector_worker = PrefillConnectorWorker(vllm_config, str(self.host_ip), str(self.host_port), kv_cache_config)
             else:
-                self.connector_worker = DecodeConnectorWorker(vllm_config, str(self.host_ip), self.host_cluster_id)
+                self.connector_worker = DecodeConnectorWorker(vllm_config, str(self.host_ip), self.host_cluster_id, kv_cache_config)
             self.connector_scheduler = None
 
     ############################################################
@@ -230,6 +231,16 @@ class LLMDataDistConnector(KVConnectorBase_V1):
         """Connector does not save explicitly."""
         pass
 
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if self.connector_scheduler is None:
+            raise RuntimeError("self.connector_scheduler cannot be None")
+        flatten_block_ids = [block for group in block_ids for block in group]
+        return self.connector_scheduler.request_finished(request, flatten_block_ids)
+
 class PrefillConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
@@ -294,7 +305,8 @@ class PrefillConnectorScheduler:
 class PrefillConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, vllm_config: "VllmConfig", host_ip: str, host_port: str):
+    def __init__(self, vllm_config: "VllmConfig", host_ip: str, host_port: str,
+                 kv_cache_config: Optional["KVCacheConfig"] = None):
         # Metadata.
         self.host_ip = host_ip
         self.host_port = host_port
@@ -306,6 +318,7 @@ class PrefillConnectorWorker:
         manager_cls = LLMDataDistManager
         datadist_host_port = LLMDATADIST_BASE_PORT
         self.datadist_manager = manager_cls(vllm_config, self.host_ip, datadist_host_port)
+        self.kv_cache_config = kv_cache_config
 
         if self.rank == 0:
             self.input_socket = self.ctx.socket(zmq.constants.PULL)
@@ -382,7 +395,7 @@ class PrefillConnectorWorker:
                 logger.info(f"force unlink: {data}")
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        self.datadist_manager.register_memory(kv_caches)
+        self.datadist_manager.register_memory(kv_caches, self.kv_cache_config)
 
     def start_load_kv(self, metadata: DatadistConnectorMetadataPrefill):
         pass
@@ -516,6 +529,10 @@ class DecodeConnectorScheduler:
     def _round_up(self, x: int, y: int) -> int:
         return ((x + y - 1) // y) * y
 
+    def get_unhashed_block_ids(self, blocks) -> list[int]:
+        """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
+        return [block.block_id for group in blocks.blocks for block in group if block.block_hash is None]
+
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
                                  num_external_tokens: int):
@@ -531,7 +548,7 @@ class DecodeConnectorScheduler:
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_cluster_id", "remote_host_ip")):
                     self._reqs_need_recv[request.request_id] = (
-                        request, blocks.get_unhashed_block_ids())
+                        request, self.get_unhashed_block_ids(blocks))
                 else:
                     logger.warning("Got invalid KVTransferParams: %s.", params)
 
@@ -578,7 +595,8 @@ class DecodeConnectorScheduler:
 class DecodeConnectorWorker:
     """Worker implementation for datadist."""
 
-    def __init__(self, vllm_config: "VllmConfig", host_ip: str, host_cluster_id: int):
+    def __init__(self, vllm_config: "VllmConfig", host_ip: str, host_cluster_id: int,
+                 kv_cache_config: Optional["KVCacheConfig"] = None):
         self.vllm_config = vllm_config
         self.host_cluster_id = host_cluster_id
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank_local
@@ -603,6 +621,7 @@ class DecodeConnectorWorker:
 
         self._transfer_lock = threading.Lock()
         self.host_ip = host_ip
+        self.kv_cache_config = kv_cache_config
 
         self.ctx = zmq.Context()
         self.zmq_socket_map_lock = threading.Lock()
@@ -678,7 +697,7 @@ class DecodeConnectorWorker:
             time.sleep(HEARTBEAT_INTERVAL)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        self.datadist_manager.register_memory(kv_caches)
+        self.datadist_manager.register_memory(kv_caches, self.kv_cache_config)
         # TODO:put multi-thread_pull_kv and multi_rank_pull_kv related registered_link_infos into queues
         # In single thread pull kv mode, we use a single thread to pull kv
         logger.info(" ***** Using single thread to pull kv.")

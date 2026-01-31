@@ -542,13 +542,12 @@ class TestNPUModelRunner:
         )
         self.runner.runner_only_attn_layers = set()
 
-        # MambaSpec branch should raise NotImplementedError
-        with pytest.raises(NotImplementedError, match="Mamba functionality is in progress"):
-            self.runner._reshape_kv_cache_tensors(
-                kv_cache_config=MagicMock(),
-                kv_cache_raw_tensors=kv_cache_raw_tensors,
-                kernel_block_sizes=[mamba_spec.block_size],
-            )
+        result = self.runner._reshape_kv_cache_tensors(
+            kv_cache_config=MagicMock(),
+            kv_cache_raw_tensors=kv_cache_raw_tensors,
+            kernel_block_sizes=[mamba_spec.block_size],
+        )
+        assert layer_name in result
 
     def test_reshape_kv_cache_tensors_unknown_spec(self, monkeypatch):
         """Test unknown spec type (covers line 107 else branch).

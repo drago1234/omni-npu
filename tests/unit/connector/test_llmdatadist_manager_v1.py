@@ -373,8 +373,11 @@ class TestLLMDataDistManager:
         
         mock_cache = MagicMock()
         mock_llm_datadist.cache_manager.register_blocks_cache.return_value = mock_cache
-        
-        manager.register_memory(kv_cache)
+        kv_cache_config = MagicMock()
+        kv_cache_group = MagicMock()
+        kv_cache_group.layer_names = ['layer.0']
+        kv_cache_config.kv_cache_groups = [kv_cache_group]
+        manager.register_memory(kv_cache, kv_cache_config)
         
         # Verify the cache was registered
         assert len(manager.registered_kv_caches) == 1
@@ -390,8 +393,11 @@ class TestLLMDataDistManager:
         
         mock_cache = MagicMock()
         mock_llm_datadist.cache_manager.register_blocks_cache.return_value = mock_cache
-        
-        manager.register_memory(kv_cache)
+        kv_cache_config = MagicMock()
+        kv_cache_group = MagicMock()
+        kv_cache_group.layer_names = ['layer.0']
+        kv_cache_config.kv_cache_groups = [kv_cache_group]
+        manager.register_memory(kv_cache, kv_cache_config)
         
         # Verify the cache was registered
         assert len(manager.registered_kv_caches) == 2

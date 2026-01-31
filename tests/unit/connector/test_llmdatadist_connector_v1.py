@@ -44,8 +44,8 @@ class TestLLMDataDistConnectorV1LifeCycle:
                              wraps=connector.build_connector_meta)
             )
             mock_finish = stack.enter_context(
-                patch.object(connector, 'request_finished',
-                             wraps=connector.request_finished)
+                patch.object(connector, 'request_finished_all_groups',
+                             wraps=connector.request_finished_all_groups)
             )
 
             schedule_output = scheduler.schedule()
@@ -123,9 +123,10 @@ class TestLLMDataDistConnectorV1LifeCycle:
             mock4 = stack.enter_context(patch("omni_npu.connector.llmdatadist_manager_v1.BlocksCacheKey"))
             mock_dcp = stack.enter_context(patch("omni_npu.connector.llmdatadist_connector_v1.get_dcp_group"))
             mock_dcp.return_value.world_size = 0
+            kv_cache_config = MagicMock()
 
-            connector_p = LLMDataDistConnector(vllm_config_p, KVConnectorRole.WORKER)
-            connector_d = LLMDataDistConnector(vllm_config_d, KVConnectorRole.WORKER)
+            connector_p = LLMDataDistConnector(vllm_config_p, KVConnectorRole.WORKER, kv_cache_config)
+            connector_d = LLMDataDistConnector(vllm_config_d, KVConnectorRole.WORKER, kv_cache_config)
 
             kv_caches = {"layer.0": torch.empty(1, 1, 1, 1, 1)} # 1 * [block_num, block_size, head_num, head_dim]
             connector_p.register_kv_caches(kv_caches)
@@ -759,7 +760,7 @@ class TestDecodeConnectorScheduler:
         req.request_id = "req_1"
         req.kv_transfer_params = {"remote_block_ids": [1, 2], "remote_cluster_id": "cluster_1", "remote_host_ip": "tcp://127.0.0.1:5568"}
         blocks = MagicMock()
-        blocks.get_unhashed_block_ids.return_value = [10, 11]
+        scheduler.get_unhashed_block_ids = lambda _: [10, 11]
 
         scheduler.update_state_after_alloc(req, blocks, 0)
 
@@ -836,7 +837,7 @@ class TestDecodeConnectorWorker:
         kv_caches = {"layer_0": torch.tensor([1, 2, 3])}
 
         worker.register_kv_caches(kv_caches)
-        worker.datadist_manager.register_memory.assert_called_once_with(kv_caches)
+        worker.datadist_manager.register_memory.assert_called_once_with(kv_caches, None)
 
     @pytest.mark.parametrize("tp", [1, 2])
     @pytest.mark.parametrize("local_blocks,remote_blocks", [

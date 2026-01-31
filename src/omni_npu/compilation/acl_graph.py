@@ -142,16 +142,19 @@ class ACLGraphWrapper:
         aslkv = None
         seq_sink_lens = None
         if attn_metadata is not None:
-            attn_metadata = attn_metadata[next(iter(attn_metadata))]
-            if not hasattr(attn_metadata, "decode"):
-                # GQA
-                asl = attn_metadata.query_cumlens
-                aslkv = attn_metadata.seq_lens
-            elif attn_metadata.decode:
-                # MLA
-                asl = attn_metadata.decode.query_cumlens
-                aslkv = attn_metadata.decode.seq_lens
-                seq_sink_lens = getattr(attn_metadata.decode, "seq_sink_len", None)
+            for _, metadata in attn_metadata.items():
+                if not hasattr(metadata, "decode"):
+                    # GQA
+                    if hasattr(metadata, "query_cumlens"):
+                        asl = metadata.query_cumlens
+                        aslkv = metadata.seq_lens
+                        break
+                elif metadata.decode:
+                    # MLA
+                    asl = metadata.decode.query_cumlens
+                    aslkv = metadata.decode.seq_lens
+                    seq_sink_lens = getattr(metadata.decode, "seq_sink_len", None)
+                    break
 
         if (
             aclgraph_runtime_mode == CUDAGraphMode.NONE

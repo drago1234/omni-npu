@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional, Union, Any, cast, TypeAlias
 import torch
 import numpy as np
 import torch.nn as nn
+from dataclasses import replace
 
 from vllm.config import (
     CompilationMode,
@@ -24,7 +25,7 @@ from vllm.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype, get_dtype_size
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
@@ -136,6 +137,10 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
+                if isinstance(kv_cache_spec, MambaSpec):
+                    # Original page_size is padded, the actual applied size is the real required one,
+                    # refer to get_kv_cache_config_from_groups in KVCacheUtilsPatch.
+                    kv_cache_spec = replace(kv_cache_spec, page_size_padded=None)
                 raw_tensor = kv_cache_raw_tensors[layer_name]
                 assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                 num_blocks = (raw_tensor.numel() //
@@ -159,10 +164,23 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     kv_caches[layer_name] = kv_cache_tensors
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    raise NotImplementedError("Mamba functionality is in progress.")
+                    state_tensors = []
+                    offset = 0
+                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                        dtype_size = get_dtype_size(dtype)
+                        target_shape = (num_blocks, *shape)
+
+                        # Make contiguous tensor
+                        size_bytes = np.prod(target_shape) * dtype_size
+                        final_tensor = raw_tensor[offset:offset + size_bytes].view(dtype).view(target_shape)
+                        offset += size_bytes
+                        assert final_tensor.is_contiguous()
+                        state_tensors.append(final_tensor)
+
+                    kv_caches[layer_name] = tuple(state_tensors)
                 else:
                     raise NotImplementedError
-
+        # NPU kernels need contiguous layout
         if has_attn and has_mamba:
             self._update_hybrid_attention_mamba_layout(kv_caches)
 
