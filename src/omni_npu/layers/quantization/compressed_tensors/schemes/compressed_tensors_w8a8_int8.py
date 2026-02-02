@@ -95,15 +95,14 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
             bias: Optional[torch.Tensor]
         ) -> Union[torch.Tensor, Dict[str, Any]]:
             # activation per-token dynamic quant
-            if len(x.shape) > 2: # [xxx,1,xxx]
-                squeezed = True
-                x = x.squeeze(1)
-            else:
-                squeezed = False
+            squeezed = False
             if isinstance(x, Dict):
                 x_int8 = x.get('x_int8')
                 pertoken_scale = x.get('pertoken_scale')
             else:
+                if len(x.shape) > 2:
+                    squeezed = True
+                    x = x.squeeze(1)
                 x_int8, pertoken_scale = torch_npu.npu_dynamic_quant(x)
 
             throw_dequant = getattr(layer, 'throw_dequant', False)

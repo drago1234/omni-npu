@@ -61,6 +61,7 @@ class NPUFusedMoEMethodBase(ABC):
 
 
 class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMethod, NPUFusedMoEMethodBase):
+    all2all_threshold: int = 64
     def __init__(self, parent, layer):
         NPUCompressedTensorsW8A8Int8MoEMethod.__init__(self, parent, layer)
         NPUFusedMoEMethodBase.__init__(self)
@@ -78,6 +79,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+        router_logits: torch.Tensor,
         gate: torch.nn.Module,
         shared_experts: torch.nn.Module,
         top_k: int,
@@ -98,8 +100,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-
-        router_logits, _ = gate(x)
+        if gate is not None:
+            router_logits, _ = gate(x)
         topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
             top_k=top_k,
@@ -126,9 +128,9 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
             layer.moe_layer_idx = self.moe_layer_idx
 
         attn_metadata = get_forward_context().attn_metadata
-        is_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
+        use_all2all = x.shape[0] > NPUCompressedTensorsW8A8Int8MoEMethodV1.all2all_threshold
 
-        if is_prefill:
+        if use_all2all:
             prepare_permute_and_unpermute_finalize = self.prefill_prepare_permute_and_unpermute_finalize
         else:
             prepare_permute_and_unpermute_finalize = self.decode_prepare_permute_and_unpermute_finalize

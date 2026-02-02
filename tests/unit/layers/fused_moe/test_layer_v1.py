@@ -18,6 +18,7 @@ def layer_v1_module(monkeypatch):
     )
     distributed_module.get_tensor_model_parallel_world_size = MagicMock(return_value=1)
     distributed_module.get_tensor_model_parallel_rank = MagicMock(return_value=0)
+    distributed_module.get_dp_group = lambda: SimpleNamespace(world_size=1)
 
     shared_layer_module = types.ModuleType("omni_npu.layers.fused_moe.layer")
 
@@ -66,7 +67,7 @@ def layer_v1_module(monkeypatch):
 
     loader_module = types.ModuleType("omni_npu.v1.models.config_loader.loader")
     loader_module.model_extra_config = SimpleNamespace(
-        operator_opt_config=SimpleNamespace(enable_prefetch=True)
+        operator_opt_config=SimpleNamespace(enable_prefetch=True, decode_moe_dispatch_combine=True)
     )
 
     prepare_module = types.ModuleType(
@@ -81,8 +82,13 @@ def layer_v1_module(monkeypatch):
         def __init__(self, layer):
             self.layer = layer
 
+    class DummyAGRS:
+        def __init__(self, layer):
+            self.layer = layer
+
     prepare_module.All2AllPrepPmtAndUnpmtFinal = DummyAll2All
     prepare_module.DispatchCombinePrepPmtAndUnpmtFinal = DummyDispatchCombine
+    prepare_module.AGRSPrepPmtAndUnpmtFinal = DummyAGRS
 
     monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
     monkeypatch.setitem(sys.modules, "omni_npu.layers.fused_moe.layer", shared_layer_module)

@@ -41,6 +41,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
@@ -229,22 +230,69 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[
         CUDAGraphMode, BatchDescriptor, UBatchSlices | None, torch.Tensor | None
     ]:
-        (
-            cudagraph_mode,
-            batch_desc,
-            ubatch_slices,
-            num_tokens_across_dp,
-        ) = super()._determine_batch_execution_and_padding(
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            num_scheduled_tokens_np=num_scheduled_tokens_np,
-            max_num_scheduled_tokens=max_num_scheduled_tokens,
-            use_cascade_attn=use_cascade_attn,
-            allow_microbatching=allow_microbatching,
-            force_eager=force_eager,
-            force_uniform_decode=force_uniform_decode,
-            force_has_lora=force_has_lora,
+        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        uniform_decode = (
+            (
+                (max_num_scheduled_tokens == self.uniform_decode_query_len)
+                and (num_tokens_padded == max_num_scheduled_tokens * num_reqs)
+            )
+            if force_uniform_decode is None
+            else force_uniform_decode
         )
+
+        has_lora = (
+            len(self.input_batch.lora_id_to_lora_request) > 0
+            if force_has_lora is None
+            else force_has_lora
+        )
+
+        dispatch_cudagraph = (
+            lambda num_tokens: self.cudagraph_dispatcher.dispatch(
+                num_tokens=num_tokens,
+                has_lora=has_lora,
+                use_cascade_attn=use_cascade_attn,
+                uniform_decode=uniform_decode,
+            )
+            if not force_eager
+            else (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
+        )
+
+        cudagraph_mode, batch_desc = dispatch_cudagraph(num_tokens_padded)
+        num_tokens_padded = batch_desc.num_tokens
+
+        # Extra coordination when running data-parallel since we need to coordinate
+        # across ranks
+        ubatch_slices, num_tokens_across_dp = None, None
+        if self.vllm_config.parallel_config.data_parallel_size > 1:
+            # Disable DP padding when running eager to avoid excessive padding when
+            # running prefills. This lets us set cudagraph_mode="NONE" on the prefiller
+            # in a P/D setup and still use CUDA graphs (enabled by this padding) on the
+            # decoder.
+            allow_dp_padding = (
+                self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+                or self.parallel_config.enable_expert_parallel
+            )
+
+            ubatch_slices, num_tokens_across_dp = coordinate_batch_across_dp(
+                num_tokens_unpadded=num_tokens_padded,
+                parallel_config=self.parallel_config,
+                allow_microbatching=allow_microbatching,
+                allow_dp_padding=allow_dp_padding,
+                num_tokens_padded=num_tokens_padded,
+                uniform_decode=uniform_decode,
+                num_scheduled_tokens_per_request=num_scheduled_tokens_np,
+            )
+
+            # Extract DP padding if there is any
+            if num_tokens_across_dp is not None:
+                dp_rank = self.parallel_config.data_parallel_rank
+                num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
+
+                # Re-dispatch with DP padding
+                cudagraph_mode, batch_desc = dispatch_cudagraph(num_tokens_padded)
+                # Assert to make sure the agreed upon token count is correct otherwise
+                # num_tokens_across_dp will no-longer be valid
+                assert batch_desc.num_tokens == num_tokens_padded
 
         if self.speculative_config and isinstance(self.drafter, EagleProposer):
             self.drafter.batch_desc = batch_desc

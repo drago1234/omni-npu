@@ -235,18 +235,25 @@ def parse_hf_config(hf_config):
     else:
         model_name = matches[0]
 
-    if hasattr(hf_config, "quantization_config") and hf_config.quantization_config['format'].strip() == 'int-quantized':
-        weights_type = hf_config.quantization_config["config_groups"]["group_0"]["weights"]["num_bits"]
+    if hasattr(hf_config, "quantization_config"):
+        quantization_config = hf_config.quantization_config
+    elif hasattr(hf_config, "text_config"):
+        quantization_config = getattr(hf_config.text_config, "quantization_config", None)
+    else:
+        quantization_config = None
+
+    if quantization_config is not None and quantization_config['format'].strip() == 'int-quantized':
+        weights_type = quantization_config["config_groups"]["group_0"]["weights"]["num_bits"]
         if isinstance(weights_type, dict):
             num_bits_values = weights_type.values()
             weights_type = f"{min(num_bits_values)}"
 
-        input_activations_type = hf_config.quantization_config["config_groups"]["group_0"]["input_activations"]["num_bits"]
+        input_activations_type = quantization_config["config_groups"]["group_0"]["input_activations"]["num_bits"]
         if isinstance(input_activations_type, dict):
             num_bits_values = input_activations_type.values()
             input_activations_type = f"{min(num_bits_values)}"
         
-        kv_cache_scheme_type = hf_config.quantization_config["kv_cache_scheme"]
+        kv_cache_scheme_type = quantization_config["kv_cache_scheme"]
         quant_type = f"w{weights_type}a{input_activations_type}"
         if kv_cache_scheme_type == "Opti-C8":
             quant_type = quant_type+"_fa_c8"

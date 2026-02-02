@@ -35,6 +35,13 @@ def prepare_module(monkeypatch):
         rank=1,
         rank_in_group=1,
         device_group=DummyDeviceGroup(),
+        all_gather=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim),
+    )
+    world_group = SimpleNamespace(
+        world_size=2,
+        rank=1,
+        rank_in_group=1,
+        device_group=DummyDeviceGroup(),
     )
 
     context_holder = SimpleNamespace(attn_metadata=None)
@@ -52,6 +59,7 @@ def prepare_module(monkeypatch):
     monkeypatch.setattr(
         distributed_module, "get_ep_group", lambda: ep_group, raising=False
     )
+
     monkeypatch.setattr(
         forward_context_module,
         "get_forward_context",
@@ -135,6 +143,58 @@ def test_all2all_prepare_permute_no_quant(prepare_module):
     assert result.expert_tokens.equal(tokens_per_local_expert)
     assert stubs.torch_npu.npu_moe_init_routing_v2.call_args.kwargs["quant_mode"] == -1
 
+def test_agrs_prepare_permute_with_quant(prepare_module):
+    module, stubs = prepare_module
+    layer = SimpleNamespace(
+        global_num_experts=4,
+        local_num_experts=2,
+        ep_size=stubs.ep_group.world_size,
+        quant_config=object(),
+        quant_method=MagicMock(),
+        w13_weight=torch.zeros(2, 1, 1),  # shape: (local_num_experts, ...)
+    )
+    
+    # 准备输入数据
+    x = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32)
+    topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    
+    # 模拟 npu_dynamic_quant 的返回值
+    x_int8 = x.to(torch.int8)  # 模拟量化后的张量
+    x_scale = torch.tensor([0.1, 0.1], dtype=torch.float32)  # 模拟缩放因子
+    
+    stubs.torch_npu.npu_dynamic_quant.return_value = (x_int8, x_scale)
+    
+    # 模拟 all_gather 后的数据
+    # all_gather 后数据会重复（因为是模拟）
+    x_int8_gathered = torch.cat([x_int8, x_int8], dim=0)
+    x_scale_gathered = torch.cat([x_scale, x_scale], dim=0)
+    topk_ids_gathered = torch.cat([topk_ids, topk_ids], dim=0)
+    
+    # 模拟 npu_moe_init_routing_v2 的返回值
+    expanded_x = torch.tensor([[2.0, 2.0, 2.0], [2.0, 2.0, 2.0]], dtype=torch.float32)
+    expanded_row_idx = torch.tensor([0, 1], dtype=torch.int32)
+    expert_tokens = torch.tensor([1, 1, 0, 0], dtype=torch.int32)  # 4个专家，前2个有token
+    expanded_scale = torch.tensor([0.1, 0.1], dtype=torch.float32)
+
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+        expanded_x,
+        expanded_row_idx,
+        expert_tokens,
+        expanded_scale,
+    )
+    
+    # 创建handler并调用prepare_permute
+    handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
+    result = handler.prepare_permute(
+        layer=layer,
+        x=torch.ones(2, 3),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+    )
+    
+    stubs.torch_npu.npu_moe_init_routing_v2.assert_called_once()
+    assert torch.equal(result.hidden_states_sorted_by_experts, expanded_x)
+    assert torch.equal(result.expert_tokens, expert_tokens)
+    assert result.dtype == x.dtype
 
 def test_all2all_unpermute_finalize_reorders_and_finalizes(prepare_module):
     module, stubs = prepare_module

@@ -5,14 +5,16 @@ import torch
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
     get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank
+    get_tensor_model_parallel_rank,
+    get_dp_group,
 )
 from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
 from omni_npu.v1.layers.prefetch import PrefetcherBase
 from omni_npu.v1.models.config_loader.loader import model_extra_config
 from omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize import (
     DispatchCombinePrepPmtAndUnpmtFinal,
-    All2AllPrepPmtAndUnpmtFinal
+    All2AllPrepPmtAndUnpmtFinal,
+    AGRSPrepPmtAndUnpmtFinal,
 )
 
 
@@ -25,7 +27,10 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
 
     def make_prepare_permute_and_unpermute_finalize(self):
         prefill_prepare_permute_and_unpermute_finalize = All2AllPrepPmtAndUnpmtFinal(self)
-        decode_prepare_permute_and_unpermute_finalize = DispatchCombinePrepPmtAndUnpmtFinal(self)
+        if model_extra_config.operator_opt_config.decode_moe_dispatch_combine:
+            decode_prepare_permute_and_unpermute_finalize = DispatchCombinePrepPmtAndUnpmtFinal(self)
+        else:
+            decode_prepare_permute_and_unpermute_finalize = AGRSPrepPmtAndUnpmtFinal(self)
         self.quant_method.set_prepare_permute_and_unpermute_finalize(
             prefill_prepare_permute_and_unpermute_finalize=prefill_prepare_permute_and_unpermute_finalize,
             decode_prepare_permute_and_unpermute_finalize=decode_prepare_permute_and_unpermute_finalize,
@@ -44,8 +49,9 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
                                 prefetch_shared_experts=True)
 
         tp_size = get_tensor_model_parallel_world_size()  # attn tp size
+        dp_size = get_dp_group().world_size
         x = hidden_states
-        if tp_size > 1:
+        if tp_size > 1 and dp_size == 1:
             tp_rank = get_tensor_model_parallel_rank()
             t_ori = x.shape[0]
             t_pad = -(t_ori // -tp_size) * tp_size
@@ -53,7 +59,9 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
             num_pads = t_pad - t_ori
             if num_pads > 0:
                 x = torch.nn.functional.pad(x, (0, 0, 0, num_pads), value=0)
+                router_logits = torch.nn.functional.pad(router_logits, (0, 0, 0, num_pads), value=0)
             x = x[tp_rank * t_local: (tp_rank + 1) * t_local]
+            router_logits = router_logits[tp_rank * t_local: (tp_rank + 1) * t_local]
 
         if model_extra_config.operator_opt_config.enable_prefetch:
             prefetch_moe_fn = getattr(self, "prefetch_moe", None)
@@ -65,6 +73,7 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
         expert_output = self.quant_method.apply(
             layer=self,
             x=x,
+            router_logits=router_logits,
             gate=self.gate,
             shared_experts=self.shared_experts,
             top_k=self.top_k,
@@ -86,7 +95,7 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
             logical_replica_count=self.logical_replica_count
         )
 
-        if tp_size > 1:
+        if tp_size > 1 and dp_size == 1:
             expert_output = tensor_model_parallel_all_gather(expert_output, dim=0)[:t_ori]
 
         if model_extra_config.operator_opt_config.enable_prefetch:
