@@ -22,18 +22,6 @@ class _FakeRMSNorm(nn.Module):
         return x
 
 
-class _FakeRowParallelFlashCommLinear(nn.Module):
-    """Return tensor directly (not tuple) because code uses it as a module output."""
-    def __init__(self, in_features, out_features, **kwargs):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.kwargs = kwargs
-
-    def forward(self, x):
-        return torch.zeros((x.shape[0], self.out_features), dtype=x.dtype, device=x.device)
-
-
 class _FakeRotaryEmb:
     def __init__(self):
         self.calls = 0
@@ -396,7 +384,6 @@ def _make_fake_vllm_config():
 class TestDeepSeekMultiTokenPredictorLayerInitForward(unittest.TestCase):
     @patch.object(deepseek_mtp_mod, "ParallelLMHead", _FakeParallelLMHead)
     @patch.object(deepseek_mtp_mod, "RMSNorm", _FakeRMSNorm)
-    @patch.object(deepseek_mtp_mod, "RowParallelFlashCommLinear", _FakeRowParallelFlashCommLinear)
     def test_layer_init_and_forward(self):
         vllm_config = _make_fake_vllm_config()
 
@@ -435,7 +422,6 @@ class TestDeepSeekMultiTokenPredictorLayerInitForward(unittest.TestCase):
 class TestDeepSeekMultiTokenPredictorInitForwardLogits(unittest.TestCase):
     @patch.object(deepseek_mtp_mod, "ParallelLMHead", _FakeParallelLMHead)
     @patch.object(deepseek_mtp_mod, "RMSNorm", _FakeRMSNorm)
-    @patch.object(deepseek_mtp_mod, "RowParallelFlashCommLinear", _FakeRowParallelFlashCommLinear)
     @patch.object(deepseek_mtp_mod, "VocabParallelEmbedding", _FakeVocabParallelEmbedding)
     @patch.object(deepseek_mtp_mod, "LogitsProcessor", _FakeLogitsProcessor)
     def test_predictor_init_forward_and_compute_logits(self):
@@ -477,7 +463,6 @@ class TestDeepSeekMultiTokenPredictorInitForwardLogits(unittest.TestCase):
 class TestDeepSeekMTPInitSetMoEForward(unittest.TestCase):
     @patch.object(deepseek_mtp_mod, "ParallelLMHead", _FakeParallelLMHead)
     @patch.object(deepseek_mtp_mod, "RMSNorm", _FakeRMSNorm)
-    @patch.object(deepseek_mtp_mod, "RowParallelFlashCommLinear", _FakeRowParallelFlashCommLinear)
     @patch.object(deepseek_mtp_mod, "VocabParallelEmbedding", _FakeVocabParallelEmbedding)
     @patch.object(deepseek_mtp_mod, "LogitsProcessor", _FakeLogitsProcessor)
     def test_mtp_init_set_moe_and_forward(self):

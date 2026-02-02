@@ -817,20 +817,27 @@ class TestNPUDeepseekSparseAttentionInit(unittest.TestCase):
         mock_attn.return_value = MagicMock()
         mock_rope.return_value = MagicMock()
 
-        m = npu_dsa_mod.NPUDeepseekSparseAttention(
-            vllm_config=self._fake_vllm_config(),
-            config=self._fake_config(),
-            hidden_size=16,
-            num_heads=4,
-            qk_nope_head_dim=4,
-            qk_rope_head_dim=4,
-            v_head_dim=4,
-            q_lora_rank=12,
-            kv_lora_rank=3,
-            cache_config=None,
-            quant_config=None,
-            prefix="layers.0",
+        fake_opt_cfg = SimpleNamespace(
+            enable_mlaprolog=False,
+            use_omni_cache=False,
+            enable_dsa=False,
+            mtp_remove_redundant_kv=False,
         )
+        with patch.object(npu_dsa_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True):
+            m = npu_dsa_mod.NPUDeepseekSparseAttention(
+                vllm_config=self._fake_vllm_config(),
+                config=self._fake_config(),
+                hidden_size=16,
+                num_heads=4,
+                qk_nope_head_dim=4,
+                qk_rope_head_dim=4,
+                v_head_dim=4,
+                q_lora_rank=12,
+                kv_lora_rank=3,
+                cache_config=None,
+                quant_config=None,
+                prefix="layers.0",
+            )
 
         self.assertTrue(hasattr(m, "q_a_proj"))
         self.assertTrue(hasattr(m, "q_b_proj"))
@@ -868,20 +875,27 @@ class TestNPUDeepseekSparseAttentionInit(unittest.TestCase):
         mock_attn.return_value = MagicMock()
         mock_rope.return_value = MagicMock()
 
-        m = npu_dsa_mod.NPUDeepseekSparseAttention(
-            vllm_config=self._fake_vllm_config(),
-            config=self._fake_config(rope_type="deepseek_yarn"),
-            hidden_size=16,
-            num_heads=4,
-            qk_nope_head_dim=4,
-            qk_rope_head_dim=4,
-            v_head_dim=4,
-            q_lora_rank=None,
-            kv_lora_rank=3,
-            cache_config=None,
-            quant_config=None,
-            prefix="layers.1",
+        fake_opt_cfg = SimpleNamespace(
+            enable_mlaprolog=False,
+            use_omni_cache=False,
+            enable_dsa=False,
+            mtp_remove_redundant_kv=False,
         )
+        with patch.object(npu_dsa_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True):
+            m = npu_dsa_mod.NPUDeepseekSparseAttention(
+                vllm_config=self._fake_vllm_config(),
+                config=self._fake_config(rope_type="deepseek_yarn"),
+                hidden_size=16,
+                num_heads=4,
+                qk_nope_head_dim=4,
+                qk_rope_head_dim=4,
+                v_head_dim=4,
+                q_lora_rank=None,
+                kv_lora_rank=3,
+                cache_config=None,
+                quant_config=None,
+                prefix="layers.1",
+            )
 
         self.assertTrue(hasattr(m, "q_proj"))
         self.assertFalse(hasattr(m, "q_a_proj"))

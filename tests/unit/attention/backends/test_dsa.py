@@ -106,7 +106,9 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
 
         fake_meta = _Meta()
 
-        with patch.object(mla_mod.MLACommonMetadataBuilder, "build", return_value=fake_meta):
+        fake_opt_cfg = SimpleNamespace(use_omni_cache=False)
+        with patch.object(mla_mod.MLACommonMetadataBuilder, "build", return_value=fake_meta), \
+             patch.object(mla_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True):
             out = b.build(common_prefix_len=0, common_attn_metadata=MagicMock(), fast_build=False)
 
         self.assertIs(out, fake_meta)
