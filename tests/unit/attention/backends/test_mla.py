@@ -208,17 +208,9 @@ class TestNPUAttentionBackendMLAUtilsFunc(unittest.TestCase):
         
         batch_size = 1
         prompt_len = 1
-        mock_ctx = MagicMock()
-        mock_ctx.batch_descriptor = MagicMock(
-            num_reqs=batch_size,
-            max_q_len=prompt_len,
-            max_seq_len=prompt_len,
-            uniform=True,
-        )
 
         with patch('vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size', return_value=64), \
-            patch('omni_npu.attention.backends.mla.get_current_vllm_config', return_value=None), \
-            patch('omni_npu.attention.backends.mla.get_forward_context', return_value=mock_ctx):
+            patch('omni_npu.attention.backends.mla.get_current_vllm_config', return_value=None):
             global NPUMLAImpl
             impl = NPUMLAImpl(
                 num_heads=num_heads,
