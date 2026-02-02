@@ -23,47 +23,54 @@ else
     echo ""
 fi
 
+cd ..
+echo "[INFO] git status"
+git status
+echo "[INFO] git branch"
+git branch --show-current && git log -5 --pretty=%s
+cd -
+
 case "$TEST_TYPE" in
     unit)
         echo "Running unit tests (no NPU required)..."
         if [ "$HAS_COV" = true ]; then
-            pytest unit/ \
+            pytest unit/ --tb=long \
                 --cov=omni_npu \
                 --cov-report=term-missing \
                 --cov-report=html \
                 --cov-config=./.coveragerc \
                 -v
         else
-            pytest unit/ -v
+            pytest unit/ -v --tb=long
         fi
         ;;
     integration)
         echo "Running integration tests (requires NPU hardware)..."
         echo "  - Single-device tests with pytest"
-        pytest integration/ -v -k "not TestNPUCommunicatorMultiDevice"
+        pytest integration/ --tb=long -v -k "not TestNPUCommunicatorMultiDevice"
         echo ""
         echo "  - Multi-device tests with torchrun (2 NPUs)"
-        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v
+        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v --tb=long
         ;;
     all)
         echo "Running all tests..."
         if [ "$HAS_COV" = true ]; then
-            pytest \
+            pytest --tb=long \
                 --cov=omni_npu \
                 --cov-report=term-missing \
                 --cov-report=html \
                 --cov-config=./.coveragerc \
                 -v
         else
-            pytest -v
+            pytest -v --tb=long
         fi
         echo ""
         echo "Running integration tests (requires NPU hardware)..."
         echo "  - Single-device tests with pytest"
-        pytest integration/distributed/test_communicator.py::TestNPUCommunicatorIntegration -v
+        pytest integration/distributed/test_communicator.py::TestNPUCommunicatorIntegration -v--tb=long
         echo ""
         echo "  - Multi-device tests with torchrun (2 NPUs)"
-        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v
+        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v --tb=long
         ;;
     *)
         echo "Usage: $0 [unit|integration|all]"
