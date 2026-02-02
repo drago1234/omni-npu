@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPermuteExpertsUnpermute,
     FusedMoEPrepareAndFinalize
@@ -43,6 +44,13 @@ def _get_npu_device_name(device_id: int) -> str:
 
 @UnquantizedFusedMoEMethod.register_oot
 class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+    def __init__(self, moe: FusedMoEConfig):
+        super().__init__(moe)
+        device_name = _get_npu_device_name(device_id=0)
+        self.is_a2_device = device_name.startswith("Ascend910B")
+        self.dp_size = get_dp_group().world_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+
     def forward_oot(
         self,
         layer: torch.nn.Module,
@@ -66,8 +74,6 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        tp_size = get_tensor_model_parallel_world_size()  # tensor parallel world size
-
         # Attention metadata is used to decide whether we can use all-to-all for
         # MoE inference (prefill stage) or should fall back to other paths.
         forward_ctx = get_forward_context()
@@ -87,8 +93,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
 
         # For Ascend910B in decode stage, use the allgather-based EP kernel.
-        device_name = _get_npu_device_name(x.device.index)
-        use_allgather_ep = device_name.startswith("Ascend910B") and not use_all2all
+        use_allgather_ep = self.is_a2_device and not use_all2all
 
         hidden_states = x
         orig_num_tokens = x.shape[0]
@@ -97,11 +102,11 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # When EP is enabled and TP>1, we split tokens across TP ranks before
         # routing to avoid duplicated work. This is NOT used for the allgather
         # EP kernel.
-        if layer.moe_parallel_config.use_ep and tp_size > 1 and not use_allgather_ep:
+        if layer.moe_parallel_config.use_ep and self.tp_size > 1 and not use_allgather_ep:
             tp_rank = get_tensor_model_parallel_rank()
 
-            padded_num_tokens = -(orig_num_tokens // -tp_size) * tp_size
-            local_num_tokens = padded_num_tokens // tp_size
+            padded_num_tokens = -(orig_num_tokens // -self.tp_size) * self.tp_size
+            local_num_tokens = padded_num_tokens // self.tp_size
             num_pads = padded_num_tokens - orig_num_tokens
 
             if num_pads > 0:
@@ -148,10 +153,10 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 topk_ids=topk_ids,
             )
         elif use_allgather_ep:
-            if get_dp_group().world_size > 1:
-                hidden_states = get_ep_group().all_gather(hidden_states, dim=0)
-                topk_weights = get_ep_group().all_gather(topk_weights, dim=0)
-                topk_ids = get_ep_group().all_gather(topk_ids, dim=0)
+            if self.dp_size > 1:
+                hidden_states = get_dp_group().all_gather(hidden_states, dim=0)
+                topk_weights = get_dp_group().all_gather(topk_weights, dim=0)
+                topk_ids = get_dp_group().all_gather(topk_ids, dim=0)
             output = fused_experts_allgather_ep_unquant(
                 layer=layer,
                 x=hidden_states,
@@ -173,12 +178,11 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
 
         # TP post-processing (merge results from different TP ranks).
-        if tp_size > 1:
+        if self.tp_size > 1:
             if use_allgather_ep:
-                if get_dp_group().world_size > 1:
-                    output = get_ep_group().reduce_scatter(output, dim=0) # [8,576]
-                else:
-                    output = get_tp_group().all_reduce(output)
+                if self.dp_size > 1:
+                    output = get_dp_group().reduce_scatter(output,dim=0)
+                output = get_tp_group().all_reduce(output)
             else:
                 output = tensor_model_parallel_all_gather(output, dim=0)
                 if did_tp_padding:

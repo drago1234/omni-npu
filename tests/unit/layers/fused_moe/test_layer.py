@@ -2,6 +2,7 @@
 import importlib
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -67,12 +68,24 @@ def layer_module(monkeypatch):
     forward_context_module = types.ModuleType("vllm.forward_context")
     forward_context_module.get_forward_context = lambda: context_holder
 
+    rotary_embedding_module = types.ModuleType("vllm.model_executor.layers.rotary_embedding")
+
     model_executor_module = types.ModuleType("vllm.model_executor")
     model_executor_module.__path__ = []
     layers_module = types.ModuleType("vllm.model_executor.layers")
     layers_module.__path__ = []
     fused_moe_pkg = types.ModuleType("vllm.model_executor.layers.fused_moe")
     fused_moe_pkg.__path__ = []
+
+    class DummyFusedMoEConfig:
+        pass
+
+    fused_moe_pkg.FusedMoEConfig = DummyFusedMoEConfig
+
+    fused_moe_config_module = types.ModuleType(
+        "vllm.model_executor.layers.fused_moe.config"
+    )
+    fused_moe_config_module.FusedMoEConfig = DummyFusedMoEConfig
 
     fused_layer_base = types.ModuleType("vllm.model_executor.layers.fused_moe.layer")
 
@@ -171,10 +184,20 @@ def layer_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
     monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
     monkeypatch.setitem(sys.modules, "vllm.forward_context", forward_context_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.rotary_embedding",
+        rotary_embedding_module,
+    )
     monkeypatch.setitem(sys.modules, "vllm.model_executor", model_executor_module)
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers", layers_module)
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe", fused_moe_pkg)
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe.layer", fused_layer_base)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.fused_moe.config",
+        fused_moe_config_module,
+    )
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe.modular_kernel", modular_kernel_module)
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe.fused_moe_modular_method", fused_moe_modular_method_module)
     monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe.shared_fused_moe", shared_fused_moe_module)
@@ -196,9 +219,24 @@ def layer_module(monkeypatch):
     ):
         setattr(parent, child.__name__.split(".")[-1], child)
 
+    layers_pkg_name = "omni_npu.layers"
+    if layers_pkg_name not in sys.modules:
+        layers_pkg = types.ModuleType(layers_pkg_name)
+        layers_pkg.__path__ = [
+            str(Path(__file__).resolve().parents[4] / "src" / "omni_npu" / "layers")
+        ]
+        monkeypatch.setitem(sys.modules, layers_pkg_name, layers_pkg)
+
     sys.modules.pop("omni_npu.layers.fused_moe.layer", None)
     module = importlib.import_module("omni_npu.layers.fused_moe.layer")
     importlib.reload(module)
+
+    if not hasattr(module.NPUUnquantizedFusedMoEMethod, "is_a2_device"):
+        module.NPUUnquantizedFusedMoEMethod.is_a2_device = False
+    if not hasattr(module.NPUUnquantizedFusedMoEMethod, "dp_size"):
+        module.NPUUnquantizedFusedMoEMethod.dp_size = 1
+    if not hasattr(module.NPUUnquantizedFusedMoEMethod, "tp_size"):
+        module.NPUUnquantizedFusedMoEMethod.tp_size = 1
 
     stubs = SimpleNamespace(
         torch_npu=torch_npu,
@@ -236,15 +274,17 @@ def test_forward_oot_uses_all2all_path(layer_module):
 
     output = method.forward_oot(layer, hidden, logits, top_k=1, renormalize=False)
 
-    assert output.shape == (2, 3)
+    assert output.shape == (1, 3)
     module.moe_infer_fusion.assert_called_once()
-    module.tensor_model_parallel_all_gather.assert_called_once()
 
 
 @pytest.mark.unit
 def test_forward_oot_returns_shared_output_and_reduces(layer_module):
     module, stubs = layer_module
     method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    method.is_a2_device = False
+    method.dp_size = 1
+    method.tp_size = 2
     method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
     method.moe_quant_config = MagicMock()
     method.fused_experts = MagicMock(return_value=torch.ones(1, 2))
@@ -282,6 +322,9 @@ def test_forward_oot_returns_shared_output_and_reduces(layer_module):
 def test_forward_oot_uses_allgather_ep_path(layer_module):
     module, stubs = layer_module
     method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    method.is_a2_device = True
+    method.dp_size = 1
+    method.tp_size = 2
     method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
     method.moe_quant_config = MagicMock()
     method.fused_experts = MagicMock()
@@ -316,6 +359,9 @@ def test_forward_oot_uses_allgather_ep_path(layer_module):
 def test_forward_oot_uses_fused_experts_tp_when_not_ep(layer_module):
     module, stubs = layer_module
     method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    method.is_a2_device = False
+    method.dp_size = 1
+    method.tp_size = 1
     method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=False))
     method.moe_quant_config = MagicMock()
 

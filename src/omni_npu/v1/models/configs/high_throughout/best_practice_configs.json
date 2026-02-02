@@ -22,6 +22,14 @@
             "1P1D": {
                 "prefill_config_file": "deepseek/ds_v32_w8a8c16_a3_1p1d_p.json",
                 "decode_config_file": "deepseek/ds_v32_w8a8c16_a3_1p1d_d.json"
+            },
+            "2P1D": {
+                "prefill_config_file": "deepseek/ds_v32_w8a8c16_a3_1p1d_p.json",
+                "decode_config_file": "deepseek/ds_v32_w8a8c16_a3_1p1d_d.json"
+            },
+            "4P1D": {
+                "prefill_config_file": "deepseek/ds_v32_w8a8c16_a3_1p1d_p.json",
+                "decode_config_file": "deepseek/ds_v32_w8a8c16_a3_1p1d_d.json"
             }
         }
     },

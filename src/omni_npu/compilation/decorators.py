@@ -89,8 +89,14 @@ def patch_compile_decorators():
         _dec_mododule._support_torch_compile = support_ge_compile
     else:
         _original_decorator = _dec_mododule._support_torch_compile
-        def _patched_support_torch_compile(cls, *args, **kwargs):
-            cls = _original_decorator(cls, *args, **kwargs)
+        def _patched_support_torch_compile(cls, dynamic_arg_dims, *args, **kwargs):
+            # Avoid marking inputs_embeds as dynamic to prevent Dynamo
+            # specializing it to a constant and raising ConstraintViolationError.
+            if isinstance(dynamic_arg_dims, dict) and "inputs_embeds" in dynamic_arg_dims:
+                dynamic_arg_dims = dict(dynamic_arg_dims)
+                dynamic_arg_dims.pop("inputs_embeds")
+
+            cls = _original_decorator(cls, dynamic_arg_dims, *args, **kwargs)
 
             cls.__call__ = _wrap_call(cls.__call__)
             logger.debug("<<< cls.__call__ wrapped!")
