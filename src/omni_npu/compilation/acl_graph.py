@@ -257,7 +257,7 @@ class ACLGraphWrapper:
                 aslkv = self._pad_list(aslkv, padding_lens, 0) # padding  aslkv to match gear
                 asl = self._pad_list(asl, padding_lens) # padding  asl to match gear
                 # FIXME: for TND FIA validation
-                if aslkv[-1] != 0 or not is_gqa:
+                if aslkv[-1] != 0 or (not is_gqa and seq_sink_lens is None):
                     aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
                 asl[-1] = batch_descriptor.num_tokens
                 if seq_sink_lens is not None:
