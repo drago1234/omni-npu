@@ -257,26 +257,27 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
         layer._k_scale_float = 1.0
         layer._v_scale_float = 1.0
 
-        batch_size = 12
-        query = torch.randn(batch_size, 8 * 128)
-        key = torch.randn(batch_size, 4 * 128)
-        value = torch.randn(batch_size, 4 * 128)
-        kv_cache = (torch.zeros(batch_size ** 2, 16, 4 * 128), torch.zeros(100, 16, 4 * 128))
+        batch_size = 10
+        query = torch.randn(batch_size, 8 , 128).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device)
+        key = torch.randn(batch_size, 4 , 128).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device)
+        value = torch.randn(batch_size, 4 , 128).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device)
+        kv_cache = (torch.zeros(batch_size ** 2, 16, 4 * 128).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device), torch.zeros(100, 16, 4 * 128).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device))
 
         metadata = self.metadata_cls(
             num_actual_tokens=10,
-            block_tables=torch.randint(0, 100, (2, 10)),
+            block_tables=torch.randint(0, 100, (2, 10)).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device),
             query_cumlens=[10],
             seq_lens=[10],
             max_query_len=1,
-            slot_mapping=torch.arange(10),
+            slot_mapping=torch.arange(10).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device),
             num_prefills=0,
             num_decode_tokens=8,
             num_decodes=2,
         )
 
-        attn_output = torch.randn(batch_size, 8, 128)
-        output = torch.empty_like(attn_output)
+        attn_output = torch.randn(batch_size, 8, 128).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device)
+        output = torch.empty_like(attn_output).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device)
+        prefill_output=output.clone()
     
         def fake_scatter_nd_update_(tensor, indices, updates):
             if indices.ndim == 2 and indices.shape[1] == 1:
@@ -292,7 +293,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             return tensor
 
         with patch('torch_npu.npu_scatter_nd_update_', side_effect=fake_scatter_nd_update_), \
-         patch('torch_npu.npu_fused_infer_attention_score', return_value=(output,)) as mock_decode:
+         patch('torch_npu.npu_fused_infer_attention_score_v2', return_value=(prefill_output,)) as mock_decode:
             
             result = impl.forward(
                 layer=layer,
@@ -307,10 +308,10 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             # self.assertEqual(mock_scatter.call_count, 2)
             mock_decode.assert_called_once()
             args, kwargs = mock_decode.call_args
-            self.assertEqual(kwargs['num_heads'], 8)
+            self.assertEqual(kwargs['num_query_heads'], 8)
             self.assertEqual(kwargs['num_key_value_heads'], 4)
-            self.assertEqual(kwargs['input_layout'], "BSND")
-            self.assertAlmostEqual(kwargs['scale'], 0.125)
+            self.assertEqual(kwargs['input_layout'], "TND")
+            self.assertAlmostEqual(kwargs['softmax_scale'], 0.125)
             self.assertIs(result, output)
 
     def test_forward_prefill_path_calls_npu_fused_infer_attention_score_v2(self):
