@@ -200,8 +200,8 @@ class OpenPanguMoE(nn.Module):
             # Keep an explicit assertion for easier debugging if kernels change.
             assert shared_output is None
         else:
-            assert shared_output is not None
-            final_hidden_states = final_hidden_states + shared_output
+            if shared_output is not None:
+                final_hidden_states = final_hidden_states + shared_output
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
