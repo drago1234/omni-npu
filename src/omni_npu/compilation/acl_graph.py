@@ -141,9 +141,11 @@ class ACLGraphWrapper:
         asl = None
         aslkv = None
         seq_sink_lens = None
+        is_gqa = False
         if attn_metadata is not None:
             for _, metadata in attn_metadata.items():
                 if not hasattr(metadata, "decode"):
+                    is_gqa = True
                     # GQA
                     if hasattr(metadata, "query_cumlens"):
                         asl = metadata.query_cumlens
@@ -255,7 +257,7 @@ class ACLGraphWrapper:
                 aslkv = self._pad_list(aslkv, padding_lens, 0) # padding  aslkv to match gear
                 asl = self._pad_list(asl, padding_lens) # padding  asl to match gear
                 # FIXME: for TND FIA validation
-                if aslkv[-1] != 0:
+                if aslkv[-1] != 0 or not is_gqa:
                     aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
                 asl[-1] = batch_descriptor.num_tokens
                 if seq_sink_lens is not None:
