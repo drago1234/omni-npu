@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from typing import Optional
 import torch
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
@@ -25,6 +26,10 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
         self.ensure_moe_quant_config_init()
         self.make_prepare_permute_and_unpermute_finalize()
 
+    @property
+    def gate(self):
+        return self._gate
+    
     def make_prepare_permute_and_unpermute_finalize(self):
         prefill_prepare_permute_and_unpermute_finalize = All2AllPrepPmtAndUnpmtFinal(self)
         if model_extra_config.operator_opt_config.decode_moe_dispatch_combine:
@@ -39,7 +44,7 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        router_logits: Optional[torch.Tensor],
     ):
         if model_extra_config.operator_opt_config.enable_prefetch and self.shared_experts is not None:
             prefetch_moe_fn = getattr(self, "prefetch_moe", None)
@@ -59,9 +64,7 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
             num_pads = t_pad - t_ori
             if num_pads > 0:
                 x = torch.nn.functional.pad(x, (0, 0, 0, num_pads), value=0)
-                router_logits = torch.nn.functional.pad(router_logits, (0, 0, 0, num_pads), value=0)
             x = x[tp_rank * t_local: (tp_rank + 1) * t_local]
-            router_logits = router_logits[tp_rank * t_local: (tp_rank + 1) * t_local]
 
         if model_extra_config.operator_opt_config.enable_prefetch:
             prefetch_moe_fn = getattr(self, "prefetch_moe", None)

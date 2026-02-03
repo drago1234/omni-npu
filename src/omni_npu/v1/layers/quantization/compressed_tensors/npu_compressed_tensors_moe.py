@@ -79,7 +79,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
+        router_logits: Optional[torch.Tensor],
         gate: torch.nn.Module,
         shared_experts: torch.nn.Module,
         top_k: int,
@@ -102,6 +102,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if gate is not None:
             router_logits, _ = gate(x)
+        else:
+            assert router_logits is not None, "Either gate or router_logits must be provided."
         topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
             top_k=top_k,

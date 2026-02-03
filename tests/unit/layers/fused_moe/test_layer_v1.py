@@ -172,7 +172,7 @@ def test_forward_prefetch_and_shared_experts(layer_v1_module):
 
     hidden_states = torch.ones(2, 3)
     router_logits = torch.full((2, 2), 4.0)
-    layer.gate = MagicMock(return_value=(router_logits, None))
+    layer._gate = MagicMock(return_value=(router_logits, None))
     layer.shared_experts = MagicMock(return_value=torch.full((2, 3), 5.0))
     layer.quant_method = MagicMock()
 
@@ -230,7 +230,7 @@ def test_forward_tp_padding_and_all_gather(layer_v1_module):
 
     hidden_states = torch.arange(6, dtype=torch.float32).view(3, 2)
     router_logits = torch.arange(6, dtype=torch.float32).view(3, 2)
-    layer.gate = MagicMock(return_value=(router_logits, None))
+    layer._gate = MagicMock(return_value=(router_logits, None))
     layer.shared_experts = None
     layer.quant_method = MagicMock()
     layer.quant_method.apply = MagicMock(return_value=torch.ones(2, 2))
