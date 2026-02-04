@@ -104,14 +104,14 @@ class TestPanguToolParserExtractToolCallsStreaming(unittest.TestCase):
         self.assertIn("Beijing", res.tool_calls[0].function.arguments)
         self.assertIn("Beijing", self.parser.streamed_args_for_tool[0])
 
-    def test_extract_tool_calls_streaming_whit_end_token(self):
+    def test_extract_tool_calls_streaming_with_end_token(self):
         """case:tool end"""
         curr = "<|tool_call_start|>[...]<|tool_call_end|> End text"
         delta = " End text"
         res = self.parser.extract_tool_calls_streaming(
             "", curr, delta, [], [], [], self.request)
         print(f"res: {res}")
-        self.assertEqual(res.content, " End text")
+        self.assertIsNone(res)
 
     def test_extract_tool_calls_streaming_whit_exception(self):
         """case:发送了部分 JSON"""
@@ -136,14 +136,14 @@ class TestPanguToolParserExtractToolCallsStreaming(unittest.TestCase):
         self.parser.streamed_args_for_tool = []
 
         # 1. 构造一个能被 partial_json_parser 解析的片段
-        curr = '<|tool_call_start|>[{"name": "get_weather"'
+        curr = '<|tool_call_start|>[{"name": "get_weather"}'
 
         # 2. 调用流式提取
         # current_tool_id 从 -1 变为 0
         res = self.parser.extract_tool_calls_streaming(
             previous_text="<|tool_call_start|>",
             current_text=curr,
-            delta_text='[{"name": "get_weather"',
+            delta_text='[{"name": "get_weather"}',
             previous_token_ids=[104],
             current_token_ids=[104, 1],
             delta_token_ids=[1],

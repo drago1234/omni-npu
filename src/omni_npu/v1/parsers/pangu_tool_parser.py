@@ -18,7 +18,8 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
 from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
     ToolParser)
 from vllm.entrypoints.openai.tool_parsers.utils import (find_common_prefix,
-                                                        is_complete_json)
+                                                        is_complete_json,
+                                                        partial_json_loads)
 from vllm.logger import logger
 from vllm.tokenizers import TokenizerLike
 
@@ -36,11 +37,21 @@ class PanguToolParser(ToolParser):
         self.streamed_args_for_tool: List[str] = [
         ]  # map what has been streamed for each tool so far to a list
 
-        self.tool_call_start_token: str = "<|tool_call_start|>" if self.vocab.get(
-            "<|tool_call_start|>") else "[unused11]"
-        self.tool_call_end_token: str = "<|tool_call_end|>" if self.vocab.get("<|tool_call_end|>") else "[unused12]"
-        self.pattern = re.escape(self.tool_call_start_token) \
-                       + "(.*?)" + re.escape(self.tool_call_end_token)
+        self.tool_call_start_token: str = (
+            "<|tool_call_start|>"
+            if self.vocab.get("<|tool_call_start|>")
+            else "[unused11]"
+        )
+        self.tool_call_end_token: str = (
+            "<|tool_call_end|>" 
+            if self.vocab.get("<|tool_call_end|>") 
+            else "[unused12]"
+        )
+        self.pattern = (
+            re.escape(self.tool_call_start_token) 
+            + "(.*?)" 
+            + re.escape(self.tool_call_end_token)
+            )
         self.tool_call_regex = re.compile(self.pattern, re.DOTALL)
 
         self.tool_call_start_token_id = self.vocab.get(
@@ -53,7 +64,6 @@ class PanguToolParser(ToolParser):
             raise RuntimeError(
                 "Pangu Tool parser could not locate tool calls start/end "
                 "tokens in the tokenizer!")
-        self.is_complete = []
         self.text_after_start_token = ""
 
     def extract_tool_calls(
@@ -126,7 +136,7 @@ class PanguToolParser(ToolParser):
 
         if (self.tool_call_end_token in current_text
                 and self.tool_call_end_token not in delta_text):
-            return DeltaMessage(content=delta_text)
+            return None
 
         if self.tool_call_start_token not in current_text:
             return DeltaMessage(content=delta_text)
@@ -150,14 +160,31 @@ class PanguToolParser(ToolParser):
         flags = Allow.ALL if self.current_tool_name_sent \
             else Allow.ALL & ~Allow.STR
         try:
-            tool_call_portion = current_text.split(
+            tool_call_arr = []
+            self.is_complete = []
+            current_text = current_text.split(
                 self.tool_call_start_token)[-1].split(self.tool_call_end_token)[0]
+            current_text = current_text[
+                current_text.find('[') + 1: current_text.rfind(']')
+                ]
+            start_idx = current_text.find("{")
+        
             try:
-                tool_call_arr: list[dict] = partial_json_parser.loads(
-                    tool_call_portion, flags)
-
-                self.is_complete.append(
-                    is_complete_json(tool_call_portion))
+                while start_idx < len(current_text):
+                    (obj, end_idx) = partial_json_loads(current_text[start_idx:], flags)
+                    current_tool_text = current_text[start_idx: start_idx + end_idx]
+                    next_tool_text = current_text[start_idx + end_idx:]
+                    if next_tool_text.find("{") != -1:
+                        next_tool_start_idx = next_tool_text.find("{")
+                        next_tool_start = next_tool_text[:next_tool_start_idx]
+                    else:
+                        next_tool_start = next_tool_text
+                    self.is_complete.append(
+                        is_complete_json(current_tool_text)
+                    )
+                    start_idx += end_idx + len(next_tool_start)
+                    
+                    tool_call_arr.append(obj)
             except partial_json_parser.core.exceptions.MalformedJSON:
                 logger.debug('not enough tokens to parse into JSON yet')
                 return None
@@ -206,7 +233,6 @@ class PanguToolParser(ToolParser):
                 self.current_tool_id += 1
                 self.current_tool_name_sent = False
                 self.streamed_args_for_tool.append("")
-                self.is_complete = []
                 logger.debug("starting on new tool %d", self.current_tool_id)
                 return delta
 
@@ -232,19 +258,7 @@ class PanguToolParser(ToolParser):
             else:
                 cur_arguments = current_tool_call.get("arguments")
                 delta = None
-                if (self.is_complete[-1] and not cur_arguments
-                        and not self.streamed_args_for_tool[-1]):
-                    argument_diff = "{}"
-                    delta = DeltaMessage(tool_calls=[
-                        DeltaToolCall(index=self.current_tool_id,
-                                      function=DeltaFunctionCall(
-                                          arguments=argument_diff).
-                                      model_dump(exclude_none=True))
-                    ])
-                    self.streamed_args_for_tool[
-                        self.current_tool_id] += argument_diff
-
-                if cur_arguments:
+                if cur_arguments is not None:
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = json.dumps(cur_arguments,
@@ -253,7 +267,7 @@ class PanguToolParser(ToolParser):
                         self.current_tool_id].get("arguments")
 
                     argument_diff = None
-                    if self.is_complete[-1]:
+                    if self.is_complete[self.current_tool_id]:
                         argument_diff = cur_args_json[sent:]
                     elif prev_arguments:
                         prev_args_json = json.dumps(prev_arguments,
