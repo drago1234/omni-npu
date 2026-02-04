@@ -81,6 +81,19 @@ def _wrap_call(original_call):
             return model_output
     return _new_call
 
+def _patched_mark_dynamic():
+    import inspect
+    import sys
+    origin_torch_compile = _dec_mododule._support_torch_compile
+    origin_torch_compile_str = inspect.getsource(origin_torch_compile)
+    new_torch_compile_str = origin_torch_compile_str.replace('torch._dynamo.mark_dynamic',
+                                                             'torch._dynamo.maybe_mark_dynamic')
+    new_torch_compile = {}
+    module_globals = sys.modules[_dec_mododule.__name__].__dict__
+    exec(new_torch_compile_str, module_globals, new_torch_compile)
+    _dec_mododule._support_torch_compile = new_torch_compile["_support_torch_compile"]
+    logger.debug("<<< _patched_mark_dynamic applied!")
+
 def patch_compile_decorators():
     import os
     use_gegraph = os.getenv("TORCH_COMPILE_GE", "False").lower() == "true"
@@ -88,15 +101,10 @@ def patch_compile_decorators():
         logger.debug("<<< patch_compile_decorators:use ge graph!")
         _dec_mododule._support_torch_compile = support_ge_compile
     else:
+        _patched_mark_dynamic()
         _original_decorator = _dec_mododule._support_torch_compile
-        def _patched_support_torch_compile(cls, dynamic_arg_dims, *args, **kwargs):
-            # Avoid marking inputs_embeds as dynamic to prevent Dynamo
-            # specializing it to a constant and raising ConstraintViolationError.
-            if isinstance(dynamic_arg_dims, dict) and "inputs_embeds" in dynamic_arg_dims:
-                dynamic_arg_dims = dict(dynamic_arg_dims)
-                dynamic_arg_dims.pop("inputs_embeds")
-
-            cls = _original_decorator(cls, dynamic_arg_dims, *args, **kwargs)
+        def _patched_support_torch_compile(cls, *args, **kwargs):
+            cls = _original_decorator(cls, *args, **kwargs)
 
             cls.__call__ = _wrap_call(cls.__call__)
             logger.debug("<<< cls.__call__ wrapped!")

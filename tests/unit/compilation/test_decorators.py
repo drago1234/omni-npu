@@ -112,17 +112,19 @@ def test_patch_compile_decorators_ge_compile():
 def test_patch_compile_decorators_no_ge_compile():
     """Test set TORCH_COMPILE_GE to False and replace it with the native wrapper function."""
     os.environ["TORCH_COMPILE_GE"] = "False"
-    original_decorator = MagicMock(return_value = TestModel)
-    _dec_mododule._support_torch_compile = original_decorator
+    mock_original_decorator = MagicMock(return_value = TestModel)
+    _dec_mododule._support_torch_compile = mock_original_decorator
 
-    with patch("omni_npu.compilation.decorators._wrap_call", MagicMock(side_effect=lambda x: x)) as mock_wrap:
-        patch_compile_decorators()
+    with patch("omni_npu.compilation.decorators._patched_mark_dynamic") as mock_patched_mark_dynamic:
+        with patch("omni_npu.compilation.decorators._wrap_call", MagicMock(side_effect=lambda x: x)) as mock_wrap:
+            patch_compile_decorators()
 
-        patched_cls = _dec_mododule._support_torch_compile(TestModel, {})
+            patched_cls = _dec_mododule._support_torch_compile(TestModel)
 
-        original_decorator.assert_called_once()
-        mock_wrap.assert_called_once_with(TestModel.__call__)
-        assert issubclass(patched_cls, nn.Module)
+            mock_original_decorator.assert_called_once()
+            mock_patched_mark_dynamic.assert_called_once()
+            mock_wrap.assert_called_once_with(TestModel.__call__)
+            assert issubclass(patched_cls, nn.Module)
 
 
 @pytest.mark.parametrize("env", ["True", "TRUE", "true", "False", "FALSE", "false"])
@@ -130,18 +132,20 @@ def test_patch_compile_decorators_ge_env(env):
     """Test the case-insensitivity of the TORCH_COMPILE_GE size."""
     os.environ["TORCH_COMPILE_GE"] = env
     with patch("omni_npu.compilation.decorators.support_ge_compile") as mock_ge_compile_func:
-        patch_compile_decorators()
-        if env.lower() == "true":
-            assert _dec_mododule._support_torch_compile == mock_ge_compile_func
-        else:
-            assert _dec_mododule._support_torch_compile.__name__ == "_patched_support_torch_compile"
+        with patch("omni_npu.compilation.decorators._patched_mark_dynamic"):
+            patch_compile_decorators()
+            if env.lower() == "true":
+                assert _dec_mododule._support_torch_compile == mock_ge_compile_func
+            else:
+                assert _dec_mododule._support_torch_compile.__name__ == "_patched_support_torch_compile"
 
 
 def test_patch_compile_decorators_no_env():
     """Test not set the TORCH_COMPILE_GE, default uses the native packaging branch."""
     os.environ.pop("TORCH_COMPILE_GE", None)
-    patch_compile_decorators()
-    assert _dec_mododule._support_torch_compile.__name__ == "_patched_support_torch_compile"
+    with patch("omni_npu.compilation.decorators._patched_mark_dynamic"):
+        patch_compile_decorators()
+        assert _dec_mododule._support_torch_compile.__name__ == "_patched_support_torch_compile"
 
 
 if __name__ == "__main__":
