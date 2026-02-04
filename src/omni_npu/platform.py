@@ -189,3 +189,6 @@ class NPUPlatform(Platform):
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         return True
+
+    def is_sleep_mode_available(self) -> bool:
+        return bool(int(os.environ.get("VLLM_ENABLE_SLEEP_MODE", "0")))

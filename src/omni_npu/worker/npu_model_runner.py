@@ -687,3 +687,23 @@ class NPUModelRunner(GPUModelRunner):
             omni_cache=omni_cache
         )
         self.omni_cache = omni_cache
+
+    def kv_cache_after_wake_up(self) -> None:
+        attn_layers = self.compilation_config.static_forward_context
+        import os
+        if bool(int(os.environ.get("VLLM_ENABLE_SLEEP_MODE", "0"))):
+            from vllm.attention.layers import StaticSinkAttention
+            for name, module in attn_layers.items():
+                if isinstance(module, StaticSinkAttention):
+                    self._kv_cache_sink_attn_after_wake_up(module)
+    
+    def _kv_cache_sink_attn_after_wake_up(self, module) -> None:
+        sink_kv_cache = getattr(module, "kv_cache")
+        populate_sink_kv_method = getattr(module, "populate_sink_kv")
+
+        # populate_sink_kv in SinkAttention retrieves the `virtual_engine` value from `ForwardContext`
+        # but this value is unavailable here. 
+        # Since `virtual_engine` is defaulted to 0 and will be deprecated, we directly set it to 0 here.
+        self_kv_cache = sink_kv_cache[0] 
+        if self_kv_cache is not None and len(self_kv_cache) > 0:
+            populate_sink_kv_method(self_kv_cache[0], self_kv_cache[1])

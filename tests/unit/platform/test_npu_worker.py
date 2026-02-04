@@ -24,6 +24,7 @@ class TestNpuWorker:
             pre_register_and_update=lambda: None,
             set_device=lambda device: None,
             dist_backend="hccl",
+            is_sleep_mode_available=lambda: True,
         )
         monkeypatch.setattr("omni_npu.worker.npu_worker.current_platform", mock_platform)
 
@@ -460,12 +461,42 @@ class TestNpuWorker:
             mock_ensure_kv_initialized,
         )
 
+        # Mock NpuMemAllocator
+        mock_allocator = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.NpuMemAllocator.get_instance",
+            lambda: mock_allocator
+        )
+
+        # Mock model_extra_config
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.model_extra_config.operator_opt_config.use_omni_cache",
+            True
+        )
+
         worker.initialize_from_config(mock_kv_cache_config)
 
-        # Verify ensure_kv_transfer_initialized and initialize_kv_cache are called
+        # Assertions
         assert ensure_kv_initialized_called["called"] is True
         assert ensure_kv_initialized_called["args"] == (worker.vllm_config, mock_kv_cache_config)
+        mock_allocator.use_memory_pool.assert_called_once_with(tag="kv_cache")
+        worker.model_runner.initialize_omni_kv_cache.assert_called_once_with(mock_kv_cache_config)
+
+        # Test case: use_omni_cache is False
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.model_extra_config.operator_opt_config.use_omni_cache",
+            False
+        )
+        worker.initialize_from_config(mock_kv_cache_config)
         worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
+
+        # Test case: sleep mode not available
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.current_platform.is_sleep_mode_available",
+            lambda: False
+        )
+        worker.initialize_from_config(mock_kv_cache_config)
+        worker.model_runner.initialize_kv_cache.assert_called()
 
     def test_initialize_cache(self, monkeypatch):
         """Test initialize_cache method (should return None).
@@ -525,13 +556,37 @@ class TestNpuWorker:
     def test_load_model(self, monkeypatch):
         """Test load_model method.
         
-        Verifies that model loading delegates to model_runner.load_model.
+        Verifies that model loading delegates to model_runner.load_model
+        and handles memory pool context correctly.
         """
         worker = self._create_worker(monkeypatch)
 
+        # Mock NpuMemAllocator
+        mock_allocator = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.NpuMemAllocator.get_instance",
+            lambda: mock_allocator
+        )
+        mock_allocator.get_current_usage.return_value = 0
+
         worker.load_model()
 
+        # Assertions
+        mock_allocator.use_memory_pool.assert_called_once_with(tag="weights")
         worker.model_runner.load_model.assert_called_once()
+
+        # Test case: allocator usage is not zero
+        mock_allocator.get_current_usage.return_value = 1
+        with pytest.raises(RuntimeError, match="Sleep mode can only be used for one instance per process."):
+            worker.load_model()
+
+        # Test case: sleep mode not available
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.current_platform.is_sleep_mode_available",
+            lambda: False
+        )
+        worker.load_model()
+        worker.model_runner.load_model.assert_called()
 
     def test_execute_dummy_batch(self, monkeypatch):
         """Test execute_dummy_batch method.
@@ -619,3 +674,40 @@ class TestNpuWorker:
         result = worker.execute_model(mock_scheduler_output)
         assert worker.profile_finished is True
         mock_profiler.stop.assert_called_once()
+
+    def test_sleep(self, monkeypatch):
+        """Test the sleep method."""
+        worker = self._create_worker(monkeypatch)
+
+        # Mock NpuMemAllocator
+        mock_allocator = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_mem_pool.NpuMemAllocator.get_instance",
+            lambda: mock_allocator
+        )
+        # Update memory info after sleep
+        monkeypatch.setattr(
+            "torch.npu.mem_get_info",
+            lambda: (15 * (1 << 30), 20 * (1 << 30))
+        )
+
+        worker.sleep(level=1)
+
+        # Assertions
+        mock_allocator.sleep.assert_called_once_with(offload_tags=("weights",))
+
+    def test_wake_up(self, monkeypatch):
+        """Test the wake_up method."""
+        worker = self._create_worker(monkeypatch)
+
+        # Mock NpuMemAllocator
+        mock_allocator = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_mem_pool.NpuMemAllocator.get_instance",
+            lambda: mock_allocator
+        )
+
+        worker.wake_up(tags=['weights', 'kv_cache'])
+
+        # Assertions
+        mock_allocator.wake_up.assert_called_once_with(tags=['weights', 'kv_cache'])

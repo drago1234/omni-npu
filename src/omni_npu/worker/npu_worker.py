@@ -29,11 +29,11 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
+from omni_npu.worker.npu_mem_pool import NpuMemAllocator
 from omni_npu.v1.models.config_loader.loader import model_extra_config
 
 
 logger = init_logger(__name__)
-
 
 class NPUWorker(WorkerBase):
     """An NPU worker class using torch_npu and HCCL backend."""
@@ -164,9 +164,7 @@ class NPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
-        from vllm.platforms import current_platform
         if current_platform.is_sleep_mode_available():
-            from .npu_mem_pool import NpuMemAllocator
             allocator = NpuMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")
         else:
@@ -205,7 +203,16 @@ class NPUWorker(WorkerBase):
         return self.model_runner.get_model()
 
     def load_model(self) -> None:
-        self.model_runner.load_model()
+        if current_platform.is_sleep_mode_available():
+            allocator = NpuMemAllocator.get_instance()
+            if allocator.get_current_usage() != 0:
+                raise RuntimeError("Sleep mode can only be used for one instance per process.")
+            context = allocator.use_memory_pool(tag="weights")
+        else:
+            from contextlib import nullcontext
+            context = nullcontext()
+        with context:
+            self.model_runner.load_model()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
@@ -289,3 +296,30 @@ class NPUWorker(WorkerBase):
     @torch.inference_mode()
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
+
+    def sleep(self, level: int = 1) -> None:
+
+        def GiB(b):
+            return b / (1 << 30)
+        free_bytes_before_sleep = torch.npu.mem_get_info()[0]
+
+        allocator = NpuMemAllocator.get_instance()
+        allocator.sleep(offload_tags=("weights", ) if level == 1 else tuple())
+
+        free_bytes_after_sleep, total = torch.npu.mem_get_info()
+        freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+        used_bytes = total - free_bytes_after_sleep
+        assert freed_bytes >= 0, "Memory increase after sleep."
+
+        logger.info(
+            "Sleep mode freed %.2f GiB memory, "
+            "%.2f GiB memory is still in use", GiB(freed_bytes), GiB(used_bytes)
+        )
+
+    def wake_up(self, tags: Optional[list[str]] = None) -> None:
+        allocator = NpuMemAllocator.get_instance()
+        allocator.wake_up(tags=tags)
+        if ("kv_cache" in tags and hasattr(self.model_runner, "kv_cache_after_wake_up")):
+            self.model_runner.kv_cache_after_wake_up()
+
+    

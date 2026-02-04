@@ -13,9 +13,7 @@ from vllm.attention.backends.abstract import (
     AttentionType,
 )
 from vllm.attention.layer import Attention
-from vllm.attention.selector import get_attn_backend
 from vllm.config import CacheConfig, VllmConfig
-from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.utils import (
@@ -31,7 +29,6 @@ from vllm.attention import layers
 from vllm.platforms import current_platform
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-
 
 logger = init_logger(__name__)
 
@@ -180,6 +177,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
             assert self.sink_key is not None and self.sink_value is not None, (
                 "sink_key and sink_value have not been prepared"
             )
+
             if not self.sink_populated:
                 forward_context: ForwardContext = get_forward_context()
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
