@@ -6,10 +6,6 @@ from typing import Optional
 import torch
 import torch_npu
 from transformers import DeepseekV2Config, DeepseekV3Config
-try:
-    import custom_ops
-except:
-    print("custom_ops failed to import!!!")
 
 from vllm.config import VllmConfig, CacheConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -130,7 +126,7 @@ class DSV32IndexerPatch(VLLMPatch):
         block_table = metadata.block_table
 
         bs = q.shape[0]
-        topk_indices = torch.ops.custom.npu_lightning_indexer(
+        topk_indices = torch_npu.npu_lightning_indexer(
             query=q,
             key=kv_cache[2],
             weights=weights,
@@ -141,6 +137,6 @@ class DSV32IndexerPatch(VLLMPatch):
             layout_query="TND",
             sparse_count=self.topk_tokens,
             sparse_mode=3
-        )
+        )[0]
         self.topk_indices_buffer[:bs] = topk_indices.view(-1, self.topk_tokens)
         return topk_indices      

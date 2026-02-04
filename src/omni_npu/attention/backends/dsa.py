@@ -273,7 +273,7 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
         block_table = metadata.block_table
 
         bs = q_nope.shape[0]
-        return torch.ops.custom.npu_sparse_flash_attention(
+        return torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=kv_cache[0],
             value=kv_cache[0],
@@ -285,10 +285,13 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
             actual_seq_lengths_kv=actual_seq_lens_key,
             query_rope=q_pe,
             key_rope=kv_cache[1],
+            pre_tokens=(1<<63)-1,
+            next_tokens=(1<<63)-1,
+            attention_mode=2,
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
-        )
+        )[0]
 
     def forward(
         self,

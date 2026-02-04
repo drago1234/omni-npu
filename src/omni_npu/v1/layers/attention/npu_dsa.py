@@ -6,10 +6,6 @@ from typing import Optional
 import torch
 import torch_npu
 from transformers import DeepseekV2Config, DeepseekV3Config
-try:
-    import custom_ops
-except:
-    print("custom_ops failed to import!!!")
 
 from vllm.platforms import current_platform
 from vllm.model_executor.models.utils import extract_layer_index
@@ -89,7 +85,7 @@ class Indexer(torch.nn.Module):
         actual_seq_lens_key = metadata.seq_lens.to(torch.int32)
         block_table = metadata.block_table
 
-        return torch.ops.custom.npu_lightning_indexer(
+        return torch_npu.npu_lightning_indexer(
             query=q,
             key=kv_cache[2],
             weights=weights,
@@ -100,7 +96,7 @@ class Indexer(torch.nn.Module):
             layout_query="TND",
             sparse_count=self.topk_tokens,
             sparse_mode=3
-        )
+        )[0]
 
     def forward(
         self,
@@ -338,7 +334,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         actual_seq_lens_kv = metadata.seq_lens.to(torch.int32)
         block_table = metadata.block_table
 
-        return torch.ops.custom.npu_sparse_flash_attention(
+        return torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=k_nope,
             value=k_nope,
@@ -350,10 +346,13 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             actual_seq_lengths_kv=actual_seq_lens_kv,
             query_rope=q_pe,
             key_rope=k_pe,
+            pre_tokens=(1<<63)-1,
+            next_tokens=(1<<63)-1,
+            attention_mode=2,
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
-        )
+        )[0]
             
     def _mla_epilog(
         self,
@@ -449,7 +448,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         attn_metadata
     ):
         bs, _ = hidden_states.view(-1, hidden_states.shape[-1]).shape
-        q_nope, q_pe, dequant_scale_q_nope, q_norm, dequant_scale_q_norm = torch.ops.custom.npu_mla_prolog_v3(
+        q_nope, q_pe, dequant_scale_q_nope, q_norm, dequant_scale_q_norm = torch_npu.npu_mla_prolog_v3(
             token_x=hidden_states.view(bs, 1, -1),
             weight_dq=self.q_a_proj.weight,                 # BF16, NZ
             weight_uq_qr=self.q_b_proj.weight,              # BF16, NZ
@@ -561,7 +560,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             key_rope_dsa = k_pe
 
         actual_seq_lens_query = attn_metadata.decode.query_cumlens.to(torch.int32)
-        attn_output = torch.ops.custom.npu_sparse_flash_attention(
+        attn_output = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=kv_dsa,
             value=kv_dsa,
@@ -573,8 +572,11 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             actual_seq_lengths_kv=kv_actual_seqlen_dsa,
             query_rope=q_pe,
             key_rope=key_rope_dsa,
+            pre_tokens=(1<<63)-1,
+            next_tokens=(1<<63)-1,
+            attention_mode=2,
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
-        )
+        )[0]
         return self._mla_epilog(attn_output)
