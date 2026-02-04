@@ -77,7 +77,7 @@ from vllm.model_executor.models.utils import (
 )
 
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
-from vllm.model_executor.layers.rotary_embedding import get_rope
+from omni_npu.v1.layers.rotary_embedding import get_rope
 
 logger = init_logger(__name__)
 
@@ -325,7 +325,7 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k, is_prefill)
+        q, k = self.rotary_emb(positions, q, k, is_prefill=is_prefill)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
