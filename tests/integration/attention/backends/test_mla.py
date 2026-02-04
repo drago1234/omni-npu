@@ -67,8 +67,7 @@ class TestNPUAttentionBackendMLAImplIntegration(unittest.TestCase):
             )
 
             with patch('vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size', return_value=64), \
-                patch('omni_npu.attention.backends.mla.get_current_vllm_config', return_value=None), \
-                patch('omni_npu.attention.backends.mla.get_forward_context', return_value=mock_ctx):
+                patch('omni_npu.attention.backends.mla.get_current_vllm_config', return_value=None):
 
                 # Create kv_b_proj and convert to bfloat16
                 kv_b_proj = torch.nn.Linear(
@@ -136,6 +135,9 @@ class TestNPUAttentionBackendMLAImplIntegration(unittest.TestCase):
                 prefill_meta.block_table = block_table
                 prefill_meta.seq_lens = seq_lens
                 prefill_meta.query_start_loc = query_start_loc
+                # Provide a plain-Python cumulative list so MLA impl can
+                # consume it without touching device tensors.
+                prefill_meta.query_start_loc_list = [int(x) for x in query_start_loc.tolist()]
                 prefill_meta.query_cumlens = query_start_loc
                 prefill_meta.slot_mapping = slot_mapping
                 prefill_meta.chunked_context = chunked_context

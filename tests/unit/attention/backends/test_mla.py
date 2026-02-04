@@ -588,7 +588,7 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             self.assertEqual(kwargs["input_layout"], "TND_NTD")
             self.assertEqual(kwargs["num_key_value_heads"], 1)
 
-            # Output from _forward_decode is (N, T, D) after transpose
-            self.assertEqual(o.shape, (num_heads, T, v_head_dim))  # e.g., (32, 2, 128)
+            # Output from _forward_decode is (T, 1, N, D) after transpose
+            self.assertEqual(o.shape, (T, 1, num_heads, v_head_dim))  # e.g., (2, 1, 32, 128)
             # self.assertIsNone(extra)
             print(" _forward_decode test passed!")
