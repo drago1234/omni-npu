@@ -88,7 +88,7 @@ class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
 
 @dataclass
 class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
-    pass
+    decode_threshold: int = 1
 
 
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
@@ -146,6 +146,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         fast_build: bool = False,
     ) -> NPUMLAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        metadata.decode_threshold = self.reorder_batch_threshold
         if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
             # for pd-mixed, TP is used, no need to use mc2_mask
             metadata.decode.mc2_mask = self.generate_activate_mask(metadata.decode.query_cumlens[-1])
