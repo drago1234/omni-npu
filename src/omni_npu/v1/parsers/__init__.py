@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-__all__ = ["register_lazy_parsers"]
-
 from omni_npu.v1.parsers.pangu_reasoning_parser import PanguReasoningParser
 from omni_npu.v1.parsers.pangu_tool_parser import PanguToolParser
 from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -33,3 +31,9 @@ def register_lazy_parsers():
         module_path = parser_cls.__module__
         class_name = parser_cls.__name__
         ToolParserManager.register_lazy_module(name, module_path, class_name)
+
+
+"""
+tool and reasoning parsers register
+"""
+register_lazy_parsers()
