@@ -70,14 +70,11 @@ class EagleProposerPatch(VLLMPatch):
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
 
-        # Mask out the sampled tokens indices that should not be sampled.
-        discard_sampled_tokens_req_indices = torch.nonzero(
-            discard_request_mask[:num_reqs]
-        )
-
+        # Mask out sampled tokens for requests that should not be sampled.
         valid_sampled_token_ids_gpu = sampled_token_ids.clone()
-        valid_sampled_token_ids_gpu.index_fill_(
-            0, discard_sampled_tokens_req_indices, -1
+        valid_sampled_token_ids_gpu = valid_sampled_token_ids_gpu.masked_fill(
+            discard_request_mask[:num_reqs].unsqueeze(1),
+            -1,
         )
 
         # Generate a mask for all valid tokens within those requests
@@ -540,12 +537,20 @@ class EagleProposerPatch(VLLMPatch):
             draft_token_ids = logits.argmax(dim=-1)
             return draft_token_ids.view(-1, 1)
 
+        # FIXME (zxp): Adapt: currently, when num_speculative_tokens > 1, only supports cudagraph_mode "FULL" and "NONE"
+        cudagraph_mode = self.compilation_config.cudagraph_mode
+        if cudagraph_mode != CUDAGraphMode.FULL and cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                f"Speculative decoding with num_speculative_tokens > 1 only "
+                f"supports cudagraph_mode FULL and NONE, but got {cudagraph_mode}."
+            )
+
         if self.uses_mrope:
             positions = target_positions[:, last_token_indices]
         else:
             positions = target_positions[last_token_indices]
+        # Adapt: remove deepseek_mtp
         if self.method in (
-            "deepseek_mtp",
             "ernie_mtp",
             "longcat_flash_mtp",
             "pangu_ultra_moe_mtp",
@@ -592,9 +597,7 @@ class EagleProposerPatch(VLLMPatch):
             <= self.compilation_config.max_cudagraph_capture_size
         ):
             input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size_dp_padded)
-            # Adapt: set FULL mode for eagle proposer
-            cudagraph_runtime_mode = CUDAGraphMode.FULL
-            # END Adapt
+            cudagraph_runtime_mode = self.target_model_cuda_graph_mode  # Adapt : get cudagraph mode from model runner
         else:
             input_batch_size = batch_size_dp_padded
             cudagraph_runtime_mode = CUDAGraphMode.NONE
@@ -644,7 +647,7 @@ class EagleProposerPatch(VLLMPatch):
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
 
-            common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+            common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_max_model_len, 1)
 
             common_attn_metadata.num_computed_tokens_cpu = (
                 common_attn_metadata.seq_lens_cpu - 1
