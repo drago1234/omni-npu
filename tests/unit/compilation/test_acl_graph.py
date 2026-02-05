@@ -12,7 +12,8 @@ from omni_npu.compilation.acl_graph import(
     set_graph_params,
     update_graph_params_workspaces,
     get_graph_params,
-    ACLGraphWrapper
+    ACLGraphWrapper,
+    ACLGraphEntry
 )
 
 
@@ -85,10 +86,32 @@ class TestACLGraphWrapper:
     """Test class for ACLGraphWrapper"""
 
     @pytest.fixture
-    def default_aclgraph_wrapper(self):
+    def default_npu_graph(self):
+        with patch("torch.npu.NPUGraph") as mock_npu_graph, \
+             patch("torch.npu.graph") as mock_npu_graph_ctx, \
+             patch("torch.npu.Stream") as mock_npu_stream:
+            mock_graph_instance = MagicMock()
+            mock_graph_instance.replay = MagicMock()
+            mock_graph_instance.update = MagicMock()
+            mock_npu_graph.return_value = mock_graph_instance
+
+            # mock torch.npu.graph context manager to avoid executing the actual logic within the with statement
+            mock_npu_graph_ctx.return_value.__enter__ = lambda self: None
+            mock_npu_graph_ctx.return_value.__exit__ = lambda *args: None
+
+            mock_npu_stream.return_value = MagicMock()
+
+            yield mock_graph_instance
+
+
+    @pytest.fixture
+    def default_aclgraph_wrapper(self, default_npu_graph):
         with patch("omni_npu.compilation.acl_graph.get_forward_context") as mock_get_forward_context:
             mock_context = MagicMock()
-            mock_context.batch_descriptor = MagicMock(uniform=True)
+            mock_batch_descriptor = MagicMock()
+            mock_batch_descriptor.num_reqs = None
+            mock_batch_descriptor.num_tokens = None
+            mock_context.batch_descriptor = mock_batch_descriptor
             mock_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
             mock_context.attn_metadata = None
             mock_get_forward_context.return_value = mock_context
@@ -101,6 +124,8 @@ class TestACLGraphWrapper:
             )
             wrapper._forward_context = mock_context
             wrapper.concrete_aclgraph_entries = {}
+            wrapper.aclgraph_options = MagicMock(gc_disable=False, debug_log_enable=False)
+            wrapper.default_npu_graph = default_npu_graph
             yield wrapper
 
 
@@ -195,6 +220,116 @@ class TestACLGraphWrapper:
         assert result == default_aclgraph_wrapper.runnable.return_value
         # Verify not create a new entry for batch descriptor
         assert not default_aclgraph_wrapper.concrete_aclgraph_entries
+
+
+    def test_call_with_non_none_aclgraph_runtime_mode(self, default_aclgraph_wrapper):
+        """Test the aclgraph replay behavior in a non-NONE aclgraph_runtime_mode."""
+        default_aclgraph_wrapper.runtime_mode = CUDAGraphMode.PIECEWISE
+        default_aclgraph_wrapper._forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+        
+        default_aclgraph_wrapper._forward_context.attn_metadata = {
+            "metadata1": MagicMock(query_cumlens=torch.tensor([1]), seq_lens=torch.tensor([2]))
+        }
+        batch_descriptor = default_aclgraph_wrapper._forward_context.batch_descriptor
+        batch_descriptor.num_reqs = 3
+        batch_descriptor.num_tokens = 4
+        default_aclgraph_wrapper.vllm_config.scheduler_config.max_num_seqs = 10
+
+        with patch.object(default_aclgraph_wrapper, "concrete_aclgraph_entries", new_callable=dict) as mock_concrete_aclgraph_entries:
+            # simulate the captured aclgraph
+            mock_entry = MagicMock(spec=ACLGraphEntry)
+            mock_aclgraph = MagicMock()
+            mock_aclgraph.replay = MagicMock()
+            mock_aclgraph.update = MagicMock()
+
+            mock_entry.aclgraph = mock_aclgraph
+            mock_entry.output = torch.tensor([2.0])
+            mock_concrete_aclgraph_entries[batch_descriptor] = mock_entry
+
+            result = default_aclgraph_wrapper(torch.tensor([1.0]))
+
+            # Verify runnable should not be called
+            default_aclgraph_wrapper.runnable.assert_not_called()
+            # Verify replay and update should be called
+            mock_aclgraph.replay.assert_called_once()
+            mock_aclgraph.update.assert_called_once()
+            assert result == mock_entry.output
+            assert batch_descriptor in default_aclgraph_wrapper.concrete_aclgraph_entries
+
+
+    def test_call_with_aslkv_none(self, default_aclgraph_wrapper):
+        """Test __call__ method raise error when attn_metadata is None."""
+        default_aclgraph_wrapper._forward_context.attn_metadata = None
+        batch_descriptor = default_aclgraph_wrapper._forward_context.batch_descriptor
+        batch_descriptor.num_reqs = 3
+        batch_descriptor.num_tokens = 4
+        with patch.object(default_aclgraph_wrapper, "concrete_aclgraph_entries", new_callable=dict) as mock_concrete_aclgraph_entries:
+            mock_entry = MagicMock(spec=ACLGraphEntry)
+            mock_aclgraph = MagicMock()
+            mock_aclgraph.replay = MagicMock()
+            mock_concrete_aclgraph_entries[batch_descriptor] = mock_entry
+
+            with pytest.raises(RuntimeError):
+                default_aclgraph_wrapper(torch.tensor([1.0]))
+            
+            mock_entry.aclgraph.replay.assert_called_once()
+
+
+    def test_call_attn_metadata_gqa_mode(self, default_aclgraph_wrapper):
+        """Test __call__ method executes normally under the GQA mode."""
+        mock_attn_metadata = MagicMock(spec_set=["query_cumlens", "seq_lens"])
+        mock_attn_metadata.query_cumlens = torch.tensor([1])
+        mock_attn_metadata.seq_lens = torch.tensor([2])
+        default_aclgraph_wrapper._forward_context.attn_metadata = {
+            "metadata1": mock_attn_metadata
+        }
+        default_aclgraph_wrapper.runnable = MagicMock(return_value=torch.tensor([1.0]))
+
+        result = default_aclgraph_wrapper(torch.tensor([1.0]))
+
+        default_aclgraph_wrapper.runnable.assert_called_once()
+        assert torch.equal(result, torch.tensor([1.0]))
+
+
+    def test_call_attn_metadata_mla_mode(self, default_aclgraph_wrapper):
+        """Test __call__ method executes normally under the MLA mode."""
+        mock_attn_metadata = MagicMock()
+        mock_attn_metadata.decode = MagicMock()
+        mock_attn_metadata.decode.query_cumlens = torch.tensor([1])
+        mock_attn_metadata.decode.seq_lens = torch.tensor([2])
+        mock_attn_metadata.decode.seq_sink_len = torch.tensor([3])
+        default_aclgraph_wrapper._forward_context.attn_metadata = {
+            "metadata1": mock_attn_metadata
+        }
+        default_aclgraph_wrapper.runnable = MagicMock(return_value=torch.tensor([1.0]))
+
+        result = default_aclgraph_wrapper(torch.tensor([1.0]))
+
+        default_aclgraph_wrapper.runnable.assert_called_once()
+        assert torch.equal(result, torch.tensor([1.0]))
+
+
+    def test_call_with_input_address_mismatch(self, default_aclgraph_wrapper):
+        """Test the behavior when input address do not match in debugging mode."""
+        default_aclgraph_wrapper.is_debugging_mode = True
+        default_aclgraph_wrapper.runnable = MagicMock(return_value=torch.tensor([1.0]))
+
+        test_tensor = torch.tensor([1.0])
+        new_input_address = [test_tensor.data_ptr()]
+        old_input_address = [new_input_address[0] + 1]
+
+        batch_descriptor = default_aclgraph_wrapper._forward_context.batch_descriptor
+        default_aclgraph_wrapper.runnable = MagicMock(return_value=torch.tensor([1.0]))
+
+        with patch.object(default_aclgraph_wrapper, "concrete_aclgraph_entries", new_callable=dict) as mock_concrete_aclgraph_entries:
+            mock_entry = MagicMock(spec=ACLGraphEntry)
+            mock_entry.input_addresses = old_input_address
+            mock_concrete_aclgraph_entries[batch_descriptor] = mock_entry
+
+            with pytest.raises(AssertionError):
+                default_aclgraph_wrapper(test_tensor)
+
+            mock_entry.aclgraph.replay.assert_not_called()
 
 
 if __name__ == "__main__":
