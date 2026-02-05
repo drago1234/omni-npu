@@ -4,6 +4,7 @@ import sys
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from pathlib import Path
 
 import pytest
 import torch
@@ -30,8 +31,14 @@ def fused_module(monkeypatch):
     platforms_module.current_platform = SimpleNamespace(device_type="cpu")
 
     distributed_module = types.ModuleType("vllm.distributed")
-    distributed_module.get_ep_group = lambda: SimpleNamespace(world_size=1)
+    fake_device_group = SimpleNamespace()
+    distributed_module.get_ep_group = lambda: SimpleNamespace(
+        world_size=1, device_group=fake_device_group
+    )
     distributed_module.get_tp_group = lambda: SimpleNamespace(world_size=1)
+    distributed_module.get_dp_group = lambda: SimpleNamespace(
+        world_size=1, device_group=fake_device_group, rank=0, rank_in_group=0
+    )
     distributed_module.tensor_model_parallel_all_reduce = lambda x, *args, **kwargs: x
     distributed_module.tensor_model_parallel_all_gather = lambda x, *args, **kwargs: x
     distributed_module.get_tensor_model_parallel_world_size = lambda: 1

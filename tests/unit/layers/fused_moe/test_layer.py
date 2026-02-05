@@ -386,15 +386,13 @@ def test_process_weights_after_loading_transposes_and_casts(layer_module):
     method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
 
     layer = SimpleNamespace()
-    layer.w13_weight = torch.nn.Parameter(torch.ones(2, 4, 3), requires_grad=True)
-    layer.w2_weight = torch.nn.Parameter(torch.ones(2, 4, 3), requires_grad=True)
+    layer.w13_weight = torch.nn.Parameter(torch.ones(2, 4, 3))
+    layer.w2_weight = torch.nn.Parameter(torch.ones(2, 4, 3))
 
     method.process_weights_after_loading(layer)
 
     assert layer.w13_weight.shape == (2, 3, 4)
     assert layer.w2_weight.shape == (2, 3, 4)
-    assert layer.w13_weight.requires_grad is False
-    assert layer.w2_weight.requires_grad is False
     assert stubs.torch_npu.npu_format_cast.call_count == 2
 
 

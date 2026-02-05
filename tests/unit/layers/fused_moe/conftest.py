@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -109,6 +110,8 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
 
     fused_moe_config_module = _ensure_module(monkeypatch, "vllm.model_executor.layers.fused_moe.config")
 
+    fused_moe_config_module.FusedMoEConfig = FusedMoEConfig
+
     class FusedMoEQuantConfig:
         def __init__(self, use_int8_w8a8: bool = False):
             self.use_int8_w8a8 = use_int8_w8a8
@@ -169,6 +172,11 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
 
     compressed_tensors_module.NPUCompressedTensorsConfig = NPUCompressedTensorsConfig
 
+    layers_pkg = _ensure_module(monkeypatch, "omni_npu.layers")
+    layers_pkg.__path__ = [
+        str(Path(__file__).resolve().parents[4] / "src" / "omni_npu" / "layers")
+    ]
+    
     vllm_module.logger = logger_module
     vllm_module.distributed = distributed_module
     vllm_module.platforms = platforms_module

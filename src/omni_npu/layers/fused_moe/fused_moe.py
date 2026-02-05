@@ -251,7 +251,8 @@ def moe_infer_fusion(
 
     tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
     dist.all_to_all_single(tokens_per_expert_group,
-                           tokens_per_expert)  # (total_experts,) --> (total_ranks * n_routed_experts_per_rank)
+                           tokens_per_expert, 
+                           group=get_ep_group().device_group)  # (total_experts,) --> (total_ranks * n_routed_experts_per_rank)
 
     # combine tensors, do reduceSum and D2H toghter
     combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
@@ -266,13 +267,21 @@ def moe_infer_fusion(
     output_splits = combine_tokens_cpu[0]
     # alltoall output, unfolded into one dimension, the size is the sum of the number of tokens routed from other cards to the current rank.
     gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
-    dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits)
+    dist.all_to_all_single(gathered_tokens, 
+                           expanded_x, 
+                           output_splits, 
+                           input_splits,
+                           group=get_ep_group().device_group)
 
     if layer.quant_config is None:
         gathered_pertoken_scale = None
     else:
         gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
-        dist.all_to_all_single(gathered_pertoken_scale, pertoken_scale, output_splits, input_splits)
+        dist.all_to_all_single(gathered_pertoken_scale, 
+                               pertoken_scale, 
+                               output_splits, 
+                               input_splits,
+                               group=get_ep_group().device_group)
 
     # reroute
     # Tokens merged by experts, scales merged by experts, indices for FinalizeRouting, number of tokens processed by each expert
@@ -298,7 +307,11 @@ def moe_infer_fusion(
                                gathered_idxs_unsort.to(torch.float32).argsort().to(torch.int32))
     gathered_tokens = new_x.new_empty(*expanded_x.shape)
 
-    dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits)
+    dist.all_to_all_single(gathered_tokens, 
+                           new_x, 
+                           input_splits, 
+                           output_splits,
+                           group=get_ep_group().device_group)
 
     hidden_states = torch_npu.npu_moe_finalize_routing(
         gathered_tokens,
