@@ -2,7 +2,6 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import torch
-from typing import Optional
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import DeepseekScalingRotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import (
@@ -10,10 +9,12 @@ from vllm.model_executor.layers.rotary_embedding.common import (
     yarn_linear_ramp_mask,
 )
 
-from .common import get_cos_sin
+from .common import CachedCosSinMixin
 
 @DeepseekScalingRotaryEmbedding.register_oot
-class NPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
+class NPUDeepseekScalingRotaryEmbedding(
+    CachedCosSinMixin, DeepseekScalingRotaryEmbedding
+):
     def __init__(
         self,
         head_size: int,
@@ -84,6 +85,3 @@ class NPUDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         self.register_buffer(
             "sin_cached", (emb.sin() * self.mscale).to(dtype), persistent=False
         )
-
-    def get_cos_sin(self, positions: torch.Tensor, offsets: Optional[torch.Tensor] = None):
-        return get_cos_sin(self.cos_cached, self.sin_cached, positions, offsets)

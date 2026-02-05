@@ -16,6 +16,8 @@ from vllm.v1.sample.rejection_sampler import (
     MAX_SPEC_LEN,
 )
 
+NEW_GREEDY_TEMPERATURE = 1e-6 # convert greedy cases into random cases
+
 logger = init_logger(__name__)
 
 from omni_npu.sample.sampler import apply_top_k_top_p
@@ -24,7 +26,7 @@ from omni_npu.sample.sampler import apply_top_k_top_p
 class NPURejectionSampler(RejectionSampler):
     def __init__(self, sampler: Sampler):
         super().__init__(sampler)
-
+        self.dsa_stream = sampler.dsa_stream
 
     def forward(
         self,
@@ -74,8 +76,10 @@ class NPURejectionSampler(RejectionSampler):
                 sampling_metadata,
                 max_num_logprobs=-1,
             ),
-            predict_bonus_token=True
-            # Apdator: NPU sampler does not have logprobs_mode_override parameter
+            predict_bonus_token=True,
+            logprobs_mode_override="processed_logits"
+            if self.is_processed_logprobs_mode
+            else "raw_logits",
         )
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
 
@@ -85,10 +89,15 @@ class NPURejectionSampler(RejectionSampler):
         raw_target_logits = logits[target_logits_indices]
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
+        target_logits = raw_target_logits
+        if not self.is_processed_logprobs_mode:
+            # Clone raw_target_logits before applying processors to preserve
+            # the original raw logits for logprobs computation, since
+            # apply_logits_processors modifies the tensor in-place.
+            target_logits = target_logits.clone()
         target_logits = self.apply_logits_processors(
-            raw_target_logits, sampling_metadata, metadata
+            target_logits, sampling_metadata, metadata
         )
-
 
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
@@ -202,7 +211,7 @@ def compute_probs(
             cu_num_draft_tokens,
             num_tokens,
             replace_from=GREEDY_TEMPERATURE,
-            replace_to=1,
+            replace_to=NEW_GREEDY_TEMPERATURE,
         )
     # Get expanded top_k and top_p tensors.
     top_k = None

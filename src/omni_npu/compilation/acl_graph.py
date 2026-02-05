@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import dataclasses
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -139,6 +140,7 @@ class ACLGraphWrapper:
         attn_metadata =  get_forward_context().attn_metadata
         asl = None
         aslkv = None
+        seq_sink_lens = None
         if attn_metadata is not None:
             attn_metadata = attn_metadata[next(iter(attn_metadata))]
             if not hasattr(attn_metadata, "decode"):
@@ -149,6 +151,7 @@ class ACLGraphWrapper:
                 # MLA
                 asl = attn_metadata.decode.query_cumlens
                 aslkv = attn_metadata.decode.seq_lens
+                seq_sink_lens = getattr(attn_metadata.decode, "seq_sink_len", None)
 
         if (
             aclgraph_runtime_mode == CUDAGraphMode.NONE
@@ -161,9 +164,6 @@ class ACLGraphWrapper:
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
             return self.runnable(*args, **kwargs)
-
-        if not batch_descriptor.uniform:
-            raise RuntimeError(f"Currently only uniform decode supports graph mode. {self.runtime_mode=}, {aclgraph_runtime_mode=}.")
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
@@ -246,16 +246,30 @@ class ACLGraphWrapper:
             ## NOTE: The parameter list should match.
             # entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
             if not isinstance(aslkv, torch.Tensor):
-                aslkv = self._pad_list(aslkv, batch_descriptor.num_reqs) # padding  aslkv to match gear
-                entry.aclgraph.update(cpu_update_input=[{"actual_seq_kvlen": aslkv, "actual_seq_lengths_kv": aslkv}])
+                padding_lens = batch_descriptor.num_reqs
+                if padding_lens is None:
+                    padding_lens = min(self.vllm_config.scheduler_config.max_num_seqs, batch_descriptor.num_tokens)
+                aslkv = self._pad_list(aslkv, padding_lens, 0) # padding  aslkv to match gear
+                asl = self._pad_list(asl, padding_lens) # padding  asl to match gear
+                # FIXME: for TND FIA validation
+                if aslkv[-1] != 0:
+                    aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
+                asl[-1] = batch_descriptor.num_tokens
+                if seq_sink_lens is not None:
+                    seq_sink_lens = self._pad_list(seq_sink_lens, padding_lens) # padding seq_sink_lens to match gear
+                    entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": seq_sink_lens, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
+                else:
+                    entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
         return entry.output
 
-    def _pad_list(self, lst, n):
+    def _pad_list(self, lst, n, v=None):
         if not lst or len(lst) == n:
-            return lst
-        return lst + [lst[-1]] * (n - len(lst)) if len(lst) < n else lst[:n]
+            return copy.deepcopy(lst)
+        if v is None:
+            v = lst[-1]
+        return (lst + [v] * (n - len(lst))) if len(lst) < n else lst[:n]
 
 @dataclass
 class GraphParams:
@@ -283,7 +297,7 @@ def set_graph_params(aclgraph_capture_sizes: set[int]):
     )
 
 
-def update_graph_params_workspaces(num_tokens: int, workspace: int):
+def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor):
     global _graph_params
     if _graph_params is not None:
         _graph_params.workspaces[num_tokens] = weak_ref_tensors(workspace)

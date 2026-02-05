@@ -70,7 +70,7 @@ def load_model_extra_config(model_config, vllm_config, scheduler_config):
         enable_omni_cache = enable_omni_cache
     )
     _validate_config(vllm_config.additional_config)
-    _print_model_config()
+    # _print_model_config()
 
 
 @dataclass

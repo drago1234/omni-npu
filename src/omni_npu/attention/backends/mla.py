@@ -6,30 +6,32 @@ backend to remain fully self-contained and avoid external dependencies.
 It satisfies vLLM's backend interface so the platform selector can
 import and use it. We can iterate later with true MLA specialization.
 """
+
+import math
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Tuple
-import math
 
 import torch
 import torch_npu
 
+from vllm.platforms import current_platform
 from vllm.attention.backends.abstract import AttentionLayer, AttentionType
-from vllm.forward_context import get_forward_context
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBackend,
+    MLACommonBaseImpl,
     MLACommonDecodeMetadata,
     MLACommonMetadata,
     MLACommonMetadataBuilder,
-    MLACommonBaseImpl,
+    MLACommonPrefillMetadata,
     QueryLenSupport,
 )
-from vllm.distributed.parallel_state import get_tp_group
-from omni_npu.connector.utils import TP_Convertor
 from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.platforms import current_platform
+
+from omni_npu.connector.utils import TP_Convertor
 from omni_npu.attention import ops
 
 
@@ -73,9 +75,16 @@ class NPUMLABackend(MLACommonBackend):
 
 
 @dataclass
+class NPUMLAPrefillMetadata(MLACommonPrefillMetadata):
+    query_cumlens: list[int] = None
+    seq_lens: list[int] = None
+
+
+@dataclass
 class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
     mc2_mask: torch.Tensor = None
+
 
 @dataclass
 class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
@@ -83,7 +92,8 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
 
 
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    supports_uniform_spec_as_decode: ClassVar[bool] = True
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
@@ -96,7 +106,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         super().__init__(
             kv_cache_spec, layer_names, vllm_config, device, NPUMLAMetadata
         )
-
+        self.prefill_metadata_cls = NPUMLAPrefillMetadata
         if self._use_fi_prefill:
             raise ValueError("Flashinfer should not be enabled.")
         if self._use_cudnn_prefill:
@@ -106,12 +116,10 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
 
-        self.uniform_decode_query_len = (
-            1
-            if not self.vllm_config.speculative_config
-            else 1 + self.vllm_config.speculative_config.num_speculative_tokens
-        )
-        max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
+        if self.compilation_config is not None:
+            self.reorder_batch_threshold = max(self.compilation_config.max_cudagraph_capture_size, self.reorder_batch_threshold)
+        # FIXME (zhao): since current the max length of input of mc2_mask only support 256, so we clamp it to 256
+        max_decode_tokens = min(256, self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold)
         self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
 
     def _build_decode(
@@ -141,8 +149,12 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
             # for pd-mixed, TP is used, no need to use mc2_mask
             metadata.decode.mc2_mask = self.generate_activate_mask(common_attn_metadata.num_actual_tokens)
+        if metadata.decode is not None and hasattr(self.kv_cache_spec, "sink_len") and self.kv_cache_spec.sink_len > 0:
+            metadata.decode.seq_sink_len = [self.kv_cache_spec.sink_len] * metadata.num_decodes
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc_list = metadata.prefill.query_start_loc.tolist()
+            metadata.prefill.query_cumlens = common_attn_metadata.query_start_loc_cpu[1:].tolist()
+            metadata.prefill.seq_lens = metadata.prefill.query_cumlens
         if self.dcp_world_size > 1:
             self.prepare_dcp_slots(metadata)
             self.prepare_dcp_ag_reorg(metadata)
@@ -266,12 +278,13 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         self.sink_k_pe = None
         self.sink_compressed_kv = None
         self.sink_len = 0
+        self.sliding_window = sliding_window
 
-        unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
+        unsupported_features = [alibi_slopes, logits_soft_cap]
         if any(unsupported_features):
             raise NotImplementedError(
                 "NPUMLAImpl does not support one of the following: "
-                "alibi_slopes, sliding_window, logits_soft_cap"
+                "alibi_slopes, logits_soft_cap"
             )
 
         if attn_type != AttentionType.DECODER:
@@ -448,7 +461,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         assert attn_metadata.prefill is not None
 
         # When sink tokens are used, we need to insert cached sink tokens at the beginning of each sequence
-        if self.sink_len > 0:
+        if self.sink_len > 0 and self.sliding_window is None:
             k_pe = self._insert_tensor_by_start_loc(
                 k_pe,
                 self.sink_k_pe,
@@ -469,28 +482,112 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         tnd_cumlens = attn_metadata.prefill.query_start_loc_list[1:]
 
-        # When sink tokens are used, the actual sequence lengths for key and value are different.
-        num_prefills = len(tnd_cumlens)
-        sink_len_offset = [self.sink_len * (i + 1) for i in range(num_prefills)]
-        kv_cumlens = [x + y for x, y in zip(tnd_cumlens, sink_len_offset)]
+        if self.sink_len > 0 and self.sliding_window is None:
+            # When sink tokens are used, the actual sequence lengths for key and value are different.
+            num_prefills = len(tnd_cumlens)
+            sink_len_offset = [self.sink_len * (i + 1) for i in range(num_prefills)]
+            kv_cumlens = [x + y for x, y in zip(tnd_cumlens, sink_len_offset)]
+        else:
+            kv_cumlens = tnd_cumlens
+            
+        # Currently, when use static sink-mla with sliding window,
+        # we need to compute sink and normal attention scores separately
+        # TODO: Support sink and sliding window case with only one FIA call
+        if self.sink_len > 0:
+            has_context = False
+            if self.sliding_window is not None:
+                kv_c_normed_sink = self.kv_b_proj(self.sink_compressed_kv)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                kv_c_normed_sink = kv_c_normed_sink.repeat(len(tnd_cumlens), 1, 1)
+                kv_nope_sink, v_sink = kv_c_normed_sink.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        output, output_lse = torch.ops.npu.npu_fused_infer_attention_score(
-            q_nope,
-            k_nope,
-            v,
-            query_rope=q_pe,
-            key_rope=k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1),
-            num_heads=self.num_heads,
-            num_key_value_heads=self.num_heads,
-            input_layout="TND",
-            atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
-            sparse_mode=3,
-            actual_seq_lengths=tnd_cumlens,
-            actual_seq_lengths_kv=kv_cumlens,
-            scale=self.scale,
-            next_tokens=0,
-            softmax_lse_flag=has_context,
-        )
+                # Compute sink attention score and LSE
+                output_sink, output_lse_sink = torch.ops.npu.npu_fused_infer_attention_score(
+                    q_nope,
+                    kv_nope_sink,
+                    v_sink,
+                    query_rope=q_pe,
+                    key_rope=self.sink_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(len(tnd_cumlens), self.num_heads, 1),
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_heads,
+                    input_layout="TND",
+                    actual_seq_lengths=tnd_cumlens,
+                    actual_seq_lengths_kv=[self.sink_len * (i + 1) for i in range(len(tnd_cumlens))],
+                    scale=self.scale,
+                    next_tokens=0,
+                    softmax_lse_flag=True,
+                )
+
+                # Compute normal attention score and LSE
+                output_normal, output_lse_normal = torch.ops.npu.npu_fused_infer_attention_score(
+                    q_nope,
+                    k_nope,
+                    v,
+                    query_rope=q_pe,
+                    key_rope=k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1),
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_heads,
+                    input_layout="TND",
+                    sparse_mode=4,
+                    atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                    actual_seq_lengths=tnd_cumlens,
+                    actual_seq_lengths_kv=kv_cumlens,
+                    scale=self.scale,
+                    pre_tokens=(self.sliding_window-1),
+                    next_tokens=0,
+                    softmax_lse_flag=True,
+                )
+
+                # Merge sink and normal attention outputs
+                merged_output = torch.empty_like(output_normal)
+                merged_output_lse = torch.empty_like(output_lse_normal)
+                ops.merge_attn_states(
+                    output=merged_output,
+                    output_lse=merged_output_lse,
+                    prefix_output=output_sink,
+                    prefix_lse=output_lse_sink,
+                    suffix_output=output_normal,
+                    suffix_lse=output_lse_normal,
+                )
+                output = merged_output
+                output_lse = merged_output_lse
+            else:
+                output, output_lse = torch.ops.npu.npu_fused_infer_attention_score(
+                    q_nope,
+                    k_nope,
+                    v,
+                    query_rope=q_pe,
+                    key_rope=k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1),
+                    num_heads=self.num_heads,
+                    num_key_value_heads=self.num_heads,
+                    input_layout="TND",
+                    atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                    sparse_mode=3,
+                    actual_seq_lengths=tnd_cumlens,
+                    actual_seq_lengths_kv=kv_cumlens,
+                    scale=self.scale,
+                    next_tokens=0,
+                    softmax_lse_flag=has_context,
+                )
+        else:
+            output, output_lse = torch.ops.npu.npu_fused_infer_attention_score(
+                q_nope,
+                k_nope,
+                v,
+                query_rope=q_pe,
+                key_rope=k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1),
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_heads,
+                input_layout="TND",
+                atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                sparse_mode=3,
+                actual_seq_lengths=tnd_cumlens,
+                actual_seq_lengths_kv=kv_cumlens,
+                scale=self.scale,
+                next_tokens=0,
+                softmax_lse_flag=has_context,
+            )
 
         if has_context:
             if self.dcp_world_size > 1:
@@ -614,43 +711,75 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             decode_q_pe = torch.cat([decode_q_pe, q_pe_pad], dim=1)
         else:
             query_heads = self.num_heads
+            
+        # Currently, when use static sink-mla with sliding window,
+        # we need to compute sink and normal attention scores separately
+        # TODO: Support sink and sliding window case with only one FIA call
+        if self.sink_len > 0:
+            if self.sink_len % 128 != 0:
+                raise ValueError(f"sink_len {self.sink_len} must align with block size")
+            num_sink_blocks = self.sink_len // 128
 
-        ## TODO: TND_NTD layout bug. Currently graph mode only support BSND.
-        # output shape: (N, T, D)
-        batch_descriptor = get_forward_context().batch_descriptor
-        if batch_descriptor is not None and batch_descriptor.uniform:
-            batch_size = attn_metadata.decode.block_table.shape[0]
-            T, N, D = decode_ql_nope.shape
-            S = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
-            if T > batch_size:
-                attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
-                sparse_mode = 3
-            else:
-                attn_mask = None
-                sparse_mode = 0
-
-            o = torch.ops.npu.npu_fused_infer_attention_score(
-                decode_ql_nope.view(-1, S, N, D), kv_cache[0], kv_cache[0],
-                query_rope=decode_q_pe.view(-1, S, N, self.qk_rope_head_dim),
+            # Compute sink attention scores and LSE
+            output_sink, output_lse_sink = torch.ops.npu.npu_fused_infer_attention_score_v2(
+                decode_ql_nope, kv_cache[0], kv_cache[0],
+                query_rope=decode_q_pe,
                 key_rope=kv_cache[1],
-                num_heads=query_heads,
+                num_query_heads=query_heads,
                 num_key_value_heads=1,
-                input_layout="BSND",
-                scale=self.scale,
-                antiquant_mode=0,
-                antiquant_scale=None,
+                input_layout="TND",
+                softmax_scale=self.scale,
                 block_table=attn_metadata.decode.block_table,
                 block_size=128,
-                # actual_seq_lengths=attn_metadata.decode.query_cumlens,
-                actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
-                atten_mask=attn_mask,
-                sparse_mode=sparse_mode,
-            )[0]
-            o = o.view(-1, N, D).transpose(0, 1).contiguous()
+                actual_seq_qlen=attn_metadata.decode.query_cumlens,
+                actual_seq_kvlen=attn_metadata.decode.seq_sink_len,
+                return_softmax_lse=True,
+            )
+
+            # Compute normal attention scores and LSE with sliding window
+            if self.sliding_window is not None:
+                output_normal, output_lse_normal = torch.ops.npu.npu_fused_infer_attention_score(
+                    decode_ql_nope, kv_cache[0], kv_cache[0],
+                    query_rope=decode_q_pe,
+                    key_rope=kv_cache[1],
+                    num_heads=query_heads,
+                    num_key_value_heads=1,
+                    input_layout="TND",
+                    scale=self.scale,
+                    block_table=attn_metadata.decode.block_table[:, num_sink_blocks:],
+                    block_size=128,
+                    actual_seq_lengths=attn_metadata.decode.query_cumlens,
+                    actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
+                    atten_mask=NPUMLAImpl.DECORE_ATTN_MASK,
+                    sparse_mode=4,
+                    pre_tokens=(self.sliding_window-1),
+                    softmax_lse_flag=True,
+                )
+            # Compute normal attention scores and LSE without sliding window
+            else:
+                output_normal, output_lse_normal = torch.ops.npu.npu_fused_infer_attention_score(
+                    decode_ql_nope, kv_cache[0], kv_cache[0],
+                    query_rope=decode_q_pe,
+                    key_rope=kv_cache[1],
+                    num_heads=query_heads,
+                    num_key_value_heads=1,
+                    input_layout="TND",
+                    scale=self.scale,
+                    block_table=attn_metadata.decode.block_table[:, num_sink_blocks:],
+                    block_size=128,
+                    actual_seq_lengths=attn_metadata.decode.query_cumlens,
+                    actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
+                    softmax_lse_flag=True,
+                )
+
+            # Merge sink and normal attention scores
+            lse_max = torch.maximum(output_lse_sink, output_lse_normal)
+            w_sink = torch.exp(output_lse_sink - lse_max)
+            w_normal = torch.exp(output_lse_normal - lse_max)
+            o = (output_sink * w_sink + output_normal * w_normal) / (w_sink + w_normal)
+            o = o.transpose(0, 1).contiguous() # TND -> NTD
         else:
-            num_tokens = attn_metadata.decode.query_cumlens[-1]
-            decode_ql_nope = decode_ql_nope[:num_tokens]
-            decode_q_pe = decode_q_pe[:num_tokens]
+            # output shape: (N, T, D)
             o = torch.ops.npu.npu_fused_infer_attention_score(
                 decode_ql_nope, kv_cache[0], kv_cache[0],
                 query_rope=decode_q_pe,
@@ -665,6 +794,8 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 block_size=128,
                 actual_seq_lengths=attn_metadata.decode.query_cumlens,
                 actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
+                atten_mask = NPUMLAImpl.DECORE_ATTN_MASK,
+                sparse_mode = 3
             )[0]
 
         if self.sink_len > 0:
@@ -732,7 +863,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         has_prefill = attn_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.num_decode_tokens
 
-        decode_q = q
+        decode_q = q[:num_decode_tokens]
 
         def store_kv(cache, kv):
             if self.dcp_world_size == 1:

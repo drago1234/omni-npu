@@ -15,12 +15,17 @@ def register_models():
         "Qwen3ForCausalLM",
         "omni_npu.v1.models.qwen.qwen3:Qwen3ForCausalLM")
     ModelRegistry.register_model(
+        "Qwen3VLForConditionalGeneration",
+        "omni_npu.v1.models.qwen.qwen3_vl:Qwen3VLForConditionalGeneration")
+    ModelRegistry.register_model(
         "PanguUltraMoEForCausalLM",
         "omni_npu.v1.models.pangu.pangu_ultra_moe:PanguUltraMoEForCausalLM")
     ModelRegistry.register_model(
         "OpenPanguMTPModel",
         "omni_npu.v1.models.pangu.pangu_ultra_moe_mtp:OpenPanguMTP")
-
+    ModelRegistry.register_model(
+        "PanguProMoEV2ForCausalLM",
+        "omni_npu.v1.models.pangu.pangu_pro_moe:PanguProMoEV2ForCausalLM")
     import os
 
     if (

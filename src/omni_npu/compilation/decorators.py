@@ -10,6 +10,7 @@ import torch.nn as nn
 import vllm.compilation.decorators as _dec_mododule
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.config import CUDAGraphMode
 
 
 logger = init_logger(__name__)
@@ -53,10 +54,9 @@ def _bypass_prefill(self, *args, **kwargs):
     We use the non-compiled forward for this case.
     """
     attn_metadata = get_forward_context().attn_metadata
-    batch_descriptor = get_forward_context().batch_descriptor
-    uniform = batch_descriptor.uniform if batch_descriptor is not None else False
     has_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-    if has_prefill or not uniform:
+    # FIXME (zhao): currently we only support full cudagraph mode for compiled graphs.
+    if has_prefill or get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
         logger.debug(f"<<< use original forward")
         return True, self.forward(*args, **kwargs)
     return False, None

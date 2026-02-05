@@ -36,7 +36,6 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ):
-
         if model_extra_config.operator_opt_config.enable_prefetch and self.shared_experts is not None:
             prefetch_moe_fn = getattr(self, "prefetch_moe", None)
             if callable(prefetch_moe_fn):
@@ -44,26 +43,17 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
                                 prefetch_experts=False,
                                 prefetch_shared_experts=True)
 
-        router_logits, _ = self.gate(hidden_states)
-        if self.shared_experts is not None:
-            share_expert_output = self.shared_experts(hidden_states)
-        else:
-            share_expert_output = None
-
         tp_size = get_tensor_model_parallel_world_size()  # attn tp size
         x = hidden_states
         if tp_size > 1:
             tp_rank = get_tensor_model_parallel_rank()
-            t_ori = hidden_states.shape[0]
+            t_ori = x.shape[0]
             t_pad = -(t_ori // -tp_size) * tp_size
             t_local = t_pad // tp_size
             num_pads = t_pad - t_ori
-            # pad
-            x = torch.nn.functional.pad(hidden_states, (0, 0, 0, num_pads), value=0)
-            router_logits = torch.nn.functional.pad(router_logits, (0, 0, 0, num_pads), value=0)
-            # deduplicate
+            if num_pads > 0:
+                x = torch.nn.functional.pad(x, (0, 0, 0, num_pads), value=0)
             x = x[tp_rank * t_local: (tp_rank + 1) * t_local]
-            router_logits = router_logits[tp_rank * t_local: (tp_rank + 1) * t_local]
 
         if model_extra_config.operator_opt_config.enable_prefetch:
             prefetch_moe_fn = getattr(self, "prefetch_moe", None)
@@ -72,10 +62,11 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
                                 prefetch_experts=True,
                                 prefetch_shared_experts=False)
 
-        route_expert_output = self.quant_method.apply(
+        expert_output = self.quant_method.apply(
             layer=self,
             x=x,
-            router_logits=router_logits,
+            gate=self.gate,
+            shared_experts=self.shared_experts,
             top_k=self.top_k,
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
@@ -96,9 +87,8 @@ class NPUFusedMoEV1(NPUSharedFusedMoE, PrefetcherBase):
         )
 
         if tp_size > 1:
-            route_expert_output = tensor_model_parallel_all_gather(route_expert_output, dim=0)[:t_ori]
+            expert_output = tensor_model_parallel_all_gather(expert_output, dim=0)[:t_ori]
 
         if model_extra_config.operator_opt_config.enable_prefetch:
             self.prefetch_attention(trigger=hidden_states)
-            
-        return share_expert_output, route_expert_output
+        return None, expert_output

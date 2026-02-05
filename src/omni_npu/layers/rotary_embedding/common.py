@@ -6,6 +6,7 @@
 This module contains utility functions that are reuse.
 """
 
+from typing import Optional
 import torch
 
 from vllm.logger import init_logger
@@ -40,9 +41,11 @@ def apply_rotary_emb_full_dim(
     return x * cos + x_rotated * sin    
 
 def get_cos_sin(
-        cos: torch.Tensor, sin: torch.Tensor, 
-        positions: torch.Tensor, offsets: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    offsets: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Get cos and sin values for the given positions.
 
     Args:
@@ -58,3 +61,23 @@ def get_cos_sin(
     cos = cos[positions].view(-1, 1, 1, cos.shape[-1])
     sin = sin[positions].view(-1, 1, 1, sin.shape[-1])
     return cos, sin
+
+
+class CachedCosSinMixin:
+    """Mixin to expose cached cos/sin lookup with optional seqlen support."""
+
+    def get_cos_sin(
+        self,
+        positions_or_seqlen: int | torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(positions_or_seqlen, int):
+            return super().get_cos_sin(positions_or_seqlen)
+        if isinstance(positions_or_seqlen, torch.Tensor) and positions_or_seqlen.ndim == 0:
+            return super().get_cos_sin(positions_or_seqlen)
+        return get_cos_sin(
+            self.cos_cached,
+            self.sin_cached,
+            positions_or_seqlen,
+            offsets,
+        )

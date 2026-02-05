@@ -723,7 +723,7 @@ class OpenPanguVisionTransformer(nn.Module):
                         context_dim=self.hidden_size,
                         norm_layer=norm_layer,
                         spatial_merge_size=self.spatial_merge_size,
-                        quant_config=quant_config,
+                        quant_config=None,
                         prefix=f"{prefix}.merger.{i}",
                     )
                     for i in range(len(self.select_layer))

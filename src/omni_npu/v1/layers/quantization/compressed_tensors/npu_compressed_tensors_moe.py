@@ -17,6 +17,7 @@ from omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize i
     FusedMoEPreparePermuteAndUnpermuteFinalize,
     PreparePermuteResult
 )
+from omni_npu.v1.layers.utils import named_stream
 
 
 class NPUFusedMoEMethodBase(ABC):
@@ -63,11 +64,6 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
     def __init__(self, parent, layer):
         NPUCompressedTensorsW8A8Int8MoEMethod.__init__(self, parent, layer)
         NPUFusedMoEMethodBase.__init__(self)
-        self.scale_2 = torch.ones(
-            (layer.local_num_experts, layer.intermediate_size_per_partition), 
-            dtype=torch.float32,
-            device=current_platform.device_type
-        )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> Optional[FusedMoEQuantConfig]:
         return int8_w8a8_moe_quant_config(
@@ -82,7 +78,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
+        gate: torch.nn.Module,
+        shared_experts: torch.nn.Module,
         top_k: int,
         renormalize: bool,
         use_grouped_topk: bool = False,
@@ -101,6 +98,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+
+        router_logits, _ = gate(x)
         topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
             top_k=top_k,
@@ -143,9 +142,22 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
 
         hidden_states = self.apply_experts(layer, prepare_permute_result)
 
-        return self.apply_unpermute_finalize(
+        if shared_experts is not None:
+            cur_stream = torch.npu.current_stream()
+            sub_stream = named_stream("moe_sub_stream")
+
+            sub_stream.wait_stream(cur_stream)
+            with torch.npu.stream(sub_stream):
+                share_expert_output = shared_experts(x)
+
+        route_expert_output = self.apply_unpermute_finalize(
             prepare_permute_and_unpermute_finalize, hidden_states, topk_ids, topk_weights, prepare_permute_result
         )
+
+        if shared_experts is not None:
+            cur_stream.wait_stream(sub_stream)
+            return route_expert_output + share_expert_output
+        return route_expert_output
 
     def apply_experts(self, layer: torch.nn.Module, prepare_permute_result: PreparePermuteResult) -> torch.Tensor:
         hidden_states = prepare_permute_result.hidden_states_sorted_by_experts
@@ -168,6 +180,11 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
             group_type=0,
             group_list_type=1)[0]
 
+        self.scale_2 = torch.ones(
+            (len(layer.w13_weight), layer.intermediate_size_per_partition), 
+            dtype=torch.float32,
+            device=current_platform.device_type
+        )
         intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             gate_up_proj,
             weight_scale=layer.w13_weight_scale,

@@ -1,24 +1,32 @@
-import math
-from typing import Optional
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
+"""YaRN (Yet another RoPE extensioN) scaling rotary embedding implementation.
+
+Credits to Peng et al. github.com/jquesnelle/yarn
+
+This module provides the YaRN scaling method for extending rotary positional embeddings.
+"""
+
 import torch
 import torch_npu
 
-from vllm.model_executor.layers.rotary_embedding.llama3_rope import Llama3RotaryEmbedding
-from .common import apply_rotary_emb_full_dim, get_cos_sin
+from vllm.model_executor.layers.rotary_embedding import YaRNScalingRotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.common import yarn_get_mscale
+from .common import CachedCosSinMixin, apply_rotary_emb_full_dim
 
-LOW_FREQ_FACTOR = 1
-HIGH_FREQ_FACTOR = 4
-OLD_CONTEXT_LEN = 8192
-ROPE_ROTARY_FACTOR = 64
-SCALE_FACTOR = 8
+@YaRNScalingRotaryEmbedding.register_oot
+class NPUYaRNScalingRotaryEmbedding(
+    CachedCosSinMixin, YaRNScalingRotaryEmbedding
+):
+    """RotaryEmbedding extended with YaRN method.
 
-@Llama3RotaryEmbedding.register_oot
-class NPULlama3RotaryEmbedding(Llama3RotaryEmbedding):
-    """Llama3 Rotary Embedding with linear scaling for NPU devices.
+    YaRN (Yet another RoPE extensioN) is a method for extending the context
+    length of models using rotary positional embeddings.
 
-    This implementation provides the Llama3-specific rotary embedding
-    application with linear scaling for NPU devices.
+    Credits to Peng et al. github.com/jquesnelle/yarn
     """
+
     def __init__(
         self,
         head_size: int,
@@ -26,24 +34,34 @@ class NPULlama3RotaryEmbedding(Llama3RotaryEmbedding):
         max_position_embeddings: int,
         base: float,
         is_neox_style: bool,
-        dtype: torch.dtype,
         scaling_factor: float,
-        low_freq_factor: float,
-        high_freq_factor: float,
-        orig_max_position: int,
+        dtype: torch.dtype,
+        *,
+        extrapolation_factor: float = 1,
+        attn_factor: float = 1,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
+        apply_yarn_scaling: bool = True,
+        truncate: bool = True,
     ) -> None:
-        super().__init__(
-            head_size, rotary_dim, max_position_embeddings, base, 
-            is_neox_style, dtype, scaling_factor, low_freq_factor,
-            high_freq_factor, orig_max_position)
-    
+
+        super().__init__(head_size, rotary_dim, max_position_embeddings, base,
+                         is_neox_style, scaling_factor, dtype,
+                         extrapolation_factor=extrapolation_factor,
+                         attn_factor=attn_factor,
+                         beta_fast=beta_fast,
+                         beta_slow=beta_slow, 
+                         apply_yarn_scaling=apply_yarn_scaling, 
+                         truncate=truncate)
+        
         self._set_cos_sin_cache()
+        
 
     def _set_cos_sin_cache(self) -> None:
-        """Compute the cos and sin cache separately with Llama3 scaling."""
-        inv_freq = self._compute_inv_freq(self.base).npu()
-        t = torch.arange(self.max_position_embeddings, device=inv_freq.device,
-                         dtype=inv_freq.dtype)
+        """Compute the cos and sin cache separately with YaRN scaling."""
+        inv_freq = self._compute_inv_freq(self.scaling_factor).npu()
+        self.max_len = self.max_position_embeddings * self.scaling_factor
+        t = torch.arange(self.max_len, device=inv_freq.device, dtype=torch.float32)
 
         # Adapt for ascend rope
         if self.is_neox_style:
@@ -53,11 +71,11 @@ class NPULlama3RotaryEmbedding(Llama3RotaryEmbedding):
             freqs = torch.outer(t, inv_freq).float()
             emb = torch.stack((freqs, freqs), dim=-1).reshape(freqs.shape[0], -1)
 
-        self.register_buffer("cos_cached", torch.cos(emb).to(dtype=torch.get_default_dtype()), persistent=False)
-        self.register_buffer("sin_cached", torch.sin(emb).to(dtype=torch.get_default_dtype()), persistent=False)
+        emb_cos = torch.cos(emb) * self.mscale
+        emb_sin = torch.sin(emb) * self.mscale
 
-    def get_cos_sin(self, positions: torch.Tensor, offsets: Optional[torch.Tensor] = None):
-        return get_cos_sin(self.cos_cached, self.sin_cached, positions, offsets)
+        self.register_buffer("cos_cached", emb_cos.to(dtype=torch.get_default_dtype()), persistent=False)
+        self.register_buffer("sin_cached", emb_sin.to(dtype=torch.get_default_dtype()), persistent=False)
 
     def forward_oot(
         self,
@@ -101,4 +119,3 @@ class NPULlama3RotaryEmbedding(Llama3RotaryEmbedding):
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
-    

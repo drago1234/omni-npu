@@ -150,15 +150,7 @@ class NPUPlatform(Platform):
         use_sparse: bool,
         attn_type: str | None = None,
     ) -> str:
-        if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
-            if use_mla:
-                if use_sparse:
-                    return "omni_npu.attention.backends.dsa.NPUDSABackend"
-                else:
-                    return "omni_npu.v1.attention.backends.mla.NPUMLABackend"
-            else:
-                return "omni_npu.attention.backends.attention.NPUAttentionBackend"
-        elif "omni_models_v0" in os.environ.get("VLLM_PLUGINS", ""):
+        if "omni_models_v0" in os.environ.get("VLLM_PLUGINS", ""):
             return "omni_npu.v0.layers.attention.backend.attention.NPUAttentionBackend"
         else:
             if use_mla:

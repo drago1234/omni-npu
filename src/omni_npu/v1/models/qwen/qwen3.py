@@ -34,11 +34,13 @@ from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
+from omni_npu.v1.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
@@ -46,15 +48,13 @@ from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsLoRA, 
 from vllm.model_executor.models.qwen2 import Qwen2MLP as Qwen3MLP
 from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
-from vllm.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
 
-from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
+logger = init_logger(__name__)
 
-class Qwen3MLP(FusedMLP):
-    pass
+# from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
+
+# class Qwen3MLP(FusedMLP):
+#     pass
 
 
 class Qwen3Attention(nn.Module):
@@ -144,6 +144,20 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+
+        from vllm.forward_context import ForwardContext, get_forward_context
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            is_prefill = False
+        else:
+            if isinstance(attn_metadata, dict):
+                first_key = next(iter(attn_metadata.keys()))
+                meta = attn_metadata[first_key]
+            else:
+                meta = attn_metadata
+            is_prefill = getattr(meta, 'num_prefills', 0) > 0
+        
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
@@ -153,7 +167,7 @@ class Qwen3Attention(nn.Module):
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, is_prefill=is_prefill)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -231,7 +245,6 @@ class Qwen3DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-
         return hidden_states, residual
 
 

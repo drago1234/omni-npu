@@ -213,7 +213,7 @@ class TestNPUPlatform:
             has_sink=False,
             use_sparse=False,
         )
-        assert result == "omni_npu.v1.attention.backends.mla.NPUMLABackend"
+        assert result == "omni_npu.attention.backends.mla.NPUMLABackend"
         
         result = NPUPlatform.get_attn_backend_cls(
             selected_backend="test",

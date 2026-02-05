@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-import os
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import TYPE_CHECKING, Optional, Union, Any, cast, TypeAlias
@@ -26,13 +25,10 @@ from vllm.attention.backends.abstract import (
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -40,6 +36,10 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
 )
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.ubatch_utils import UBatchSlices
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.spec_decode.eagle import EagleProposer
 
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
@@ -74,7 +74,9 @@ class NPUModelRunner(GPUModelRunner):
         # enable mtp acl graph mode
         if self.speculative_config and isinstance(self.drafter, EagleProposer):
             if self.compilation_config.mode == CompilationMode.VLLM_COMPILE:
-                self.drafter.use_cuda_graph = self.compilation_config.cudagraph_mode.has_mode(CUDAGraphMode.PIECEWISE)
+                self.drafter.use_cuda_graph = self.compilation_config.cudagraph_mode.has_mode(CUDAGraphMode.FULL)
+                self.drafter.batch_desc = None
+                self.drafter.target_model_cuda_graph_mode = None
 
         # NOTE:(runze) query_lens and seq_lens arguments need to be int64 in FIA op,
         # otherwise an implicit conversion would happen which might hurt performance.
@@ -195,6 +197,43 @@ class NPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         torch.npu.synchronize()
 
+    def _determine_batch_execution_and_padding(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+        max_num_scheduled_tokens: int,
+        use_cascade_attn: bool,
+        allow_microbatching: bool = True,
+        force_eager: bool = False,
+        force_uniform_decode: bool | None = None,
+        force_has_lora: bool | None = None,
+    ) -> tuple[
+        CUDAGraphMode, BatchDescriptor, UBatchSlices | None, torch.Tensor | None
+    ]:
+        (
+            cudagraph_mode,
+            batch_desc,
+            ubatch_slices,
+            num_tokens_across_dp,
+        ) = super()._determine_batch_execution_and_padding(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            use_cascade_attn=use_cascade_attn,
+            allow_microbatching=allow_microbatching,
+            force_eager=force_eager,
+            force_uniform_decode=force_uniform_decode,
+            force_has_lora=force_has_lora,
+        )
+
+        if self.speculative_config and isinstance(self.drafter, EagleProposer):
+            self.drafter.batch_desc = batch_desc
+            self.drafter.target_model_cuda_graph_mode = cudagraph_mode
+
+        return cudagraph_mode, batch_desc, ubatch_slices, num_tokens_across_dp
+
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
         Args:
@@ -224,6 +263,13 @@ class NPUModelRunner(GPUModelRunner):
                                          self.vllm_config,
                                          runtime_mode=CUDAGraphMode.FULL)
             logger.debug("<<< Wrapped original model with ACLGraphWrapper")
+            if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
+                self.drafter.model = ACLGraphWrapper(
+                    self.drafter.model,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL
+                )
+                logger.debug("<<< Wrapped drafter model with ACLGraphWrapper")
 
     def capture_model(self) -> int:
         logger.debug("<<< Capturing model in npu_model_runner")
@@ -497,7 +543,10 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
                 # enable mtp acl graph mode
-                use_cudagraphs = cudagraph_runtime_mode.has_mode(CUDAGraphMode.PIECEWISE)
+                use_cudagraphs = (
+                    cudagraph_runtime_mode.has_mode(CUDAGraphMode.FULL)
+                    and not self.speculative_config.enforce_eager
+                )
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
@@ -512,6 +561,8 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_padded,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
+                    batch_descriptor=batch_desc,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
                 )
                 # Adapt end : to pass attn_metadata and batch_desc
 

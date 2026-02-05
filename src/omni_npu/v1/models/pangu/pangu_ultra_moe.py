@@ -48,7 +48,7 @@ from vllm.sequence import IntermediateTensors
 
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
-from omni_npu.v1.fused_mlp.layer import FusedMLP
+from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
 
 
 def check_ffn_act_fn(act_fn: str) -> None:
@@ -128,7 +128,17 @@ class OpenPanguMoE(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        self.gate.e_score_correction_bias = None
+        #####patch start: for pangu72B-VL
+        if (
+            hasattr(config, "router_enable_expert_bias")
+            and config.router_enable_expert_bias
+        ):
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(self.n_routed_experts, dtype=torch.float32)
+            )
+        else:
+            self.gate.e_score_correction_bias = None
+        #####patch end
 
         # Load balancing settings.
         eplb_config = parallel_config.eplb_config

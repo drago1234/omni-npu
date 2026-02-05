@@ -6,10 +6,13 @@ from typing import Optional
 import torch
 import torch_npu
 
+from vllm.config.model import LogprobsMode
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler as TopKTopPSampler
 from vllm.v1.sample.sampler import Sampler as SamplerV1
 from vllm.v1.outputs import SamplerOutput as SamplerOutputV1
+
+from omni_npu.sample.ops.topk_topp_sampler import NPUTopKTopPSampler
 
 FP32_EPS = 2 ** -24
 USE_SORT_OP_MIN_BS = 2
@@ -131,42 +134,6 @@ def generate_random_sequence(
     torch.npu.default_stream().wait_stream(stream)
     return q
 
-class NPUTopKTopPSamplerV1(TopKTopPSampler):
-    """
-    Module that performs optional top-k and top-p filtering followed by
-    weighted random sampling of logits.
-
-    Implementations may update the logits tensor in-place.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.dsa_stream = torch_npu.npu.Stream()
-    def forward_native(
-        self,
-        logits: torch.Tensor,
-        generators: dict[int, torch.Generator],
-        k: Optional[torch.Tensor],
-        p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        PyTorch-native implementation of top-k and top-p sampling.
-
-        The logits tensor may be updated in-place.
-        """
-        use_npu_top_k_top_p_sample = False  # TODO(runze): read from config
-        if use_npu_top_k_top_p_sample == False or p is None or k is None:
-            logits, idx = apply_top_k_top_p(logits, k, p)
-            probs = logits.softmax(dim=-1, dtype=torch.float32)
-            return random_sample(probs, idx, generators, self.dsa_stream), None
-        else:
-            logits = logits.type(torch.bfloat16)
-            p = p.type(torch.bfloat16)
-            k = k.type(torch.int32)
-            q = generate_random_sequence(logits, generators, self.dsa_stream)
-            res = torch_npu.npu_top_k_top_p_sample(logits, k, p, q)
-            return res[0], None
-
 def _apply_penalties_v1(logits: torch.Tensor, prompt_mask: torch.Tensor,
                     output_mask: torch.Tensor,
                     output_bin_counts: torch.Tensor,
@@ -190,44 +157,10 @@ def _apply_penalties_v1(logits: torch.Tensor, prompt_mask: torch.Tensor,
 
     return logits
 
+# TODO import penalty cache
 class NPUSamplerV1(SamplerV1):
-    def __init__(self):
-        super().__init__()
-        self.topk_topp_sampler = NPUTopKTopPSamplerV1()
-        self.penalty_cache = None
-
-    def apply_penalties(
-            self,
-            logits: torch.Tensor,
-            sampling_metadata: SamplingMetadata,
-            output_token_ids: Optional[list[list[int]]] = None,
-    ) -> torch.Tensor:
-        if self.penalty_cache is None:
-            return logits
-        if not sampling_metadata.no_penalties:
-            assert sampling_metadata.prompt_token_ids is not None
-            logits = _apply_penalties_v1(
-                logits,
-                self.penalty_cache.prompt_mask,
-                self.penalty_cache.output_mask,
-                self.penalty_cache.output_bin_counts,
-                sampling_metadata.presence_penalties,
-                sampling_metadata.frequency_penalties,
-                sampling_metadata.repetition_penalties,
-                self.penalty_cache.do_presence_penalties,
-                self.penalty_cache.do_frequency_penalties,
-                self.penalty_cache.do_repetition_penalties
-            )
-        return logits
-
-    def forward(
-            self,
-            logits: torch.Tensor,
-            sampling_metadata: SamplingMetadata,
-            update_penalty: Optional[bool] = True,
-            predict_bonus_token: bool = False,
-    ) -> SamplerOutputV1:
-        result = super().forward(logits, sampling_metadata)
-        if self.penalty_cache is not None and update_penalty:
-            self.penalty_cache.save_token_ids(result.sampled_token_ids)
-        return result
+    def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs"):
+        super().__init__(logprobs_mode)
+        self.dsa_stream = torch_npu.npu.Stream()
+        self.topk_topp_sampler = NPUTopKTopPSampler(logprobs_mode, self.dsa_stream)
+        

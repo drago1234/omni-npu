@@ -151,11 +151,7 @@ class DeepseekV2MoE(nn.Module):
             topk_group=getattr(config, "topk_group", 1),
             prefix=f"{prefix}.experts",
             scoring_func=getattr(config, "scoring_func", "softmax"),
-            # we do scaling outside, set factor to 1.0 to avoid double mul
-            # aiter applies routed_scaling_factor internally
-            routed_scaling_factor=1.0
-            if not self.is_rocm_aiter_moe_enabled
-            else self.routed_scaling_factor,
+            routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
@@ -248,8 +244,7 @@ class DeepseekV2MoE(nn.Module):
         if self.shared_experts is None:
             assert shared_output is None
 
-        if self.shared_experts is not None:
-            assert shared_output is not None
+        if shared_output is not None:
             final_hidden_states += shared_output
 
         if self.is_sequence_parallel:
@@ -334,7 +329,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
     def forward(
         self,

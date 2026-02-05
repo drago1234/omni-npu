@@ -47,6 +47,7 @@ def layer_module(monkeypatch):
     logger_module.init_logger = lambda name: MagicMock()
 
     distributed_module = types.ModuleType("vllm.distributed")
+    distributed_module.get_dp_group = lambda: SimpleNamespace(rank=0, world_size=1)
     distributed_module.get_ep_group = lambda: SimpleNamespace(rank=0)
     distributed_module.get_tp_group = lambda: SimpleNamespace(
         all_gather=lambda x, dim=0: x,
@@ -62,7 +63,7 @@ def layer_module(monkeypatch):
     platforms_module = types.ModuleType("vllm.platforms")
     platforms_module.current_platform = SimpleNamespace(device_type="cpu")
 
-    context_holder = SimpleNamespace(attn_metadata=None)
+    context_holder = SimpleNamespace(attn_metadata=None, batch_descriptor=None)
     forward_context_module = types.ModuleType("vllm.forward_context")
     forward_context_module.get_forward_context = lambda: context_holder
 
