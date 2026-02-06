@@ -1000,6 +1000,14 @@ class OpenPanguVLProcessingInfo(Qwen2_5_VLProcessingInfo):
             ),
             **kwargs,
         )
+
+    def get_max_video_tokens(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> int:
+        # to support chunked prefill for videos
+        return seq_len
 #####patch end
 
 
