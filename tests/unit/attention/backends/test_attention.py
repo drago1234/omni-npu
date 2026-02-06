@@ -244,7 +244,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
                 attn_type=AttentionType.DECODER,
             )
 
-    def test_forward_decode_path_calls_npu_fused_infer_attention_score(self):
+    def test_forward_calls_npu_fused_infer_attention_score_v2(self):
         impl = self.impl_cls(
             num_heads=8,
             head_size=128,
@@ -314,10 +314,11 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             self.assertAlmostEqual(kwargs['softmax_scale'], 0.125)
             self.assertIs(result, output)
 
-    def test_forward_prefill_path_calls_npu_fused_infer_attention_score_v2(self):
+    def test_forward_calls_npu_fused_infer_attention_score_bsnd(self):
+        head_size = 256
         impl = self.impl_cls(
             num_heads=8,
-            head_size=128,
+            head_size=head_size,
             scale=0.125,
             num_kv_heads=4,
             attn_type=AttentionType.DECODER,
@@ -327,11 +328,11 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
         layer._k_scale_float = 1.0
         layer._v_scale_float = 1.0
 
-        query = torch.randn(20, 8 * 128)  # [20, 1024]
-        key = torch.randn(20, 4 * 128)    # [20, 512]
-        value = torch.randn(20, 4 * 128)
-        kv_cache = (torch.zeros(100, 16, 4 * 128), torch.zeros(100, 16, 4 * 128))
-        output = torch.empty_like(query)  # [20, 1024]
+        query = torch.randn(20, 8, head_size)
+        key = torch.randn(20, 4, head_size)
+        value = torch.randn(20, 4, head_size)
+        kv_cache = (torch.zeros(100, 16, 4 * head_size), torch.zeros(100, 16, 4 * head_size))
+        output = torch.empty_like(query)
 
         metadata = self.metadata_cls(
             num_actual_tokens=20,
@@ -343,7 +344,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             num_prefills=2,
         )
 
-        prefill_output = output.clone()  # [20, 1024]
+        prefill_output = output.clone()
         def fake_scatter_nd_update_(tensor, indices, updates):
             if indices.ndim == 2 and indices.shape[1] == 1:
                 indices = indices.squeeze(1)
@@ -358,7 +359,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             return tensor
 
         with patch('torch_npu.npu_scatter_nd_update_', side_effect=fake_scatter_nd_update_), \
-         patch('torch_npu.npu_fused_infer_attention_score_v2', return_value=(prefill_output,)) as mock_decode:
+         patch('torch_npu.npu_fused_infer_attention_score', return_value=(prefill_output,)) as mock_decode:
             result = impl.forward(
                 layer=layer,
                 query=query,
@@ -368,7 +369,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
                 attn_metadata=metadata,
                 output=output,
             )
-
+            mock_decode.assert_called_once()
             self.assertIs(result, output)
 
     def test_forward_requires_output_tensor(self):
