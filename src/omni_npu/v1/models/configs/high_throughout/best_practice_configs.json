@@ -60,5 +60,16 @@
                 "config_file":"pangu_ultra_moe/pangu_ultra_moe_a3_hybrid.json"
             }
         }
+    },
+    {
+        "model": "glm4_moe",
+        "hardware": "A2",
+        "precision": "w8a8c16",
+        "configs":{
+            "1P1D": {
+                "prefill_config_file": "glm/glm_moe_w8a8c16_a2_1p1d_p.json",
+                "decode_config_file": "glm/glm_moe_w8a8c16_a2_1p1d_d.json"
+            }
+        }
     }
 ]

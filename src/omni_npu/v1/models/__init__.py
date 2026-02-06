@@ -24,6 +24,12 @@ def register_models():
         "PanguUltraMoEForCausalLM",
         "omni_npu.v1.models.pangu.pangu_ultra_moe:PanguUltraMoEForCausalLM")
     ModelRegistry.register_model(
+        "Glm4MoeForCausalLM",
+        "omni_npu.v1.models.glm.glm4_moe:Glm4MoeForCausalLM")
+    ModelRegistry.register_model(
+        "Glm4MoeMTPModel",
+        "omni_npu.v1.models.glm.glm4_moe_mtp:Glm4MoeMTP")
+    ModelRegistry.register_model(
         "OpenPanguMTPModel",
         "omni_npu.v1.models.pangu.pangu_ultra_moe_mtp:OpenPanguMTP")
 
