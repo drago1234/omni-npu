@@ -142,6 +142,8 @@ class ModelOperatorOptConfig:
     use_omni_cache: bool = False
     enable_dsa: bool=True
 
+    omni_disable_npu_add_rms_norm: bool = False
+
 
     def __post_init__(self):
 

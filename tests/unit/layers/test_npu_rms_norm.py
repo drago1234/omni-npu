@@ -21,6 +21,14 @@ class TestNPURMSNorm(unittest.TestCase):
         self.tp_group_patch = patch("vllm.distributed.get_tp_group", return_value=self.mock_tp_group)
         self.tp_group_patch.start()
 
+        self.mock_config = MagicMock()
+        self.mock_config.operator_opt_config = MagicMock()
+        self.mock_config.operator_opt_config.omni_disable_npu_add_rms_norm = False
+        self.config_patch = patch("omni_npu.v1.models.config_loader.loader.model_extra_config", self.mock_config)
+        self.config_patch_loader = patch("omni_npu.layers.npu_rms_norm.model_extra_config", self.mock_config)
+        self.config_patch.start()
+        self.config_patch_loader.start()
+
         self.npu_add_rms_norm_mock = MagicMock(side_effect=lambda x, r, w, e: (x.clone(), None, r.clone()))
         self.npu_rms_norm_mock = MagicMock(side_effect=lambda x, w, e: (x.clone(),))
         self.npu_dynamic_quant_mock = MagicMock(side_effect=lambda x: (x.clone().to(torch.int8), torch.ones(x.shape[0])))
@@ -40,6 +48,8 @@ class TestNPURMSNorm(unittest.TestCase):
     def tearDown(self):
         """clear test environment"""
         self.tp_group_patch.stop()
+        self.config_patch.stop()
+        self.config_patch_loader.stop()
         self.patch_add.stop()
         self.patch_rms.stop()
         self.patch_quant.stop()
