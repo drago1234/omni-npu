@@ -30,7 +30,7 @@ from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.v1.models.config_loader.loader import model_extra_config, load_model_extra_config
 
 
 logger = init_logger(__name__)
@@ -88,12 +88,14 @@ class NPUWorker(WorkerBase):
                 self.local_rank,
                 backend,
             )
+
+            # Initialize the model best practice configs.
+            load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
+
             # Only initialize the custom layer-parallel communication domain when
             # explicitly enabled by the high-performance launcher script.
             if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
                 # Initialize the model best practice configs.
-                from omni_npu.v1.models.config_loader.loader import load_model_extra_config
-                load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
                 from omni_npu.v1.distributed.parallel_state_ext import ( 
                     ensure_layer_parallel_initialized,
                 )

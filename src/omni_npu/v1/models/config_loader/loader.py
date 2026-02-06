@@ -270,7 +270,14 @@ def parse_hf_config(hf_config):
 
 def _init_model_extra_config(task_config):
 
-    config_data = _get_best_practice_config(task_config)
+    custom_model_config_path = os.environ.get("CUSTOM_MODEL_CONFIG_PATH", None)
+    if custom_model_config_path:
+        logger.info(f"Get custom_model_config_path from environ: {os.environ.get('CUSTOM_MODEL_CONFIG_PATH')}")
+        # load best_pratice_model_config_path from os.environ
+        best_practice_model_config_path = os.path.join(default_config_path, custom_model_config_path)
+        config_data = _loader_configs_data(best_practice_model_config_path)
+    else:
+        config_data = _get_best_practice_config(task_config)
 
     setattr(model_extra_config, 'task_config', task_config)
 
