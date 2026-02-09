@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 def get_model_type_from_args():
     try:
-        model_type = sys.argv[2]
+        idx = sys.argv.index('--model') + 1 if '--model' in sys.argv else 2
+        model_type = sys.argv[idx]
         if not model_type:
             raise ValueError("Command-line argument sys.argv[2] cannot be empty")
         return model_type
