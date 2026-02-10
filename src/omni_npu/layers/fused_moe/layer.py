@@ -86,10 +86,10 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             attn_meta = next(iter(attn_metadata.values()), None)
             decode_threshold = getattr(attn_meta, "decode_threshold", None)
             if decode_threshold is not None and batch_descriptor is not None:
-                use_all2all = batch_descriptor.num_tokens > decode_threshold
+                use_all2all = batch_descriptor.num_tokens > decode_threshold and self.dp_size > 1
             else:
                 num_prefills = getattr(attn_meta, "num_prefills", 0)
-                use_all2all = num_prefills > 0
+                use_all2all = num_prefills > 0 and self.dp_size > 1
 
 
         # For Ascend910B in decode stage, use the allgather-based EP kernel.
