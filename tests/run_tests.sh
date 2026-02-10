@@ -25,9 +25,10 @@ fi
 
 cd ..
 echo "[INFO] git status"
-git status
+GIT_PAGER=cat git status
 echo "[INFO] git branch"
-git branch --show-current && git log -5 --pretty=%s
+GIT_PAGER=cat git branch --show-current
+GIT_PAGER=cat git log -5 --pretty=%s
 cd -
 
 case "$TEST_TYPE" in
