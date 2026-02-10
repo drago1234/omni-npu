@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPermuteExpertsUnpermute,
@@ -211,6 +212,8 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
         layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29)
         layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
+        set_weight_attrs(layer.w13_weight, {"is_weight_transposed": True})
+        set_weight_attrs(layer.w2_weight, {"is_weight_transposed": True})
 
     def gmm_expert(self, layer, h, expert_tokens, dynamic_scale=None, avg_tokens_per_expert=None):
         group_list_type = int(layer.moe_parallel_config.use_ep)
@@ -228,6 +231,44 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             group_list_type=group_list_type
         )[0]
         return out_hidden
+
+    def weight_loader(
+        self, 
+        param: torch.nn.Parameter, 
+        loaded_weight: torch.Tensor, 
+        weight_name: str, 
+        shard_id: str, 
+        expert_id: int, 
+        return_success: bool = False
+    ) -> bool | None:
+        # Backward-compatible loader path that does not depend on the local
+        # `weight_loader` override. Some NPU weights are stored transposed.
+        full_load = loaded_weight.ndim == 3
+        is_weight_transposed = getattr(param, "is_weight_transposed", False)
+
+        if is_weight_transposed:
+            if full_load:
+                # For expert-packed 3D tensors, swap the last two dims.
+                param.data = param.data.transpose(1, 2).contiguous()
+            else:
+                param.data[expert_id] = param.data[expert_id].t().contiguous()
+
+        result = super().weight_loader(
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success,
+        )
+
+        if is_weight_transposed and "weight" in weight_name:
+            if full_load:
+                param.data = param.data.transpose(1, 2).contiguous()
+            else:
+                param.data[expert_id] = param.data[expert_id].t().contiguous()
+
+        return result
 
 
 @FusedMoE.register_oot

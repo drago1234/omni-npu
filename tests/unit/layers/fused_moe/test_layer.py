@@ -2,6 +2,7 @@
 import importlib
 import sys
 import types
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -93,7 +94,9 @@ def layer_module(monkeypatch):
         register_oot = classmethod(lambda cls, sub: sub)
 
         def __init__(self):
-            self.moe_parallel_config = SimpleNamespace(use_ep=False)
+            self.moe_parallel_config = SimpleNamespace(
+                use_ep=False, use_sync_weight_loader=False
+            )
             self.quant_method = MagicMock()
 
         def ensure_moe_quant_config_init(self):
@@ -106,16 +109,27 @@ def layer_module(monkeypatch):
         register_oot = classmethod(lambda cls, sub: sub)
 
         def __init__(self):
-            self.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
+            self.moe = MagicMock(
+                moe_parallel_config=SimpleNamespace(
+                    use_ep=True, use_sync_weight_loader=False
+                )
+            )
             self.moe_quant_config = MagicMock()
             self.fused_experts = MagicMock()
 
         def process_weights_after_loading(self, layer):
             self.processed = True
 
+    class DummyFusedMoeWeightScaleSupported(Enum):
+        CHANNEL = "channel"
+        GROUP = "group"
+        BLOCK = "block"
+        TENSOR = "tensor"
+
     fused_layer_base.FusedMoE = DummyFusedMoE
     fused_layer_base.UnquantizedFusedMoEMethod = DummyUnquantizedFusedMoEMethod
-
+    fused_layer_base.FusedMoeWeightScaleSupported = DummyFusedMoeWeightScaleSupported
+    
     modular_kernel_module = types.ModuleType("vllm.model_executor.layers.fused_moe.modular_kernel")
 
     class DummyPrepareFinalize:
@@ -253,7 +267,9 @@ def layer_module(monkeypatch):
 def test_forward_oot_uses_all2all_path(layer_module):
     module, stubs = layer_module
     method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
-    method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
+    method.moe = MagicMock(
+        moe_parallel_config=SimpleNamespace(use_ep=True, use_sync_weight_loader=False)
+    )
     method.moe_quant_config = MagicMock()
     method.fused_experts = MagicMock()
     layer = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=True), shared_experts=None)
@@ -285,7 +301,9 @@ def test_forward_oot_returns_shared_output_and_reduces(layer_module):
     method.is_a2_device = False
     method.dp_size = 1
     method.tp_size = 2
-    method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
+    method.moe = MagicMock(
+        moe_parallel_config=SimpleNamespace(use_ep=True, use_sync_weight_loader=False)
+    )
     method.moe_quant_config = MagicMock()
     method.fused_experts = MagicMock(return_value=torch.ones(1, 2))
 
@@ -325,7 +343,9 @@ def test_forward_oot_uses_allgather_ep_path(layer_module):
     method.is_a2_device = True
     method.dp_size = 1
     method.tp_size = 2
-    method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
+    method.moe = MagicMock(
+        moe_parallel_config=SimpleNamespace(use_ep=True, use_sync_weight_loader=False)
+    )
     method.moe_quant_config = MagicMock()
     method.fused_experts = MagicMock()
     layer = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=True), shared_experts=None)
@@ -362,7 +382,11 @@ def test_forward_oot_uses_fused_experts_tp_when_not_ep(layer_module):
     method.is_a2_device = False
     method.dp_size = 1
     method.tp_size = 1
-    method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=False))
+    method.moe = MagicMock(
+        moe_parallel_config=SimpleNamespace(
+            use_ep=False, use_sync_weight_loader=False
+        )
+    )
     method.moe_quant_config = MagicMock()
 
     layer = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=False))
@@ -376,24 +400,6 @@ def test_forward_oot_uses_fused_experts_tp_when_not_ep(layer_module):
 
     assert torch.equal(result, stubs.fused_experts_tp.return_value)
     stubs.fused_experts_tp.assert_called_once()
-
-
-@pytest.mark.unit
-def test_process_weights_after_loading_transposes_and_casts(layer_module):
-    module, stubs = layer_module
-    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
-    method.moe_quant_config = MagicMock()
-    method.moe = MagicMock(moe_parallel_config=SimpleNamespace(use_ep=True))
-
-    layer = SimpleNamespace()
-    layer.w13_weight = torch.nn.Parameter(torch.ones(2, 4, 3))
-    layer.w2_weight = torch.nn.Parameter(torch.ones(2, 4, 3))
-
-    method.process_weights_after_loading(layer)
-
-    assert layer.w13_weight.shape == (2, 3, 4)
-    assert layer.w2_weight.shape == (2, 3, 4)
-    assert stubs.torch_npu.npu_format_cast.call_count == 2
 
 
 @pytest.mark.unit

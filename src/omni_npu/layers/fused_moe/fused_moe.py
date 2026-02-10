@@ -90,7 +90,7 @@ def fused_experts_allgather_ep_unquant(
         expert_tokens_num_flag=True,
         quant_mode=-1, 
         active_expert_range=expert_range, 
-        row_idx_type=1)
+        row_idx_type=0)
 
 
     group_list_type = int(layer.moe_parallel_config.use_ep)
@@ -110,22 +110,15 @@ def fused_experts_allgather_ep_unquant(
                                         group_type=0,
                                         group_list_type=group_list_type
                                         )[0]
-    token_sum = torch.sum(expert_tokens)
-    rows = hidden_states_experts.shape[0]
-    valid_rows = torch.arange(rows,
-                              device=hidden_states_experts.device,
-                              dtype=torch.int32) < token_sum
-    hidden_states_experts.mul_(valid_rows.to(hidden_states_experts.dtype).unsqueeze(-1))
-    expanded_x_idx = torch.argsort(expanded_x_idx.to(torch.float), dim=-1).to(torch.int32)
     output = torch_npu.npu_moe_finalize_routing(
-                hidden_states_experts,
+                hidden_states_experts.unsqueeze(0),
                 skip1=None,
                 skip2=None,
                 bias=None,
-                scales=topk_weights.to(hidden_states_experts.dtype),
+                scales=topk_weights,
                 expanded_src_to_dst_row=expanded_x_idx,
                 export_for_source_row=topk_ids,
-                drop_pad_mode=2
+                drop_pad_mode=3
                 )
     return output
 
