@@ -26,7 +26,7 @@ from vllm.attention.backends.abstract import (
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype, get_dtype_size
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context, get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -123,6 +123,65 @@ class NPUModelRunner(GPUModelRunner):
             (self.max_num_reqs * num_tokens_per_reqs_decode,
              self.max_num_blocks_per_req),
             dtype=np.int32)
+        val = getattr(self.model_config.hf_text_config, "router_sliding_window", 0)
+        if isinstance(val, (int, float)):
+            self.router_sliding_window = val
+        else:
+            self.router_sliding_window = 0
+        if self.router_sliding_window > 0:
+            self.req_cache_map = {self.max_num_reqs + 1: 0}
+            self.cache_slot_id = torch.zeros(self.max_num_reqs, 
+                                    dtype=torch.long, device=self.device)
+
+    def _build_conv_context(self, dummy:bool = False):
+        forward_context = get_forward_context()
+        if not dummy:
+            keys_to_remove = [k for k in self.req_cache_map if k not in self.input_batch.req_ids]
+            for k in keys_to_remove:
+                del self.req_cache_map[k]
+            for idx, req_id in enumerate(self.input_batch.req_ids):
+                if req_id in self.req_cache_map:
+                    cache_id = self.req_cache_map[req_id]
+                    self.cache_slot_id[idx] = cache_id
+                else:
+                    self.cache_slot_id[idx] = 0
+                self.req_cache_map[req_id] = idx + 1
+            self.cache_slot_id[self.input_batch.num_reqs:] = 0
+        forward_context.cache_slot_id = self.cache_slot_id
+
+    def _model_forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
+    ) -> Any:
+        """Helper method to call the model forward pass.
+
+        This method can be overridden by subclasses for model execution.
+        Motivation: We can inspect only this method versus
+        the whole execute_model, which has additional logic.
+
+        Args:
+            input_ids: Input token IDs
+            positions: Token positions
+            intermediate_tensors: Tensors from previous pipeline stages
+            inputs_embeds: Input embeddings (alternative to input_ids)
+            **model_kwargs: Additional model arguments
+
+        Returns:
+            Model output tensor
+        """
+        if self.router_sliding_window > 1:
+            self._build_conv_context()
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **model_kwargs,
+        )
 
     def _reshape_kv_cache_tensors(
         self,
@@ -593,6 +652,8 @@ class NPUModelRunner(GPUModelRunner):
                     ubatch_slices=ubatch_slices,
                 ),
             ):
+                if self.router_sliding_window > 1:
+                    self._build_conv_context(dummy=True)
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
