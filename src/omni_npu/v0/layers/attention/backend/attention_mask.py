@@ -17,9 +17,9 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import warnings
 import torch
 from typing import Optional
-
 
 class AttentionMaskBuilder:
 
@@ -33,7 +33,13 @@ class AttentionMaskBuilder:
                             max_seq_len: int,
                             dtype: torch.dtype = torch.float16,
                             mask_value: Optional[int] = None):
-        return cls(generate_attn_mask(max_seq_len, dtype, mask_value))
+        warnings.warn(
+            "The size of attention mask is fixed as 2048 * 2048. \
+            Parameter 'max_seq_len' is deprecated, and will be removed in a future version. ",
+            DeprecationWarning,
+            stacklevel=2  # Make sure that the warning points to where 'initialize_from_len' is called.
+        )
+        return cls(generate_attn_mask(2048, dtype, mask_value))
 
     def update_attn_cache(self, seqlen: int, dtype: torch.dtype,
                           device: torch.device):
