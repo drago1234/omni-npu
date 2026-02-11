@@ -751,8 +751,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def kv_cache_after_wake_up(self) -> None:
         attn_layers = self.compilation_config.static_forward_context
-        import os
-        if bool(int(os.environ.get("VLLM_ENABLE_SLEEP_MODE", "0"))):
+        if self.model_config.enable_sleep_mode:
             from vllm.attention.layers import StaticSinkAttention
             for name, module in attn_layers.items():
                 if isinstance(module, StaticSinkAttention):

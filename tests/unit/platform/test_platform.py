@@ -339,18 +339,8 @@ class TestNPUPlatform:
     def test_is_sleep_mode_available(self, monkeypatch):
         """Test the is_sleep_mode_available method of NPUPlatform."""
         platform = NPUPlatform()
-
-        # Test case: VLLM_ENABLE_SLEEP_MODE is set to 1
-        monkeypatch.setenv("VLLM_ENABLE_SLEEP_MODE", "1")
+        
         assert platform.is_sleep_mode_available() is True
-
-        # Test case: VLLM_ENABLE_SLEEP_MODE is set to 0
-        monkeypatch.setenv("VLLM_ENABLE_SLEEP_MODE", "0")
-        assert platform.is_sleep_mode_available() is False
-
-        # Test case: VLLM_ENABLE_SLEEP_MODE is not set
-        monkeypatch.delenv("VLLM_ENABLE_SLEEP_MODE", raising=False)
-        assert platform.is_sleep_mode_available() is False
 
 
 class TestConfigUpdater:

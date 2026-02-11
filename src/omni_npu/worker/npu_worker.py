@@ -166,7 +166,7 @@ class NPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
-        if current_platform.is_sleep_mode_available():
+        if self.model_config.enable_sleep_mode:
             allocator = NpuMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")
         else:
@@ -205,7 +205,7 @@ class NPUWorker(WorkerBase):
         return self.model_runner.get_model()
 
     def load_model(self) -> None:
-        if current_platform.is_sleep_mode_available():
+        if self.model_config.enable_sleep_mode:
             allocator = NpuMemAllocator.get_instance()
             if allocator.get_current_usage() != 0:
                 raise RuntimeError("Sleep mode can only be used for one instance per process.")

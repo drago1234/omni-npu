@@ -448,6 +448,7 @@ class TestNpuWorker:
         are properly called with the correct arguments.
         """
         worker = self._create_worker(monkeypatch)
+        worker.model_config = SimpleNamespace(enable_sleep_mode=False)
         mock_kv_cache_config = MagicMock()
 
         # Mock ensure_kv_transfer_initialized
@@ -479,7 +480,7 @@ class TestNpuWorker:
         # Assertions
         assert ensure_kv_initialized_called["called"] is True
         assert ensure_kv_initialized_called["args"] == (worker.vllm_config, mock_kv_cache_config)
-        mock_allocator.use_memory_pool.assert_called_once_with(tag="kv_cache")
+        mock_allocator.use_memory_pool.assert_not_called()
         worker.model_runner.initialize_omni_kv_cache.assert_called_once_with(mock_kv_cache_config)
 
         # Test case: use_omni_cache is False
@@ -490,12 +491,10 @@ class TestNpuWorker:
         worker.initialize_from_config(mock_kv_cache_config)
         worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
 
-        # Test case: sleep mode not available
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_worker.current_platform.is_sleep_mode_available",
-            lambda: False
-        )
+        # Test case: sleep mode is enabled
+        worker.model_config.enable_sleep_mode = True
         worker.initialize_from_config(mock_kv_cache_config)
+        mock_allocator.use_memory_pool.assert_called_once_with(tag="kv_cache")
         worker.model_runner.initialize_kv_cache.assert_called()
 
     def test_initialize_cache(self, monkeypatch):
@@ -560,7 +559,7 @@ class TestNpuWorker:
         and handles memory pool context correctly.
         """
         worker = self._create_worker(monkeypatch)
-
+        worker.model_config = SimpleNamespace(enable_sleep_mode=False)
         # Mock NpuMemAllocator
         mock_allocator = MagicMock()
         monkeypatch.setattr(
@@ -572,21 +571,19 @@ class TestNpuWorker:
         worker.load_model()
 
         # Assertions
-        mock_allocator.use_memory_pool.assert_called_once_with(tag="weights")
+        mock_allocator.use_memory_pool.assert_not_called() 
         worker.model_runner.load_model.assert_called_once()
+
+        # Test case: sleep mode is enabled
+        worker.model_config.enable_sleep_mode = True
+        worker.load_model()
+        mock_allocator.use_memory_pool.assert_called_once_with(tag="weights")
+        worker.model_runner.load_model.assert_called()
 
         # Test case: allocator usage is not zero
         mock_allocator.get_current_usage.return_value = 1
         with pytest.raises(RuntimeError, match="Sleep mode can only be used for one instance per process."):
             worker.load_model()
-
-        # Test case: sleep mode not available
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_worker.current_platform.is_sleep_mode_available",
-            lambda: False
-        )
-        worker.load_model()
-        worker.model_runner.load_model.assert_called()
 
     def test_execute_dummy_batch(self, monkeypatch):
         """Test execute_dummy_batch method.

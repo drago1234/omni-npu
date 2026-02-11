@@ -191,4 +191,7 @@ class NPUPlatform(Platform):
         return True
 
     def is_sleep_mode_available(self) -> bool:
-        return bool(int(os.environ.get("VLLM_ENABLE_SLEEP_MODE", "0")))
+        """
+        Returns if the sleep mode is available for the current platform.
+        """
+        return True
