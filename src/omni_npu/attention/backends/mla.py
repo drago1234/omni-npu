@@ -708,7 +708,17 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert attn_metadata.decode is not None
-            
+
+        if self.sink_len > 0:
+            query_heads = 1 << (self.num_heads - 1).bit_length()
+            pad_len = query_heads - self.num_heads
+            ql_nope_pad = decode_ql_nope.new_empty((decode_ql_nope.shape[0], pad_len, decode_ql_nope.shape[-1]))
+            decode_ql_nope = torch.cat([decode_ql_nope, ql_nope_pad], dim=1)
+            q_pe_pad = decode_q_pe.new_empty((decode_q_pe.shape[0], pad_len, decode_q_pe.shape[-1]))
+            decode_q_pe = torch.cat([decode_q_pe, q_pe_pad], dim=1)
+        else:
+            query_heads = self.num_heads           
+
         # Currently, when use static sink-mla with sliding window,
         # we need to compute sink and normal attention scores separately
         # TODO: Support sink and sliding window case with only one FIA call
@@ -722,7 +732,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 decode_ql_nope, kv_cache[0], kv_cache[0],
                 query_rope=decode_q_pe,
                 key_rope=kv_cache[1],
-                num_query_heads=self.num_heads,
+                num_query_heads=query_heads,
                 num_key_value_heads=1,
                 input_layout="TND",
                 softmax_scale=self.scale,
@@ -740,7 +750,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                     decode_ql_nope, kv_cache[0], kv_cache[0],
                     query_rope=decode_q_pe,
                     key_rope=kv_cache[1],
-                    num_heads=self.num_heads,
+                    num_heads=query_heads,
                     num_key_value_heads=1,
                     input_layout="TND",
                     scale=self.scale,
@@ -760,7 +770,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                     decode_ql_nope, kv_cache[0], kv_cache[0],
                     query_rope=decode_q_pe,
                     key_rope=kv_cache[1],
-                    num_heads=self.num_heads,
+                    num_heads=query_heads,
                     num_key_value_heads=1,
                     input_layout="TND",
                     scale=self.scale,
@@ -786,7 +796,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 decode_ql_nope, kv_cache[0], kv_cache[0],
                 query_rope=decode_q_pe,
                 key_rope=kv_cache[1],
-                num_heads=self.num_heads,
+                num_heads=query_heads,
                 num_key_value_heads=1,
                 input_layout="TND_NTD",
                 scale=self.scale,
@@ -800,6 +810,9 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 sparse_mode=3,
             )[0]
 
+        if self.sink_len > 0:
+            o = o[:self.num_heads]
+            
         return o
 
     def forward(
