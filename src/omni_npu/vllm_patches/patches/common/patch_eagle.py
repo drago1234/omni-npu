@@ -553,7 +553,7 @@ class EagleProposerPatch(VLLMPatch):
         if self.method in (
             "ernie_mtp",
             "longcat_flash_mtp",
-            "pangu_ultra_moe_mtp",
+            "openpangu_mtp",
         ):
             hidden_states = self.hidden_states[last_token_indices]
         else:

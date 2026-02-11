@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+import os
 
 from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import NPUCompressedTensorsConfig
 from omni_npu.layers.fused_moe.layer import NPUUnquantizedFusedMoEMethod, NPUFusedMoE
@@ -11,3 +12,8 @@ from omni_npu.layers.rotary_embedding.linear_scaling_rope import NPULinearScalin
 from omni_npu.layers.rotary_embedding.llama3_rope import NPULlama3RotaryEmbedding
 from omni_npu.layers.rotary_embedding.deepseek_scaling_rope import NPUDeepseekScalingRotaryEmbedding
 from omni_npu.layers.rotary_embedding.yarn_scaling_rope import NPUYaRNScalingRotaryEmbedding
+patches_dir = os.getenv("OMNI_NPU_PATCHES_DIR", "")
+if patches_dir == "pangu_sink_swa_mla":
+    from omni_npu.layers.mhc.mhc import NPUmHCModule
+else:
+    pass

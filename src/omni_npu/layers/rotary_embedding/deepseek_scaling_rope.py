@@ -2,11 +2,14 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import torch
+import torch_npu
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import DeepseekScalingRotaryEmbedding
 from vllm.model_executor.layers.rotary_embedding.common import (
     yarn_find_correction_range,
     yarn_linear_ramp_mask,
+    rotate_gptj,
+    rotate_neox,
 )
 
 from .common import CachedCosSinMixin
@@ -85,3 +88,45 @@ class NPUDeepseekScalingRotaryEmbedding(
         self.register_buffer(
             "sin_cached", (emb.sin() * self.mscale).to(dtype), persistent=False
         )
+
+    def forward_oot(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """PyTorch-native implementation equivalent to forward()."""
+        assert key is not None
+        self._match_cos_sin_cache_dtype(query)
+        query_rot = query[..., : self.rotary_dim]
+        key_rot = key[..., : self.rotary_dim]
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            key_pass = key[..., self.rotary_dim :]
+
+        cos_sin = self.cos_sin_cache[
+            torch.add(positions, offsets) if offsets is not None else positions
+        ]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if self.is_neox_style:
+            # NOTE(woosuk): Here we assume that the positions tensor has the
+            # shape [batch_size, seq_len].
+            cos = cos.repeat(1, 1, 2).unsqueeze(-2)
+            sin = sin.repeat(1, 1, 2).unsqueeze(-2)
+            query_rot, key_rot = torch_npu.npu_apply_rotary_pos_emb(query_rot, key_rot, cos, sin, rotary_mode='half')
+        else:
+            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
+
+            rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
+            query_rot = query_rot * cos + rotate_fn(query_rot) * sin
+            key_rot = key_rot * cos + rotate_fn(key_rot) * sin
+
+        if self.rotary_dim < self.head_size:
+            query = torch.cat((query_rot, query_pass), dim=-1)
+            key = torch.cat((key_rot, key_pass), dim=-1)
+        else:
+            query = query_rot
+            key = key_rot
+        return query, key
