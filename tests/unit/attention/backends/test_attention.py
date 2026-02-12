@@ -19,7 +19,7 @@ from vllm.attention.backends.abstract import (
     AttentionType,
     AttentionBackend,
     AttentionImpl
-) 
+)
 
 import torch_npu
 utils_mod_patcher = None
@@ -34,7 +34,7 @@ NPUAttentionMetadataBuilder = None
 
 def setup_module():
     try:
-        global NPUAttentionBackendImpl, NPUMetadata, NPUAttentionBackend, NPUAttentionMetadataBuilder 
+        global NPUAttentionBackendImpl, NPUMetadata, NPUAttentionBackend, NPUAttentionMetadataBuilder
         # Define a TypeVar for the metadata type
         MetadataT = TypeVar('MetadataT')
 
@@ -64,7 +64,7 @@ def setup_module():
                 'vllm.v1.attention.backends.utils': utils_mod
         })
         utils_mod_patcher.start()
-        
+
         fake_dcp = MagicMock()
         fake_dcp.world_size = 1
         fake_dcp.rank_in_group = 0
@@ -75,13 +75,13 @@ def setup_module():
 
         patcher_dcp = patch('vllm.distributed.parallel_state.get_dcp_group', return_value=fake_dcp)
         patcher_pcp = patch('vllm.distributed.parallel_state.get_pcp_group', return_value=fake_pcp)
-        
+
         distributed_mod_patcher = patch.dict('sys.modules', {
             'vllm.distributed': MagicMock(),
             'vllm.distributed.eplb': MagicMock(),
             'vllm.distributed.eplb.eplb_state': MagicMock(),
         })
-        
+
         patcher_dcp.start()
         patcher_pcp.start()
         distributed_mod_patcher.start()
@@ -128,7 +128,7 @@ def teardown_module():
         patcher_dcp.stop()
     if patcher_dcp:
         patcher_pcp.stop()
-    
+
 @pytest.mark.unit
 class TestNPUAttentionBackendDefault(unittest.TestCase):
 
@@ -165,7 +165,7 @@ class TestNPUAttentionBackendDefaultMetadataBuilder(unittest.TestCase):
 
     def setUp(self):
         self.metadata_builder_cls = NPUAttentionMetadataBuilder
-        
+
     def test_metadata_builder(self):
             # Define a minimal CommonAttentionMetadata (normally from vLLm)
             class CommonAttentionMetadata:
@@ -177,6 +177,7 @@ class TestNPUAttentionBackendDefaultMetadataBuilder(unittest.TestCase):
             spec.block_size = 16
             vllm_config = MagicMock()
             vllm_config.reorder_batch_threshold = 0
+            vllm_config.compilation_config = None
             builder = self.metadata_builder_cls(
                 kv_cache_spec=spec,
                 layer_names=["test"],
@@ -212,7 +213,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
     def setUp(self):
         self.impl_cls = NPUAttentionBackendImpl
         self.metadata_cls = NPUMetadata
-    
+
     def test_init_success(self):
         impl = self.impl_cls(
             num_heads=8,
@@ -278,7 +279,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
         attn_output = torch.randn(batch_size, 8, 128).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device)
         output = torch.empty_like(attn_output).to(self.impl_cls.SHARE_MASK_TRIL_SPARSE.device)
         prefill_output=output.clone()
-    
+
         def fake_scatter_nd_update_(tensor, indices, updates):
             if indices.ndim == 2 and indices.shape[1] == 1:
                 indices = indices.squeeze(1)
@@ -294,7 +295,7 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
 
         with patch('torch_npu.npu_scatter_nd_update_', side_effect=fake_scatter_nd_update_), \
          patch('torch_npu.npu_fused_infer_attention_score_v2', return_value=(prefill_output,)) as mock_decode:
-            
+
             result = impl.forward(
                 layer=layer,
                 query=query,
