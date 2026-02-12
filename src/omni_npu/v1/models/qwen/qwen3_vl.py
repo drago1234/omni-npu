@@ -62,7 +62,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from omni_npu.v1.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
@@ -111,7 +111,7 @@ from vllm.model_executor.models.utils  import (
     WeightsMapper,
     maybe_prefix,
 )
-from omni_npu.v1.models.qwen.utils  import _merge_multimodal_embeddings
+from vllm.model_executor.models.utils  import _merge_multimodal_embeddings
 
 from vllm.model_executor.models.vision import (
     get_vit_attn_backend,

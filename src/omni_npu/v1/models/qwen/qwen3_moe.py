@@ -77,7 +77,7 @@ from vllm.model_executor.models.utils import (
 )
 
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
-from omni_npu.v1.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding import get_rope
 
 logger = init_logger(__name__)
 

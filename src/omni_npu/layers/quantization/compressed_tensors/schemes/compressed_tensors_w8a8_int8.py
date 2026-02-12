@@ -89,45 +89,45 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsScheme):
         return
 
     def apply_weights(
-            self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            bias: Optional[torch.Tensor]
-        ) -> Union[torch.Tensor, Dict[str, Any]]:
-            # activation per-token dynamic quant
-            squeezed = False
-            if isinstance(x, Dict):
-                x_int8 = x.get('x_int8')
-                pertoken_scale = x.get('pertoken_scale')
-            else:
-                if len(x.shape) > 2:
-                    squeezed = True
-                    x = x.squeeze(1)
-                x_int8, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor]
+    ) -> Union[torch.Tensor, Dict[str, Any]]:
+        # activation per-token dynamic quant
+        squeezed = False
+        if isinstance(x, Dict):
+            x_int8 = x.get('x_int8')
+            pertoken_scale = x.get('pertoken_scale')
+        else:
+            if len(x.shape) > 2:
+                squeezed = True
+                x = x.squeeze(1)
+            x_int8, pertoken_scale = torch_npu.npu_dynamic_quant(x)
 
-            throw_dequant = getattr(layer, 'throw_dequant', False)
-            if throw_dequant and bias is None:
-                out = \
-                    (
-                        torch_npu.npu_quant_matmul(
-                            x_int8,
-                            layer.weight,
-                            layer.weight_scale,
-                            bias=None,
-                            output_dtype=torch.int32
-                        ),
-                        pertoken_scale,
-                    )
-            else:
-                out = torch_npu.npu_quant_matmul(
-                    x_int8,
-                    layer.weight,
-                    layer.weight_scale,
-                    offset=None,
-                    pertoken_scale=pertoken_scale,
-                    bias=bias,
-                    output_dtype=torch.bfloat16
+        throw_dequant = getattr(layer, 'throw_dequant', False)
+        if throw_dequant and bias is None:
+            out = \
+                (
+                    torch_npu.npu_quant_matmul(
+                        x_int8,
+                        layer.weight,
+                        layer.weight_scale,
+                        bias=None,
+                        output_dtype=torch.int32
+                    ),
+                    pertoken_scale,
                 )
-            if squeezed:
-                out = out.unsqueeze(1)
-            return out
+        else:
+            out = torch_npu.npu_quant_matmul(
+                x_int8,
+                layer.weight,
+                layer.weight_scale,
+                offset=None,
+                pertoken_scale=pertoken_scale,
+                bias=bias,
+                output_dtype=torch.bfloat16
+            )
+        if squeezed:
+            out = out.unsqueeze(1)
+        return out

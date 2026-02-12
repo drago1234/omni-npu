@@ -11,6 +11,7 @@ from omni_npu.layers.rotary_embedding.rotary_embedding_torch_npu import NPURotar
 from omni_npu.layers.rotary_embedding.linear_scaling_rope import NPULinearScalingRotaryEmbedding
 from omni_npu.layers.rotary_embedding.llama3_rope import NPULlama3RotaryEmbedding
 from omni_npu.layers.rotary_embedding.deepseek_scaling_rope import NPUDeepseekScalingRotaryEmbedding
+from omni_npu.layers.rotary_embedding.mrope import NPUMRotaryEmbedding
 from omni_npu.layers.rotary_embedding.yarn_scaling_rope import NPUYaRNScalingRotaryEmbedding
 patches_dir = os.getenv("OMNI_NPU_PATCHES_DIR", "")
 if patches_dir == "pangu_sink_swa_mla":
