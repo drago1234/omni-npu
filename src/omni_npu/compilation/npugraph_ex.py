@@ -6,7 +6,6 @@ import torch._inductor.compile_fx
 import torch.fx as fx
 import torchair
 
-from vllm.compilation.counter import compilation_counter
 from vllm.compilation.compiler_interface import CompilerInterface
 
 class NpuGraphExAdaptor(CompilerInterface):
@@ -21,6 +20,10 @@ class NpuGraphExAdaptor(CompilerInterface):
         key: str | None = None,
     ) -> tuple[Callable | None, Any | None]:
 
+        from omni_npu.compilation.npugraph_ex_config import get_aclgraph_config
+        npugraph_ex_config = get_aclgraph_config().npugraph_ex_config
+        if not npugraph_ex_config.get("enable", False):
+            return graph, None
         from torch._inductor.compile_fx import graph_returns_tuple
         fx_graph = graph.graph
         if not graph_returns_tuple(graph):
@@ -37,7 +40,8 @@ class NpuGraphExAdaptor(CompilerInterface):
         # execute FX graph in eager mode before graph mode to optimize FX graph.
         config.debug.run_eagerly = True
         # static kernel switch, suitable for static shapes or scenes with less shape changes.
-        config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
+        if npugraph_ex_config.get("enable_static_kernel", False):
+            config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
 
         npugraph_ex = torchair.get_npu_backend(compiler_config=config)
         compile_graph = npugraph_ex(graph, example_inputs)

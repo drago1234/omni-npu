@@ -103,6 +103,8 @@ class NPUModelRunner(GPUModelRunner):
             self.rejection_sampler = NPURejectionSampler(self.sampler)
 
         if vllm_config.additional_config is not None:
+            from omni_npu.compilation.npugraph_ex_config import init_aclgraph_config
+            init_aclgraph_config(vllm_config)
             self.use_rejection_sampler = vllm_config.additional_config.get("use_rejection_sampler", False)
             self.use_penalty = vllm_config.additional_config.get("use_penalty", False)
             self.total_step = vllm_config.additional_config.get("multi_step", 1)
