@@ -234,34 +234,36 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         )[0]
         return out_hidden
 
+
+@FusedMoE.register_oot
+class NPUFusedMoE(FusedMoE):
     def weight_loader(
-        self, 
-        param: torch.nn.Parameter, 
-        loaded_weight: torch.Tensor, 
-        weight_name: str, 
-        shard_id: str, 
-        expert_id: int, 
-        return_success: bool = False
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
     ) -> bool | None:
-        # Backward-compatible loader path that does not depend on the local
-        # `weight_loader` override. Some NPU weights are stored transposed.
+        # Some NPU-packed weights are kept transposed in memory for kernels.
+        # Temporarily switch to canonical layout for parent loading logic.
         full_load = loaded_weight.ndim == 3
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
 
-        if is_weight_transposed:
+        if is_weight_transposed and "weight" in weight_name:
             if full_load:
-                # For expert-packed 3D tensors, swap the last two dims.
                 param.data = param.data.transpose(1, 2).contiguous()
             else:
                 param.data[expert_id] = param.data[expert_id].t().contiguous()
 
         result = super().weight_loader(
-            param,
-            loaded_weight,
-            weight_name,
-            shard_id,
-            expert_id,
-            return_success,
+            param=param,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+            shard_id=shard_id,
+            expert_id=expert_id,
+            return_success=return_success,
         )
 
         if is_weight_transposed and "weight" in weight_name:
@@ -271,10 +273,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 param.data[expert_id] = param.data[expert_id].t().contiguous()
 
         return result
-
-
-@FusedMoE.register_oot
-class NPUFusedMoE(FusedMoE):
+        
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
         """With NPU all-to-all, there is no need to perform all-reduce on final hidden states.
         """
