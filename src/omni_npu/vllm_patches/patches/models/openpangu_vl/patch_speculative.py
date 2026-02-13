@@ -53,7 +53,7 @@ class SpeculativeConfigPatch(VLLMPatch):
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["OpenPanguMTPModel"]}
             )
-        if hf_config.model_type in ("openpangu_vl", "PanguProMoE"):
+        if hf_config.model_type in ("openpangu_vl", "PanguProMoE", "openpangu_omni"):
             hf_config.model_type = "openpangu_vl_mtp"
         if hf_config.model_type == "openpangu_vl_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
