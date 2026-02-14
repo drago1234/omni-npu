@@ -114,7 +114,11 @@ class NPUDeepseekScalingRotaryEmbedding(
             # shape [batch_size, seq_len].
             cos = cos.repeat(1, 1, 2).unsqueeze(-2)
             sin = sin.repeat(1, 1, 2).unsqueeze(-2)
+            query_rot = query_rot.unsqueeze(0)
+            key_rot = key_rot.unsqueeze(0)
             query_rot, key_rot = torch_npu.npu_apply_rotary_pos_emb(query_rot, key_rot, cos, sin, rotary_mode='half')
+            query_rot = query_rot.squeeze(0)
+            key_rot = key_rot.squeeze(0)
         else:
             cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
             sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)

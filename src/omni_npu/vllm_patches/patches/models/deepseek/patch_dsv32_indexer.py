@@ -92,6 +92,8 @@ class DSV32IndexerPatch(VLLMPatch):
         )
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        q_pe = q_pe.unsqueeze(0)
+        k_pe = k_pe.unsqueeze(0)
         q = torch.cat([q_pe.squeeze(0), q_nope], dim=-1)
         k = torch.cat([k_pe.squeeze((0, 2)), k_nope], dim=-1)
 

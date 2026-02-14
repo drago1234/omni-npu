@@ -136,9 +136,9 @@ class mlaPatch(VLLMPatch):
 
             if self.rotary_emb is not None:
                 q_pe, k_pe = self.rotary_emb(
-                    positions, q[..., self.qk_nope_head_dim :].unsqueeze(0), k_pe.unsqueeze(0)
+                    positions, q[..., self.qk_nope_head_dim :], k_pe
                 )
-                q[..., self.qk_nope_head_dim :], k_pe = q_pe.squeeze(0), k_pe.squeeze(0)
+                q[..., self.qk_nope_head_dim :], k_pe = q_pe, k_pe
 
             if self.indexer and self.is_sparse:
                 _topk_indices = self.indexer(
