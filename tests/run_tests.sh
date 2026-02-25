@@ -35,43 +35,43 @@ case "$TEST_TYPE" in
     unit)
         echo "Running unit tests (no NPU required)..."
         if [ "$HAS_COV" = true ]; then
-            pytest unit/ --tb=long \
+            pytest unit/ --tb=short \
                 --cov=omni_npu \
                 --cov-report=term-missing \
                 --cov-report=html \
                 --cov-config=./.coveragerc \
                 -v
         else
-            pytest unit/ -v --tb=long
+            pytest unit/ -v --tb=short
         fi
         ;;
     integration)
         echo "Running integration tests (requires NPU hardware)..."
         echo "  - Single-device tests with pytest"
-        pytest integration/ --tb=long -v -k "not TestNPUCommunicatorMultiDevice"
+        pytest integration/ --tb=short -v -k "not TestNPUCommunicatorMultiDevice"
         echo ""
         echo "  - Multi-device tests with torchrun (2 NPUs)"
-        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v --tb=long
+        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v --tb=short
         ;;
     all)
         echo "Running all tests..."
         if [ "$HAS_COV" = true ]; then
-            pytest --tb=long \
+            pytest --tb=short \
                 --cov=omni_npu \
                 --cov-report=term-missing \
                 --cov-report=html \
                 --cov-config=./.coveragerc \
                 -v
         else
-            pytest -v --tb=long
+            pytest -v --tb=short
         fi
         echo ""
         echo "Running integration tests (requires NPU hardware)..."
         echo "  - Single-device tests with pytest"
-        pytest integration/distributed/test_communicator.py::TestNPUCommunicatorIntegration -v--tb=long
+        pytest integration/distributed/test_communicator.py::TestNPUCommunicatorIntegration -v--tb=short
         echo ""
         echo "  - Multi-device tests with torchrun (2 NPUs)"
-        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v --tb=long
+        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v --tb=short
         ;;
     *)
         echo "Usage: $0 [unit|integration|all]"
