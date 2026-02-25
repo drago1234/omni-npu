@@ -5,3 +5,8 @@ source =
 omit =
     */omni_npu/v0/*
     */omni_npu/vllm_patches/*
+
+[paths]
+source =
+    */omni-npu
+    */omni-npu/src

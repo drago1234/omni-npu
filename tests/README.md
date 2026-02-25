@@ -122,6 +122,70 @@ For systems with NPU hardware:
 pytest tests/ -v
 ```
 
+## Multi-Container UT (Multi-Docker)
+
+This workflow runs UT across multiple containers in parallel, splits tests by duration,
+collects per-container coverage/duration artifacts, and optionally merges reports.
+By default, it starts 4 containers on an 8-NPU host, with 2 NPUs per container.
+
+If you need to change container mapping, Ascend device allocation, split config, or
+per-container test args, edit `tests/ut_config.sh`. The commands below remain the same.
+
+### 1. Start containers
+
+```bash
+cd tests
+bash run_docker.sh <docker_image>
+```
+
+### 2. Run tests in parallel
+
+```bash
+cd tests
+bash concurrent_test_run_multi_docker.sh <omni-npu_root>
+```
+
+This will:
+- Sync the repo into each container
+- Run pytest with duration-based splits
+- Write per-container logs to `tests/install_logs/`
+- Write per-container durations to `tests/test_durations_from_dockers/`
+- Copy per-container coverage files to `tests/coverage_from_dockers/`
+- Merge coverage and durations files(optional) inside a container and copy reports back to host
+
+
+### 3. Optional: check duration balance
+
+```bash
+python3 tests/ut_CI_check/ut_CI_check_durations_balance.py \
+  --dir tests/test_durations_from_dockers
+```
+
+If containers are imbalanced, please update `tests/test_durations_v1.json` using the merged
+`tests/test_durations_merged.json`.
+
+### 4. Optional: parse logs and coverage
+
+```bash
+python3 tests/ut_CI_check/ut_CI_parse_logs.py \
+  --log tests/install_logs/DT_1.log \
+  --log tests/install_logs/DT_2.log \
+  --log tests/install_logs/DT_3.log \
+  --log tests/install_logs/DT_4.log \
+  --merged-log tests/install_logs/merged_log.log \
+  --known /path/to/known_fails_cases.txt
+
+python3 tests/ut_CI_check/ut_CI_cover_rate_check.py \
+  --report tests/coverage_from_dockers/coverage_report.txt \
+  --min 60
+```
+
+### 5. Cleanup containers
+
+```bash
+cd tests
+bash rm_docker.sh
+```
 ## Notes
 
 - **Unit tests** use mocking and can run anywhere
