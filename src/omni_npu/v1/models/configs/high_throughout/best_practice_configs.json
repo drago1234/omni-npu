@@ -62,6 +62,26 @@
         }
     },
     {
+        "model": "pangu_72B_VL",
+        "hardware": "A2",
+        "precision": "bf16",
+        "configs":{
+            "hybrid": {
+                "config_file": "pangu_pro_moe/openpangu_vl_bf16_a2_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "PanguProMoE",
+        "hardware": "A3",
+        "precision": "bf16",
+        "configs":{
+            "hybrid":{
+                "config_file":"pangu_pro_moe/pangu_pro_moe_bf16_a3_hybrid.json"
+            }
+        }
+    },
+    {
         "model": "glm4_moe",
         "hardware": "A2",
         "precision": "w8a8c16",

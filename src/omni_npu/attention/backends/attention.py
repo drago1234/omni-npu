@@ -32,6 +32,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from omni_npu.v1.models.config_loader.loader import model_extra_config
+
 
 NZ_DIM = 16
 
@@ -232,10 +234,12 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         key = key.view(-1, self.num_kv_heads*key.shape[-1]).contiguous()
         value = value.view(-1, self.num_kv_heads*value.shape[-1]).contiguous()
 
-        # update kv cache
-        slots = attn_metadata.slot_mapping.view(-1, 1)
-        torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
-        torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
+        # npu kv rmsnorm not enable, use the default methods
+        if not getattr(model_extra_config.operator_opt_config, 'enable_kv_rmsnorm_rope_cache', False):
+            # update kv cache
+            slots = attn_metadata.slot_mapping.view(-1, 1)
+            torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
+            torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
         actual_seq_qlen = attn_metadata.query_cumlens
         # npu_fused_infer_attention_score_v2 does not support TND with dim 256, delete the branch when the operator supports it.

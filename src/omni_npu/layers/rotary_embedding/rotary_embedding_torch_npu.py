@@ -7,13 +7,18 @@ This module provides the basic rotary embedding implementation for NPU devices.
 It includes optimizations for different rotary_dim values and uses torch_npu
 operations when available.
 """
+from typing import Optional
 
 import torch
 import torch_npu
 
-from .common import CachedCosSinMixin, apply_rotary_emb_full_dim
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.common import apply_rotary_emb_torch
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
+from .common import CachedCosSinMixin, apply_rotary_emb_full_dim
 
 NEOX_ROTARY_COEFF = 2
 
@@ -112,6 +117,8 @@ class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor | None = None,
+        offsets: Optional[torch.Tensor] = None,
+        output_cos_sin: Optional[bool] = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """PyTorch-native implementation.
 
@@ -121,7 +128,10 @@ class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
         if self.rotary_dim < self.head_size:
             if self.cos_sin_cache.device != query.device:
                 self.cos_sin_cache = self.cos_sin_cache.npu()
-            q_embed, k_embed = super().forward_native(positions, query, key)
+            if output_cos_sin: # return query, key, cos_cache, sin_cache
+                return self._forward_npu_interleave_rope(positions, query, key)
+            else:
+                q_embed, k_embed = super().forward_native(positions, query, key)
         elif self.rotary_dim != 128:
             # torch_npu.npu_apply_rotary_pos_emb last dim must be 128, resort to small ops when not
             q_embed, k_embed = self._forward_ascend_ops_and_small_ops(positions, query, key)
@@ -129,4 +139,45 @@ class NPURotaryEmbedding(CachedCosSinMixin, RotaryEmbedding):
             q_embed, k_embed = self._forward_fused_ops(positions, query, key)
         else:
             q_embed, k_embed = self._forward_ascend_ops_and_small_ops(positions, query, key)
+
         return q_embed, k_embed
+
+    def _forward_npu_interleave_rope(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos_cache = torch.cat((cos, cos), dim=1)
+        sin_cache = torch.cat((sin, sin), dim=1)
+    
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        query_rot = query[..., :self.rotary_dim]
+        query_pass = query[..., self.rotary_dim:]
+        query_rot = torch_npu.npu_interleave_rope(
+            query_rot.unsqueeze(2),
+            cos_cache.unsqueeze(1).unsqueeze(1),
+            sin_cache.unsqueeze(1).unsqueeze(1)
+        ).squeeze(2)
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+     
+        # key may be None in some cases, e.g. cross-layer KV sharing
+        if key is not None:
+            key_shape = key.shape
+            key = key.view(num_tokens, -1, self.head_size)
+            key_rot = key[..., :self.rotary_dim]
+            key_pass = key[..., self.rotary_dim:]
+            key_rot = torch_npu.npu_interleave_rope(
+                key_rot.unsqueeze(2), 
+                cos_cache.unsqueeze(1).unsqueeze(1),
+                sin_cache.unsqueeze(1).unsqueeze(1)
+            ).squeeze(2)
+            key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+
+        return query, key, cos_cache, sin_cache
+
