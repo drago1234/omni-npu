@@ -1,6 +1,8 @@
 [run]
 source =
     omni_npu
+parallel = True
+concurrency = multiprocessing
 
 omit =
     */omni_npu/v0/*
