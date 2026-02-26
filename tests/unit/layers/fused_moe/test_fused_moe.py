@@ -22,7 +22,7 @@ def fused_module(monkeypatch):
     torch_npu.npu_grouped_matmul = MagicMock(side_effect=lambda inputs, weights, **kwargs: [inputs[0]])
     torch_npu.npu_swiglu = MagicMock(side_effect=lambda x, **kwargs: x)
     torch_npu.npu_dequant_swiglu_quant = MagicMock(
-        side_effect=lambda gate_up_proj, **kwargs: (gate_up_proj, torch.ones(gate_up_proj.shape[0]))
+        side_effect=lambda **kwargs: (kwargs["x"], torch.ones(kwargs["x"].shape[0]))
     )
     torch_npu.npu_grouped_matmul_finalize_routing = MagicMock(return_value=torch.full((2, 2), 9.0))
     torch_npu.npu_moe_re_routing = MagicMock()
@@ -294,6 +294,7 @@ def test_fused_experts_allgather_ep_quant(fused_module):
         topk_weights=torch.ones(2, 1),
         topk_ids=torch.zeros(2, 1, dtype=torch.int32),
         share_experts_output=None,
+        is_prefill=False,
     )
 
     assert output.shape == (2, 2)

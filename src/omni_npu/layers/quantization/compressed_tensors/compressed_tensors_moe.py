@@ -28,7 +28,7 @@ from vllm.config import get_current_vllm_config
 from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
-from omni_npu.layers.fused_moe.fused_moe import moe_infer_fusion, fused_experts_tp
+from omni_npu.layers.fused_moe.fused_moe import moe_infer_fusion, fused_experts_tp, fused_experts_allgather_ep
 
 
 torch.npu.config.allow_internal_format = True
@@ -43,6 +43,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
     ):
         super().__init__(parent, layer.moe_config)
         self.init_eplb(layer)
+        device_name = torch_npu.npu.get_device_name(0)
+        self.is_a2_device = device_name.startswith("Ascend910B")
 
     def init_eplb(self, layer):
         self.enable_eplb = layer.enable_eplb
@@ -146,19 +148,34 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w13_weight_offset, extra_weight_attrs)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+        
+        if self.moe.has_bias:
+            w13_bias = torch.nn.Parameter(
+                torch.zeros(num_experts,
+                            2 * intermediate_size_per_partition,
+                            dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            w2_bias = torch.nn.Parameter(
+                torch.zeros(num_experts,
+                            hidden_size,
+                            dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight = torch.nn.Parameter(layer.w13_weight.transpose(1, 2).contiguous(), requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(layer.w2_weight.transpose(1, 2).contiguous(), requires_grad=False)
-        # if model_extra_config.operator_opt_config.gmm_nz:
+
         layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29)
         layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
-        # if model_extra_config.operator_opt_config.pd_seperate_prefill:
-        layer.w2_weight_scale = torch.nn.Parameter(layer.w2_weight_scale.to(torch.bfloat16), requires_grad=False)
-        # elif not model_extra_config.operator_opt_config.opt_w2_scale_cast:
-        #     layer.w2_weight_scale = torch.nn.Parameter(layer.w2_weight_scale.to(torch.float32), requires_grad=False)
+
         layer.w13_weight_scale = torch.nn.Parameter(layer.w13_weight_scale.to(torch.float32).squeeze(-1), requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(layer.w2_weight_scale.squeeze(-1), requires_grad=False)
+        layer.w2_weight_scale = torch.nn.Parameter(layer.w2_weight_scale.to(torch.bfloat16).squeeze(-1), requires_grad=False)
 
     def maybe_make_prepare_finalize(self, routing_tables) -> Optional[FusedMoEPrepareAndFinalize]:
         return NpuMoEPrepareAndFinalize(self.moe)
@@ -193,11 +210,12 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-
+        use_allgather_ep = self.is_a2_device and layer.moe_parallel_config.use_ep
         tp_size = get_tensor_model_parallel_world_size()  # attn tp size
         hidden_states = x
-        global_num_experts=global_num_experts + get_world_group().world_size * self.num_of_redundant_experts
-        if layer.moe_parallel_config.use_ep and tp_size > 1:
+        global_num_experts = global_num_experts + get_world_group().world_size * self.num_of_redundant_experts
+
+        if not use_allgather_ep and layer.moe_parallel_config.use_ep and tp_size > 1:
             tp_rank = get_tensor_model_parallel_rank()
             t_ori = x.shape[0]
             t_pad = -(t_ori // -tp_size) * tp_size
@@ -234,13 +252,24 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
             layer.planner = self.planner
             layer.moe_layer_idx = self.moe_layer_idx
 
-        if layer.moe_parallel_config.use_ep:
+        attn_metadata = get_forward_context().attn_metadata
+        is_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
+        if use_allgather_ep:
+            output = fused_experts_allgather_ep(
+                layer=layer,
+                x=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                is_prefill=is_prefill,
+            )
+            output = tensor_model_parallel_all_reduce(output)
+            return output
+        elif layer.moe_parallel_config.use_ep:
             share_output = None
             if layer.shared_experts is not None:
                 share_output = layer.shared_experts(x)
-            attn_metadata = get_forward_context().attn_metadata
-            use_all2all = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-            if use_all2all:
+            if is_prefill:
                 output = moe_infer_fusion(
                     layer=layer,
                     x=hidden_states,

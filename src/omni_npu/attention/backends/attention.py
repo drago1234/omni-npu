@@ -178,6 +178,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[str] = None,
+        sinks: torch.Tensor | None = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -192,6 +193,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             )
         self.alibi_slopes = alibi_slopes
         self.attn_type = attn_type
+        self.attn_sinks = sinks
 
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(f"Only support decoder models, but {attn_type=}.")
@@ -273,21 +275,34 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             output.copy_(attn_output)
             return output
 
-        attn_output = torch_npu.npu_fused_infer_attention_score_v2(
-            query[:actual_seq_qlen[-1]],
-            kv_cache[0],
-            kv_cache[1],
-            num_query_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
-            input_layout="TND",
-            softmax_scale=self.scale,
-            block_table=attn_metadata.block_tables,
-            block_size=kv_cache[0].shape[1],
-            sparse_mode=3,
-            atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=attn_metadata.seq_lens,
-        )[0]
+        fused_infer_attn_kwargs = {
+            "query": query[:actual_seq_qlen[-1]],
+            "key": kv_cache[0],
+            "value": kv_cache[1],
+            "num_query_heads": self.num_heads,
+            "num_key_value_heads": self.num_kv_heads,
+            "input_layout": "TND",
+            "softmax_scale": self.scale,
+            "block_table": attn_metadata.block_tables,
+            "block_size": kv_cache[0].shape[1],
+            "sparse_mode": 3,
+            "atten_mask": NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
+            "actual_seq_qlen": actual_seq_qlen,
+            "actual_seq_kvlen": attn_metadata.seq_lens,
+        }
+        
+        if self.sliding_window is not None:
+            fused_infer_attn_kwargs.update({
+                "sparse_mode": 4,
+                "pre_tokens": self.sliding_window,
+                "next_tokens": 0,
+            })
+        if getattr(self, "attn_sinks", None) is not None:
+            fused_infer_attn_kwargs.update({
+                "learnable_sink": self.attn_sinks.view(self.num_heads),
+            })
+
+        attn_output = torch_npu.npu_fused_infer_attention_score_v2(**fused_infer_attn_kwargs)[0]
 
         output[:actual_seq_qlen[-1]].copy_(attn_output)
         return output

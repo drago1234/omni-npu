@@ -84,6 +84,7 @@ def mock_dependencies(monkeypatch: pytest.MonkeyPatch):
     torch.npu.config.allow_internal_format = False
 
     torch_npu = SimpleNamespace(
+        npu=SimpleNamespace(get_device_name=lambda idx: "MockDevice"),
         npu_format_cast=lambda tensor, fmt: tensor,
         npu_grouped_matmul=lambda inputs, weights, **kwargs: [inputs[0]],
         npu_swiglu=lambda tensor: tensor,
@@ -208,6 +209,9 @@ def mock_dependencies(monkeypatch: pytest.MonkeyPatch):
     npu_fused_moe_module.fused_experts_tp = MagicMock(
         return_value=torch.tensor([2.0])
     )
+    npu_fused_moe_module.fused_experts_allgather_ep = MagicMock(
+        return_value=torch.tensor([4.0])
+    )
 
     base_path = Path(__file__).resolve().parents[4]
     omni_pkg = types.ModuleType("omni_npu")
@@ -253,7 +257,10 @@ def compressed_moe_module(mock_dependencies):
 
 
 def _make_method(module, layer):
-    parent = SimpleNamespace(moe_parallel_config=layer.moe_parallel_config)
+    parent = SimpleNamespace(
+        moe_parallel_config=layer.moe_parallel_config,
+        has_bias=False,
+    )
     return module.NPUCompressedTensorsW8A8Int8MoEMethod(parent, layer)
 
 

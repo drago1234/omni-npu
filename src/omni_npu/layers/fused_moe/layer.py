@@ -342,7 +342,12 @@ class NPUFusedMoE(FusedMoE):
                 eps=1e-20,
             )
         elif custom_routing_function is None:
-            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(router_logits, k=top_k)
+            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+                router_logits.float(),
+                k=top_k,
+                routed_scaling_factor=routed_scaling_factor,
+                bias=e_score_correction_bias,
+            )
             if renormalize:
                 topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
         else:
