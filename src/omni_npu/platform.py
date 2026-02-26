@@ -180,6 +180,13 @@ class NPUPlatform(Platform):
         return "omni_npu.compilation.acl_graph.ACLGraphWrapper"
 
     @classmethod
+    def get_pass_manager_cls(cls) -> str:
+        """
+        Get the pass manager class for the current platform.
+        """
+        return "omni_npu.compilation.pass_manager.GraphPassManager"
+        
+    @classmethod
     def get_compile_backend(cls) -> str:
         """
         Get the custom compile backend for current platform.

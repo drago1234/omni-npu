@@ -42,6 +42,9 @@ class NpuGraphExAdaptor(CompilerInterface):
         # static kernel switch, suitable for static shapes or scenes with less shape changes.
         if npugraph_ex_config.get("enable_static_kernel", False):
             config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
+        # insert the GraphPassManager into the torchair config
+        if "post_grad_custom_post_pass" in compiler_config:
+            config.post_grad_custom_post_pass = compiler_config["post_grad_custom_post_pass"]
 
         npugraph_ex = torchair.get_npu_backend(compiler_config=config)
         compile_graph = npugraph_ex(graph, example_inputs)
