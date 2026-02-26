@@ -31,7 +31,13 @@ from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
     FusedMoEModularMethod,
 )
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
-from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp, moe_infer_fusion, fused_experts_allgather_ep_unquant
+
+from omni_npu.layers.utils import named_stream
+from omni_npu.layers.fused_moe.fused_moe import (
+    fused_experts_tp, 
+    moe_infer_fusion, 
+    fused_experts_allgather_ep_unquant
+)
 from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
 
@@ -145,7 +151,15 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 layer=layer, x=x, topk_ids=topk_ids, topk_weights=topk_weights
             )
 
-        shared_output = layer.shared_experts(x) if layer.shared_experts is not None else None
+        if layer.shared_experts is not None:
+            cur_stream = named_stream("current")
+            sub_stream = named_stream("moe_sub_stream")
+            sub_stream.wait_stream(cur_stream)
+            with torch.npu.stream(sub_stream):
+                shared_output = layer.shared_experts(x)  
+        else:
+            shared_output = None
+
 
         # EP execution path selection.
         if use_all2all:
@@ -191,10 +205,12 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 if did_tp_padding:
                     output = output[:orig_num_tokens]
 
-            if shared_output is not None:
+            if layer.shared_experts is not None:
+                cur_stream.wait_stream(sub_stream)
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
 
-        if shared_output is not None:
+        if layer.shared_experts is not None:
+            cur_stream.wait_stream(sub_stream)
             return shared_output, output
         return output
 
