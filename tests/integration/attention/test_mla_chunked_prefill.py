@@ -22,6 +22,7 @@ concatenated KV sequence: [context_prefix, suffix_tokens] with causal masking.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
@@ -54,6 +55,25 @@ NUM_HEADS = 4
 BLOCK_SIZE = 128
 
 
+@pytest.fixture(autouse=True)
+def _clear_mla_static_masks() -> None:
+    NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = None
+    NPUMLAImpl.DECORE_ATTN_MASK = None
+    yield
+    NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = None
+    NPUMLAImpl.DECORE_ATTN_MASK = None
+
+
+@contextmanager
+def _default_device(device: str):
+    prev_device = torch.get_default_device() if hasattr(torch, "get_default_device") else "cpu"
+    torch.set_default_device(device)
+    try:
+        yield
+    finally:
+        torch.set_default_device(prev_device)
+
+
 @dataclass
 class DummyChunkedContext:
     # Total number of gathered KV tokens for each chunk iteration.
@@ -78,7 +98,7 @@ def _assert_allclose(actual: torch.Tensor,
         return
     diff = (actual - expected).abs()
     flat_idx = diff.view(-1).argmax().item()
-    idx = torch.unravel_index(torch.tensor(flat_idx), diff.shape)
+    idx = torch.unravel_index(torch.tensor(flat_idx, device="cpu"), diff.shape)
     raise AssertionError(
         f"{name} mismatch: max_diff={diff.max().item()} idx={tuple(idx)} "
         f"actual={actual.view(-1)[flat_idx].item()} expected={expected.view(-1)[flat_idx].item()} "
@@ -280,9 +300,24 @@ def test_mla_chunked_prefill_matches_full_attention(monkeypatch: pytest.MonkeyPa
         "omni_npu.attention.backends.mla.get_current_vllm_config",
         lambda: None,
     )
+    ctx = type("Ctx", (), {"batch_descriptor": None, "virtual_engine": 0})()
+    # vLLM's MLA code may use `get_forward_context` via different import paths
+    # depending on vLLM version. Patch the likely targets, but don't hard-fail
+    # if one doesn't exist.
     monkeypatch.setattr(
-        "omni_npu.attention.backends.mla.get_forward_context",
-        lambda: type("Ctx", (), {"batch_descriptor": None, "virtual_engine": 0})(),
+        "vllm.forward_context.get_forward_context",
+        lambda: ctx,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.attention.layer.get_forward_context",
+        lambda: ctx,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.common.get_forward_context",
+        lambda: ctx,
+        raising=False,
     )
 
     # vLLM linear layers return `(out, bias)`; NPUMLAImpl expects that convention.
@@ -382,7 +417,7 @@ def test_mla_chunked_prefill_matches_full_attention(monkeypatch: pytest.MonkeyPa
             cp_kv_cache_interleave_size=1,
             decode_context_parallel_size=1,
         ),
-        compilation_config=SimpleNamespace(),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=0),
         kv_transfer_config=None,
         speculative_config=None,
     )
@@ -440,12 +475,12 @@ def test_mla_chunked_prefill_matches_full_attention(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(ops, "merge_attn_states", merge_wrapper)
 
     query_start_loc_cpu = torch.tensor(
-        [i * suffix_len for i in range(batch_size + 1)], dtype=torch.int32
+        [i * suffix_len for i in range(batch_size + 1)], dtype=torch.int32, device="cpu"
     )
     query_start_loc = query_start_loc_cpu.to(device)
-    seq_lens_cpu = torch.full((batch_size,), total_seq_len, dtype=torch.int32)
+    seq_lens_cpu = torch.full((batch_size,), total_seq_len, dtype=torch.int32, device="cpu")
     seq_lens = seq_lens_cpu.to(device)
-    num_computed_tokens_cpu = torch.full((batch_size,), context_len, dtype=torch.int32)
+    num_computed_tokens_cpu = torch.full((batch_size,), context_len, dtype=torch.int32, device="cpu")
 
     common_attn_metadata = CommonAttentionMetadata(
         query_start_loc=query_start_loc,
@@ -460,10 +495,11 @@ def test_mla_chunked_prefill_matches_full_attention(monkeypatch: pytest.MonkeyPa
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
     )
-    attn_metadata = metadata_builder.build(
-        common_prefix_len=0,
-        common_attn_metadata=common_attn_metadata,
-    )
+    with _default_device("cpu"):
+        attn_metadata = metadata_builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
     chunked_context = attn_metadata.prefill.chunked_context
 
     layer = type("Layer", (), {})()

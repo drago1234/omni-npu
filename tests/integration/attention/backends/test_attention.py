@@ -55,8 +55,8 @@ class TestNPUAttentionBackendDefaultImplIntegration(unittest.TestCase):
 
         # Tensors: [2, ...]
         query = torch.randn(num_decode_tokens, hidden_size, device=self.device, dtype=self.dtype)
-        key = torch.randn(num_decode_tokens, kv_hidden_size, device=self.device, dtype=self.dtype)
-        value = torch.randn(num_decode_tokens, kv_hidden_size, device=self.device, dtype=self.dtype)
+        key = torch.randn(num_decode_tokens, 4, 128, device=self.device, dtype=self.dtype)
+        value = torch.randn(num_decode_tokens, 4, 128, device=self.device, dtype=self.dtype)
 
         k_cache = torch.zeros(num_blocks, block_size, kv_hidden_size, device=self.device, dtype=self.dtype)
         v_cache = torch.zeros(num_blocks, block_size, kv_hidden_size, device=self.device, dtype=self.dtype)
@@ -81,7 +81,7 @@ class TestNPUAttentionBackendDefaultImplIntegration(unittest.TestCase):
             num_decode_tokens=num_decode_tokens,  # 2
             num_decodes=num_decodes,              # 2
             seq_lens=seq_lens,                    # [10, 15] → length=2
-            query_cumlens=[0, 1, 2],              # cumsum([1,1]) → length=3
+            query_cumlens=[1, 2],                 # cumulative decode qlens per request
             slot_mapping=slot_mapping,            # [9, 14] → length=2
             block_tables=block_tables,            # [2, 10]
             max_query_len=1,                      # decode: 1 token per seq

@@ -55,6 +55,7 @@ class TestNPUAttentionBackendMLAImplIntegration(unittest.TestCase):
         MAX_SEQ_LEN_NPU = 2048  # NPU hard-coded limit for sparse_mode=3
         causal_mask = torch.tril(torch.ones((MAX_SEQ_LEN_NPU, MAX_SEQ_LEN_NPU), dtype=torch.bool, device=self.device))
         original_mask = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE
+        original_decode_mask = NPUMLAImpl.DECORE_ATTN_MASK
         NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = causal_mask
 
         try:
@@ -174,7 +175,8 @@ class TestNPUAttentionBackendMLAImplIntegration(unittest.TestCase):
                 self.assertTrue(torch.isfinite(result).all())
 
         finally:
-            NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = original_mask    
+            NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = original_mask
+            NPUMLAImpl.DECORE_ATTN_MASK = original_decode_mask
 
 
 if __name__ == '__main__':

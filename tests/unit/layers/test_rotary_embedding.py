@@ -13,7 +13,6 @@ from vllm.platforms import current_platform
 from vllm.config import (
     VllmConfig,
 )
-torch.set_default_device('npu')
 platforms.current_platform = NPUPlatform()
 
 from omni_npu.layers.rotary_embedding.common import apply_rotary_emb_full_dim
@@ -33,6 +32,17 @@ from omni_npu.layers.rotary_embedding.rotary_embedding_torch_npu import (
 from omni_npu.layers.rotary_embedding.yarn_scaling_rope import (
     NPUYaRNScalingRotaryEmbedding,
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _module_default_device_npu():
+    prev_device = (
+        torch.get_default_device() if hasattr(torch, "get_default_device") else "cpu"
+    )
+    torch.set_default_device("npu")
+    yield
+    torch.set_default_device(prev_device)
+
 
 def _require_npu() -> torch.device:
     try:

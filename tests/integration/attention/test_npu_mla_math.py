@@ -37,6 +37,7 @@ import torch
 
 from transformers import DeepseekV3Config as _DeepseekConfig
 
+from omni_npu.attention.backends.mla import NPUMLAImpl
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
@@ -57,10 +58,20 @@ if not (hasattr(torch, "npu") and torch.npu.device_count() > 0):
 NPU_AVAILABLE = True
 
 
+@pytest.fixture(autouse=True)
+def _clear_mla_static_masks() -> None:
+    NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = None
+    NPUMLAImpl.DECORE_ATTN_MASK = None
+    yield
+    NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = None
+    NPUMLAImpl.DECORE_ATTN_MASK = None
+
+
 QK_NOPE_HEAD_DIM = 128
 QK_ROPE_HEAD_DIM = 64
 V_HEAD_DIM = 128
 KV_LORA_RANK = 512
+Q_LORA_RANK = 64
 QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 NUM_HEADS = 4
 HIDDEN_SIZE = 256
@@ -135,8 +146,15 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     if cos.dim() == 3:
         cos = cos.squeeze(1)
         sin = sin.squeeze(1)
-    cos = cos[..., ::2].to(x.dtype)
-    sin = sin[..., ::2].to(x.dtype)
+    if cos.shape[-1] == x.shape[-1]:
+        cos = cos[..., ::2]
+        sin = sin[..., ::2]
+    elif cos.shape[-1] * 2 != x.shape[-1]:
+        raise ValueError(
+            f"Incompatible rope cache shape: cos={tuple(cos.shape)}, x={tuple(x.shape)}"
+        )
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
     if x.dim() == 2:
         x = x.unsqueeze(1)
         out = apply_rotary_emb_torch(x, cos, sin, is_neox_style=False).squeeze(1)
@@ -153,7 +171,7 @@ def _assert_allclose(actual: torch.Tensor,
         return
     diff = (actual - expected).abs()
     flat_idx = diff.view(-1).argmax().item()
-    idx = torch.unravel_index(torch.tensor(flat_idx), diff.shape)
+    idx = torch.unravel_index(torch.tensor(flat_idx, device="cpu"), diff.shape)
     actual_val = actual.view(-1)[flat_idx].item()
     expected_val = expected.view(-1)[flat_idx].item()
     raise AssertionError(
@@ -168,6 +186,25 @@ def _build_positions(batch_size: int, seq_len: int, device: torch.device) -> tor
     # shape [B*S], with each sequence being [0..S-1].
     positions = torch.arange(seq_len, device=device, dtype=torch.long)
     return positions.repeat(batch_size)
+
+
+def _get_cos_sin_for_positions(
+    rotary_emb: torch.nn.Module, positions: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    positions = positions.flatten()
+    try:
+        return rotary_emb.get_cos_sin(positions)
+    except TypeError:
+        seqlen = int(positions.max().item()) + 1
+        cos, sin = rotary_emb.get_cos_sin(seqlen)
+        cos = cos.index_select(0, positions)
+        sin = sin.index_select(0, positions)
+        # vLLM base rotary cache is half-dim [T, D/2], while NPU MLA kernels
+        # consume interleaved full-dim [T, D].
+        if cos.dim() >= 1:
+            cos = cos.repeat_interleave(2, dim=-1)
+            sin = sin.repeat_interleave(2, dim=-1)
+        return cos, sin
 
 
 def _build_query_cumlens(batch_size: int, seq_len: int) -> list[int]:
@@ -230,15 +267,18 @@ def _init_kv_cache(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # KV caches are shaped per-block; MLA uses separate rope and compressed KV caches.
-    # In NPU MLA, compressed KV is stored as [num_blocks, BLOCK_SIZE, 1, KV_LORA_RANK]
-    # and RoPE part is stored as [num_blocks, BLOCK_SIZE, 1, QK_ROPE_HEAD_DIM].
+    # `NPUDeepseekMLAAttention` expects:
+    # - kv_cache[0]: [num_blocks, BLOCK_SIZE, KV_LORA_RANK]
+    # - kv_cache[1]: [num_blocks, BLOCK_SIZE, QK_ROPE_HEAD_DIM]
+    #
+    # The module itself unsqueezes dim=2 before calling fused NPU ops.
     num_blocks_per_seq = math.ceil(seq_len / BLOCK_SIZE)
     num_blocks = batch_size * num_blocks_per_seq
     k_cache = torch.zeros(
-        (num_blocks, BLOCK_SIZE, 1, KV_LORA_RANK), dtype=dtype, device=device
+        (num_blocks, BLOCK_SIZE, KV_LORA_RANK), dtype=dtype, device=device
     )
     k_rope_cache = torch.zeros(
-        (num_blocks, BLOCK_SIZE, 1, QK_ROPE_HEAD_DIM), dtype=dtype, device=device
+        (num_blocks, BLOCK_SIZE, QK_ROPE_HEAD_DIM), dtype=dtype, device=device
     )
     return k_cache, k_rope_cache
 
@@ -264,7 +304,7 @@ def _fill_existing_cache(
         return
 
     positions = torch.arange(seq_len - 1, device=device, dtype=torch.long).repeat(batch_size)
-    cos, sin = module.rotary_emb.get_cos_sin(positions)
+    cos, sin = _get_cos_sin_for_positions(module.rotary_emb, positions)
 
     kv_a = torch.randn(
         num_tokens, KV_LORA_RANK, generator=rng, device=device, dtype=k_cache.dtype
@@ -297,6 +337,13 @@ def _transpose_flashcomm_weights(module: torch.nn.Module) -> None:
             if weight is not None and weight.ndim == 2:
                 weight.data = weight.data.t().contiguous()
                 setattr(weight, "is_weight_transposed", True)
+
+
+def _project_q(module: NPUDeepseekMLAAttention, hidden_states: torch.Tensor) -> torch.Tensor:
+    # Test-only helper: match the module's q path (q_a_proj -> RMSNorm -> q_b_proj).
+    q_lora = module.q_a_proj(hidden_states)[0]
+    q_norm = module.q_a_layernorm(q_lora)
+    return module.q_b_proj(q_norm)[0]
 
 
 def _reset_mla_impl_weights(module: NPUDeepseekMLAAttention) -> None:
@@ -371,6 +418,16 @@ def _build_module(
         lambda: ctx,
     )
 
+    # Production prefill quantizes q into a dict (`{'x_int8': ..., 'pertoken_scale': ...}`)
+    # before feeding it into q_b_proj. In unit tests we don't exercise quantized matmul,
+    # so we:
+    # - make dynamic quant a no-op (keep float tensor)
+    # - wrap q_b_proj.forward to accept that dict and unwrap it back to a tensor
+    monkeypatch.setattr(
+        "omni_npu.v1.layers.attention.npu_mla.torch_npu.npu_dynamic_quant",
+        lambda x: (x, None),
+    )
+
     config = _DeepseekConfig(
         hidden_size=HIDDEN_SIZE,
         num_attention_heads=NUM_HEADS,
@@ -379,7 +436,7 @@ def _build_module(
         qk_rope_head_dim=QK_ROPE_HEAD_DIM,
         v_head_dim=V_HEAD_DIM,
         kv_lora_rank=KV_LORA_RANK,
-        q_lora_rank=None,
+        q_lora_rank=Q_LORA_RANK,
     )
     config.rope_parameters = {"rope_type": "default", "rope_theta": 10000.0}
 
@@ -391,13 +448,22 @@ def _build_module(
         qk_nope_head_dim=QK_NOPE_HEAD_DIM,
         qk_rope_head_dim=QK_ROPE_HEAD_DIM,
         v_head_dim=V_HEAD_DIM,
-        q_lora_rank=None,
+        q_lora_rank=Q_LORA_RANK,
         kv_lora_rank=KV_LORA_RANK,
         max_position_embeddings=MAX_POS,
         cache_config=dummy_config.cache_config,
         quant_config=None,
         prefix=f"test_mla_{uuid.uuid4().hex}",
     ).to(device=device, dtype=dtype)
+
+    orig_q_b_forward = module.q_b_proj.forward
+
+    def _q_b_forward_accept_dict(input_: object, throw_dequant: bool = False):
+        if isinstance(input_, dict):
+            input_ = input_["x_int8"]
+        return orig_q_b_forward(input_, throw_dequant=throw_dequant)
+
+    module.q_b_proj.forward = _q_b_forward_accept_dict  # type: ignore[method-assign]
 
     torch.manual_seed(0)
     for param in module.parameters():
@@ -425,7 +491,7 @@ def _reference_prefill(
     # - kv_a:         [T, KV_LORA_RANK] (compressed key/value)
     # - k_pe:         [T, QK_ROPE_HEAD_DIM] (RoPE part)
     # - k_nope / v:   [T, N, ...] (expanded per-head via kv_b_proj)
-    q = module.q_proj(hidden_states)[0].view(-1, NUM_HEADS, QK_HEAD_DIM)
+    q = _project_q(module, hidden_states).view(-1, NUM_HEADS, QK_HEAD_DIM)
     latent_cache = module.kv_a_proj_with_mqa(hidden_states)[0]
     kv_a, k_pe = latent_cache.split([KV_LORA_RANK, QK_ROPE_HEAD_DIM], dim=-1)
     kv_a = module.kv_a_layernorm(kv_a)
@@ -490,11 +556,11 @@ def _reference_decode(
     # - hidden_states: [B, H] (one token per sequence)
     # - q_nope:        [B, N, QK_NOPE_HEAD_DIM]
     # - q_pe:          [B, N, QK_ROPE_HEAD_DIM]
-    # - kv_cache[0]:   [num_blocks, BLOCK_SIZE, 1, KV_LORA_RANK]
-    # - kv_cache[1]:   [num_blocks, BLOCK_SIZE, 1, QK_ROPE_HEAD_DIM]
+    # - kv_cache[0]:   [num_blocks, BLOCK_SIZE, KV_LORA_RANK]
+    # - kv_cache[1]:   [num_blocks, BLOCK_SIZE, QK_ROPE_HEAD_DIM]
     #
     # Design: we emulate the paged KV-cache by indexing into flattened slots.
-    q = module.q_proj(hidden_states)[0]
+    q = _project_q(module, hidden_states)
     kv = module.kv_a_proj_with_mqa(hidden_states)[0]
 
     q = q.view(-1, NUM_HEADS, 1, QK_HEAD_DIM)
@@ -581,7 +647,7 @@ def test_npu_mla_prefill_matches_reference(
     # Cos/sin for every token position (length = B * S).
     # Example: positions = [0, 1, 2, ..., S-1] repeated for each sequence.
     positions = _build_positions(batch_size, seq_len, device)
-    cos, sin = module.rotary_emb.get_cos_sin(positions)
+    cos, sin = _get_cos_sin_for_positions(module.rotary_emb, positions)
 
     # Make a non-contiguous input: base [H, 2*B*S] -> take every other column.
     # This ensures the attention kernel handles strided inputs correctly.
@@ -654,7 +720,7 @@ def test_npu_mla_decode_matches_reference(
         device=device,
         dtype=torch.long,
     )
-    cos, sin = module.rotary_emb.get_cos_sin(positions)
+    cos, sin = _get_cos_sin_for_positions(module.rotary_emb, positions)
 
     # Non-contiguous [B, H] input by slicing a transposed base.
     # This mirrors a strided decode input in a fused pipeline.
