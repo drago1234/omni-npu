@@ -592,3 +592,275 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             self.assertEqual(o.shape, (T, 1, num_heads, v_head_dim))  # e.g., (2, 1, 32, 128)
             # self.assertIsNone(extra)
             print(" _forward_decode test passed!")
+
+    def _test_forward_prefill_dcp(self, TP: int, CHK: int):
+        cfg = {"dtype": torch.bfloat16, "device": "cpu"}
+        cfg_i32 = {"dtype": torch.int32, "device": "cpu"}
+        cfg_f32 = {"dtype": torch.float, "device": "cpu"}
+
+        PG = 128 # block_size
+        BLK = 10 # num_blocks
+
+        T = 8    # prefill tokens
+        T2 = 23  # context len of chunks
+        N = 128  # num_heads
+        R = 64   # qk_rope_head_dim
+        D1 = 128 # qk_nope_head_dim
+        D2 = 128 # v_head_dim
+        L = 512  # kv_lora_rank
+        SC = 1.0 / (128 ** 0.5)
+
+        mock_tp_group = MagicMock(
+            rank_in_group=0,
+            world_size=TP,
+            all_gather=lambda x, dim=-1:torch.cat(([x] * TP), dim=dim),
+            device_group=None,
+        )
+
+        with patch(
+            "vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size",
+            return_value=64,
+        ), patch(
+            "omni_npu.attention.backends.mla.get_current_vllm_config",
+            return_value=None,
+        ), patch(
+            "omni_npu.attention.backends.mla.get_tp_group",
+            return_value=mock_tp_group,
+        ), patch(
+            "vllm.distributed.parallel_state.get_dcp_group",
+            return_value=mock_tp_group,
+        ):
+            global NPUMLAImpl
+            impl = NPUMLAImpl(
+                scale=SC,
+                num_heads=N,
+                kv_lora_rank=L,
+                qk_rope_head_dim=R,
+                qk_nope_head_dim=D1,
+                v_head_dim=D2,
+                num_kv_heads=1,   # MLA
+                head_size=None,   # not used
+                q_lora_rank=None, # not used
+                qk_head_dim=None, # not used
+                kv_b_proj=lambda x: (torch.randn(x.shape[0], N * (D1 + D2), **cfg), None),
+                kv_cache_dtype="auto",
+                attn_type=AttentionType.DECODER,
+                alibi_slopes=None,
+                sliding_window=None,
+                logits_soft_cap=None,
+                kv_sharing_target_layer_name=None,
+            )
+
+            q = torch.randn(T, N, D1 + R, **cfg)
+            kv_c_normed = torch.randn(T, L, **cfg)
+            k_pe = torch.randn(T, R, **cfg)
+            k_scale = torch.tensor(1.0, **cfg)
+
+            kv_cache = (
+                torch.randn(BLK, PG, L, **cfg), # nope_cache
+                torch.randn(BLK, PG, R, **cfg), # rope_cache
+            )
+
+            chunk_ctx = MagicMock(
+                seq_tot=[T2] * CHK,
+                dcp_local_idx=[torch.randint(0, BLK * PG, (T2,), **cfg_i32),] * CHK,
+                dcp_reorg_order=[torch.arange(T2, **cfg_i32)] * CHK,
+                cu_seq_lens=torch.tensor([[0, T2]] * CHK, **cfg_i32),
+            )
+
+            metadata = MagicMock(
+                prefill=MagicMock(
+                    query_start_loc_list=[0, T],
+                    chunked_context=(chunk_ctx if CHK > 0 else None),
+                ),
+                decode=None,
+                num_actual_tokens=T,
+                num_prefills=1,
+                num_decodes=0,
+                num_decode_tokens=0,
+                slot_mapping=None,
+            )
+
+            call_count = [0]
+            def mock_fia(
+                q, k, v,
+                query_rope,
+                key_rope,
+                num_heads,
+                num_key_value_heads,
+                input_layout,
+                actual_seq_lengths,
+                actual_seq_lengths_kv,
+                scale,
+                softmax_lse_flag=False,
+                sparse_mode=0,
+                **kwargs,
+            ):
+                call_count[0] += 1
+                q_len = T
+                kv_len = T if call_count[0] == 1 else T2
+                mode = 3 if call_count[0] == 1 else 0
+
+                assert scale == SC
+                assert num_heads == N
+                assert num_key_value_heads == N
+                assert softmax_lse_flag == (CHK > 0)
+                assert input_layout == "TND"
+
+                assert sparse_mode == mode
+                assert actual_seq_lengths[-1] == T
+                assert actual_seq_lengths_kv[-1] == kv_len
+
+                assert q.shape == (q_len, N, D1)
+                assert k.shape == (kv_len, N, D1)
+                assert v.shape == (kv_len, N, D2)
+                assert query_rope.shape == (q_len, N, R)
+                assert key_rope.shape == (kv_len, N, R)
+
+                return (
+                    torch.randn(q_len, N, D2, **cfg),    # out
+                    torch.randn(q_len, N, 1, **cfg_f32), # lse
+                )
+
+            with patch(
+                "torch.ops.npu.npu_fused_infer_attention_score",
+                side_effect=mock_fia,
+            ), patch(
+                "torch_npu.npu_fused_infer_attention_score",
+                side_effect=mock_fia,
+            ) as mock_fia:
+                result = impl._forward_prefill(q, kv_c_normed, k_pe, kv_cache, metadata, k_scale)
+
+            call_count[0] == CHK + 1
+            result.shape == (T, N * D2)
+            print("_forward_prefill_dcp test passed!")
+
+    def _test_forward_decode_dcp(self, TP: int):
+        cfg = {"dtype": torch.bfloat16, "device": "cpu"}
+        cfg_i32 = {"dtype": torch.int32, "device": "cpu"}
+        cfg_f32 = {"dtype": torch.float, "device": "cpu"}
+
+        PG = 128           # block_size
+        BLK = 10           # num_blocks
+        TAB = 16           # table_len
+        CU_Q_LENS = [1, 2] # cu_q_lens
+        KV_LENS = [77, 33] # kv_lens, PA not cummulated
+        T = len(CU_Q_LENS) # decode tokens
+
+        N = 8    # num_local_heads
+        R = 64   # qk_rope_head_dim
+        D1 = 128 # qk_nope_head_dim
+        D2 = 128 # v_head_dim
+        L = 512  # kv_lora_rank
+        SC = 1.0 / (128 ** 0.5)
+
+        mock_tp_group = MagicMock(
+            rank_in_group=0,
+            world_size=TP,
+            all_gather=lambda x, dim=-1:torch.cat(([x] * TP), dim=dim),
+            device_group=None,
+        )
+
+        def mock_all_to_all_single(output, input, group=None):
+            output.copy_(input)
+
+        def mock_npu_attention_update(lse, local_out, update_type):
+            assert update_type == 0
+            print([it.shape for it in local_out])
+            return torch.zeros_like(local_out[0]), None
+
+        with patch(
+            "vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size",
+            return_value=64,
+        ), patch(
+            "omni_npu.attention.backends.mla.get_current_vllm_config",
+            return_value=None,
+        ), patch(
+            "omni_npu.attention.backends.mla.get_tp_group",
+            return_value=mock_tp_group,
+        ), patch(
+            "torch.distributed.all_to_all_single",
+            side_effect=mock_all_to_all_single,
+        ), patch(
+            "torch_npu.npu_attention_update",
+            side_effect=mock_npu_attention_update,
+        ):
+            global NPUMLAImpl
+            impl = NPUMLAImpl(
+                scale=SC,
+                num_heads=N,
+                kv_lora_rank=L,
+                qk_rope_head_dim=R,
+                qk_nope_head_dim=D1,
+                v_head_dim=D2,
+                num_kv_heads=1,   # MLA
+                head_size=None,   # not used
+                q_lora_rank=None, # not used
+                qk_head_dim=None, # not used
+                kv_b_proj=None,   # absorb, not used
+                kv_cache_dtype="auto",
+                attn_type=AttentionType.DECODER,
+                alibi_slopes=None,
+                sliding_window=None,
+                logits_soft_cap=None,
+                kv_sharing_target_layer_name=None,
+            )
+
+            metadata = MagicMock(
+                decode=MagicMock(
+                    query_cumlens=CU_Q_LENS,
+                    seq_lens=KV_LENS,
+                    block_table=torch.randint(0, BLK, (T, TAB), **cfg_i32),
+                    dcp_tot_seq_lens=None,
+                ),
+                prefill=None,
+                num_prefills=0,
+                num_decodes=T,
+                num_decode_tokens=T,
+            )
+
+            kv_cache = (
+                torch.randn(BLK, PG, L, **cfg), # nope_cache
+                torch.randn(BLK, PG, R, **cfg), # rope_cache
+            )
+
+            ql_nope = torch.randn(T, N, L, **cfg)
+            q_pe = torch.randn(T, N, R, **cfg)
+            layer = MagicMock()
+
+            with patch(
+                "torch.ops.npu.npu_fused_infer_attention_score",
+                return_value=(
+                    torch.randn(N * TP, T, L, **cfg),     # out, NTD
+                    torch.randn(T, N * TP, 1, **cfg_f32), # lse, TN1
+                ),
+            ) as mock_fia:
+                o = impl._forward_decode_dcp(ql_nope, q_pe, kv_cache, metadata, layer)
+
+            mock_fia.assert_called_once()
+            args, kwargs = mock_fia.call_args
+            self.assertEqual(args[0].shape, (T, N * TP, L))    # q
+            self.assertEqual(args[1].shape, kv_cache[0].shape) # k
+            self.assertEqual(args[2].shape, kv_cache[0].shape) # v
+            self.assertEqual(kwargs["query_rope"].shape, (T, N * TP, R))
+            self.assertEqual(kwargs["key_rope"].shape, kv_cache[1].shape)
+
+            self.assertEqual(kwargs["num_heads"], N * TP)
+            self.assertEqual(kwargs["num_key_value_heads"], 1)
+            self.assertEqual(kwargs["actual_seq_lengths"], CU_Q_LENS)
+            self.assertEqual(kwargs["actual_seq_lengths_kv"], KV_LENS)
+            self.assertEqual(kwargs["input_layout"], "TND_NTD")
+            self.assertEqual(kwargs["block_size"], PG)
+            self.assertEqual(kwargs["block_table"].shape, (T, TAB))
+
+            self.assertEqual(o.shape, (N, T, L))
+            print("_forward_decode_dcp test passed!")
+
+    def test_forward_prefill_dcp(self):
+        for tp in [8, 16, 32]:
+            for chk in [0, 3, 7]:
+                self._test_forward_prefill_dcp(TP=tp, CHK=chk)
+
+    def test_forward_decode_dcp(self):
+        for tp in [8, 16, 32]:
+            self._test_forward_decode_dcp(TP=tp)
