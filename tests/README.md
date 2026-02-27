@@ -180,6 +180,27 @@ python3 tests/ut_CI_check/ut_CI_cover_rate_check.py \
   --min 60
 ```
 
+### 4.1 Optional: incremental coverage (diff-cover)
+
+Incremental coverage is currently supported only in the multi-container UT workflow.
+The implementation lives in `tests/ut_CI_check/ut_diff_cov.py`, and it only checks
+the **staged** changes in the working tree (uses `git diff --cached`).
+
+If you want to run incremental coverage locally, follow the same idea as `tests/ut_CI_check/ut_diff_cov.py`:
+1. get the diff file (if not provided)
+2. run diff-cover
+
+Example:
+
+```bash
+python3 tests/ut_CI_check/ut_diff_cov.py \
+  --repo-root /path/to/omni-npu \
+  --coverage-xml /path/to/coverage.xml \
+  --old-prefix /workspace/omniinfer/components/omni-npu \
+  --out-html /path/to/diffcov.html \
+  --out-txt /path/to/diffcov.txt
+```
+
 ### 5. Cleanup containers
 
 ```bash

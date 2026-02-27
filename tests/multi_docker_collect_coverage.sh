@@ -58,11 +58,13 @@ docker exec "${MERGE_CONTAINER}" /bin/bash -c "
   coverage combine --keep --data-file .coverage .coverage.*
   coverage html --rcfile '${RCFILE_IN_CONTAINER}' --data-file .coverage -d htmlcov
   coverage report --rcfile '${RCFILE_IN_CONTAINER}' --data-file .coverage -m | tee coverage_report.txt
+  coverage xml --rcfile '${RCFILE_IN_CONTAINER}' --data-file .coverage -o coverage.xml
 "
 
 echo "[INFO] copying merged reports from container..."
 docker cp "${MERGE_CONTAINER}:${MERGE_DIR_IN_CONTAINER}/.coverage" "${MERGED_COV}"
 docker cp "${MERGE_CONTAINER}:${MERGE_DIR_IN_CONTAINER}/htmlcov" "${HTML_DIR}"
 docker cp "${MERGE_CONTAINER}:${MERGE_DIR_IN_CONTAINER}/coverage_report.txt" "${REPORT_TXT}"
+docker cp "${MERGE_CONTAINER}:${MERGE_DIR_IN_CONTAINER}/coverage.xml" "${HOST_COV_DIR}/coverage.xml"
 
 echo "[INFO] merged coverage file: ${MERGED_COV}"
