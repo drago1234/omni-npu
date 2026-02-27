@@ -76,8 +76,12 @@ class NPUPlatform(Platform):
     def import_kernels(cls):
         from omni_npu.compilation.decorators import patch_compile_decorators
         patch_compile_decorators()
-        from omni_npu.connector import register_connectors
-        register_connectors()
+        if "omni_cache" in os.environ.get("VLLM_PLUGINS", ""):
+            from omni_cache.connector import register_connectors
+            register_connectors()
+        else:
+            from omni_npu.connector import register_connectors
+            register_connectors()
 
     @classmethod
     def get_current_memory_usage(cls, device: Optional[torch.types.Device] = None) -> float:

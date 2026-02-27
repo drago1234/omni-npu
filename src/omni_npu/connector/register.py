@@ -41,11 +41,7 @@ def register_connectors() -> None:
     # support LLMDataDistConnector as the basic kv connector
     _safe_register(
         "LLMDataDistConnector",
-        (
-            "omni_npu.connector.omni_cache_connector_v1"
-            if os.getenv("ENABLE_OMNI_CACHE", "0") == "1"
-            else "omni_npu.connector.llmdatadist_connector_v1"
-        ),
+        "omni_npu.connector.llmdatadist_connector_v1",
         "LLMDataDistConnector",
     )
 
