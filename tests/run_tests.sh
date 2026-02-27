@@ -125,15 +125,6 @@ case "$TEST_TYPE" in
             echo "[INFO] About to run: pytest -v ${TB_ARG} ${pytest_args[*]}"
             pytest -v "${TB_ARG}" "${duration_args[@]}" "${pytest_args[@]}"
         fi
-        echo ""
-        echo "Running integration tests (requires NPU hardware)..."
-        echo "  - Single-device tests with pytest"
-        echo "[INFO] About to run: pytest integration/distributed/test_communicator.py::TestNPUCommunicatorIntegration -v ${TB_ARG} ${pytest_args[*]}"
-        pytest integration/distributed/test_communicator.py::TestNPUCommunicatorIntegration -v "${TB_ARG}" "${pytest_args[@]}"
-        echo ""
-        echo "  - Multi-device tests with torchrun (2 NPUs)"
-        echo "[INFO] About to run: torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v ${TB_ARG} ${pytest_args[*]}"
-        torchrun --nproc_per_node=2 -m pytest integration/distributed/test_communicator.py::TestNPUCommunicatorMultiDevice -v "${TB_ARG}" "${pytest_args[@]}"
         ;;
     *)
         echo "Usage: $0 [unit|integration|all]"
