@@ -1,5 +1,6 @@
 {
     "model_parallel_config": {
+        "dense_mlp_tp_size": 4
     },
     "operator_optimization_config": {
         "enable_kv_rmsnorm_rope_cache": true
