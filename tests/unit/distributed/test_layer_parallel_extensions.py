@@ -72,9 +72,151 @@ class TestCommunicationOpExtensions(unittest.TestCase):
         group.reduce_scatter.assert_called_once_with(tensor, dim=0)
         self.assertEqual(result, "out")
 
+    @patch("omni_npu.v1.distributed.communication_op_ext.get_local_world_group")
+    def test_all_gather_local_returns_input_when_world_size_one(self, mock_get_local_group):
+        group = Mock()
+        group.world_size = 1
+        mock_get_local_group.return_value = group
+        tensor = torch.randn(2, 3)
+
+        result = communication_op_ext.all_gather_local(tensor, dim=1)
+        self.assertIs(result, tensor)
+
+    @patch("omni_npu.v1.distributed.communication_op_ext.get_local_world_group")
+    def test_all_gather_local_delegates_to_group(self, mock_get_local_group):
+        group = Mock()
+        group.world_size = 2
+        group.all_gather.return_value = "gathered"
+        mock_get_local_group.return_value = group
+        tensor = torch.randn(2, 3)
+
+        result = communication_op_ext.all_gather_local(tensor, dim=0)
+        group.all_gather.assert_called_once_with(tensor, 0)
+        self.assertEqual(result, "gathered")
+
+    @patch("omni_npu.v1.distributed.communication_op_ext.get_local_world_group")
+    def test_reduce_scatter_local_delegates_to_group(self, mock_get_local_group):
+        group = Mock()
+        group.world_size = 2
+        group.reduce_scatter.return_value = "scattered"
+        mock_get_local_group.return_value = group
+        tensor = torch.randn(2, 3)
+
+        result = communication_op_ext.reduce_scatter_local(tensor)
+        group.reduce_scatter.assert_called_once_with(tensor)
+        self.assertEqual(result, "scattered")
+
+    @patch("omni_npu.v1.distributed.communication_op_ext.get_local_world_group")
+    def test_all_to_all_local_requires_device_communicator(self, mock_get_local_group):
+        group = Mock()
+        group.world_size = 2
+        group.device_communicator = None
+        mock_get_local_group.return_value = group
+
+        with self.assertRaises(RuntimeError) as context:
+            communication_op_ext.all_to_all_local(torch.randn(2, 4))
+        self.assertIn("no device communicator", str(context.exception))
+
+    @patch("omni_npu.v1.distributed.communication_op_ext.get_local_world_group")
+    def test_all_to_all_local_validates_dims_and_divisibility(self, mock_get_local_group):
+        communicator = Mock()
+        group = Mock()
+        group.world_size = 2
+        group.device_communicator = communicator
+        mock_get_local_group.return_value = group
+
+        with self.assertRaises(ValueError):
+            communication_op_ext.all_to_all_local(torch.randn(2, 4), scatter_dim=3, gather_dim=0)
+        with self.assertRaises(ValueError):
+            communication_op_ext.all_to_all_local(torch.randn(2, 4), scatter_dim=0, gather_dim=3)
+        with self.assertRaises(ValueError):
+            communication_op_ext.all_to_all_local(torch.randn(3, 4), scatter_dim=0, gather_dim=1)
+
+    @patch("omni_npu.v1.distributed.communication_op_ext.get_local_world_group")
+    def test_all_to_all_local_uses_normalized_dims(self, mock_get_local_group):
+        communicator = Mock()
+        communicator.all_to_all.return_value = "ok"
+        group = Mock()
+        group.world_size = 2
+        group.device_communicator = communicator
+        mock_get_local_group.return_value = group
+        tensor = torch.randn(2, 4)
+
+        result = communication_op_ext.all_to_all_local(tensor, scatter_dim=-1, gather_dim=0)
+        communicator.all_to_all.assert_called_once_with(tensor, scatter_dim=1, gather_dim=0)
+        self.assertEqual(result, "ok")
+
+    @patch("omni_npu.v1.distributed.communication_op_ext._get_group", return_value=None)
+    def test_layer_parallel_all2all_single_returns_input_without_group(self, _):
+        tensor = torch.randn(2, 2)
+        self.assertIs(
+            communication_op_ext.layer_parallel_all2all_single(tensor, "layer"),
+            tensor,
+        )
+
+    @patch("omni_npu.v1.distributed.communication_op_ext._get_group")
+    def test_layer_parallel_all2all_single_validates_type_and_group(self, mock_get_group):
+        group = Mock()
+        group.world_size = 2
+        group.device_group = object()
+        mock_get_group.return_value = group
+        tensor = torch.randn(2, 4)
+
+        with self.assertRaises(TypeError):
+            communication_op_ext.layer_parallel_all2all_single(tensor, "layer", dim="0")
+
+        group.device_group = None
+        with self.assertRaises(RuntimeError):
+            communication_op_ext.layer_parallel_all2all_single(tensor, "layer", dim=0)
+
+    @patch("omni_npu.v1.distributed.communication_op_ext._get_group")
+    def test_layer_parallel_all2all_single_validates_dim_and_split_size(self, mock_get_group):
+        group = Mock()
+        group.world_size = 2
+        group.device_group = object()
+        mock_get_group.return_value = group
+
+        with self.assertRaises(ValueError):
+            communication_op_ext.layer_parallel_all2all_single(torch.randn(2, 4), "layer", dim=3)
+        with self.assertRaises(ValueError):
+            communication_op_ext.layer_parallel_all2all_single(torch.randn(3, 4), "layer", dim=0)
+
+    @patch("omni_npu.v1.distributed.communication_op_ext.dist.get_world_size", return_value=2)
+    @patch("omni_npu.v1.distributed.communication_op_ext.dist.all_to_all_single")
+    @patch("omni_npu.v1.distributed.communication_op_ext._get_group")
+    def test_layer_parallel_all2all_single_happy_path_nonzero_dim(
+        self, mock_get_group, mock_all_to_all_single, _
+    ):
+        group = Mock()
+        group.world_size = None  # cover fallback to dist.get_world_size
+        group.device_group = object()
+        mock_get_group.return_value = group
+
+        def _copy_with_bias(out_buf, in_buf, group=None):  # noqa: ARG001
+            out_buf.copy_(in_buf + 1)
+
+        mock_all_to_all_single.side_effect = _copy_with_bias
+        tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+        result = communication_op_ext.layer_parallel_all2all_single(
+            tensor, "layer", dim=1
+        )
+        torch.testing.assert_close(result, tensor + 1)
+        mock_all_to_all_single.assert_called_once()
+
 
 class TestParallelStateExtensions(unittest.TestCase):
     """Unit tests for parallel_state helper functions."""
+
+    def setUp(self):
+        self._orig_layer_comm_dict = parallel_state_ext._LAYER_COMM_DICT
+        self._orig_local_world = parallel_state_ext._LOCAL_WORLD
+        parallel_state_ext._LAYER_COMM_DICT = None
+        parallel_state_ext._LOCAL_WORLD = None
+
+    def tearDown(self):
+        parallel_state_ext._LAYER_COMM_DICT = self._orig_layer_comm_dict
+        parallel_state_ext._LOCAL_WORLD = self._orig_local_world
 
     def test_normalize_comm_op_type_aliases_and_canonical(self):
         mapping = {
@@ -139,6 +281,249 @@ class TestParallelStateExtensions(unittest.TestCase):
         with self.assertRaises(RuntimeError) as context:
             parallel_state_ext._tp_size_or_ranks_to_group_ranks(4, "layer")
         self.assertIn("must be divisible", str(context.exception))
+
+    def test_calculate_effective_local_size(self):
+        self.assertEqual(parallel_state_ext.calculate_effective_local_size(8, 4), 4)
+        with self.assertRaises(AssertionError):
+            parallel_state_ext.calculate_effective_local_size(3, 5)
+
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.torch.distributed.is_initialized",
+        return_value=False,
+    )
+    def test_initialize_local_world_group_requires_dist_initialized(self, _):
+        with self.assertRaises(RuntimeError):
+            parallel_state_ext.initialize_local_world_group()
+
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.torch.distributed.is_initialized",
+        return_value=True,
+    )
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.get_world_size", return_value=4)
+    def test_initialize_local_world_group_noop_if_already_initialized(
+        self, mock_get_world_size, _
+    ):
+        parallel_state_ext._LOCAL_WORLD = Mock()
+        parallel_state_ext.initialize_local_world_group()
+        mock_get_world_size.assert_not_called()
+
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.torch.distributed.is_initialized",
+        return_value=True,
+    )
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.get_world_size", return_value=4)
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.calculate_effective_local_size",
+        return_value=2,
+    )
+    @patch("omni_npu.v1.distributed.parallel_state_ext.init_model_parallel_group")
+    @patch("omni_npu.v1.distributed.parallel_state_ext.get_world_group")
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.torch.distributed.get_backend",
+        return_value="hccl",
+    )
+    def test_initialize_local_world_group_uses_visible_devices_when_mock_enabled(
+        self,
+        _,
+        mock_get_world_group,
+        mock_init_group,
+        __,
+        ___,
+        ____,
+    ):
+        mock_world_group = Mock()
+        mock_world_group.device_group = object()
+        mock_world_group.local_rank = 0
+        mock_get_world_group.return_value = mock_world_group
+        local_world_group = Mock()
+        mock_init_group.return_value = local_world_group
+
+        with patch.dict(
+            "os.environ",
+            {"NO_NPU_MOCK": "1", "ASCEND_RT_VISIBLE_DEVICES": "0,1"},
+            clear=False,
+        ):
+            parallel_state_ext.initialize_local_world_group()
+
+        self.assertIs(parallel_state_ext._LOCAL_WORLD, local_world_group)
+        mock_init_group.assert_called_once_with(
+            [[0, 1], [2, 3]],
+            0,
+            "hccl",
+            use_message_queue_broadcaster=True,
+            group_name="world_local",
+        )
+
+    def test_get_local_world_group_raises_when_uninitialized(self):
+        parallel_state_ext._LOCAL_WORLD = None
+        with self.assertRaises(RuntimeError):
+            parallel_state_ext.get_local_world_group()
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=False)
+    def test_ensure_layer_parallel_initialized_noop_when_dist_not_ready(self, _):
+        parallel_state_ext.ensure_layer_parallel_initialized()
+        self.assertEqual(parallel_state_ext._LAYER_COMM_DICT, {})
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=True)
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.initialize_local_world_group",
+        return_value=None,
+    )
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext._load_layer_parallel_config_from_model_extra_config",
+        return_value=None,
+    )
+    def test_ensure_layer_parallel_initialized_with_no_model_config(self, *_):
+        parallel_state_ext.ensure_layer_parallel_initialized()
+        self.assertEqual(parallel_state_ext._LAYER_COMM_DICT, {})
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.get_tp_group")
+    def test_get_layer_parallel_group_fallback_order(self, mock_get_tp_group):
+        tp_group = Mock(name="tp")
+        layer_group = Mock(name="layer")
+        x_group = Mock(name="x")
+        mock_get_tp_group.return_value = tp_group
+        parallel_state_ext._LAYER_COMM_DICT = {
+            "layer": {
+                "parallel_group": layer_group,
+                "x_transform": {"parallel_group": x_group},
+            }
+        }
+
+        self.assertIs(parallel_state_ext.get_layer_parallel_group("layer", "x"), x_group)
+        self.assertIs(parallel_state_ext.get_layer_parallel_group("layer", "y"), layer_group)
+        self.assertIs(parallel_state_ext.get_layer_parallel_group("other"), tp_group)
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.get_tp_group", side_effect=AssertionError)
+    def test_get_layer_parallel_group_handles_uninitialized_tp_group(self, _):
+        parallel_state_ext._LAYER_COMM_DICT = None
+        self.assertIsNone(parallel_state_ext.get_layer_parallel_group("layer"))
+
+    def test_get_layer_transform_type_and_dim_default_and_configured(self):
+        self.assertEqual(parallel_state_ext.get_layer_transform_type("layer", "x"), "NoOp")
+        self.assertEqual(parallel_state_ext.get_layer_dim("layer", "x"), 0)
+
+        parallel_state_ext._LAYER_COMM_DICT = {
+            "layer": {"x_transform": {"type": "AllGather", "dim": 2}}
+        }
+        self.assertEqual(parallel_state_ext.get_layer_transform_type("layer", "x"), "AllGather")
+        self.assertEqual(parallel_state_ext.get_layer_dim("layer", "x"), 2)
+
+    def test_maybe_pad_and_slice_invalid_dim(self):
+        with self.assertRaises(ValueError):
+            parallel_state_ext.maybe_pad_and_slice(torch.randn(2), dim=2, layer_name_inside_block="x")
+
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.is_layer_parallel_input_split_enabled",
+        return_value=False,
+    )
+    def test_maybe_pad_and_slice_returns_input_when_split_disabled(self, _):
+        tensor = torch.randn(2, 3)
+        out, original = parallel_state_ext.maybe_pad_and_slice(
+            tensor, dim=1, layer_name_inside_block="layer"
+        )
+        self.assertIs(out, tensor)
+        self.assertEqual(original, tensor.shape[1])
+
+    def test_maybe_unpad_and_all_gather_invalid_dim(self):
+        with self.assertRaises(ValueError):
+            parallel_state_ext.maybe_unpad_and_all_gather(
+                torch.randn(2), actual_length=2, dim=3, layer_name_inside_block="x"
+            )
+
+    @patch(
+        "omni_npu.v1.distributed.parallel_state_ext.is_layer_parallel_input_split_enabled",
+        return_value=True,
+    )
+    @patch("omni_npu.v1.distributed.parallel_state_ext.get_layer_parallel_group", return_value=None)
+    def test_maybe_unpad_and_all_gather_returns_input_without_group(self, *_):
+        tensor = torch.randn(2, 3)
+        out = parallel_state_ext.maybe_unpad_and_all_gather(
+            tensor, actual_length=3, dim=1, layer_name_inside_block="layer"
+        )
+        self.assertIs(out, tensor)
+
+    def test_parse_tensor_transform_cfg(self):
+        self.assertIsNone(
+            parallel_state_ext._parse_tensor_transform_cfg(
+                transform_cfg=None,
+                local_rank=0,
+                backend="hccl",
+                group_name="group",
+            )
+        )
+
+        with patch(
+            "omni_npu.v1.distributed.parallel_state_ext._create_group_from_tp_size_or_ranks",
+            return_value="group_obj",
+        ):
+            result = parallel_state_ext._parse_tensor_transform_cfg(
+                transform_cfg={"type": "all_to_all", "dim": "2", "tp_size_or_ranks": [[0]]},
+                local_rank=0,
+                backend="hccl",
+                group_name="group",
+            )
+        self.assertEqual(
+            result,
+            {"type": "ALL2ALL", "dim": 2, "parallel_group": "group_obj"},
+        )
+
+    def test_create_group_from_tp_size_or_ranks(self):
+        with patch(
+            "omni_npu.v1.distributed.parallel_state_ext._tp_size_or_ranks_to_group_ranks",
+            return_value=None,
+        ), patch("omni_npu.v1.distributed.parallel_state_ext.init_model_parallel_group") as mock_init:
+            self.assertIsNone(
+                parallel_state_ext._create_group_from_tp_size_or_ranks(
+                    tp_size_or_ranks=None,
+                    local_rank=0,
+                    backend="hccl",
+                    group_name="g",
+                )
+            )
+            mock_init.assert_not_called()
+
+        with patch(
+            "omni_npu.v1.distributed.parallel_state_ext._tp_size_or_ranks_to_group_ranks",
+            return_value=[[0]],
+        ), patch(
+            "omni_npu.v1.distributed.parallel_state_ext.init_model_parallel_group",
+            return_value="created_group",
+        ) as mock_init:
+            result = parallel_state_ext._create_group_from_tp_size_or_ranks(
+                tp_size_or_ranks=[[0]],
+                local_rank=0,
+                backend="hccl",
+                group_name="g",
+            )
+            self.assertEqual(result, "created_group")
+            mock_init.assert_called_once()
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=False)
+    def test_tp_size_or_ranks_list_requires_initialized_dist(self, _):
+        with self.assertRaises(RuntimeError):
+            parallel_state_ext._tp_size_or_ranks_to_group_ranks([0, 1], "layer")
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.get_world_size", return_value=4)
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=True)
+    def test_tp_size_or_ranks_list_rejects_invalid_nested_types(self, *_):
+        with self.assertRaises(RuntimeError):
+            parallel_state_ext._tp_size_or_ranks_to_group_ranks([0, [1]], "layer")
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.get_world_size", return_value=4)
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=True)
+    def test_tp_size_or_ranks_list_rejects_duplicate_within_group(self, *_):
+        with self.assertRaises(RuntimeError):
+            parallel_state_ext._tp_size_or_ranks_to_group_ranks([[0, 0], [1, 2]], "layer")
+
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.get_world_size", return_value=4)
+    @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=True)
+    def test_tp_size_or_ranks_list_rejects_rank_out_of_range(self, *_):
+        with self.assertRaises(RuntimeError):
+            parallel_state_ext._tp_size_or_ranks_to_group_ranks([[0, 4], [1, 2]], "layer")
+
+    def test_tp_size_or_ranks_unsupported_type_returns_none(self):
+        self.assertIsNone(parallel_state_ext._tp_size_or_ranks_to_group_ranks("invalid", "layer"))
 
     def test_ensure_layer_parallel_initialized_uses_passed_backend(self):
         # Force re-init within this test.
