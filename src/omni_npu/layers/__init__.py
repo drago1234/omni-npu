@@ -24,5 +24,6 @@ from omni_npu.layers.rotary_embedding.yarn_scaling_rope import NPUYaRNScalingRot
 patches_dir = os.getenv("OMNI_NPU_PATCHES_DIR", "")
 if patches_dir == "pangu_sink_swa_mla":
     from omni_npu.layers.mhc.mhc import NPUmHCModule
+    from omni_npu.layers.mome.mome import NPUAggregateConv
 else:
     pass

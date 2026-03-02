@@ -23,16 +23,21 @@ class NPUAggregateConv(AggregateConv):
             batch_size = attn_metadata.query_start_loc.shape[0] - 1
             conv_output_list = []
             for i in range(batch_size):
-                local_input = hidden_states[attn_metadata.query_start_loc[i]: attn_metadata.query_start_loc[i + 1]]
-                conv_input = local_input
-                conv_input_transpose = local_input.unsqueeze(dim=1)
+                s = attn_metadata.query_start_loc[i]
+                e = attn_metadata.query_start_loc[i + 1]
+                local_input = hidden_states[s: e]
+                conv_input = torch.cat([self.cache_states[cache_slot_id[i]].contiguous(), local_input], dim=0)
+                conv_input_transpose = conv_input.unsqueeze(dim=1)
                 weight = self.merge_conv.weight.squeeze(1).transpose(0, 1)
                 conv_output = torch.ops.custom.npu_aggregate_hidden(
-                                conv_input_transpose, weight).reshape(local_input.shape)
+                                conv_input_transpose, weight).reshape(conv_input.shape)
+                conv_output = conv_output[self.cache_length:]
                 if cache_slot_id[i] == 0:
                     conv_output[:self.cache_length] = 0
                 conv_output_list.append(conv_output)
                 self.cache_states[i + 1] = conv_input[-self.cache_length:, :]
+            if e < hidden_states.shape[0]:
+                conv_output_list.append(hidden_states[e:])
             conv_output =  torch.cat(conv_output_list, dim=0)
         else:
             num_tokens = hidden_states.shape[0]
