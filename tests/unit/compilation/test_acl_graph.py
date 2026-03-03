@@ -75,6 +75,10 @@ def test_set_get_graph_params():
 
 def test_update_graph_params_workspaces():
     """Test update_graph_params_workspaces function"""
+    if get_graph_params() is None:
+        aclgraph_capture_sizes = {1, 2, 3}
+        set_graph_params(aclgraph_capture_sizes)
+    
     workspace = torch.tensor([1.0, 2.0, 3.0])
     update_graph_params_workspaces(1, workspace)
 
