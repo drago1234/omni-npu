@@ -2,6 +2,6 @@
     "model_parallel_config": {
     },
     "operator_optimization_config": {
-        "enable_kv_rmsnorm_rope_cache": true
+        "enable_kv_rmsnorm_rope_cache": false
     }
 }
