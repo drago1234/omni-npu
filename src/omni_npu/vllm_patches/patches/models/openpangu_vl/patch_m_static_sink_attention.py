@@ -77,21 +77,27 @@ class create_static_sink_attention_backendPatch(VLLMPatch):
                 common_attn_metadata: CommonAttentionMetadata,
                 fast_build: bool = False,
             ) -> AttentionMetadata:
-                common_attn_metadata.seq_lens[:] = (
-                    common_attn_metadata.seq_lens + self.sink_len
-                )
-                common_attn_metadata.seq_lens[
-                    common_attn_metadata.seq_lens == self.sink_len
-                ] = 0
-                common_attn_metadata.seq_lens_cpu[:] = (
-                    common_attn_metadata.seq_lens_cpu + self.sink_len
-                )
-                common_attn_metadata.seq_lens_cpu[
-                    common_attn_metadata.seq_lens_cpu == self.sink_len
-                ] = 0
-                common_attn_metadata.max_seq_len = (
-                    common_attn_metadata.max_seq_len + self.sink_len
-                )
+                sink_len = self.sink_len
+                if sink_len != 0:
+                    # Keep zero-length requests unchanged while shifting others by sink_len.
+                    seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+                    has_zero_len = bool(seq_lens_cpu.eq(0).any().item())
+
+                    if has_zero_len:
+                        seq_lens = common_attn_metadata.seq_lens
+                        zero_mask = seq_lens.eq(0)
+                        seq_lens.add_(sink_len)
+                        seq_lens.masked_fill_(zero_mask, 0)
+
+                        zero_mask_cpu = seq_lens_cpu.eq(0)
+                        seq_lens_cpu.add_(sink_len)
+                        seq_lens_cpu.masked_fill_(zero_mask_cpu, 0)
+                    else:
+                        common_attn_metadata.seq_lens.add_(sink_len)
+                        seq_lens_cpu.add_(sink_len)
+
+                    if common_attn_metadata.max_seq_len > 0:
+                        common_attn_metadata.max_seq_len += sink_len
 
 
                 return super().build(common_prefix_len, common_attn_metadata, fast_build)

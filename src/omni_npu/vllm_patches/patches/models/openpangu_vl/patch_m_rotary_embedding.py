@@ -1,4 +1,5 @@
 from typing import Any, Dict, Optional, List, Literal
+import numpy as np
 
 import torch
 
@@ -16,9 +17,48 @@ _orig_get_rope = _rope_mod.get_rope
 @register_patch("rotary_embeddingPatch", rotary_embedding)
 class rotary_embeddingPatch(VLLMPatch):
     _attr_names_to_apply = ['get_rope_wrapper', 'MRotaryEmbeddingInterleaved']
-
+    # Class-level NumPy cache for decode position slices, keyed by dtype.
+    _position_cache: Dict[np.dtype, np.ndarray] = {}
 
     #####patch start: for pangu72B-VL
+    @classmethod
+    def _get_np_position_slice(
+        cls,
+        start: int,
+        end: int,
+        dtype: np.dtype,
+    ) -> np.ndarray:
+        """Get a cached np.arange slice for [start, end)."""
+        cache = cls._position_cache.get(dtype)
+        cache_size = 0 if cache is None else cache.shape[0]
+        if cache_size < end:
+            new_size = max(end, cache_size * 2 if cache_size > 0 else 1)
+            cache = np.arange(new_size, dtype=dtype)
+            cls._position_cache[dtype] = cache
+        return cache[start:end]
+
+    @staticmethod 
+    def get_next_input_positions_tensor(
+        out: np.ndarray,
+        out_offset: int,
+        mrope_position_delta: int,
+        context_len: int,
+        num_new_tokens: int,
+    ) -> None:
+        """Get next input positions tensor using cached NumPy arange slices."""
+        if num_new_tokens <= 0:
+            return
+
+        start = mrope_position_delta + context_len
+        # Decode commonly appends one token; avoid slice/cache overhead.
+        if num_new_tokens == 1:
+            out[:, out_offset] = start
+            return
+
+        end = start + num_new_tokens
+        values = rotary_embeddingPatch._get_np_position_slice(start, end, out.dtype)
+        out[:, out_offset : out_offset + num_new_tokens] = values
+
     def get_rope_wrapper(
         head_size: int,
         rotary_dim: int,
@@ -161,6 +201,12 @@ class rotary_embeddingPatch(VLLMPatch):
             self.layer_counts = 0
             self.num_hidden_layers_cache = num_hidden_layers_cache
 
+            rotary_embeddingPatch._get_np_position_slice(
+                0,
+                max_position_embeddings * 4 + self.cache_max_position_num,
+                np.dtype(np.int64),
+            )
+
         def _rebuild_pos_emb(
             self,
             positions: torch.Tensor,
@@ -273,3 +319,6 @@ class rotary_embeddingPatch(VLLMPatch):
     #####patch end
 
     rotary_embedding.MRotaryEmbeddingInterleaved = MRotaryEmbeddingInterleaved
+    rotary_embedding.MRotaryEmbedding.get_next_input_positions_tensor = staticmethod(
+        get_next_input_positions_tensor
+    )
