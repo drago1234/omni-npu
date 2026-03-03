@@ -20,5 +20,45 @@
                 "config_file":"deepseek/ds_r1_a3_hybrid.json"
             }
         }
+    },
+    {
+        "model": "gpt-oss",
+        "hardware": "A3",
+        "precision": "w8a8c16",
+        "configs": {
+            "hybrid": {
+                "config_file": "gpt_oss/gpt_oss_w8a8c16_a3_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "gpt_oss",
+        "hardware": "A3",
+        "precision": "w8a8c16",
+        "configs": {
+            "hybrid": {
+                "config_file": "gpt_oss/gpt_oss_w8a8c16_a3_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "gpt-oss",
+        "hardware": "A2",
+        "precision": "w8a8c16",
+        "configs": {
+            "hybrid": {
+                "config_file": "gpt_oss/gpt_oss_w8a8c16_a2_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "gpt_oss",
+        "hardware": "A2",
+        "precision": "w8a8c16",
+        "configs": {
+            "hybrid": {
+                "config_file": "gpt_oss/gpt_oss_w8a8c16_a2_hybrid.json"
+            }
+        }
     }
 ]

@@ -21,20 +21,24 @@ def register_models():
         "Qwen3VLMoeForConditionalGeneration",
         "omni_npu.v1.models.qwen.qwen3_vl_moe:Qwen3VLMoeForConditionalGeneration")
     ModelRegistry.register_model(
+        "PanguUltraMoEForCausalLM",
+        "omni_npu.v1.models.pangu.pangu_ultra_moe:PanguUltraMoEForCausalLM")
+    ModelRegistry.register_model(
         "Glm4MoeForCausalLM",
         "omni_npu.v1.models.glm.glm4_moe:Glm4MoeForCausalLM")
     ModelRegistry.register_model(
         "Glm4MoeMTPModel",
         "omni_npu.v1.models.glm.glm4_moe_mtp:Glm4MoeMTP")
     ModelRegistry.register_model(
-        "PanguUltraMoEForCausalLM",
-        "omni_npu.v1.models.pangu.pangu_ultra_moe:PanguUltraMoEForCausalLM")
+        "GptOssForCausalLM",
+        "omni_npu.v1.models.gpt_oss.gpt_oss:GptOssForCausalLM")
     ModelRegistry.register_model(
         "OpenPanguMTPModel",
         "omni_npu.v1.models.pangu.pangu_ultra_moe_mtp:OpenPanguMTP")
     ModelRegistry.register_model(
         "PanguProMoEV2ForCausalLM",
         "omni_npu.v1.models.pangu.pangu_pro_moe:PanguProMoEV2ForCausalLM")
+
     import os
 
     if (
@@ -44,8 +48,7 @@ def register_models():
     ):
         from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
         from omni_npu.v1.models.mock.mock import mock_model_class_factory
-        
+
         ModelRegistry.register_model(
-            "Qwen2ForCausalLM", 
+            "Qwen2ForCausalLM",
             mock_model_class_factory(Qwen2ForCausalLM))
-            

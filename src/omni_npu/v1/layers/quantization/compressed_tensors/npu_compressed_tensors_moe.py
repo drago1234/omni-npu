@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import Optional, Callable, Union
+from typing import Optional, Callable, Union, Dict
 from abc import ABC
 
 import torch
@@ -10,7 +10,6 @@ import torch_npu
 from vllm.platforms import current_platform
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config, FusedMoEQuantConfig
-
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
 from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethod
 from omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize import (
@@ -129,7 +128,6 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
             layer.planner = self.planner
             layer.moe_layer_idx = self.moe_layer_idx
 
-        attn_metadata = get_forward_context().attn_metadata
         use_all2all = x.shape[0] > NPUCompressedTensorsW8A8Int8MoEMethodV1.all2all_threshold
 
         if use_all2all:
@@ -189,23 +187,35 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
             dtype=torch.float32,
             device=current_platform.device_type
         )
-        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
-            gate_up_proj,
-            weight_scale=layer.w13_weight_scale,
-            activation_scale=pertoken_scale,
-            bias=None,
-            quant_offset=None,
-            quant_scale=self.scale_2,
-            group_index=expert_tokens,
-            activate_left=True,
-            quant_mode=1)
+        use_swigluoai = getattr(layer, "activation", "silu") == "swigluoai"
+        use_bias = getattr(getattr(self, "moe", None), "has_bias", False)
+
+        dequant_swiglu_quant_kwargs: Dict[str, object] = {
+            "x": gate_up_proj,
+            "weight_scale": layer.w13_weight_scale,
+            "activation_scale": pertoken_scale,
+            "bias": getattr(layer, "w13_bias", None) if use_bias else None,
+            "quant_offset": None,
+            "quant_scale": self.scale_2,
+            "group_index": expert_tokens,
+            "activate_left": True,
+            "quant_mode": 1,
+        }
+        if use_swigluoai:
+            dequant_swiglu_quant_kwargs.update({
+                "swiglu_mode": 1,
+                "clamp_limit": getattr(layer, "swiglu_limit", 0.0),
+                "glu_alpha": getattr(layer, "glu_alpha", 1.0),
+                "glu_bias": getattr(layer, "glu_bias", 0.0),
+            })
+        intermediate_hidden_states, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(**dequant_swiglu_quant_kwargs)
 
         hidden_states_experts = torch_npu.npu_grouped_matmul(
             [intermediate_hidden_states],
             [layer.w2_weight],
             scale=[layer.w2_weight_scale.to(torch.bfloat16)],
             per_token_scale=[pertoken_scale],
-            bias=None,
+            bias=[layer.w2_bias] if use_bias and hasattr(layer, "w2_bias") else None,
             group_list=expert_tokens,
             split_item=3,
             output_dtype=torch.bfloat16,

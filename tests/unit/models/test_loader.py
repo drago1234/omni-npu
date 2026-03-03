@@ -154,6 +154,139 @@ class TestConfigLoaderUnit(unittest.TestCase):
         self.assertEqual(model_name, "some_model")
         self.assertEqual(quant_type, "bf16")
 
+    @patch('os.path.exists', return_value=True)
+    def test_get_best_practice_config_gpt_oss_alias(self, mock_exists):
+        """Test low-latency best-practice config lookup for gpt_oss alias."""
+        parser_stub = MagicMock()
+        parser_stub.register_lazy_parsers = MagicMock()
+        with patch.dict("sys.modules", {"omni_npu.v1.parsers": parser_stub}):
+            from omni_npu.v1.models.config_loader.loader import _get_best_practice_config, TaskConfig
+
+            best_practice_entries = [
+                {
+                    "model": "gpt_oss",
+                    "hardware": "A3",
+                    "precision": "w8a8c16",
+                    "configs": {
+                        "hybrid": {
+                            "config_file": "gpt_oss/gpt_oss_w8a8c16_a3_hybrid.json"
+                        }
+                    },
+                }
+            ]
+            selected_config = {
+                "model_parallel_config": {
+                    "layer_parallel_config": {
+                        "self_attn.o_proj": {
+                            "x_transform": {"type": "NoOp"},
+                            "y_transform": {"type": "AllReduce"},
+                        }
+                    }
+                },
+                "operator_optimization_config": {"decode_moe_dispatch_combine": True},
+            }
+
+            with patch(
+                "omni_npu.v1.models.config_loader.loader._loader_configs_data",
+                side_effect=[best_practice_entries, selected_config],
+            ) as mock_loader:
+                task_config = TaskConfig(
+                    model_name="gpt_oss",
+                    hardware_platform="A3",
+                    quant_type="w8a8c16",
+                    is_pd_disaggregation=False,
+                    enable_low_latency=True,
+                )
+                result = _get_best_practice_config(task_config)
+
+            self.assertEqual(result, selected_config)
+            self.assertEqual(mock_loader.call_count, 2)
+
+    @patch('os.path.exists', return_value=True)
+    def test_get_best_practice_config_gpt_oss_a2_low_latency_hyphen_alias(self, mock_exists):
+        parser_stub = MagicMock()
+        parser_stub.register_lazy_parsers = MagicMock()
+        with patch.dict("sys.modules", {"omni_npu.v1.parsers": parser_stub}):
+            from omni_npu.v1.models.config_loader.loader import _get_best_practice_config, TaskConfig
+
+            best_practice_entries = [
+                {
+                    "model": "gpt-oss",
+                    "hardware": "A2",
+                    "precision": "w8a8c16",
+                    "configs": {
+                        "hybrid": {
+                            "config_file": "gpt_oss/gpt_oss_w8a8c16_a2_hybrid.json"
+                        }
+                    },
+                }
+            ]
+            selected_config = {
+                "model_parallel_config": {
+                    "layer_parallel_config": {
+                        "self_attn.o_proj": {
+                            "x_transform": {"type": "NoOp"},
+                            "y_transform": {"type": "AllReduce"},
+                        }
+                    }
+                },
+                "operator_optimization_config": {"decode_moe_dispatch_combine": False},
+            }
+
+            with patch(
+                "omni_npu.v1.models.config_loader.loader._loader_configs_data",
+                side_effect=[best_practice_entries, selected_config],
+            ):
+                task_config = TaskConfig(
+                    model_name="gpt-oss",
+                    hardware_platform="A2",
+                    quant_type="w8a8c16",
+                    is_pd_disaggregation=False,
+                    enable_low_latency=True,
+                )
+                result = _get_best_practice_config(task_config)
+
+            self.assertEqual(result, selected_config)
+
+    @patch('os.path.exists', return_value=True)
+    def test_get_best_practice_config_gpt_oss_a2_high_throughout_alias(self, mock_exists):
+        parser_stub = MagicMock()
+        parser_stub.register_lazy_parsers = MagicMock()
+        with patch.dict("sys.modules", {"omni_npu.v1.parsers": parser_stub}):
+            from omni_npu.v1.models.config_loader.loader import _get_best_practice_config, TaskConfig
+
+            best_practice_entries = [
+                {
+                    "model": "gpt_oss",
+                    "hardware": "A2",
+                    "precision": "w8a8c16",
+                    "configs": {
+                        "hybrid": {
+                            "config_file": "gpt_oss/gpt_oss_w8a8c16_a2_hybrid.json"
+                        }
+                    },
+                }
+            ]
+            selected_config = {
+                "model_parallel_config": {},
+                "operator_optimization_config": {"decode_moe_dispatch_combine": False},
+            }
+
+            with patch(
+                "omni_npu.v1.models.config_loader.loader._loader_configs_data",
+                side_effect=[best_practice_entries, selected_config],
+            ):
+                task_config = TaskConfig(
+                    model_name="gpt_oss",
+                    hardware_platform="A2",
+                    quant_type="w8a8c16",
+                    is_pd_disaggregation=False,
+                    enable_low_latency=False,
+                )
+                result = _get_best_practice_config(task_config)
+
+            self.assertEqual(result, selected_config)
+
     def test_filter_dict_by_dataclass(self):
         """Test filter_dict_by_dataclass filters valid keys"""
         from omni_npu.v1.models.config_loader.loader import filter_dict_by_dataclass, ModelOperatorOptConfig
@@ -270,7 +403,6 @@ class TestConfigLoaderUnit(unittest.TestCase):
             mock_validate.assert_called_once()
             # Verify that _print_model_config was called
             mock_print.assert_called_once()
-
 
 if __name__ == '__main__':
     unittest.main()

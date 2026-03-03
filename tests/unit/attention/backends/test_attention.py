@@ -315,6 +315,127 @@ class TestNPUAttentionBackendDefaultImpl(unittest.TestCase):
             self.assertAlmostEqual(kwargs['softmax_scale'], 0.125)
             self.assertIs(result, output)
 
+    def test_forward_passes_sink_and_sliding_kwargs(self):
+        sink = torch.randn(8)
+        impl = self.impl_cls(
+            num_heads=8,
+            head_size=128,
+            scale=0.125,
+            num_kv_heads=4,
+            sliding_window=256,
+            attn_type=AttentionType.DECODER,
+            sinks=sink,
+        )
+
+        layer = MagicMock()
+        layer._k_scale_float = 1.0
+        layer._v_scale_float = 1.0
+
+        batch_size = 10
+        device = self.impl_cls.SHARE_MASK_TRIL_SPARSE.device
+        query = torch.randn(batch_size, 8, 128, device=device)
+        key = torch.randn(batch_size, 4, 128, device=device)
+        value = torch.randn(batch_size, 4, 128, device=device)
+        kv_cache = (
+            torch.zeros(batch_size ** 2, 16, 4 * 128, device=device),
+            torch.zeros(batch_size ** 2, 16, 4 * 128, device=device),
+        )
+        output = torch.empty_like(query)
+        prefill_output = output.clone()
+        metadata = self.metadata_cls(
+            num_actual_tokens=10,
+            block_tables=torch.randint(0, 100, (2, 10), device=device),
+            query_cumlens=[10],
+            seq_lens=[10],
+            max_query_len=1,
+            slot_mapping=torch.arange(10, device=device),
+            num_prefills=0,
+            num_decode_tokens=8,
+            num_decodes=2,
+        )
+
+        def fake_scatter_nd_update_(tensor, indices, updates):
+            if indices.ndim == 2 and indices.shape[1] == 1:
+                indices = indices.squeeze(1)
+            tensor[indices] = updates[:indices.shape[0]]
+            return tensor
+
+        with patch('torch_npu.npu_scatter_nd_update_', side_effect=fake_scatter_nd_update_), \
+         patch('torch_npu.npu_fused_infer_attention_score_v2', return_value=(prefill_output,)) as mock_decode:
+            impl.forward(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=metadata,
+                output=output,
+            )
+            kwargs = mock_decode.call_args.kwargs
+            self.assertEqual(kwargs["sparse_mode"], 4)
+            self.assertEqual(kwargs["pre_tokens"], 256)
+            self.assertEqual(kwargs["next_tokens"], 0)
+            self.assertTrue(torch.equal(kwargs["learnable_sink"], sink.view(8)))
+
+    def test_forward_default_sink_none_and_non_sliding_kwargs(self):
+        impl = self.impl_cls(
+            num_heads=8,
+            head_size=128,
+            scale=0.125,
+            num_kv_heads=4,
+            attn_type=AttentionType.DECODER,
+        )
+
+        layer = MagicMock()
+        layer._k_scale_float = 1.0
+        layer._v_scale_float = 1.0
+
+        batch_size = 10
+        device = self.impl_cls.SHARE_MASK_TRIL_SPARSE.device
+        query = torch.randn(batch_size, 8, 128, device=device)
+        key = torch.randn(batch_size, 4, 128, device=device)
+        value = torch.randn(batch_size, 4, 128, device=device)
+        kv_cache = (
+            torch.zeros(batch_size ** 2, 16, 4 * 128, device=device),
+            torch.zeros(batch_size ** 2, 16, 4 * 128, device=device),
+        )
+        output = torch.empty_like(query)
+        prefill_output = output.clone()
+        metadata = self.metadata_cls(
+            num_actual_tokens=10,
+            block_tables=torch.randint(0, 100, (2, 10), device=device),
+            query_cumlens=[10],
+            seq_lens=[10],
+            max_query_len=1,
+            slot_mapping=torch.arange(10, device=device),
+            num_prefills=0,
+            num_decode_tokens=8,
+            num_decodes=2,
+        )
+
+        def fake_scatter_nd_update_(tensor, indices, updates):
+            if indices.ndim == 2 and indices.shape[1] == 1:
+                indices = indices.squeeze(1)
+            tensor[indices] = updates[:indices.shape[0]]
+            return tensor
+
+        with patch('torch_npu.npu_scatter_nd_update_', side_effect=fake_scatter_nd_update_), \
+         patch('torch_npu.npu_fused_infer_attention_score_v2', return_value=(prefill_output,)) as mock_decode:
+            impl.forward(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=metadata,
+                output=output,
+            )
+            kwargs = mock_decode.call_args.kwargs
+            self.assertEqual(kwargs["sparse_mode"], 3)
+            self.assertNotIn("pre_tokens", kwargs)
+            self.assertNotIn("next_tokens", kwargs)
+            self.assertNotIn("learnable_sink", kwargs)
+
     def test_forward_calls_npu_fused_infer_attention_score_bsnd(self):
         head_size = 256
         impl = self.impl_cls(

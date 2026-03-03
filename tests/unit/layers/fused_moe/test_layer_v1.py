@@ -67,7 +67,8 @@ def layer_v1_module(monkeypatch):
 
     loader_module = types.ModuleType("omni_npu.v1.models.config_loader.loader")
     loader_module.model_extra_config = SimpleNamespace(
-        operator_opt_config=SimpleNamespace(enable_prefetch=True, decode_moe_dispatch_combine=True)
+        operator_opt_config=SimpleNamespace(enable_prefetch=True, decode_moe_dispatch_combine=True),
+        task_config=SimpleNamespace(model_name="deepseek_v3", hardware_platform="A3"),
     )
 
     prepare_module = types.ModuleType(
@@ -141,6 +142,24 @@ def test_make_prepare_permute_and_unpermute_finalize_sets_handlers(layer_v1_modu
     assert isinstance(
         kwargs["decode_prepare_permute_and_unpermute_finalize"],
         stubs.prepare_module.DispatchCombinePrepPmtAndUnpmtFinal,
+    )
+
+
+@pytest.mark.unit
+def test_make_prepare_permute_and_unpermute_finalize_sets_agrs_when_config_disabled(
+    layer_v1_module,
+):
+    module, stubs = layer_v1_module
+    stubs.loader.model_extra_config.operator_opt_config.decode_moe_dispatch_combine = False
+
+    layer = module.NPUFusedMoEV1.__new__(module.NPUFusedMoEV1)
+    layer.quant_method = MagicMock()
+    layer.make_prepare_permute_and_unpermute_finalize()
+
+    kwargs = layer.quant_method.set_prepare_permute_and_unpermute_finalize.call_args.kwargs
+    assert isinstance(
+        kwargs["decode_prepare_permute_and_unpermute_finalize"],
+        stubs.prepare_module.AGRSPrepPmtAndUnpmtFinal,
     )
 
 
@@ -246,4 +265,3 @@ def test_forward_tp_padding_and_all_gather(layer_v1_module):
     assert share_output is None
     assert expert_output.shape == (3, 2)
     stubs.distributed.tensor_model_parallel_all_gather.assert_called_once()
-
