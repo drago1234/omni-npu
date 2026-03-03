@@ -41,11 +41,9 @@ class TestConfigLoaderIntegration(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures"""
-        from omni_npu.v1.models.config_loader.loader import model_extra_config
+        from omni_npu.v1.models.config_loader.loader import model_extra_config, ModelExtraConfig
         # Reset global config to default
-        model_extra_config.task_config = None
-        model_extra_config.parall_config = None
-        model_extra_config.operator_opt_config = None
+        model_extra_config = ModelExtraConfig()
 
     def test_config_files_exist(self):
         """Test that required config files exist"""
