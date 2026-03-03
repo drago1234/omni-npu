@@ -307,6 +307,10 @@ class GptOssModel(nn.Module):
             return name.replace(".mlp.experts.down_proj.scale", ".mlp.experts.w2_weight_scale")
         if name.endswith(".mlp.experts.gate_up_proj.scale"):
             return name.replace(".mlp.experts.gate_up_proj.scale", ".mlp.experts.w13_weight_scale")
+        if name.endswith(".mlp.experts.down_proj_bias"):
+            return name.replace(".mlp.experts.down_proj_bias", ".mlp.experts.w2_bias")
+        if name.endswith(".mlp.experts.gate_up_proj_bias"):
+            return name.replace(".mlp.experts.gate_up_proj_bias", ".mlp.experts.w13_bias")
         if name.endswith(".mlp.experts.down_proj.bias"):
             return name.replace(".mlp.experts.down_proj.bias", ".mlp.experts.w2_bias")
         if name.endswith(".mlp.experts.gate_up_proj.bias"):
@@ -315,6 +319,10 @@ class GptOssModel(nn.Module):
             return name.replace(".mlp.experts.down_proj.weight", ".mlp.experts.w2_weight")
         if name.endswith(".mlp.experts.gate_up_proj.weight"):
             return name.replace(".mlp.experts.gate_up_proj.weight", ".mlp.experts.w13_weight")
+        if name.endswith(".mlp.experts.down_proj"):
+            return name.replace(".mlp.experts.down_proj", ".mlp.experts.w2_weight")
+        if name.endswith(".mlp.experts.gate_up_proj"):
+            return name.replace(".mlp.experts.gate_up_proj", ".mlp.experts.w13_weight")
         return name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

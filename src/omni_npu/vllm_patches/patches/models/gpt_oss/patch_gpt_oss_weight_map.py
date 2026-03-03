@@ -12,6 +12,10 @@ _GPT_OSS_MOE_SUFFIX_COMPAT_MAPPER = WeightsMapper(
         ".experts.down_proj.scale": ".experts.w2_weight_scale",
         ".experts.gate_up_proj.bias": ".experts.w13_bias",
         ".experts.down_proj.bias": ".experts.w2_bias",
+        ".experts.gate_up_proj": ".experts.w13_weight",
+        ".experts.down_proj": ".experts.w2_weight",
+        ".experts.gate_up_proj_bias": ".experts.w13_bias",
+        ".experts.down_proj_bias": ".experts.w2_bias",
     },
 )
 

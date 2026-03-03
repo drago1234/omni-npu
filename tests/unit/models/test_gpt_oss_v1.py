@@ -13,7 +13,8 @@ import torch
 
 
 @pytest.mark.unit
-def test_gpt_oss_model_load_weights_remap_and_permute(monkeypatch):
+@pytest.mark.parametrize("moe_name_style", ["legacy", "new", "mixed"])
+def test_gpt_oss_model_load_weights_remap_and_permute(monkeypatch, moe_name_style):
     repo_root = Path(__file__).resolve().parents[3]
     monkeypatch.syspath_prepend(str(repo_root / "src"))
     if not hasattr(torch, "npu"):
@@ -107,6 +108,22 @@ def test_gpt_oss_model_load_weights_remap_and_permute(monkeypatch):
     w13_bias_ckpt = torch.arange(24, dtype=torch.bfloat16).view(4, 6)
     w2_bias_ckpt = torch.arange(8, dtype=torch.bfloat16).view(4, 2)
 
+    if moe_name_style == "legacy":
+        w13_weight_name = "model.layers.0.mlp.experts.gate_up_proj.weight"
+        w2_weight_name = "model.layers.0.mlp.experts.down_proj.weight"
+        w13_bias_name = "model.layers.0.mlp.experts.gate_up_proj.bias"
+        w2_bias_name = "model.layers.0.mlp.experts.down_proj.bias"
+    elif moe_name_style == "new":
+        w13_weight_name = "model.layers.0.mlp.experts.gate_up_proj"
+        w2_weight_name = "model.layers.0.mlp.experts.down_proj"
+        w13_bias_name = "model.layers.0.mlp.experts.gate_up_proj_bias"
+        w2_bias_name = "model.layers.0.mlp.experts.down_proj_bias"
+    else:
+        w13_weight_name = "model.layers.0.mlp.experts.gate_up_proj"
+        w2_weight_name = "model.layers.0.mlp.experts.down_proj.weight"
+        w13_bias_name = "model.layers.0.mlp.experts.gate_up_proj_bias"
+        w2_bias_name = "model.layers.0.mlp.experts.down_proj.bias"
+
     loaded = model.load_weights(
         [
             ("model.layers.0.self_attn.q_proj.weight", q_weight),
@@ -116,12 +133,12 @@ def test_gpt_oss_model_load_weights_remap_and_permute(monkeypatch):
             ("model.layers.0.self_attn.k_proj.bias", k_bias),
             ("model.layers.0.self_attn.v_proj.bias", v_bias),
             ("model.layers.0.self_attn.sinks", sinks_weight),
-            ("model.layers.0.mlp.experts.gate_up_proj.weight", w13_ckpt),
-            ("model.layers.0.mlp.experts.down_proj.weight", w2_ckpt),
+            (w13_weight_name, w13_ckpt),
+            (w2_weight_name, w2_ckpt),
             ("model.layers.0.mlp.experts.gate_up_proj.scale", w13_scale_ckpt),
             ("model.layers.0.mlp.experts.down_proj.scale", w2_scale_ckpt),
-            ("model.layers.0.mlp.experts.gate_up_proj.bias", w13_bias_ckpt),
-            ("model.layers.0.mlp.experts.down_proj.bias", w2_bias_ckpt),
+            (w13_bias_name, w13_bias_ckpt),
+            (w2_bias_name, w2_bias_ckpt),
         ]
     )
 
