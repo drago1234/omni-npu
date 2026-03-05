@@ -41,10 +41,18 @@ class NPUAggregateConv(AggregateConv):
                 conv_output_list.append(hidden_states[e:])
             conv_output =  torch.cat(conv_output_list, dim=0)
         else:
+            batch_size = len(attn_metadata.query_start_loc) - 1
             num_tokens = hidden_states.shape[0]
             conv_input = torch.cat([self.cache_states[cache_slot_id[:num_tokens], ...], hidden_states.unsqueeze(1)], dim=1)
-            conv_input_transpose = conv_input.permute(0, 2, 1)
-            conv_output = self.merge_conv(conv_input_transpose).permute(0, 2, 1).view(-1, self.hidden_size)
+            if batch_size<=8:
+                conv_input_transpose = conv_input.permute(1, 0, 2)
+                weight = self.merge_conv.weight.squeeze(1).transpose(0, 1)
+                conv_output = torch.ops.custom.npu_aggregate_hidden(
+                                conv_input_transpose, weight)
+                conv_output = conv_output[self.cache_length:].view(-1, self.hidden_size)
+            else:
+                conv_input_transpose = conv_input.permute(0, 2, 1)
+                conv_output = self.merge_conv(conv_input_transpose).permute(0, 2, 1).view(-1, self.hidden_size)
             # idx 0 for new requests padding 0
             self.cache_states[1: num_tokens + 1, :, :] = conv_input[:, -self.cache_length:, :]
         return conv_output
