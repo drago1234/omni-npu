@@ -15,6 +15,9 @@ def register_models():
         "Qwen3ForCausalLM",
         "omni_npu.v1.models.qwen.qwen3:Qwen3ForCausalLM")
     ModelRegistry.register_model(
+        "Qwen3MoeForCausalLM",
+        "omni_npu.v1.models.qwen.qwen3_moe:Qwen3MoeForCausalLM")
+    ModelRegistry.register_model(
         "Qwen3VLForConditionalGeneration",
         "omni_npu.v1.models.qwen.qwen3_vl:Qwen3VLForConditionalGeneration")
     ModelRegistry.register_model(

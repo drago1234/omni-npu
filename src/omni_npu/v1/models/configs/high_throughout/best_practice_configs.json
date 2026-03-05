@@ -44,6 +44,16 @@
         }
     },
     {
+        "model": "qwen3_moe",
+        "hardware": "A2",
+        "precision": "w8a8c16",
+        "configs":{
+            "hybrid": {
+                "config_file": "qwen3/qwen3_vl_w8a8c16_a2_hybrid.json"
+            }
+        }
+    },
+    {
         "model": "pangu_ultra_moe",
         "hardware": "A3",
         "precision": "w8a8c16",
