@@ -483,6 +483,40 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
         expected = torch.tensor([[9], [8], [1], [2], [9], [8], [3], [4], [5]], dtype=torch.int32)
         self.assertTrue(torch.equal(out, expected))
 
+    def test_update_sink_kv(self):
+        device = torch.device("cpu")
+        dtype = torch.bfloat16
+        sink_len = 128
+        qk_rope_head_dim = 64
+        kv_lora_rank = 512
+        sink_k_pe = torch.randn(sink_len, qk_rope_head_dim, dtype=dtype, device=device)
+        sink_compressed_kv = torch.randn(sink_len, kv_lora_rank, dtype=dtype, device=device)
+        with patch('vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size', return_value=64), \
+            patch('omni_npu.attention.backends.mla.get_current_vllm_config', return_value=None):
+            impl = NPUMLAImpl(
+                num_heads=32,
+                head_size=128,
+                scale=1.0 / (128 ** 0.5),
+                num_kv_heads=8,
+                alibi_slopes=None,
+                sliding_window=None,
+                logits_soft_cap=None,
+                kv_sharing_target_layer_name=None,
+                qk_nope_head_dim=128,
+                qk_rope_head_dim=64,
+                v_head_dim=128,
+                kv_lora_rank=512,
+                q_lora_rank=256,
+                qk_head_dim=192,
+                kv_b_proj=torch.nn.Linear(512, 8 * 256, bias=False).to(dtype),
+                kv_cache_dtype="auto",
+                attn_type=AttentionType.DECODER,
+            )
+        impl.update_sink_kv(sink_k_pe, sink_compressed_kv)
+        self.assertEqual(impl.sink_len, sink_len)
+        self.assertEqual(impl.sink_k_pe.shape, (sink_len, 1, qk_rope_head_dim))
+        self.assertTrue(torch.equal(impl.sink_compressed_kv, sink_compressed_kv))
+
     def test_forward_prefill_with_sink_and_sliding_window(self):
         device = torch.device("cpu")
         dtype = torch.bfloat16
@@ -525,7 +559,6 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             impl.kv_b_proj = lambda x: (
                 torch.randn(x.shape[0], num_heads * (qk_nope_head_dim + v_head_dim), dtype=dtype, device=device),
             )
-            # For prefill insert path, insert segment shape must match k_pe: [T, R].
             impl.sink_k_pe = torch.randn(sink_len, qk_rope_head_dim, dtype=dtype, device=device)
             impl.sink_compressed_kv = torch.randn(sink_len, kv_lora_rank, dtype=dtype, device=device)
             impl.sink_len = sink_len
@@ -554,31 +587,20 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             kv_cache = (torch.empty(0), torch.empty(0))
             sink_out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
             sink_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
-            normal_out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
-            normal_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
-
-            def mock_merge(output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse):
-                output.copy_(prefix_output + suffix_output)
-                output_lse.copy_(torch.maximum(prefix_lse, suffix_lse))
 
             with patch(
-                "torch.ops.npu.npu_fused_infer_attention_score",
-                side_effect=[(sink_out, sink_lse), (normal_out, normal_lse)],
-            ) as mock_fia, patch(
-                "omni_npu.attention.backends.mla.ops.merge_attn_states",
-                side_effect=mock_merge,
-            ) as mock_merge_op:
+                "torch.ops.custom.npu_fused_infer_attention_sink",
+                return_value=(sink_out, sink_lse),
+            ) as mock_sink_op:
                 result = impl._forward_prefill(q, kv_c_normed, k_pe, kv_cache, metadata, k_scale)
 
-            self.assertEqual(mock_fia.call_count, 2)
-            first_kwargs = mock_fia.call_args_list[0].kwargs
-            second_kwargs = mock_fia.call_args_list[1].kwargs
-            self.assertEqual(first_kwargs["actual_seq_lengths"], [T])
-            self.assertEqual(first_kwargs["actual_seq_lengths_kv"], [sink_len])
-            self.assertEqual(second_kwargs["sparse_mode"], 4)
-            self.assertEqual(second_kwargs["pre_tokens"], sliding_window - 1)
-            self.assertEqual(second_kwargs["actual_seq_lengths_kv"], [T])
-            mock_merge_op.assert_called_once()
+            mock_sink_op.assert_called_once()
+            kwargs = mock_sink_op.call_args.kwargs
+            self.assertEqual(kwargs["actual_seq_qlen"], [T])
+            self.assertEqual(kwargs["actual_seq_kvlen"], [T + sink_len])
+            self.assertEqual(kwargs["sink_number"], sink_len)
+            self.assertEqual(kwargs["pre_tokens"], sliding_window - 1)
+            self.assertEqual(kwargs["sparse_mode"], 4)
             self.assertEqual(result.shape, (T, num_heads * v_head_dim))
 
     def test_forward_decode_with_sink_and_sliding_window(self):
@@ -629,13 +651,13 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 torch.randn(num_blocks, block_size, kv_lora_rank, dtype=dtype, device=device),
                 torch.randn(num_blocks, block_size, qk_rope_head_dim, dtype=dtype, device=device),
             )
+            # seq_lens includes sink: builder adds sink_len to each seq
             decode_meta = NPUMLADecodeMetadata(
                 block_table=torch.randint(0, num_blocks, (T, table_len), dtype=torch.int32, device=device),
-                seq_lens=[5, 3],
+                seq_lens=[5 + sink_len, 3 + sink_len],
                 query_cumlens=[1, 2],
                 dcp_tot_seq_lens=None,
             )
-            decode_meta.seq_sink_len = [sink_len, sink_len]
             metadata = NPUMLAMetadata(
                 prefill=None,
                 decode=decode_meta,
@@ -649,26 +671,20 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 max_seq_len=1,
                 query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
             )
-            sink_out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
-            sink_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
-            normal_out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
-            normal_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
+            sink_out = torch.randn(num_heads, T, v_head_dim, dtype=dtype, device=device)
             with patch(
-                "torch.ops.npu.npu_fused_infer_attention_score_v2",
-                return_value=(sink_out, sink_lse),
-            ) as mock_fia_v2, patch(
-                "torch.ops.npu.npu_fused_infer_attention_score",
-                return_value=(normal_out, normal_lse),
-            ) as mock_fia:
+                "torch.ops.custom.npu_fused_infer_attention_sink",
+                return_value=(sink_out.transpose(0, 1).contiguous(),),
+            ) as mock_sink_op:
                 o = impl._forward_decode(decode_ql_nope, decode_q_pe, kv_cache, metadata, MagicMock())
-            mock_fia_v2.assert_called_once()
-            mock_fia.assert_called_once()
-            kwargs_v2 = mock_fia_v2.call_args.kwargs
-            kwargs = mock_fia.call_args.kwargs
-            self.assertEqual(kwargs_v2["actual_seq_kvlen"], [sink_len, sink_len])
-            self.assertEqual(kwargs["sparse_mode"], 4)
+            mock_sink_op.assert_called_once()
+            kwargs = mock_sink_op.call_args.kwargs
+            self.assertEqual(kwargs["actual_seq_qlen"], [1, 2])
+            self.assertEqual(kwargs["actual_seq_kvlen"], [5 + sink_len, 3 + sink_len])
+            self.assertEqual(kwargs["sink_number"], sink_len)
             self.assertEqual(kwargs["pre_tokens"], sliding_window - 1)
-            self.assertEqual(kwargs["block_table"].shape, (T, table_len - (sink_len // 128)))
+            self.assertEqual(kwargs["sparse_mode"], 4)
+            self.assertEqual(kwargs["block_table"].shape, (T, table_len))
             self.assertEqual(o.shape, (num_heads, T, v_head_dim))
 
     def test_forward_prefill_with_sink_without_sliding_window(self):
@@ -712,7 +728,6 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             impl.kv_b_proj = lambda x: (
                 torch.randn(x.shape[0], num_heads * (qk_nope_head_dim + v_head_dim), dtype=dtype, device=device),
             )
-            # Keep sink_k_pe 2D to match k_pe shape in prefill insert path.
             impl.sink_k_pe = torch.randn(sink_len, qk_rope_head_dim, dtype=dtype, device=device)
             impl.sink_compressed_kv = torch.randn(sink_len, kv_lora_rank, dtype=dtype, device=device)
             impl.sink_len = sink_len
@@ -741,17 +756,20 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             kv_cache = (torch.empty(0), torch.empty(0))
             out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
             out_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
+            # When sink_len > 0, uses npu_fused_infer_attention_sink with pre_tokens=MAX_WINDOW_SIZE
             with patch(
-                "torch.ops.npu.npu_fused_infer_attention_score",
+                "torch.ops.custom.npu_fused_infer_attention_sink",
                 return_value=(out, out_lse),
-            ) as mock_fia:
+            ) as mock_sink_op:
                 result = impl._forward_prefill(q, kv_c_normed, k_pe, kv_cache, metadata, k_scale)
-            mock_fia.assert_called_once()
-            kwargs = mock_fia.call_args.kwargs
-            self.assertEqual(kwargs["sparse_mode"], 3)
-            self.assertEqual(kwargs["actual_seq_lengths"], [T])
-            self.assertEqual(kwargs["actual_seq_lengths_kv"], [T + sink_len])
-            self.assertEqual(kwargs["softmax_lse_flag"], False)
+            mock_sink_op.assert_called_once()
+            kwargs = mock_sink_op.call_args.kwargs
+            self.assertEqual(kwargs["sparse_mode"], 4)
+            self.assertEqual(kwargs["actual_seq_qlen"], [T])
+            self.assertEqual(kwargs["actual_seq_kvlen"], [T + sink_len])
+            self.assertEqual(kwargs["sink_number"], sink_len)
+            self.assertEqual(kwargs["pre_tokens"], NPUMLAImpl.MAX_WINDOW_SIZE)
+            self.assertEqual(kwargs["return_softmax_lse"], False)
             self.assertEqual(result.shape, (T, num_heads * v_head_dim))
 
     def test_forward_decode_with_sink_without_sliding_window(self):
@@ -801,13 +819,13 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 torch.randn(num_blocks, block_size, kv_lora_rank, dtype=dtype, device=device),
                 torch.randn(num_blocks, block_size, qk_rope_head_dim, dtype=dtype, device=device),
             )
+            # seq_lens includes sink: builder adds sink_len to each seq
             decode_meta = NPUMLADecodeMetadata(
                 block_table=torch.randint(0, num_blocks, (T, table_len), dtype=torch.int32, device=device),
-                seq_lens=[5, 3],
+                seq_lens=[5 + sink_len, 3 + sink_len],
                 query_cumlens=[1, 2],
                 dcp_tot_seq_lens=None,
             )
-            decode_meta.seq_sink_len = [sink_len, sink_len]
             metadata = NPUMLAMetadata(
                 prefill=None,
                 decode=decode_meta,
@@ -821,24 +839,19 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 max_seq_len=1,
                 query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
             )
-            sink_out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
-            sink_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
-            normal_out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
-            normal_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
+            # npu_fused_infer_attention_sink returns (T, N, D), impl transposes to (N, T, D)
+            sink_out = torch.randn(num_heads, T, v_head_dim, dtype=dtype, device=device)
             with patch(
-                "torch.ops.npu.npu_fused_infer_attention_score_v2",
-                return_value=(sink_out, sink_lse),
-            ) as mock_fia_v2, patch(
-                "torch.ops.npu.npu_fused_infer_attention_score",
-                return_value=(normal_out, normal_lse),
-            ) as mock_fia:
+                "torch.ops.custom.npu_fused_infer_attention_sink",
+                return_value=(sink_out.transpose(0, 1).contiguous(),),
+            ) as mock_sink_op:
                 o = impl._forward_decode(decode_ql_nope, decode_q_pe, kv_cache, metadata, MagicMock())
-            mock_fia_v2.assert_called_once()
-            mock_fia.assert_called_once()
-            kwargs = mock_fia.call_args.kwargs
-            self.assertEqual(kwargs["sparse_mode"], 3)
-            self.assertNotIn("pre_tokens", kwargs)
-            self.assertEqual(kwargs["actual_seq_lengths_kv"], [5, 3])
+            mock_sink_op.assert_called_once()
+            kwargs = mock_sink_op.call_args.kwargs
+            self.assertEqual(kwargs["sparse_mode"], 4)
+            self.assertEqual(kwargs["pre_tokens"], NPUMLAImpl.MAX_WINDOW_SIZE)
+            self.assertEqual(kwargs["actual_seq_kvlen"], [5 + sink_len, 3 + sink_len])
+            self.assertEqual(kwargs["sink_number"], sink_len)
             self.assertEqual(o.shape, (num_heads, T, v_head_dim))
 
     def test_forward_decode(self):

@@ -140,7 +140,7 @@ class ACLGraphWrapper:
         attn_metadata =  get_forward_context().attn_metadata
         asl = None
         aslkv = None
-        seq_sink_lens = None
+        sink_len = None
         is_gqa = False
         if attn_metadata is not None:
             for _, metadata in attn_metadata.items():
@@ -155,7 +155,7 @@ class ACLGraphWrapper:
                     # MLA
                     asl = metadata.decode.query_cumlens
                     aslkv = metadata.decode.seq_lens
-                    seq_sink_lens = getattr(metadata.decode, "seq_sink_len", None)
+                    sink_len = getattr(metadata.decode, "sink_len", None)
                     break
 
         if (
@@ -257,14 +257,10 @@ class ACLGraphWrapper:
                 aslkv = self._pad_list(aslkv, padding_lens, 0) # padding  aslkv to match gear
                 asl = self._pad_list(asl, padding_lens) # padding  asl to match gear
                 # FIXME: for TND FIA validation
-                if aslkv[-1] != 0 or (not is_gqa and seq_sink_lens is None):
+                if sink_len is None and (aslkv[-1] != 0 or (not is_gqa)):
                     aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
                 asl[-1] = batch_descriptor.num_tokens
-                if seq_sink_lens is not None:
-                    seq_sink_lens = self._pad_list(seq_sink_lens, padding_lens) # padding seq_sink_lens to match gear
-                    entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": seq_sink_lens, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
-                else:
-                    entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
+                entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
         else:
             raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
         return entry.output
