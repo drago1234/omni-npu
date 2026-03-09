@@ -1,6 +1,8 @@
+import inspect
+import types
+
 from itertools import count
 from unittest.mock import MagicMock
-import inspect
 from typing import Any
 
 import torch
@@ -12,6 +14,21 @@ from vllm.v1.outputs import ModelRunnerOutput, KVConnectorOutput
 from vllm.v1.request import Request
 from vllm import SamplingParams
 
+
+def mock_with_default_value(cls):
+    mock_obj = MagicMock()
+    for k, v in cls.__dict__.items():
+        if k.startswith("__"):
+            continue
+        if not callable(v):
+            setattr(mock_obj, k, v)
+        elif isinstance(v, staticmethod):
+            setattr(mock_obj, k, v.__func__)
+        elif isinstance(v, classmethod):
+            setattr(mock_obj, k, types.MethodType(v.__func__, cls))
+        elif inspect.isfunction(v):
+            setattr(mock_obj, k, types.MethodType(v, mock_obj))
+    return mock_obj
 
 def create_vllm_config(
     kv_role: str="kv_producer",
@@ -30,7 +47,7 @@ def create_vllm_config(
         enable_chunked_prefill=enable_chunked_prefill,
         is_encoder_decoder=False,
     )
-    model_config = MagicMock()
+    model_config = mock_with_default_value(ModelConfig)
     model_config.max_model_len = max_model_len
     model_config.is_encoder_decoder = False
     model_config.is_multimodal_model = False

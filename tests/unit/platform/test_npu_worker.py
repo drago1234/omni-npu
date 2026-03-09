@@ -6,7 +6,9 @@ import pytest
 from omni_npu.worker.npu_worker import NPUWorker
 from tests.unit.platform.utils import create_vllm_config, DeviceConfig
 
+
 class TestNpuWorker:
+
     def setup_method(self):
         self.vllm_cfg = create_vllm_config()
         self.vllm_cfg.device_config = DeviceConfig("npu")
@@ -26,7 +28,8 @@ class TestNpuWorker:
             dist_backend="hccl",
             is_sleep_mode_available=lambda: True,
         )
-        monkeypatch.setattr("omni_npu.worker.npu_worker.current_platform", mock_platform)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.current_platform",
+                            mock_platform)
 
         # Mock torch.npu related operations
         monkeypatch.setattr("torch.npu.empty_cache", lambda: None)
@@ -39,7 +42,8 @@ class TestNpuWorker:
             "omni_npu.worker.npu_worker.init_worker_distributed_environment",
             lambda *args, **kwargs: None,
         )
-        monkeypatch.setattr("omni_npu.worker.npu_worker.set_random_seed", lambda seed: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.set_random_seed",
+                            lambda seed: None)
 
         # Mock NPUModelRunner
         mock_model_runner = MagicMock()
@@ -105,7 +109,7 @@ class TestNpuWorker:
         result = worker.get_kv_connector_handshake_metadata()
         assert result == {0: mock_metadata}
 
-    @pytest.mark.skip(reason="Skipping test_npu_runner_init_with_rejection_sampler due to mock conflicts @sunhaochen")
+    @pytest.mark.skip(reason="Skipping test_init_device due to mock conflicts @sunhaochen")
     def test_init_device(self, monkeypatch):
         """Test init_device method.
         
@@ -118,14 +122,11 @@ class TestNpuWorker:
         worker.local_rank = 0
         # Create mock model_config with required attributes
         mock_hf_config = SimpleNamespace(
-            architectures=["TestModel"],
             model_type="test_model",
+            quantization_config=None,
         )
         mock_registry = MagicMock()
-        # Mock resolve_model_cls to return (model_cls, arch) tuple
-        mock_model_cls = MagicMock()
-        mock_registry.resolve_model_cls.return_value = (mock_model_cls, "TestModel")
-        
+
         worker.model_config = SimpleNamespace(
             seed=42,
             hf_config=mock_hf_config,
@@ -133,26 +134,37 @@ class TestNpuWorker:
         )
         worker.cache_config = SimpleNamespace(gpu_memory_utilization=0.9)
         worker.rank = 0
+        worker.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
 
         # Mock _init_profiler
-        worker._init_profiler = lambda: None
-        
+        mock_profiler = MagicMock()
+        worker._init_profiler = MagicMock(return_value=mock_profiler)
+
         # Mock _init_omni_eplb_configs to avoid dependencies
         mock_init_eplb = MagicMock()
         monkeypatch.setattr(
             "omni_npu.distributed.eplb_state._init_omni_eplb_configs",
             mock_init_eplb,
         )
-        
-        # Mock get_model_architecture and _get_model_architecture to avoid model loading dependencies
-        mock_model_cls = MagicMock()
+
+        # Mock load_model_extra_config to avoid dependencies
+        mock_load_config = MagicMock()
         monkeypatch.setattr(
-            "vllm.model_executor.model_loader.utils.get_model_architecture",
-            lambda model_config: (mock_model_cls, "TestModel"),
+            "omni_npu.worker.npu_worker.load_model_extra_config",
+            mock_load_config,
         )
+
+        # Mock torch_npu.npu.get_device_name to avoid device dependency
         monkeypatch.setattr(
-            "vllm.model_executor.model_loader.utils._get_model_architecture",
-            lambda model_config: (mock_model_cls, "TestModel"),
+            "torch_npu.npu.get_device_name",
+            lambda device: "Ascend910B",
+        )
+
+        # Mock NPUModelRunner initialization
+        mock_model_runner = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.NPUModelRunner",
+            MagicMock(return_value=mock_model_runner),
         )
 
         worker.init_device()
@@ -160,9 +172,14 @@ class TestNpuWorker:
         assert worker.device == torch.device("npu:0")
         assert hasattr(worker, "init_snapshot")
         assert hasattr(worker, "requested_memory")
-        assert worker.model_runner is not None
+        assert worker.model_runner is mock_model_runner
+        assert worker.profiler is mock_profiler
+        mock_load_config.assert_called_once_with(worker.model_config,
+                                                 worker.vllm_config,
+                                                 worker.scheduler_config)
+        mock_init_eplb.assert_called_once()
 
-    @pytest.mark.skip(reason="Skipping test_npu_runner_init_with_rejection_sampler due to mock conflicts @sunhaochen")
+    @pytest.mark.skip(reason="Skipping test_init_device_with_custom_model_enable due to mock conflicts @sunhaochen")
     def test_init_device_with_custom_model_enable(self, monkeypatch):
         """Test init_device with VLLM_CUSTOM_MODEL_ENABLE environment variable (covers lines 91-95).
         
@@ -177,16 +194,22 @@ class TestNpuWorker:
             model_type="test_model",
             quantization_config=None,
         )
-        worker.model_config = SimpleNamespace(seed=42, hf_config=mock_hf_config)
+        worker.model_config = SimpleNamespace(seed=42,
+                                              hf_config=mock_hf_config)
         worker.cache_config = SimpleNamespace(gpu_memory_utilization=0.9)
         worker.rank = 0
-        worker._init_profiler = lambda: None
+        worker.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
+
+        # Mock _init_profiler
+        mock_profiler = MagicMock()
+        worker._init_profiler = MagicMock(return_value=mock_profiler)
 
         # Set environment variable
         monkeypatch.setenv("VLLM_PLUGINS", "omni_custom_models")
 
         # Mock ensure_layer_parallel_initialized
         ensure_called = {"called": False}
+
         def mock_ensure_layer_parallel_initialized(backend):
             ensure_called["called"] = True
             ensure_called["backend"] = backend
@@ -198,15 +221,27 @@ class TestNpuWorker:
 
         # Mock load_model_extra_config to avoid file system dependencies
         mock_load_config = MagicMock()
+        # Mock both potential import paths
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.load_model_extra_config",
+            mock_load_config,
+        )
         monkeypatch.setattr(
             "omni_npu.v1.models.config_loader.loader.load_model_extra_config",
             mock_load_config,
         )
 
-        # Mock torch_npu.npu.get_device_name to avoid hardware dependency
+        # Mock torch_npu.npu.get_device_name to avoid device dependency
         monkeypatch.setattr(
             "torch_npu.npu.get_device_name",
-            lambda device: "Ascend910",
+            lambda device: "Ascend910B",
+        )
+
+        # Mock NPUModelRunner initialization
+        mock_model_runner = MagicMock()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.NPUModelRunner",
+            MagicMock(return_value=mock_model_runner),
         )
 
         # Mock _init_omni_eplb_configs to avoid dependencies
@@ -220,7 +255,7 @@ class TestNpuWorker:
 
         assert ensure_called["called"] is True
         assert ensure_called["backend"] == "hccl"
-        # Verify load_model_extra_config was called
+        # Verify load_model_extra_config was called exactly once
         mock_load_config.assert_called_once()
 
     def test_init_device_unsupported_device_type(self, monkeypatch):
@@ -244,7 +279,8 @@ class TestNpuWorker:
         with pytest.raises(RuntimeError, match="Not support device type"):
             worker.init_device()
 
-    def test_determine_available_memory_reset_peak_exception(self, monkeypatch):
+    def test_determine_available_memory_reset_peak_exception(
+            self, monkeypatch):
         """Test determine_available_memory with reset_peak_memory_stats exception handling (covers lines 132-133).
         
         Verifies that exceptions from reset_peak_memory_stats are properly
@@ -263,7 +299,8 @@ class TestNpuWorker:
         def raise_exception():
             raise Exception("Reset failed")
 
-        monkeypatch.setattr("torch.npu.reset_peak_memory_stats", raise_exception)
+        monkeypatch.setattr("torch.npu.reset_peak_memory_stats",
+                            raise_exception)
         monkeypatch.setattr("torch.npu.mem_get_info", lambda: (500, 2000))
         monkeypatch.setattr("torch.npu.max_memory_allocated", lambda: 300)
 
@@ -271,7 +308,10 @@ class TestNpuWorker:
         result = worker.determine_available_memory()
         assert result == 1500
 
-    @pytest.mark.skip(reason="Skipping test_npu_runner_init_with_rejection_sampler due to mock conflicts @sunhaochen")
+    @pytest.mark.skip(
+        reason=
+        "Skipping test_npu_runner_init_with_rejection_sampler due to mock conflicts @sunhaochen"
+    )
     def test_init_profiler_full(self, monkeypatch):
         """Test _init_profiler full implementation (covers lines 236-267).
         
@@ -303,9 +343,12 @@ class TestNpuWorker:
             "torch_npu.profiler.profile",
             lambda **kwargs: mock_profiler,
         )
-        monkeypatch.setattr("vllm.envs.VLLM_TORCH_PROFILER_DIR", "/tmp/profiler")
-        monkeypatch.setattr("vllm.envs.VLLM_TORCH_PROFILER_RECORD_SHAPES", True)
-        monkeypatch.setattr("vllm.envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY", True)
+        monkeypatch.setattr("vllm.envs.VLLM_TORCH_PROFILER_DIR",
+                            "/tmp/profiler")
+        monkeypatch.setattr("vllm.envs.VLLM_TORCH_PROFILER_RECORD_SHAPES",
+                            True)
+        monkeypatch.setattr(
+            "vllm.envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY", True)
         monkeypatch.setattr("vllm.envs.VLLM_TORCH_PROFILER_WITH_STACK", True)
         monkeypatch.setattr("vllm.envs.VLLM_TORCH_PROFILER_WITH_FLOPS", True)
 
@@ -386,7 +429,7 @@ class TestNpuWorker:
         # Prepare mock return values
         mock_kv_spec = {"layer_0": MagicMock()}
         mock_model = MagicMock()
-        mock_tasks = (MagicMock(),)
+        mock_tasks = (MagicMock(), )
         mock_draft_tokens = MagicMock()
         mock_sample_result = MagicMock()
         mock_lora_result = True
@@ -422,7 +465,8 @@ class TestNpuWorker:
         # Test sample_tokens
         mock_grammar_output = MagicMock()
         assert worker.sample_tokens(mock_grammar_output) is mock_sample_result
-        worker.model_runner.sample_tokens.assert_called_once_with(mock_grammar_output)
+        worker.model_runner.sample_tokens.assert_called_once_with(
+            mock_grammar_output)
 
         # Test add_lora
         mock_lora_request = MagicMock()
@@ -453,9 +497,11 @@ class TestNpuWorker:
 
         # Mock ensure_kv_transfer_initialized
         ensure_kv_initialized_called = {"called": False}
+
         def mock_ensure_kv_initialized(vllm_config, kv_cache_config):
             ensure_kv_initialized_called["called"] = True
-            ensure_kv_initialized_called["args"] = (vllm_config, kv_cache_config)
+            ensure_kv_initialized_called["args"] = (vllm_config,
+                                                    kv_cache_config)
 
         monkeypatch.setattr(
             "omni_npu.worker.npu_worker.ensure_kv_transfer_initialized",
@@ -466,30 +512,30 @@ class TestNpuWorker:
         mock_allocator = MagicMock()
         monkeypatch.setattr(
             "omni_npu.worker.npu_worker.NpuMemAllocator.get_instance",
-            lambda: mock_allocator
-        )
+            lambda: mock_allocator)
 
         # Mock model_extra_config
         monkeypatch.setattr(
             "omni_npu.worker.npu_worker.model_extra_config.operator_opt_config.use_omni_cache",
-            True
-        )
+            True)
 
         worker.initialize_from_config(mock_kv_cache_config)
 
         # Assertions
         assert ensure_kv_initialized_called["called"] is True
-        assert ensure_kv_initialized_called["args"] == (worker.vllm_config, mock_kv_cache_config)
+        assert ensure_kv_initialized_called["args"] == (worker.vllm_config,
+                                                        mock_kv_cache_config)
         mock_allocator.use_memory_pool.assert_not_called()
-        worker.model_runner.initialize_omni_kv_cache.assert_called_once_with(mock_kv_cache_config)
+        worker.model_runner.initialize_omni_kv_cache.assert_called_once_with(
+            mock_kv_cache_config)
 
         # Test case: use_omni_cache is False
         monkeypatch.setattr(
             "omni_npu.worker.npu_worker.model_extra_config.operator_opt_config.use_omni_cache",
-            False
-        )
+            False)
         worker.initialize_from_config(mock_kv_cache_config)
-        worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
+        worker.model_runner.initialize_kv_cache.assert_called_once_with(
+            mock_kv_cache_config)
 
         # Test case: sleep mode is enabled
         worker.model_config.enable_sleep_mode = True
@@ -564,14 +610,13 @@ class TestNpuWorker:
         mock_allocator = MagicMock()
         monkeypatch.setattr(
             "omni_npu.worker.npu_worker.NpuMemAllocator.get_instance",
-            lambda: mock_allocator
-        )
+            lambda: mock_allocator)
         mock_allocator.get_current_usage.return_value = 0
 
         worker.load_model()
 
         # Assertions
-        mock_allocator.use_memory_pool.assert_not_called() 
+        mock_allocator.use_memory_pool.assert_not_called()
         worker.model_runner.load_model.assert_called_once()
 
         # Test case: sleep mode is enabled
@@ -582,7 +627,10 @@ class TestNpuWorker:
 
         # Test case: allocator usage is not zero
         mock_allocator.get_current_usage.return_value = 1
-        with pytest.raises(RuntimeError, match="Sleep mode can only be used for one instance per process."):
+        with pytest.raises(
+                RuntimeError,
+                match=
+                "Sleep mode can only be used for one instance per process."):
             worker.load_model()
 
     def test_execute_dummy_batch(self, monkeypatch):
@@ -596,10 +644,8 @@ class TestNpuWorker:
         worker.execute_dummy_batch()
 
         worker.model_runner._dummy_run.assert_called_once_with(
-            1, uniform_decode=True, force_attention=True
-        )
+            1, uniform_decode=True, force_attention=True)
 
-    @pytest.mark.skip(reason="Skipping test_npu_runner_init_with_rejection_sampler due to mock conflicts @sunhaochen")
     def test_execute_model(self, monkeypatch):
         """Test execute_model method.
         
@@ -618,6 +664,12 @@ class TestNpuWorker:
             worker.profile_already_start = False
         if not hasattr(worker, "profile_finished"):
             worker.profile_finished = False
+        if not hasattr(worker, "profile_step"):
+            worker.profile_step = 0
+        if not hasattr(worker, "profiler_token_threshold"):
+            worker.profiler_token_threshold = 0
+        if not hasattr(worker, "profiler_stop_step"):
+            worker.profiler_stop_step = 0
 
         # Mock scheduler_output
         mock_scheduler_output = SimpleNamespace(
@@ -631,7 +683,8 @@ class TestNpuWorker:
         worker.profiler = None
         result = worker.execute_model(mock_scheduler_output)
         assert result is mock_output
-        worker.model_runner.execute_model.assert_called_once_with(mock_scheduler_output)
+        worker.model_runner.execute_model.assert_called_once_with(
+            mock_scheduler_output)
 
         # Test case: profiler exists but token threshold is not enabled
         mock_profiler = MagicMock()
@@ -651,6 +704,8 @@ class TestNpuWorker:
         monkeypatch.setenv("PROFILER_STOP_STEP", "5")
         import vllm.envs as envs
         monkeypatch.setattr(envs, "VLLM_TORCH_PROFILER_DIR", "/tmp/profiler")
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.envs.VLLM_TORCH_PROFILER_DIR", "/tmp/profiler")
 
         worker._use_token_for_profile = True
         worker.profile_already_start = False
@@ -672,6 +727,86 @@ class TestNpuWorker:
         assert worker.profile_finished is True
         mock_profiler.stop.assert_called_once()
 
+    def test_init_profiler(self, monkeypatch):
+        """Test _init_profiler method.
+        
+        Verifies profiler initialization in different scenarios:
+        - Profiler disabled (no VLLM_TORCH_PROFILER_DIR)
+        - Profiler enabled with token threshold
+        - Profiler enabled without token threshold
+        """
+        worker = self._create_worker(monkeypatch)
+
+        # Test case: profiler disabled
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.envs.VLLM_TORCH_PROFILER_DIR", None)
+        monkeypatch.delenv("PROFILER_TOKEN_THRESHOLD", raising=False)
+        monkeypatch.delenv("PROFILER_STOP_STEP", raising=False)
+
+        profiler = worker._init_profiler()
+        assert profiler is None
+        assert worker._use_token_for_profile is False
+        assert worker.profile_already_start is False
+        assert worker.profile_finished is False
+
+        # Test case: profiler enabled with token threshold
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.envs.VLLM_TORCH_PROFILER_DIR",
+            "/tmp/profiler")
+        monkeypatch.setenv("PROFILER_TOKEN_THRESHOLD", "10")
+        monkeypatch.setenv("PROFILER_STOP_STEP", "20")
+
+        # Mock torch_npu.profiler to avoid NPU dependency
+        mock_profiler = MagicMock()
+        mock_tensorboard_trace_handler = MagicMock()
+        mock_experimental_config = MagicMock()
+
+        monkeypatch.setattr(
+            "torch_npu.profiler.profile",
+            MagicMock(return_value=mock_profiler),
+        )
+        monkeypatch.setattr(
+            "torch_npu.profiler.tensorboard_trace_handler",
+            mock_tensorboard_trace_handler,
+        )
+        monkeypatch.setattr(
+            "torch_npu.profiler._ExperimentalConfig",
+            MagicMock(return_value=mock_experimental_config),
+        )
+        monkeypatch.setattr(
+            "torch_npu.profiler.AiCMetrics",
+            SimpleNamespace(PipeUtilization="pipe_utilization"),
+        )
+        monkeypatch.setattr(
+            "torch_npu.profiler.ProfilerLevel",
+            SimpleNamespace(Level1="level1"),
+        )
+        monkeypatch.setattr(
+            "torch_npu.profiler.ProfilerActivity",
+            SimpleNamespace(CPU="cpu", NPU="npu"),
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.envs.VLLM_TORCH_PROFILER_RECORD_SHAPES",
+            False)
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.envs.VLLM_TORCH_PROFILER_WITH_PROFILE_MEMORY",
+            False)
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.envs.VLLM_TORCH_PROFILER_WITH_STACK",
+            False)
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_worker.envs.VLLM_TORCH_PROFILER_WITH_FLOPS",
+            False)
+
+        profiler = worker._init_profiler()
+
+        assert profiler is not None
+        assert worker._use_token_for_profile is True
+        assert worker.profiler_token_threshold == 10
+        assert worker.profiler_stop_step == 20
+        assert worker.profile_already_start is False
+        assert worker.profile_finished is False
+
     def test_sleep(self, monkeypatch):
         """Test the sleep method."""
         worker = self._create_worker(monkeypatch)
@@ -680,18 +815,16 @@ class TestNpuWorker:
         mock_allocator = MagicMock()
         monkeypatch.setattr(
             "omni_npu.worker.npu_mem_pool.NpuMemAllocator.get_instance",
-            lambda: mock_allocator
-        )
+            lambda: mock_allocator)
         # Update memory info after sleep
-        monkeypatch.setattr(
-            "torch.npu.mem_get_info",
-            lambda: (15 * (1 << 30), 20 * (1 << 30))
-        )
+        monkeypatch.setattr("torch.npu.mem_get_info", lambda:
+                            (15 * (1 << 30), 20 * (1 << 30)))
 
         worker.sleep(level=1)
 
         # Assertions
-        mock_allocator.sleep.assert_called_once_with(offload_tags=("weights",))
+        mock_allocator.sleep.assert_called_once_with(
+            offload_tags=("weights", ))
 
     def test_wake_up(self, monkeypatch):
         """Test the wake_up method."""
@@ -701,10 +834,10 @@ class TestNpuWorker:
         mock_allocator = MagicMock()
         monkeypatch.setattr(
             "omni_npu.worker.npu_mem_pool.NpuMemAllocator.get_instance",
-            lambda: mock_allocator
-        )
+            lambda: mock_allocator)
 
         worker.wake_up(tags=['weights', 'kv_cache'])
 
         # Assertions
-        mock_allocator.wake_up.assert_called_once_with(tags=['weights', 'kv_cache'])
+        mock_allocator.wake_up.assert_called_once_with(
+            tags=['weights', 'kv_cache'])
