@@ -124,11 +124,21 @@
     },
     {
         "model": "PanguProMoE",
+        "hardware": "A2",
+        "precision": "bf16",
+        "configs":{
+            "hybrid":{
+                "config_file":"pangu_pro_moe/pangu_pro_moe_bf16_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "PanguProMoE",
         "hardware": "A3",
         "precision": "bf16",
         "configs":{
             "hybrid":{
-                "config_file":"pangu_pro_moe/pangu_pro_moe_bf16_a3_hybrid.json"
+                "config_file":"pangu_pro_moe/pangu_pro_moe_bf16_hybrid.json"
             }
         }
     }

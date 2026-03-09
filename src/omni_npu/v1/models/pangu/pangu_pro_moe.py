@@ -71,57 +71,150 @@ class NPUOpenPanguSinkAttention(VllmOpenPanguSinkAttention):
         **kwargs,
     ) -> None:
         super().__init__(config, hidden_size, num_heads, num_kv_heads, **kwargs)
-        object.__setattr__(self, "enable_kv_rmsnorm_rope_cache", model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache)
+        # Whether to use the fused operator: k RMSNorm + RoPE + KV cache update
+        object.__setattr__(
+            self,
+            "enable_kv_rmsnorm_rope_cache",
+            model_extra_config.operator_opt_config.enable_kv_rmsnorm_rope_cache,
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+
+        # QKV projection.
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-        if self.enable_kv_rmsnorm_rope_cache:
-            q, _, cos, sin = self.rotary_emb(
-                positions, q.contiguous(), output_cos_sin=True
+
+        use_fused_kv_cache_update = (
+            self.enable_kv_rmsnorm_rope_cache
+            and attn_metadata is not None
+            and (
+                not isinstance(attn_metadata, dict)
+                or self.attn.layer_name in attn_metadata
             )
+        )
+
+        if use_fused_kv_cache_update:
+            # ------------------------------------------------------------------
+            # Fused path:
+            # 1. Apply RoPE to Q and export cos/sin for the fused KV-cache op.
+            # 2. Use npu_kv_rmsnorm_rope_cache to:
+            #      - RMSNorm K
+            #      - apply RoPE to K
+            #      - update K/V cache
+            #
+            # Notes:
+            # - vLLM uses packed token layout. Here we reshape to the layout
+            #   expected by the fused NPU operator.
+            # - During DP dummy execution, batch data may be padded, so
+            #   num_actual_tokens must be used instead of the raw tensor length.
+            # ------------------------------------------------------------------
+            q, _, cos, sin = self.rotary_emb(
+                positions,
+                q.contiguous(),
+                output_cos_sin=True,
+            )
+
+            q = q.view(-1, self.q_size)
+            k = k.view(-1, self.k_size)
+
+            if isinstance(attn_metadata, dict):
+                attn_metadata = attn_metadata[self.attn.layer_name]
+            assert hasattr(attn_metadata, "slot_mapping") and hasattr(
+                attn_metadata, "num_actual_tokens"
+            ), "attn_metadata must provide slot_mapping and num_actual_tokens"
+
+            self_kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
+
+            # Static sink KV is populated lazily on first use.
+            if (
+                not self.attn.sink_populated
+                and self_kv_cache is not None
+                and len(self_kv_cache) > 0
+            ):
+                torch.ops.vllm.maybe_populate_sink(
+                    self_kv_cache[0],
+                    self_kv_cache[1],
+                    self.attn.layer_name,
+                )
+
+            key_cache, value_cache = self_kv_cache[0], self_kv_cache[1]
+            # Slot mapping is built for the packed batch.
+            # In multi-DP mode, idle DP ranks may still enter execute_dummy_batch() with
+            # mock/padded tokens for shape alignment. In that case attn_metadata exists,
+            # but only num_actual_tokens correspond to real requests.
+            slots = attn_metadata.slot_mapping
+            num_tokens = attn_metadata.num_actual_tokens
+
+            # The fused operator expects BNSD-style input.
+            # Current packed-token layout is treated as:
+            #   B = 1, S = num_tokens
+            batch_size = 1
+            # Kernel contract: fused op applies RoPE on the first 64 dims only.
+            rope_rotary_dim = 64
+
+            k_input = (
+                k[:num_tokens]
+                .view(batch_size, -1, self.num_kv_heads, self.attn.impl.head_size)
+                .transpose(1, 2)
+            )
+            v_input = (
+                v[:num_tokens]
+                .view(batch_size, -1, self.num_kv_heads, self.v_channels)
+                .transpose(1, 2)
+            )
+
+            cos_input = (
+                cos[:num_tokens]
+                .view(batch_size, -1, rope_rotary_dim)
+                .unsqueeze(1)
+                .repeat(1, self.num_kv_heads, 1, 1)
+            )
+            sin_input = (
+                sin[:num_tokens]
+                .view(batch_size, -1, rope_rotary_dim)
+                .unsqueeze(1)
+                .repeat(1, self.num_kv_heads, 1, 1)
+            )
+            assert cos.shape[-1] == rope_rotary_dim and sin.shape[-1] == rope_rotary_dim, (
+                "fused npu_kv_rmsnorm_rope_cache expects rotary dim == 64 "
+                f"(got cos={cos.shape[-1]}, sin={sin.shape[-1]})"
+            )
+
+            torch_npu.npu_kv_rmsnorm_rope_cache(
+                k_input,
+                self.k_layernorm.weight,
+                cos_input,
+                sin_input,
+                slots[:num_tokens].to(torch.int64),
+                key_cache,
+                value_cache,
+                v=v_input,
+                epsilon=self.k_layernorm.variance_epsilon,
+                cache_mode="PA",
+            )
+
         else:
+            # ------------------------------------------------------------------
+            # Default path:
+            # Used when fused KV-cache update is disabled, or when attention
+            # metadata is unavailable (for example during certain dummy runs).
+            # In this case, follow the original OpenPangu logic:
+            #   1. RMSNorm on K
+            #   2. RoPE on Q/K
+            # ------------------------------------------------------------------
             k = self.k_layernorm(k.view(-1, self.num_kv_heads, self.head_dim))
             q, k = self.rotary_emb(positions, q, k)
 
-        q = q.view(-1, self.q_size)
-        k = k.view(-1, self.k_size)
-        if self.enable_kv_rmsnorm_rope_cache:
-            bsz = 1     # TND -> BNSD, where S=T, B=1
-            num_tokens = q.shape[0]
-            # get self_kv_cache, slot
-            forward_context: ForwardContext = get_forward_context()
-            attn_metadata = forward_context.attn_metadata
-            if attn_metadata is not None:
-                if isinstance(attn_metadata, dict):
-                    attn_metadata = attn_metadata[self.attn.layer_name]
-                self_kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
-                if not self.attn.sink_populated:
-                    if self_kv_cache is not None and len(self_kv_cache) > 0:
-                        torch.ops.vllm.maybe_populate_sink(
-                            self_kv_cache[0], self_kv_cache[1], self.attn.layer_name)
-                
-                key_cache, value_cache = self_kv_cache[0], self_kv_cache[1]
-                # get slot
-                slots = attn_metadata.slot_mapping
-                # Apply npu ops
-                key_cache, value_cache, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
-                    k[:num_tokens].view(bsz, -1, self.num_kv_heads, self.attn.impl.head_size).transpose(1, 2),
-                    self.k_layernorm.weight,
-                    cos[:num_tokens].view(bsz, -1, 64).unsqueeze(1).repeat(1, self.num_kv_heads, 1, 1),
-                    sin[:num_tokens].view(bsz, -1, 64).unsqueeze(1).repeat(1, self.num_kv_heads, 1, 1),
-                    slots[:num_tokens].to(torch.int64),
-                    key_cache,
-                    value_cache,
-                    v=v[:num_tokens].view(bsz, -1, self.num_kv_heads, self.v_channels).transpose(1, 2),
-                    epsilon=self.k_layernorm.variance_epsilon,
-                    cache_mode="PA",
-                )
+            q = q.view(-1, self.q_size)
+            k = k.view(-1, self.k_size)
 
+        # Attention output shape is based on V head dim instead of K/Q head dim.
         attn_output = self.attn(
             q,
             k,
