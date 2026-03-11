@@ -4,9 +4,8 @@ from transformers import PretrainedConfig
 
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.mome import AggregateConv
 
-from omni_models.models.pangu.openpangu import AggregateConv
 import omni_training_custom_ops
 
 

@@ -34,6 +34,21 @@ class _FakeLayerNorm:
         return x
 
 
+class _FakeAggregateConv:
+    def __call__(self, x):
+        return x
+
+
+class _Fake_even_odd_indexing():
+    def __call__(self, x):
+        return x
+
+
+class _Fake_insert_tensor_by_start_loc():
+    def __call__(self, x, insert_segment=None, start_loc=None):
+        return x
+
+
 class _FakeStream:
     def wait_stream(self, _other):
         return None
@@ -52,6 +67,7 @@ def _make_prefill_meta(bs: int, *, max_query_len=2):
         seq_lens=torch.arange(1, bs + 1, dtype=torch.int32),
         query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
         max_query_len=max_query_len,
+        query_start_loc=[0] + torch.arange(1, bs + 1, dtype=torch.int32).tolist(),
     )
 
 
@@ -62,6 +78,17 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         m.quant_symbol = False
         m._forward_prefill = MagicMock(return_value=torch.tensor([1]))
         m._forward_decode = MagicMock(return_value=torch.tensor([2]))
+        m.param_sink_number = 128
+        m.param_sink_with_value = True
+        m.kv_lora_rank = 512
+        m.qk_rope_head_dim = 64
+
+        sink_k_pe = torch.zeros((128, m.kv_lora_rank), dtype=torch.bfloat16)
+        sink_compressed_kv = torch.zeros((128, m.qk_rope_head_dim), dtype=torch.bfloat16)
+        m.attn = SimpleNamespace(sink_k_pe=sink_k_pe,
+            sink_compressed_kv=sink_compressed_kv,
+            sink_populated=True,
+        )
         return m
 
     def test_forward_routes_prefill_and_decode(self):
@@ -123,6 +150,31 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         self.assertIn("x_int8", passed_hs)
         self.assertIn("pertoken_scale", passed_hs)
 
+    def test_insert_tensor_by_start_loc(self):
+        raw = torch.tensor([[1], [2], [3], [4], [5]], dtype=torch.int32)
+        insert = torch.tensor([[9], [8]], dtype=torch.int32)
+        start_loc = [0, 2, 5]
+        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
+        with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
+            out = npu_mla_mod.NPUDeepseekMLAAttention._insert_tensor_by_start_loc(raw, insert, start_loc)
+        expected = torch.tensor([[9], [8], [1], [2], [9], [8], [3], [4], [5]], dtype=torch.int32)
+        self.assertTrue(torch.equal(out, expected))
+
+    def test_even_odd_indexing(self):
+        x = torch.tensor([
+            [1, 2, 3, 4],
+            [5, 6, 7, 8]
+        ])
+        expected = torch.tensor([
+            [1, 3, 2, 4],
+            [5, 7, 6, 8]
+        ])
+        
+        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
+        with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
+            out = npu_mla_mod.NPUDeepseekMLAAttention.even_odd_indexing(x)
+        self.assertTrue(torch.equal(out, expected))
+
 
 class TestNPUMLAPrefillDecode(unittest.TestCase):
     def _make_stub(self):
@@ -138,6 +190,10 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         m.v_head_dim = 8
         m.scaling = 0.5
         m.quant_symbol = False
+        m.param_sink_number = 128
+        m.param_sink_with_value = True
+        m.sliding_window = 512
+        m.rope_interleaved = False
 
         m.q_a_proj = _FakeLinear(m.q_lora_rank)
         m.kv_a_proj_with_mqa = _FakeLinear(m.kv_lora_rank + m.qk_rope_head_dim)
@@ -146,6 +202,11 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         m.q_b_proj = _FakeLinear(m.num_local_heads * m.qk_head_dim)
         m.kv_b_proj = _FakeLinear(m.num_local_heads * (m.qk_nope_head_dim + m.v_head_dim))
         m.o_proj = _FakeLinear(16)
+        m.qa_conv = _FakeAggregateConv()
+        m.compresskv_conv = _FakeAggregateConv()
+        m.o_conv = _FakeAggregateConv()
+        m.even_odd_indexing = _Fake_even_odd_indexing()
+        m._insert_tensor_by_start_loc = _Fake_insert_tensor_by_start_loc()
 
         impl = SimpleNamespace(
             W_UK_T=torch.zeros((m.num_local_heads, m.qk_nope_head_dim, m.kv_lora_rank), dtype=torch.float32),
@@ -154,8 +215,18 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         )
         kv0 = torch.zeros((2, 128, m.kv_lora_rank), dtype=torch.float32)
         kv1 = torch.zeros((2, 128, m.qk_rope_head_dim), dtype=torch.float32)
-        m.attn = SimpleNamespace(impl=impl, kv_cache=[(kv0, kv1)])
+        sink_k_pe = torch.zeros((128, m.kv_lora_rank), dtype=torch.bfloat16)
+        sink_compressed_kv = torch.zeros((128, m.qk_rope_head_dim), dtype=torch.bfloat16)
+        m.attn = SimpleNamespace(impl=impl, kv_cache=[(kv0, kv1)], sink_k_pe=sink_k_pe,
+                                sink_compressed_kv=sink_compressed_kv,
+                                sink_populated=True)
+        m.config = self._fake_cfg()
         return m
+
+    def _fake_cfg(self, model_type="openpangu_v2"):
+        return SimpleNamespace(
+            model_type=model_type,
+        )
 
     def test_forward_prefill_metadata_none_returns_zeroed_path(self):
         m = self._make_stub()
@@ -209,6 +280,8 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             npu_mla_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True
         ), patch.object(
             npu_mla_mod.torch.ops.npu, "npu_fused_infer_attention_score", side_effect=_fake_fused_attention, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.custom, "npu_fused_infer_attention_sink", side_effect=_fake_fused_attention, create=True
         ):
             torch_npu_ns.current_stream = lambda: fake_stream
             torch_npu_ns.stream = lambda _s: nullcontext()
@@ -252,14 +325,19 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             "npu_fused_infer_attention_score",
             return_value=(torch.zeros((m.num_local_heads, bs, m.kv_lora_rank), dtype=torch.float32),),
             create=True,
-        ):
+        ), patch.object(
+            npu_mla_mod.torch.ops.custom,
+            "npu_fused_infer_attention_sink",
+            return_value=(torch.zeros((bs, m.num_local_heads, m.kv_lora_rank), dtype=torch.float32),),
+            create=True,
+         ):
             out = npu_mla_mod.NPUDeepseekMLAAttention._forward_decode(m, hs, cos, sin, attn_metadata=meta)
 
         self.assertEqual(tuple(out.shape), (bs, 16))
 
 
 class TestNPUMLAInit(unittest.TestCase):
-    def _fake_cfg(self, rope_type="default", apply_yarn=True):
+    def _fake_cfg(self, rope_type="default", apply_yarn=True, torch_dtype=torch.bfloat16):
         return SimpleNamespace(
             rms_norm_eps=1e-6,
             rope_parameters={
@@ -268,6 +346,7 @@ class TestNPUMLAInit(unittest.TestCase):
                 "factor": 2.0,
                 "mscale_all_dim": False,
             },
+            torch_dtype=torch_dtype,
         )
 
     @patch.object(npu_mla_mod, "get_tensor_model_parallel_world_size", return_value=1)

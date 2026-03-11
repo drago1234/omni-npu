@@ -49,6 +49,9 @@ from vllm.sequence import IntermediateTensors
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
 from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
+from omni_npu.v1.layers.vocab_parallel_embedding import NPUVocabParallelEmbedding
+from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_models.models.pangu.openpangu import OpenPanguMLAAttention, mHCModule
 
 
 def check_ffn_act_fn(act_fn: str) -> None:
@@ -117,6 +120,7 @@ class OpenPanguMoE(nn.Module):
         self.ep_size = self.ep_group.size()
         self.n_routed_experts: int = config.n_routed_experts
         self.n_shared_experts: int = config.n_shared_experts
+        self.model_type: str = config.model_type
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
         check_ffn_act_fn(config.hidden_act)
@@ -128,7 +132,15 @@ class OpenPanguMoE(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        self.gate.e_score_correction_bias = None
+        if (
+            hasattr(config, "router_enable_expert_bias")
+            and config.router_enable_expert_bias
+        ):
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(self.n_routed_experts, dtype=torch.float32)
+            )
+        else:
+            self.gate.e_score_correction_bias = None
 
         # Load balancing settings.
         eplb_config = parallel_config.eplb_config
@@ -151,35 +163,58 @@ class OpenPanguMoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                disable_tp=True,
+                disable_tp=self.is_sequence_parallel if config.model_type == "openpangu_v2" else True,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
         else:
             self.shared_experts = None
 
-        self.experts = NPUFusedMoEV1(
-            shared_experts=self.shared_experts,
-            gate=self.gate,
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
-            renormalize=config.norm_topk_prob,
-            quant_config=quant_config,
-            use_grouped_topk=True,
-            num_expert_group=1,
-            topk_group=1,
-            prefix=f"{prefix}.experts",
-            scoring_func="sigmoid",
-            # we do scaling outside, set factor to 1.0 to avoid double mul
-            routed_scaling_factor=1.0,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            enable_eplb=self.enable_eplb,
-            num_redundant_experts=self.n_redundant_experts,
-            is_sequence_parallel=self.is_sequence_parallel,
-        )
+        if config.model_type == "openpangu_v2":
+            self.experts = SharedFusedMoE(
+                shared_experts=self.shared_experts,
+                num_experts=config.n_routed_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                reduce_results=False,
+                renormalize=config.norm_topk_prob,
+                quant_config=quant_config,
+                use_grouped_topk=True,
+                num_expert_group=1,
+                topk_group=1,
+                prefix=f"{prefix}.experts",
+                scoring_func="sigmoid",
+                # we do scaling outside, set factor to 1.0 to avoid double mul
+                routed_scaling_factor=1.0,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                enable_eplb=self.enable_eplb,
+                num_redundant_experts=self.n_redundant_experts,
+                is_sequence_parallel=self.is_sequence_parallel,
+            )
+        else:
+            self.experts = NPUFusedMoEV1(
+                shared_experts=self.shared_experts,
+                gate=self.gate,
+                num_experts=config.n_routed_experts,
+                top_k=config.num_experts_per_tok,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                reduce_results=False,
+                renormalize=config.norm_topk_prob,
+                quant_config=quant_config,
+                use_grouped_topk=True,
+                num_expert_group=1,
+                topk_group=1,
+                prefix=f"{prefix}.experts",
+                scoring_func="sigmoid",
+                # we do scaling outside, set factor to 1.0 to avoid double mul
+                routed_scaling_factor=1.0,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                enable_eplb=self.enable_eplb,
+                num_redundant_experts=self.n_redundant_experts,
+                is_sequence_parallel=self.is_sequence_parallel,
+            )
 
     def forward(
         self,
@@ -190,24 +225,35 @@ class OpenPanguMoE(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
-
-        fused_moe_out = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
-        )
+        if self.model_type == "openpangu_v2":
+            router_logits, _ = self.gate(hidden_states)
+            fused_moe_out = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+        else:
+            fused_moe_out = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
 
         shared_output, final_hidden_states = fused_moe_out
-        if self.shared_experts is None:
-            # Keep an explicit assertion for easier debugging if kernels change.
-            assert shared_output is None
-        else:
-            if shared_output is not None:
-                final_hidden_states = final_hidden_states + shared_output
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states *= self.routed_scaling_factor
+        elif self.shared_experts is not None:
+            assert shared_output is not None
+            shared_output *= 1.0 / self.routed_scaling_factor
+        if self.shared_experts is not None:
+            assert shared_output is not None
+            final_hidden_states += shared_output
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
+        elif self.tp_size > 1:
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
+                final_hidden_states
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -298,6 +344,21 @@ class OpenPanguDecoderLayer(nn.Module):
             self.post_mlp_layernorm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
+        block_post_layernorm_hidden_size = config.hidden_size
+        self.use_mhc = getattr(config, "use_mhc", False)
+        if self.use_mhc:
+            self.attn_mhc_module = mHCModule(
+                config=config,
+                prefix=f"{prefix}.attn_mhc_module",
+            )
+            self.mlp_mhc_module = mHCModule(
+                config=config,
+                prefix=f"{prefix}.mlp_mhc_module",
+            )
+            block_post_layernorm_hidden_size *= getattr(config, "mhc_num_stream", 4)
+        self.has_block_post_layernorm = layer_idx in getattr(config, "block_post_layernorm_idx", [])
+        if self.has_block_post_layernorm:
+            self.block_post_layernorm = RMSNorm(block_post_layernorm_hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -306,8 +367,20 @@ class OpenPanguDecoderLayer(nn.Module):
         sin: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_mhc:
+            return self.forward_mhc(hidden_states, cos, sin, residual)
+        else:
+            return self.forward_normal(hidden_states, cos, sin, residual)
+    
+    def forward_normal(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            residual = hidden_states.clone()
+            residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
@@ -329,6 +402,38 @@ class OpenPanguDecoderLayer(nn.Module):
             hidden_states = self.post_mlp_layernorm(hidden_states)
 
         return hidden_states, residual
+
+    def forward_mhc(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states, h_post, h_res = self.attn_mhc_module.hc_pre(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)
+        
+        hidden_states = self.self_attn(hidden_states, cos, sin)
+        
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.attn_mhc_module.hc_post(hidden_states, residual, h_post, h_res)
+        
+        residual = hidden_states
+        hidden_states, h_post, h_res = self.mlp_mhc_module.hc_pre(hidden_states)
+        if self.sandwich_norm:
+            hidden_states = self.pre_mlp_layernorm(hidden_states)
+        # Fully Connected
+        
+        hidden_states = self.mlp(hidden_states)
+        
+        if self.sandwich_norm:
+            hidden_states = self.post_mlp_layernorm(hidden_states)
+        hidden_states = self.mlp_mhc_module.hc_post(hidden_states, residual, h_post, h_res)
+        if self.has_block_post_layernorm:
+            hidden_states = self.block_post_layernorm(hidden_states)
+        
+        return hidden_states, None
 
 
 @support_torch_compile
@@ -372,6 +477,14 @@ class OpenPanguModel(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        self.use_mhc = getattr(config, "use_mhc", False)
+        if self.use_mhc:
+            self.num_stream = getattr(config, "mhc_num_stream", 4)
+            self.merge_mhc_module = mHCModule(
+                config=config,
+                merge_layer_only_pre=True,
+                prefix=f"{prefix}.attn_mhc_module",
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -389,6 +502,8 @@ class OpenPanguModel(nn.Module):
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            if self.use_mhc:
+                hidden_states = hidden_states.repeat(1, self.num_stream)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -406,8 +521,11 @@ class OpenPanguModel(nn.Module):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if self.use_mhc:
+            hidden_states, _, _ = self.merge_mhc_module.hc_pre(hidden_states)
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -636,18 +754,35 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
                 continue
 
             remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+
+            if remapped_name.endswith("e_score_correction_bias"):
+                remapped_name = remapped_name.replace(
+                    "e_score_correction_bias", "gate.e_score_correction_bias"
+                )
+            
             if remapped_name is None:
                 continue
 
             if is_pp_missing_parameter(remapped_name, self):
                 continue
 
+            if "_conv" in remapped_name:
+                remapped_name = remapped_name.replace("_conv", "_conv.merge_conv")
+
             param = params_dict[remapped_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(remapped_name)
 
+        self.post_weight_load()
         return loaded_params
+
+    def post_weight_load(self) -> None:
+        for name, module in self.named_modules():
+            if module is self:
+                continue
+            if hasattr(module, "post_weight_load"):
+                module.post_weight_load()
 
 
 class PanguUltraMoEForCausalLM(OpenPanguMoEModel):

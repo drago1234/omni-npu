@@ -453,7 +453,7 @@ def _build_module(
         max_position_embeddings=MAX_POS,
         cache_config=dummy_config.cache_config,
         quant_config=None,
-        prefix=f"test_mla_{uuid.uuid4().hex}",
+        prefix=f"layers.1",
     ).to(device=device, dtype=dtype)
 
     orig_q_b_forward = module.q_b_proj.forward

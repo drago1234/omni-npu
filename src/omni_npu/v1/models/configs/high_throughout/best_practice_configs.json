@@ -141,5 +141,15 @@
                 "config_file":"pangu_pro_moe/pangu_pro_moe_bf16_hybrid.json"
             }
         }
+    },
+    {
+        "model": "openpangu_v2",
+        "hardware": "A3",
+        "precision": "bf16",
+        "configs":{
+            "hybrid":{
+                "config_file":"openpangu_v2/openpangu_v2_bf16_a3_hybrid.json"
+            }
+        }
     }
 ]

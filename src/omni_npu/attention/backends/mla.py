@@ -159,7 +159,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
             metadata.decode.seq_lens = [seq + self.sink_len for seq in metadata.decode.seq_lens]
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc_list = metadata.prefill.query_start_loc.tolist()
-            metadata.prefill.query_cumlens = common_attn_metadata.query_start_loc_cpu[1:].tolist()
+            metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:].cpu().tolist()
             metadata.prefill.seq_lens = metadata.prefill.query_cumlens
         if self.dcp_world_size > 1:
             self.prepare_dcp_slots(metadata)

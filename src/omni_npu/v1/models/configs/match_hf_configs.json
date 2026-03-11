@@ -211,5 +211,16 @@
         "n_routed_experts": 80,
         "n_shared_experts": 2,
         "moe_intermediate_size": 1280
+    },
+    "openpangu_v2_92B":{
+        "model_type": "openpangu_v2",
+        "hidden_size": 2560,
+        "num_attention_heads": 48,
+        "max_position_embeddings": 32768,
+        "vocab_size": 151552,
+        "intermediate_size": 9216,
+        "n_routed_experts": 256,
+        "n_shared_experts": 1,
+        "moe_intermediate_size": 1024
     }
 }
