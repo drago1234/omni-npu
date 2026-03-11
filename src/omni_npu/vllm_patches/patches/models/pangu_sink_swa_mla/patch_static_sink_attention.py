@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
+    SinkFullAttentionSpec,
     SinkMLAAttentionSpec,
 )
 
@@ -128,7 +129,7 @@ class create_static_sink_attention_backendPatch(VLLMPatch):
 class StaticSinkAttentionPatch(VLLMPatch):
     _attr_names_to_apply = ['StaticSinkAttention', 'StaticSinkMLAAttention']
     # patch start
-    class StaticSinkAttention(Attention, CustomOp):
+    class StaticSinkAttention(Attention):
         """
         Attention with static sink tokens
         """
@@ -140,35 +141,39 @@ class StaticSinkAttentionPatch(VLLMPatch):
             sink_len: int,
             attn_backend: type[AttentionBackend] | None = None,
             cache_config: CacheConfig | None = None,
+            head_size_v: int | None = None,
             **kwargs,
         ):
             dtype = torch.get_default_dtype()
+
             if cache_config is not None:
                 kv_cache_dtype = cache_config.cache_dtype
                 block_size = cache_config.block_size
             else:
                 kv_cache_dtype = "auto"
                 block_size = 16
+
             if attn_backend is not None:
                 underlying_attn_backend = attn_backend
             else:
                 underlying_attn_backend = get_attn_backend(
                     head_size, dtype, kv_cache_dtype, block_size
                 )
-            attn_backend = create_static_sink_attention_backend(
+            attn_backend = layers.static_sink_attention.create_static_sink_attention_backend(
                 underlying_attn_backend,
                 sink_len=sink_len,
             )
-            Attention.__init__(
-                self=self,
+            self.head_size_v = head_size if head_size_v is None else head_size_v
+            super().__init__(
                 num_heads=num_heads,
                 head_size=head_size,
                 scale=scale,
+                head_size_v=self.head_size_v,
                 cache_config=cache_config,
                 attn_backend=attn_backend,
                 **kwargs,
             )
-            CustomOp.__init__(self)
+
             self.sink_len = sink_len
             self.block_size = block_size
             self.sink_populated = False
@@ -177,47 +182,28 @@ class StaticSinkAttentionPatch(VLLMPatch):
         def update_sink_kv(self, sink_key, sink_value) -> None:
             self.sink_key = sink_key
             self.sink_value = sink_value
-        def forward_native(
-            self,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            output_shape: torch.Size | None = None,
-        ) -> torch.Tensor:
+        def forward(self, *args, **kwargs) -> torch.Tensor:
             assert self.sink_key is not None and self.sink_value is not None, (
                 "sink_key and sink_value have not been prepared"
             )
             if not self.sink_populated:
                 forward_context: ForwardContext = get_forward_context()
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                torch.ops.vllm.maybe_populate_sink(self_kv_cache, self.layer_name)
-            return super().forward(query, key, value, output_shape)
-        def forward_cuda(
-            self,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            output_shape: torch.Size | None = None,
-        ) -> torch.Tensor:
-            return self.forward_native(query, key, value, output_shape)
-        def forward(self, *args, **kwargs):
-            return self._forward_method(*args, **kwargs)
-        def populate_sink_kv(self, self_kv_cache):
+                if self_kv_cache is not None and len(self_kv_cache) > 0:
+                    torch.ops.vllm.maybe_populate_sink(self_kv_cache[0], self_kv_cache[1], self.layer_name)
+            return super().forward(*args, **kwargs)
+        def populate_sink_kv(self, key_cache: torch.Tensor, value_cache: torch.Tensor):
             sink_kv_slot_mapping = torch.arange(
                 self.block_size,
                 self.sink_len + self.block_size,
-                device=torch.cuda.current_device(),
+                device=current_platform.current_device(),
                 dtype=torch.long,
-            )
-            triton_reshape_and_cache_flash_diffkv(
-                self.sink_key,
-                self.sink_value,
-                self_kv_cache,
-                sink_kv_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-                self._v_scale,
-            )
+            ).view(-1, 1)
+
+            torch_npu.npu_scatter_nd_update_(
+                key_cache.view(-1, key_cache.shape[-1]), sink_kv_slot_mapping, self.sink_key)
+            torch_npu.npu_scatter_nd_update_(
+                value_cache.view(-1, value_cache.shape[-1]), sink_kv_slot_mapping, self.sink_value)
             # We only populate the sink_key and sink_value once
             self.sink_populated = True
         def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -225,14 +211,17 @@ class StaticSinkAttentionPatch(VLLMPatch):
             block_size = vllm_config.cache_config.block_size
             # Should not be called for enc-dec or encoder-only attention.
             assert self.attn_type == AttentionType.DECODER
-            return SinkFullAttentionSpec(
+
+            attentionSpec = SinkFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
-                head_size_v=self.head_size_v,
                 sink_len=self.sink_len,
                 dtype=self.kv_cache_torch_dtype,
             )
+            attentionSpec.set_head_size_v(self.head_size_v)
+
+            return attentionSpec
 
             
     class StaticSinkMLAAttention(MLAAttention):

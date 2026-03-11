@@ -232,7 +232,7 @@ class TestACLGraphWrapper:
         default_aclgraph_wrapper._forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
         
         default_aclgraph_wrapper._forward_context.attn_metadata = {
-            "metadata1": MagicMock(query_cumlens=torch.tensor([1]), seq_lens=torch.tensor([2]))
+            "metadata1": MagicMock(query_start_loc=[0, 1], seq_lens=torch.tensor([2]))
         }
         batch_descriptor = default_aclgraph_wrapper._forward_context.batch_descriptor
         batch_descriptor.num_reqs = 3
@@ -281,8 +281,8 @@ class TestACLGraphWrapper:
 
     def test_call_attn_metadata_gqa_mode(self, default_aclgraph_wrapper):
         """Test __call__ method executes normally under the GQA mode."""
-        mock_attn_metadata = MagicMock(spec_set=["query_cumlens", "seq_lens"])
-        mock_attn_metadata.query_cumlens = torch.tensor([1])
+        mock_attn_metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
+        mock_attn_metadata.query_start_loc = [0, 1]
         mock_attn_metadata.seq_lens = torch.tensor([2])
         default_aclgraph_wrapper._forward_context.attn_metadata = {
             "metadata1": mock_attn_metadata

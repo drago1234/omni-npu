@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SinkMLAAttentionSpec,
+    SinkFullAttentionSpec,
     SlidingWindowSpec,
 )
 
@@ -26,7 +27,7 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 class SinkFullAttentionManager(FullAttentionManager):
     def __init__(
         self,
-        kv_cache_spec: SinkMLAAttentionSpec,
+        kv_cache_spec: SinkMLAAttentionSpec | SinkFullAttentionSpec,
         block_pool: BlockPool,
         kv_cache_group_id: int,
         dcp_world_size: int = 1,
@@ -58,6 +59,7 @@ class single_type_kv_cache_managerPatch(VLLMPatch):
         ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
         MambaSpec: MambaManager,
         CrossAttentionSpec: CrossAttentionManager,
+        SinkFullAttentionSpec: SinkFullAttentionManager,
         SinkMLAAttentionSpec: SinkFullAttentionManager,
     }
     # patch end

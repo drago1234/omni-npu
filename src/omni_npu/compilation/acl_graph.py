@@ -147,8 +147,8 @@ class ACLGraphWrapper:
                 if not hasattr(metadata, "decode"):
                     is_gqa = True
                     # GQA
-                    if hasattr(metadata, "query_cumlens"):
-                        asl = metadata.query_cumlens
+                    if hasattr(metadata, "query_start_loc"):
+                        asl = metadata.query_start_loc[1:]
                         aslkv = metadata.seq_lens
                         break
                 elif metadata.decode:

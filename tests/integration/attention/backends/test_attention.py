@@ -50,7 +50,7 @@ class TestNPUAttentionBackendDefaultImplIntegration(unittest.TestCase):
         num_decode_tokens = num_decodes
         hidden_size = 8 * 128      # 1024
         kv_hidden_size = 4 * 128   # 512
-        block_size = 16
+        block_size = 128
         num_blocks = 100
 
         # Tensors: [2, ...]
@@ -81,7 +81,7 @@ class TestNPUAttentionBackendDefaultImplIntegration(unittest.TestCase):
             num_decode_tokens=num_decode_tokens,  # 2
             num_decodes=num_decodes,              # 2
             seq_lens=seq_lens,                    # [10, 15] → length=2
-            query_cumlens=[1, 2],                 # cumulative decode qlens per request
+            query_start_loc=[0, 1, 2],            # cumulative decode qlens per request
             slot_mapping=slot_mapping,            # [9, 14] → length=2
             block_tables=block_tables,            # [2, 10]
             max_query_len=1,                      # decode: 1 token per seq

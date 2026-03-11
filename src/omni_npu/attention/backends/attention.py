@@ -33,7 +33,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from omni_npu.v1.models.config_loader.loader import model_extra_config
-
+import omni_custom_ops
 
 NZ_DIM = 16
 
@@ -42,7 +42,7 @@ NZ_DIM = 16
 class NPUMetadata:
     num_actual_tokens: int
     block_tables: torch.Tensor
-    query_cumlens: list[int]
+    query_start_loc: list[int]
     seq_lens: list[int]
     max_query_len: Optional[int] = None
     slot_mapping: torch.Tensor = None
@@ -80,7 +80,7 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
               fast_build: bool = False) -> NPUMetadata:
 
         num_actual_tokens = common_attn_metadata.num_actual_tokens
-        query_cumlens = common_attn_metadata.query_start_loc[1:]
+        query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
@@ -93,7 +93,7 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
         )
         attn_metadata = NPUMetadata(num_actual_tokens=num_actual_tokens,
                                        block_tables=block_table,
-                                       query_cumlens=query_cumlens.tolist(),
+                                       query_start_loc=query_start_loc.tolist(),
                                        seq_lens=seq_lens.tolist(),
                                        max_query_len=max_query_len,
                                        slot_mapping=slot_mapping,
@@ -181,9 +181,12 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[str] = None,
         sinks: torch.Tensor | None = None,
+        head_size_v: int | None = None,
+        sink_len: int = 0,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
+        self.head_size_v = self.head_size if head_size_v is None else head_size_v
         self.scale = float(scale)
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.hidden_size = self.num_heads * self.head_size
@@ -196,6 +199,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         self.alibi_slopes = alibi_slopes
         self.attn_type = attn_type
         self.attn_sinks = sinks
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(f"Only support decoder models, but {attn_type=}.")
@@ -208,6 +212,9 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                 torch.ones((2048, 2048), dtype=torch.bool, device="npu")
             )
             NPUAttentionBackendImpl.DECORE_ATTN_MASK = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
+
+        self.sparse_mode = 4 if sliding_window else 3
+        self.sink_len = sink_len
 
     def forward(
         self,
@@ -235,13 +242,38 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         value = value.view(-1, self.num_kv_heads*value.shape[-1]).contiguous()
 
         # npu kv rmsnorm not enable, use the default methods
-        if not getattr(model_extra_config.operator_opt_config, 'enable_kv_rmsnorm_rope_cache', False):
+        if (
+            self.kv_sharing_target_layer_name is None
+            and not getattr(model_extra_config.operator_opt_config, 'enable_kv_rmsnorm_rope_cache', False)
+        ):
             # update kv cache
             slots = attn_metadata.slot_mapping.view(-1, 1)
             torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
             torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
-        actual_seq_qlen = attn_metadata.query_cumlens
+        actual_seq_qlen = attn_metadata.query_start_loc[1:]
+        if self.sink_len > 0:
+            attn_output = torch.ops.custom.npu_fused_infer_attention_sink(
+                query[:actual_seq_qlen[-1]],
+                kv_cache[0],
+                kv_cache[1],
+                num_query_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="TND",
+                softmax_scale=self.scale,
+                block_table=attn_metadata.block_tables,
+                block_size=kv_cache[0].shape[1],
+                sparse_mode=self.sparse_mode,
+                pre_tokens=self.sliding_window if self.sliding_window is not None else 0,
+                next_tokens=0,
+                sink_number=self.sink_len,
+                atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=attn_metadata.seq_lens,
+            )[0]
+            output[:actual_seq_qlen[-1]].copy_(attn_output)
+            return output
+
         # npu_fused_infer_attention_score_v2 does not support TND with dim 256, delete the branch when the operator supports it.
         use_bsnd = self.head_size == 256
         if use_bsnd:
@@ -273,7 +305,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                 block_size=block_size,
                 sparse_mode=sparse_mode,
                 atten_mask=atten_mask,
-                actual_seq_lengths=attn_metadata.query_cumlens,
+                actual_seq_lengths=actual_seq_qlen,
                 actual_seq_lengths_kv=attn_metadata.seq_lens,
             )[0].view(-1, self.num_heads, self.head_size)
             output.copy_(attn_output)
