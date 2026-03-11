@@ -153,7 +153,7 @@ def fused_experts_allgather_ep(
 
     if row_idx_type == 1:
         range1 = torch.arange(0, expanded_x_idx.shape[0], dtype=torch.int32, device="npu")
-        range2 = range1 * torch.tensor(991, dtype=torch.int32, device="npu")
+        range2 = (range1 * 991).to(range1.dtype)
         mask = (range1 >= torch.sum(expert_tokens)).to(torch.int32)
         expanded_x_idx += range2 * mask
         expanded_x_idx = expanded_x_idx % expanded_x_idx.shape[0]
