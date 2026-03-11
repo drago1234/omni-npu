@@ -41,8 +41,9 @@ def prepare_module(monkeypatch):
     config_module = types.ModuleType("vllm.model_executor.layers.fused_moe.config")
 
     class DummyFusedMoEQuantConfig:
-        def __init__(self, use_int8_w8a8=False):
+        def __init__(self, use_int8_w8a8=False, use_int4_w4a8=False):
             self.use_int8_w8a8 = use_int8_w8a8
+            self.use_int4_w4a8 = use_int4_w4a8
 
     config_module.FusedMoEQuantConfig = DummyFusedMoEQuantConfig
 

@@ -75,6 +75,12 @@ class DummyNPUCompressedTensorsW8A8Int8MoEMethod:
         self.layer = layer
 
 
+class DummyNPUCompressedTensorsW4A8Int4MoEMethod:
+    def __init__(self, parent, layer):
+        self.parent = parent
+        self.layer = layer
+
+
 class DummyQuantizeMethodBase:
     pass
 
@@ -219,6 +225,9 @@ def mock_dependencies(monkeypatch: pytest.MonkeyPatch):
     npu_moe_module.NPUCompressedTensorsW8A8Int8MoEMethod = (
         DummyNPUCompressedTensorsW8A8Int8MoEMethod
     )
+    npu_moe_module.NPUCompressedTensorsW4A8Int4MoEMethod = (
+        DummyNPUCompressedTensorsW4A8Int4MoEMethod
+    )
 
     npu_scheme_module = _make_module(
         monkeypatch,
@@ -291,6 +300,10 @@ def _make_w8a8_quant(num_bits=8, strategy="tensor", dynamic=False, symmetric=Tru
         num_bits=num_bits, strategy=strategy, dynamic=dynamic, symmetric=symmetric
     )
 
+def _make_w4a8_quant(num_bits=dict(), strategy="tensor", dynamic=False, symmetric=True):
+    return DummyQuantizationArgs(
+        num_bits=num_bits, strategy=strategy, dynamic=dynamic, symmetric=symmetric
+    )
 
 class TestNPUCompressedTensorsConfig:
     def test_quantization_scheme_map_from_config(self, compressed_tensors_module):
@@ -381,7 +394,7 @@ class TestNPUCompressedTensorsConfig:
         assert isinstance(method, DummyCompressedTensorsLinearMethod)
         assert hasattr(layer, "scheme")
 
-    def test_get_quant_method_moe_returns_method(self, compressed_tensors_module):
+    def test_get_quant_method_moe_returns_w8a8_method(self, compressed_tensors_module):
         config = _make_config_instance(compressed_tensors_module)
         config.target_scheme_map = {
             "Linear": {
@@ -392,6 +405,16 @@ class TestNPUCompressedTensorsConfig:
         method = config.get_quant_method(DummyFusedMoE(), "moe")
         assert isinstance(method, DummyNPUCompressedTensorsW8A8Int8MoEMethod)
 
+    def test_get_quant_method_moe_returns_w4a8_method(self, compressed_tensors_module):
+        config = _make_config_instance(compressed_tensors_module)
+        config.target_scheme_map = {
+            "Linear": {
+                "weights": _make_w4a8_quant({"mlp.experts": 4}, "tensor", False, True),
+                "input_activations": _make_w8a8_quant(8, "token", True, True),
+            }
+        }
+        method = config.get_quant_method(DummyFusedMoE(), "moe")
+        assert isinstance(method, DummyNPUCompressedTensorsW4A8Int4MoEMethod)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

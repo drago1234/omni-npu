@@ -273,14 +273,33 @@ class NPUFusedMoE(FusedMoE):
             else:
                 param.data[expert_id] = param.data[expert_id].t().contiguous()
 
-        result = super().weight_loader(
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-            return_success=return_success,
-        )
+        if "bias" in weight_name or "int4_scale" in weight_name:
+            shard_dim = 0 if "bias" in weight_name else 1
+            quant_method = getattr(param, "quant_method", None)
+            expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+            expert_data = param.data if full_load else param.data[expert_id]
+            if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
+                self._load_per_channel_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank,
+                )
+            else:
+                raise ValueError(
+                    f"quant method must be {FusedMoeWeightScaleSupported.CHANNEL.value}, {weight_name=}"
+                )
+            result = True if return_success else None
+        else:
+            result = super().weight_loader(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+                return_success=return_success,
+            )
 
         if is_weight_transposed and "weight" in weight_name:
             if full_load:

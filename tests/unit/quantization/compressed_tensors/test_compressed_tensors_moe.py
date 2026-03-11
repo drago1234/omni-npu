@@ -256,7 +256,7 @@ def compressed_moe_module(mock_dependencies):
     return module
 
 
-def _make_method(module, layer):
+def _make_w8a8_method(module, layer):
     parent = SimpleNamespace(
         moe_parallel_config=layer.moe_parallel_config,
         has_bias=False,
@@ -264,10 +264,18 @@ def _make_method(module, layer):
     return module.NPUCompressedTensorsW8A8Int8MoEMethod(parent, layer)
 
 
+def _make_w4a8_method(module, layer):
+    parent = SimpleNamespace(
+        moe_parallel_config=layer.moe_parallel_config,
+        has_bias=False,
+    )
+    return module.NPUCompressedTensorsW4A8Int4MoEMethod(parent, layer)
+
+
 class TestNPUCompressedTensorsW8A8Int8MoEMethod:
     def test_create_weights_registers_params(self, compressed_moe_module):
         layer = MockMoELayer()
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
 
         method.create_weights(
             layer=layer,
@@ -291,7 +299,7 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
         self, compressed_moe_module
     ):
         layer = MockMoELayer()
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
         method.create_weights(
             layer=layer,
             num_experts=2,
@@ -312,7 +320,7 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
 
     def test_prepare_finalize_and_select_gemm_impl(self, compressed_moe_module):
         layer = MockMoELayer()
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
 
         prepare_finalize = method.maybe_make_prepare_finalize("routing")
         assert prepare_finalize.moe is method.moe
@@ -325,7 +333,7 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
         self, compressed_moe_module, monkeypatch
     ):
         layer = MockMoELayer(use_ep=False)
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
 
         fused_experts_tp = MagicMock(return_value=torch.tensor([9.0]))
         monkeypatch.setattr(compressed_moe_module, "fused_experts_tp", fused_experts_tp)
@@ -347,7 +355,7 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
         self, compressed_moe_module, monkeypatch
     ):
         layer = MockMoELayer(use_ep=True)
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
 
         moe_infer_fusion = MagicMock(return_value=torch.tensor([3.0]))
         monkeypatch.setattr(compressed_moe_module, "moe_infer_fusion", moe_infer_fusion)
@@ -373,7 +381,7 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
     ):
         layer = MockMoELayer(use_ep=True)
         layer.shared_experts = lambda x: torch.tensor([5.0])
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
         method.create_weights(
             layer=layer,
             num_experts=2,
@@ -406,12 +414,12 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
 
     def test_supports_eplb_property(self, compressed_moe_module):
         layer = MockMoELayer()
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
         assert method.supports_eplb is True
 
     def test_gmm_expert_no_ep_path(self, compressed_moe_module):
         layer = MockMoELayer(use_ep=False)
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
         method.create_weights(
             layer=layer,
             num_experts=2,
@@ -430,7 +438,7 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
 
     def test_gmm_expert_ep_path(self, compressed_moe_module):
         layer = MockMoELayer(use_ep=True)
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
         method.create_weights(
             layer=layer,
             num_experts=2,
@@ -480,7 +488,7 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
 
         layer = MockMoELayer(use_ep=False, num_experts=2)
         layer.enable_eplb = True
-        method = _make_method(compressed_moe_module, layer)
+        method = _make_w8a8_method(compressed_moe_module, layer)
         method.create_weights(
             layer=layer,
             num_experts=2,
@@ -492,6 +500,71 @@ class TestNPUCompressedTensorsW8A8Int8MoEMethod:
 
         assert method.num_of_redundant_experts == 1
         assert layer.w13_weight.shape[0] == 3
+
+
+class TestNPUCompressedTensorsW4A8Int4MoEMethod:
+    def test_create_weights_registers_params(self, compressed_moe_module):
+        layer = MockMoELayer()
+        method = _make_w4a8_method(compressed_moe_module, layer)
+
+        method.create_weights(
+            layer=layer,
+            num_experts=2,
+            hidden_size=4,
+            intermediate_size_per_partition=6,
+            params_dtype=torch.float16,
+            weight_loader="mock",
+        )
+
+        assert layer.w13_weight.dtype == torch.int8
+        assert layer.w13_weight.shape == (2, 6, 4)
+        assert layer.w2_weight.shape == (2, 2, 6)
+        assert layer.w13_weight_int4_scale.dtype == torch.int64
+        assert layer.w13_weight_int4_scale.shape == (2, 1, 12)
+        assert layer.w13_weight_int4_scale.quant_method == "channel"
+        assert layer.w2_weight_int4_scale.quant_method == "channel"
+        assert layer.w13_weight_bias.dtype == torch.float32
+        assert layer.w13_weight_bias.shape == (2, 12)
+        assert layer.w2_weight_bias.dtype == torch.float32
+
+    def test_process_weights_after_loading_transposes_and_casts(
+        self, compressed_moe_module
+    ):
+        layer = MockMoELayer()
+        method = _make_w4a8_method(compressed_moe_module, layer)
+        method.create_weights(
+            layer=layer,
+            num_experts=2,
+            hidden_size=8,
+            intermediate_size_per_partition=8,
+            params_dtype=torch.float16,
+            weight_loader="mock",
+        )
+
+        method.process_weights_after_loading(layer)
+
+        assert layer.w13_weight.shape == (2, 8, 2)
+        assert layer.w2_weight.shape == (2, 8, 1)
+        assert layer.w13_weight.dtype == torch.int32
+
+    def test_gmm_expert_ep_path(self, compressed_moe_module):
+        layer = MockMoELayer(use_ep=True)
+        method = _make_w4a8_method(compressed_moe_module, layer)
+        method.create_weights(
+            layer=layer,
+            num_experts=2,
+            hidden_size=4,
+            intermediate_size_per_partition=6,
+            params_dtype=torch.float16,
+            weight_loader="mock",
+        )
+
+        h = torch.randn(2, 4)
+        dynamic_scale = torch.ones(1, 2)
+        expert_tokens = torch.tensor([2], dtype=torch.int32)
+        output = method.gmm_expert(layer, h, expert_tokens, dynamic_scale=dynamic_scale)
+
+        assert output.shape == h.shape
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ class NpuMoEPrepareAndFinalize(FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
     ) -> PrepareResultType:
-        if quant_config.use_int8_w8a8:
+        if quant_config.use_int8_w8a8 or quant_config.use_int4_w4a8:
             quant_mode = 2  # Dynamic quantization
         else:
             quant_mode = 0  # No quantization

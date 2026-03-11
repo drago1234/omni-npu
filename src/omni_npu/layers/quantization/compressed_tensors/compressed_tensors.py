@@ -24,7 +24,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
 )
 
 from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import \
-    NPUCompressedTensorsW8A8Int8MoEMethod
+    NPUCompressedTensorsW8A8Int8MoEMethod, NPUCompressedTensorsW4A8Int4MoEMethod
 from omni_npu.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import \
     NPUCompressedTensorsW8A8Int8
     
@@ -213,12 +213,17 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         )
         weight_num_bits = self._get_weight_num_bits("mlp.experts", weight_quant)
         if self._is_dynamic_token_w8a8(weight_quant, input_quant, weight_num_bits):
+            layer.weight_num_bits = 8
             if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
                 from omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethodV1
                 return NPUCompressedTensorsW8A8Int8MoEMethodV1(self, layer)
             return NPUCompressedTensorsW8A8Int8MoEMethod(self, layer)
         elif self._is_dynamic_token_w4a8_int(weight_quant, input_quant, weight_num_bits):
-            raise NotImplementedError
+            layer.weight_num_bits = 4
+            if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
+                from omni_npu.v1.layers.quantization.compressed_tensors.npu_compressed_tensors_moe import NPUCompressedTensorsW4A8Int4MoEMethodV1
+                return NPUCompressedTensorsW4A8Int4MoEMethodV1(self, layer)
+            return NPUCompressedTensorsW4A8Int4MoEMethod(self, layer)
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"

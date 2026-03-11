@@ -263,7 +263,7 @@ def test_fused_experts_allgather_ep_unquant(fused_module):
 
 
 @pytest.mark.unit
-def test_fused_experts_allgather_ep_quant(fused_module):
+def test_fused_experts_allgather_ep_quant_int8(fused_module):
     module, stubs = fused_module
     layer = SimpleNamespace(
         global_num_experts=4,
@@ -275,6 +275,50 @@ def test_fused_experts_allgather_ep_quant(fused_module):
         w13_weight_scale=torch.ones(1, 2),
         w2_weight_scale=torch.ones(1),
         quant_config=object(),
+        weight_num_bits=8
+    )
+    sorted_tokens = torch.ones(2, 2)
+    expanded_x_idx = torch.tensor([0, 1], dtype=torch.int32)
+    expert_tokens = torch.tensor([1, 1], dtype=torch.int32)
+    dynamic_quant_scale = torch.ones(2)
+    stubs.torch_npu.npu_dynamic_quant.return_value = (sorted_tokens, torch.ones(2))
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+        sorted_tokens,
+        expanded_x_idx,
+        expert_tokens,
+        dynamic_quant_scale,
+    )
+
+    output = module.fused_experts_allgather_ep(
+        layer=layer,
+        x=torch.ones(2, 2),
+        topk_weights=torch.ones(2, 1),
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+        share_experts_output=None,
+        is_prefill=False,
+    )
+
+    assert output.shape == (2, 2)
+    stubs.torch_npu.npu_dequant_swiglu_quant.assert_called_once()
+    stubs.torch_npu.npu_grouped_matmul_finalize_routing.assert_called_once()
+
+
+@pytest.mark.unit
+def test_fused_experts_allgather_ep_quant_int4(fused_module):
+    module, stubs = fused_module
+    layer = SimpleNamespace(
+        global_num_experts=4,
+        ep_rank=0,
+        local_num_experts=2,
+        dp_size=1,
+        w13_weight=torch.ones(1, 2, 2),
+        w2_weight=torch.ones(1, 2, 2),
+        w13_weight_int4_scale=torch.ones(1, 2),
+        w2_weight_int4_scale=torch.ones(1, 2),
+        w13_weight_bias=torch.ones(2),
+        w2_weight_bias=torch.ones(2),
+        quant_config=object(),
+        weight_num_bits=4
     )
     sorted_tokens = torch.ones(2, 2)
     expanded_x_idx = torch.tensor([0, 1], dtype=torch.int32)

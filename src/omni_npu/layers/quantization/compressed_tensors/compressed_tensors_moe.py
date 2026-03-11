@@ -29,6 +29,7 @@ from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndF
 from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
 from omni_npu.layers.fused_moe.fused_moe import moe_infer_fusion, fused_experts_tp, fused_experts_allgather_ep
+from omni_npu.layers.fused_moe.config import int4_w4a8_moe_quant_config
 
 
 torch.npu.config.allow_internal_format = True
@@ -376,3 +377,150 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
     @property
     def supports_eplb(self) -> bool:
         return True
+
+
+class NPUCompressedTensorsW4A8Int4MoEMethod(NPUCompressedTensorsW8A8Int8MoEMethod):
+    LAST_SEQ_LEN = None
+    BEST_EXPERT_TOKENS = None
+
+    def __init__(
+        self,
+        parent,
+        layer,
+    ):
+        super().__init__(parent, layer)
+        STORAGE_BITS_NPU = 8
+        WEIGHT_BITS = 4
+        self.warm_up = True
+        self.n_total_experts = None
+        self.pack_factor = STORAGE_BITS_NPU // WEIGHT_BITS
+        self.smooth_scale = None
+
+    def create_weights(self, layer: torch.nn.Module, num_experts: int,
+                       hidden_size: int, intermediate_size_per_partition: int,
+                       params_dtype: torch.dtype, **extra_weight_attrs):
+
+        # Will transpose the loaded weight along the
+        # intermediate and hidden dim sizes. Will
+        # shard for TP along the transposed dims
+        extra_weight_attrs.update({
+            "is_transposed": False,
+            "quant_method": FusedMoeWeightScaleSupported.CHANNEL.value
+        })
+        # Fused gate_up_proj (column parallel)
+        w13_weight = torch.nn.Parameter(torch.empty(num_experts,
+                                                    2 * intermediate_size_per_partition // self.pack_factor,
+                                                    hidden_size,
+                                                    dtype=torch.int8),
+                                        requires_grad=False)
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        # down_proj (row parallel)
+        w2_weight = torch.nn.Parameter(torch.empty(num_experts,
+                                                   hidden_size // self.pack_factor,
+                                                   intermediate_size_per_partition,
+                                                   dtype=torch.int8),
+                                       requires_grad=False)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_int4_scale = torch.nn.Parameter(torch.ones(num_experts,
+                                                                1,
+                                                                2 * intermediate_size_per_partition,
+                                                                dtype=torch.int64),
+                                                    requires_grad=False)
+
+        w2_weight_int4_scale = torch.nn.Parameter(torch.ones(num_experts,
+                                                                1,
+                                                                hidden_size,
+                                                                dtype=torch.int64),
+                                                    requires_grad=False)
+
+        w13_weight_bias = torch.nn.Parameter(torch.ones(num_experts,
+                                                        2 * intermediate_size_per_partition,
+                                                        dtype=torch.float32),
+                                             requires_grad=False)
+
+        w2_weight_bias = torch.nn.Parameter(torch.ones(num_experts,
+                                                       hidden_size,
+                                                       dtype=torch.float32),
+                                            requires_grad=False)
+
+        # INPUT_SCALES
+        assert not self.static_input_scales
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+        layer.register_parameter("w13_weight_int4_scale", w13_weight_int4_scale)
+        layer.register_parameter("w13_weight_bias", w13_weight_bias)
+        set_weight_attrs(w13_weight_int4_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+
+        layer.register_parameter("w2_weight_int4_scale", w2_weight_int4_scale)
+        layer.register_parameter("w2_weight_bias", w2_weight_bias)
+        set_weight_attrs(w2_weight_int4_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight = torch.nn.Parameter(layer.w13_weight.transpose(1, 2).contiguous(), requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(layer.w2_weight.transpose(1, 2).contiguous(), requires_grad=False)
+
+        layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight, 29)            
+        layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight, 29)
+
+        layer.w13_weight.data = layer.w13_weight.data.view(torch.int32).contiguous()
+        layer.w2_weight.data = layer.w2_weight.data.view(torch.int32).contiguous()
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ):
+        return int4_w4a8_moe_quant_config(
+            w1_scale=layer.w13_weight_int4_scale,
+            w2_scale=layer.w2_weight_int4_scale,
+            w1_bias=layer.w13_weight_bias,
+            w2_bias=layer.w2_weight_bias,
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            per_act_token_quant=True,
+        )
+
+    def gmm_expert(self, layer, h, expert_tokens, dynamic_scale=None, avg_tokens_per_expert=None):
+        # no need to transpose weight here if weight_nz enabled
+        hidden_size = h.size(-1)
+        pertoken_scale = dynamic_scale
+        if pertoken_scale.dim() > 1:
+            pertoken_scale = pertoken_scale.reshape(-1)
+            h = h.view(-1, hidden_size)
+
+        assert layer.moe_parallel_config.use_ep, "W4A8 only support ep"
+
+        avg_tokens_per_expert = avg_tokens_per_expert or [0]
+        tuning_config = None
+        
+        mm1_mm3 = torch_npu.npu_grouped_matmul([h], [layer.w13_weight], bias=[layer.w13_weight_bias], scale=[layer.w13_weight_int4_scale],
+                                               offset=None, antiquant_scale=None, antiquant_offset=None,
+                                               per_token_scale=[pertoken_scale],
+                                               group_list=expert_tokens,
+                                               activation_input=None, activation_quant_scale=None,
+                                               activation_quant_offset=None, split_item=3, group_type=0,
+                                               group_list_type=1, act_type=0, output_dtype=torch.bfloat16,
+                                               tuning_config=tuning_config)[0]
+
+        # dequant_swiglu_quant
+        fake_scale = torch.ones(layer.w13_weight_int4_scale.shape, dtype=torch.float32, device="npu").view(-1, layer.w13_weight_int4_scale.shape[-1])
+        pertoken_scale = torch.ones(pertoken_scale.shape, dtype=torch.float32, device="npu")
+        intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(mm1_mm3, weight_scale=fake_scale,
+                                                                            activation_scale=pertoken_scale,
+                                                                            bias=None, quant_scale=None,
+                                                                            quant_offset=None,
+                                                                            group_index=expert_tokens,
+                                                                            activate_left=True, quant_mode=1)
+
+        out_hidden = torch_npu.npu_grouped_matmul([intermediate_h], [layer.w2_weight], bias=[layer.w2_weight_bias],
+                                                  scale=[layer.w2_weight_int4_scale], per_token_scale=[pertoken_scale],
+                                                  group_list=expert_tokens, split_item=3,
+                                                  output_dtype=torch.bfloat16, group_type=0,
+                                                  group_list_type=1, tuning_config=tuning_config)[0]
+
+        return out_hidden

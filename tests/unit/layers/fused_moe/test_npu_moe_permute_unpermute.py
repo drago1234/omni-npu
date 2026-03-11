@@ -25,10 +25,13 @@ def permute_module(monkeypatch):
     config_module = types.ModuleType("vllm.model_executor.layers.fused_moe.config")
 
     class DummyFusedMoEQuantConfig:
-        def __init__(self, use_int8_w8a8=False, w1_scale=None, w2_scale=None):
+        def __init__(self, use_int8_w8a8=False, use_int4_w4a8=False, w1_scale=None, w2_scale=None, w1_bias=None ,w2_bias=None):
             self.use_int8_w8a8 = use_int8_w8a8
+            self.use_int4_w4a8 = use_int4_w4a8
             self.w1_scale = w1_scale
             self.w2_scale = w2_scale
+            self.w1_bias = w1_bias
+            self.w2_bias = w2_bias
 
     config_module.FusedMoEQuantConfig = DummyFusedMoEQuantConfig
 
@@ -99,6 +102,22 @@ def test_init_sets_scale_2_for_int8(permute_module):
     assert permuter.local_expert_num == 3
     assert permuter.scale_2 is not None
     assert permuter.scale_2.shape == (3, 2)
+
+
+@pytest.mark.unit
+def test_init_sets_scale_2_for_int4(permute_module):
+    module, stubs = permute_module
+    layer = SimpleNamespace(
+        w13_weight=[torch.zeros(1), torch.zeros(1), torch.zeros(1)],
+        w13_weight_int4_scale=torch.zeros(1, 4),
+    )
+    quant = stubs.quant_config_cls(use_int4_w4a8=True, w1_scale=torch.ones(1), w2_scale=torch.ones(1))
+
+    permuter = module.NPUFusedMoEPermuteExpertsUnpermute(quant, layer)
+
+    assert permuter.local_expert_num == 3
+    assert permuter.scale_2 is not None
+    assert permuter.scale_2.shape == (1, 4)
 
 
 @pytest.mark.unit
@@ -189,6 +208,53 @@ def test_apply_requires_expert_tokens_meta(permute_module):
             expert_tokens_meta=None,
             apply_router_weight_on_input=False,
         )
+
+
+@pytest.mark.unit
+def test_apply_int4_path_calls_npu_kernels(permute_module):
+    module, stubs = permute_module
+    layer = SimpleNamespace(
+        w13_weight=[torch.zeros(1)],
+        w13_weight_int4_scale=torch.zeros(1, 1),
+    )
+    quant = stubs.quant_config_cls(
+        use_int4_w4a8=True,
+        w1_scale=torch.ones(1,1),
+        w2_scale=torch.ones(1,1),
+        w1_bias=torch.zeros(1),
+        w2_bias=torch.zeros(1),
+    )
+    permuter = module.NPUFusedMoEPermuteExpertsUnpermute(quant, layer)
+    expert_tokens_meta = stubs.expert_meta_cls(expert_num_tokens=torch.tensor([1]))
+
+    expected = torch.full((2, 2), 7.0)
+    stubs.torch_npu.npu_grouped_matmul.side_effect = [
+        [torch.ones(2, 2, dtype=torch.int32)],
+        [expected],
+    ]
+
+    output = torch.zeros(2, 2)
+    permuter.apply(
+        output=output,
+        hidden_states=torch.ones(2, 2),
+        w1=torch.ones(1, 1, 2),
+        w2=torch.ones(1, 1, 2),
+        topk_weights=torch.ones(1, 1),
+        topk_ids=torch.zeros(1, 1, dtype=torch.int32),
+        activation="silu",
+        global_num_experts=1,
+        expert_map=None,
+        a1q_scale=torch.ones(1),
+        a2_scale=None,
+        workspace13=torch.zeros(1, 1),
+        workspace2=torch.zeros(1, 1),
+        expert_tokens_meta=expert_tokens_meta,
+        apply_router_weight_on_input=False,
+    )
+
+    assert torch.equal(output, expected)
+    stubs.torch_npu.npu_dequant_swiglu_quant.assert_called_once()
+    stubs.torch_npu.npu_swiglu.assert_not_called()
 
 
 @pytest.mark.unit

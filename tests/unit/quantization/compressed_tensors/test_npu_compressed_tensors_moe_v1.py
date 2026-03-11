@@ -253,3 +253,38 @@ def test_apply_experts_non_swigluoai_can_still_use_bias(monkeypatch):
     assert "glu_alpha" not in dequant_kwargs
     assert "glu_bias" not in dequant_kwargs
     assert grouped_calls[1]["bias"] is not None
+
+
+@pytest.mark.unit
+def test_apply_experts_int4(monkeypatch):
+    moe_mod = _import_moe_module(monkeypatch)
+    method = moe_mod.NPUCompressedTensorsW4A8Int4MoEMethodV1.__new__(
+        moe_mod.NPUCompressedTensorsW4A8Int4MoEMethodV1
+    )
+    method.moe = SimpleNamespace(has_bias=False)
+    layer = SimpleNamespace(
+        w13_weight=torch.ones(2, 2, 6, dtype=torch.int8),
+        w2_weight=torch.ones(2, 4, 3, dtype=torch.int8),
+        w13_weight_int4_scale=torch.ones(2, 6, dtype=torch.int64),
+        w2_weight_int4_scale=torch.ones(2, 4, dtype=torch.int64),
+        w13_weight_bias=torch.zeros(2, dtype=torch.float32),
+        w2_weight_bias=torch.zeros(2),
+    )
+
+    def fake_grouped_matmul(inputs, weights, **kwargs):
+        if kwargs["output_dtype"] == torch.int32:
+            hidden = inputs[0]
+            return [torch.ones(hidden.shape[0], 6, dtype=torch.int32)]
+        return [torch.ones(3, 3, dtype=torch.bfloat16)]
+
+    dequant_mock = MagicMock(
+        return_value=(
+            torch.ones(3, 3, dtype=torch.int8),
+            torch.ones(3, dtype=torch.float32),
+        )
+    )
+    monkeypatch.setattr(moe_mod.torch_npu, "npu_grouped_matmul", fake_grouped_matmul, raising=False)
+    monkeypatch.setattr(moe_mod.torch_npu, "npu_dequant_swiglu_quant", dequant_mock, raising=False)
+
+    output = method.apply_experts(layer, _build_prepare_permute_result())
+    assert output.shape == (3, 3)

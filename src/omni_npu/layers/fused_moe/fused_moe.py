@@ -142,7 +142,7 @@ def fused_experts_allgather_ep(
     experts_start_idx = layer.ep_rank * layer.local_num_experts  # ENABLE_OMNI_PLANNER
     experts_end_idx = experts_start_idx + layer.local_num_experts
     expert_range = [experts_start_idx, experts_end_idx]
-    row_idx_type = 0 if is_prefill else 1
+    row_idx_type = 0 if (is_prefill and layer.weight_num_bits == 8) else 1
 
     x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
 
@@ -161,81 +161,127 @@ def fused_experts_allgather_ep(
         sorted_topk_weight = torch.index_select(topk_weights.reshape(-1), 0, expanded_x_idx)
         row_index = expanded_x_idx // topk_ids.shape[-1]
         row_index = row_index.to(torch.int64)
+        shared_input = torch.zeros((batch_size // get_ep_group().world_size, hidden_size), dtype=torch.bfloat16, device="npu")
 
-    gate_up_proj = torch_npu.npu_grouped_matmul([sorted_tokens], [layer.w13_weight], bias=None,
-                                                group_list=expert_tokens,
-                                                split_item=3, output_dtype=torch.int32, group_type=0,
-                                                group_list_type=1)[0]
-    
-    quant_scale = torch.ones((layer.local_num_experts, layer.w13_weight_scale.shape[-1] // 2), dtype=torch.float32,
-                                device=current_platform.device_type)
-    dequant_swiglu_quant_kwargs = {
-        "x": gate_up_proj,
-        "weight_scale": layer.w13_weight_scale,
-        "activation_scale": dynamic_quant_scale,
-        "bias": None,
-        "quant_scale": quant_scale,
-        "quant_offset": None,
-        "group_index": expert_tokens,
-        "activate_left": True,
-        "quant_mode": 1
-    }
-    
-    if activation == "swigluoai":
-        dequant_swiglu_quant_kwargs.update({
-            "bias": layer.w13_bias if hasattr(layer, "w13_bias") else None,
-            "swiglu_mode": 1,
-            "clamp_limit": 7.0,
-            "glu_alpha": 1.702,
-            "glu_bias": 1.0
-        })
-    gate_up_proj, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(**dequant_swiglu_quant_kwargs)
+    if layer.weight_num_bits == 8:
+        gate_up_proj = torch_npu.npu_grouped_matmul([sorted_tokens], [layer.w13_weight], bias=None,
+                                                    group_list=expert_tokens,
+                                                    split_item=3, output_dtype=torch.int32, group_type=0,
+                                                    group_list_type=1)[0]
+        
+        quant_scale = torch.ones((layer.local_num_experts, layer.w13_weight_scale.shape[-1] // 2), dtype=torch.float32,
+                                    device=current_platform.device_type)
+        dequant_swiglu_quant_kwargs = {
+            "x": gate_up_proj,
+            "weight_scale": layer.w13_weight_scale,
+            "activation_scale": dynamic_quant_scale,
+            "bias": None,
+            "quant_scale": quant_scale,
+            "quant_offset": None,
+            "group_index": expert_tokens,
+            "activate_left": True,
+            "quant_mode": 1
+        }
+        
+        if activation == "swigluoai":
+            dequant_swiglu_quant_kwargs.update({
+                "bias": layer.w13_bias if hasattr(layer, "w13_bias") else None,
+                "swiglu_mode": 1,
+                "clamp_limit": 7.0,
+                "glu_alpha": 1.702,
+                "glu_bias": 1.0
+            })
+        gate_up_proj, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(**dequant_swiglu_quant_kwargs)
 
-    if row_idx_type == 1:
-        if share_experts_output is None:
-            share_experts_output = torch.zeros(
-                (batch_size // layer.dp_size, hidden_size),
-                dtype=torch.bfloat16,
-                device=current_platform.device_type
-            )
+        if row_idx_type == 1:
+            if share_experts_output is None:
+                share_experts_output = torch.zeros(
+                    (batch_size // layer.dp_size, hidden_size),
+                    dtype=torch.bfloat16,
+                    device=current_platform.device_type
+                )
+            output = torch_npu.npu_grouped_matmul_finalize_routing(
+                gate_up_proj,
+                layer.w2_weight,
+                expert_tokens,
+                scale=layer.w2_weight_scale.to(torch.float),
+                bias=layer.w2_bias if hasattr(layer, "w2_bias") else None,
+                pertoken_scale=pertoken_scale,
+                shared_input=share_experts_output,
+                logit=sorted_topk_weight,
+                row_index=row_index,
+                output_bs=batch_size,
+                shared_input_weight=1.0,
+                group_list_type=1,
+                shared_input_offset=0
+            ).to(torch.bfloat16)
+        else:
+            down_proj = torch_npu.npu_grouped_matmul(
+                [gate_up_proj],
+                [layer.w2_weight],
+                scale=[layer.w2_weight_scale],
+                per_token_scale=[pertoken_scale],
+                bias=[layer.w2_bias] if hasattr(layer, "w2_bias") else None,
+                group_list=expert_tokens,
+                split_item=3,
+                output_dtype=torch.bfloat16,
+                group_type=0,
+                group_list_type=1
+            )[0]
+            output = torch_npu.npu_moe_finalize_routing(
+                expanded_permuted_rows=down_proj.unsqueeze(1),
+                skip1=None,
+                skip2=None,
+                bias=None,
+                scales=topk_weights,
+                expanded_src_to_dst_row=expanded_x_idx,
+                export_for_source_row=topk_ids,
+                drop_pad_mode=3
+            ).to(torch.bfloat16)
+    elif layer.weight_num_bits == 4:
+        tuning_config = None
+
+        gate_up_proj = torch_npu.npu_grouped_matmul(
+            [sorted_tokens], 
+            [layer.w13_weight], 
+            bias=[layer.w13_weight_bias], 
+            scale=[layer.w13_weight_int4_scale],
+            per_token_scale=[dynamic_quant_scale],
+            group_list=expert_tokens,
+            split_item=3, 
+            group_type=0,
+            group_list_type=1, 
+            tuning_config=tuning_config, 
+            act_type=0, 
+            output_dtype=torch.bfloat16)[0]
+
+        fake_scale = torch.ones(layer.w13_weight_int4_scale.shape, dtype=torch.float32, device="npu").view(-1, layer.w13_weight_int4_scale.shape[-1])
+        dynamic_quant_scale = torch.ones(dynamic_quant_scale.shape, dtype=torch.float32, device="npu")
+        # scale_2 = torch.ones((n_routed_experts, layer.w13_weight_int4_scale.shape[-1] // 2), dtype=torch.float32, device="npu")
+        gate_up_proj, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+            x=gate_up_proj, 
+            weight_scale=fake_scale,
+            activation_scale=dynamic_quant_scale,
+            bias=None, 
+            quant_scale=None,
+            quant_offset=None,
+            group_index=expert_tokens,
+            activate_left=True, 
+            quant_mode=1)
+
         output = torch_npu.npu_grouped_matmul_finalize_routing(
-            gate_up_proj,
+            gate_up_proj, 
             layer.w2_weight,
-            expert_tokens,
-            scale=layer.w2_weight_scale.to(torch.float),
-            bias=layer.w2_bias if hasattr(layer, "w2_bias") else None,
+            group_list=expert_tokens, 
+            scale=layer.w2_weight_int4_scale,
+            bias=layer.w2_weight_bias,
             pertoken_scale=pertoken_scale,
-            shared_input=share_experts_output,
+            shared_input=shared_input, 
             logit=sorted_topk_weight,
             row_index=row_index,
             output_bs=batch_size,
-            shared_input_weight=1.0,
             group_list_type=1,
-            shared_input_offset=0
-        ).to(torch.bfloat16)
-    else:
-        down_proj = torch_npu.npu_grouped_matmul(
-            [gate_up_proj],
-            [layer.w2_weight],
-            scale=[layer.w2_weight_scale],
-            per_token_scale=[pertoken_scale],
-            bias=[layer.w2_bias] if hasattr(layer, "w2_bias") else None,
-            group_list=expert_tokens,
-            split_item=3,
-            output_dtype=torch.bfloat16,
-            group_type=0,
-            group_list_type=1
-        )[0]
-        output = torch_npu.npu_moe_finalize_routing(
-            expanded_permuted_rows=down_proj.unsqueeze(1),
-            skip1=None,
-            skip2=None,
-            bias=None,
-            scales=topk_weights,
-            expanded_src_to_dst_row=expanded_x_idx,
-            export_for_source_row=topk_ids,
-            drop_pad_mode=3
-        ).to(torch.bfloat16)
+            tuning_config=tuning_config).to(torch.bfloat16)
     return output
 
 

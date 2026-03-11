@@ -11,7 +11,7 @@ from vllm.platforms import current_platform
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import int8_w8a8_moe_quant_config, FusedMoEQuantConfig
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
-from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethod
+from omni_npu.layers.quantization.compressed_tensors.compressed_tensors_moe import NPUCompressedTensorsW8A8Int8MoEMethod, NPUCompressedTensorsW4A8Int4MoEMethod
 from omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize import (
     FusedMoEPreparePermuteAndUnpermuteFinalize,
     PreparePermuteResult
@@ -222,5 +222,65 @@ class NPUCompressedTensorsW8A8Int8MoEMethodV1(NPUCompressedTensorsW8A8Int8MoEMet
             group_type=0,
             group_list_type=1,
             tuning_config=avg_tokens_per_expert)[0]
+        
+        return hidden_states_experts
+
+
+class NPUCompressedTensorsW4A8Int4MoEMethodV1(NPUCompressedTensorsW4A8Int4MoEMethod, NPUFusedMoEMethodBase):
+    all2all_threshold: int = 64
+    def __init__(self, parent, layer):
+        NPUCompressedTensorsW4A8Int4MoEMethod.__init__(self, parent, layer)
+        NPUFusedMoEMethodBase.__init__(self)
+        self.apply = NPUCompressedTensorsW8A8Int8MoEMethodV1.apply
+
+    def apply_experts(self, layer: torch.nn.Module, prepare_permute_result: PreparePermuteResult) -> torch.Tensor:
+        hidden_states = prepare_permute_result.hidden_states_sorted_by_experts
+        expert_tokens = prepare_permute_result.expert_tokens
+        avg_tokens_per_expert = prepare_permute_result.avg_tokens_per_expert or [0]
+        pertoken_scale = prepare_permute_result.dynamic_scale
+        tuning_config = None
+        # if pertoken_scale.dim() > 1:
+        #     pertoken_scale = pertoken_scale.reshape(-1)
+        #     hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        gate_up_proj = torch_npu.npu_grouped_matmul(
+            [hidden_states], 
+            [layer.w13_weight], 
+            bias=[layer.w13_weight_bias], 
+            scale=[layer.w13_weight_int4_scale],
+            per_token_scale=[pertoken_scale],
+            group_list=expert_tokens,
+            split_item=3, 
+            group_type=0,
+            group_list_type=1, 
+            act_type=0,
+            tuning_config=tuning_config, 
+            output_dtype=torch.bfloat16)[0]
+
+        fake_scale = torch.ones(layer.w13_weight_int4_scale.shape, dtype=torch.float32, device="npu").view(-1, layer.w13_weight_int4_scale.shape[-1])
+        pertoken_scale = torch.ones(pertoken_scale.shape, dtype=torch.float32, device="npu")
+        gate_up_proj, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+            gate_up_proj, 
+            weight_scale=fake_scale,
+            activation_scale=pertoken_scale,
+            bias=None, 
+            quant_scale=None,
+            quant_offset=None, 
+            group_index=expert_tokens,
+            activate_left=True, 
+            quant_mode=1)
+
+        hidden_states_experts = torch_npu.npu_grouped_matmul(
+            [gate_up_proj], 
+            [layer.w2_weight], 
+            scale=[layer.w2_weight_int4_scale],
+            per_token_scale=[pertoken_scale], 
+            bias=[layer.w2_weight_bias],
+            group_list=expert_tokens, 
+            split_item=3, 
+            output_dtype=torch.bfloat16,
+            group_type=0,
+            group_list_type=1,
+            tuning_config=tuning_config)[0]
         
         return hidden_states_experts
