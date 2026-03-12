@@ -327,7 +327,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             "actual_seq_kvlen": attn_metadata.seq_lens,
         }
         
-        if self.sliding_window is not None:
+        if self.sliding_window:
             fused_infer_attn_kwargs.update({
                 "sparse_mode": 4,
                 "pre_tokens": self.sliding_window,

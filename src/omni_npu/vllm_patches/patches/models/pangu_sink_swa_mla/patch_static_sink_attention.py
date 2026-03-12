@@ -165,7 +165,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
             param_data.copy_(loaded_weight)
     
 
-    class StaticSinkAttention(Attention, CustomOp):
+    class StaticSinkAttention(Attention):
         """
         Attention with static sink tokens
         """
