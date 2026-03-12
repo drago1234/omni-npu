@@ -755,17 +755,24 @@ class NPUModelRunner(GPUModelRunner):
         attn_layers = self.compilation_config.static_forward_context
         if self.model_config.enable_sleep_mode:
             from vllm.attention.layers import StaticSinkAttention
+            from vllm.attention.layers.static_sink_attention import StaticSinkMLAAttention
             for name, module in attn_layers.items():
-                if isinstance(module, StaticSinkAttention):
+                if isinstance(module, (StaticSinkAttention, StaticSinkMLAAttention)):
                     self._kv_cache_sink_attn_after_wake_up(module)
     
     def _kv_cache_sink_attn_after_wake_up(self, module) -> None:
         sink_kv_cache = getattr(module, "kv_cache")
-        populate_sink_kv_method = getattr(module, "populate_sink_kv")
 
         # populate_sink_kv in SinkAttention retrieves the `virtual_engine` value from `ForwardContext`
         # but this value is unavailable here. 
         # Since `virtual_engine` is defaulted to 0 and will be deprecated, we directly set it to 0 here.
         self_kv_cache = sink_kv_cache[0] 
         if self_kv_cache is not None and len(self_kv_cache) > 0:
+            populate_sink_kv_method = getattr(module, "populate_sink_kv")
             populate_sink_kv_method(self_kv_cache[0], self_kv_cache[1])
+
+        for kv_cache_group_id in range(len(self.kv_cache_config.kv_cache_groups)):
+            for attn_group in self.attn_groups[kv_cache_group_id]:
+                for attn_builder in attn_group.metadata_builders:
+                    if hasattr(attn_builder, "reinit_block_table_with_sink"):
+                        attn_builder.reinit_block_table_with_sink()

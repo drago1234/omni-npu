@@ -35,8 +35,6 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
-    SinkFullAttentionSpec,
-    SinkMLAAttentionSpec,
 )
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
@@ -77,6 +75,8 @@ class create_static_sink_attention_backendPatch(VLLMPatch):
                 self.max_num_blocks = cdiv(
                     model_config.max_model_len, vllm_config.cache_config.block_size
                 )
+                self.scheduler_config = scheduler_config
+                self.device = device
                 self.block_table_with_sink = torch.zeros(
                     (
                         scheduler_config.max_num_seqs,
@@ -89,6 +89,21 @@ class create_static_sink_attention_backendPatch(VLLMPatch):
                     1,
                     self.num_sink_blocks + 1,
                     device=device,
+                    dtype=torch.int32,
+                )
+            def reinit_block_table_with_sink(self):
+                self.block_table_with_sink[:, :] = torch.zeros(
+                    (
+                        self.scheduler_config.max_num_seqs,
+                        self.max_num_blocks + self.num_sink_blocks,
+                    ),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                self.block_table_with_sink[:, : self.num_sink_blocks] = torch.arange(
+                    1,
+                    self.num_sink_blocks + 1,
+                    device=self.device,
                     dtype=torch.int32,
                 )
             def build(
@@ -243,6 +258,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
             # We only populate the sink_key and sink_value once
             self.sink_populated = True
         def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+            from vllm.v1.kv_cache_interface import SinkFullAttentionSpec
             # Block size may get updated after model loading, refresh it
             block_size = vllm_config.cache_config.block_size
             # Should not be called for enc-dec or encoder-only attention.
@@ -362,6 +378,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
                 k_pe_cache.view(-1, k_pe_cache.shape[-1]), sink_kv_slot_mapping, self.sink_k_pe)
             self.sink_populated = True
         def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+            from vllm.v1.kv_cache_interface import SinkMLAAttentionSpec
             kv_cache_dtype = kv_cache_dtype_str_to_dtype(
                 self.kv_cache_dtype, vllm_config.model_config
             )

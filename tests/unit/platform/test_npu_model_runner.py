@@ -529,6 +529,13 @@ class TestNPUModelRunner:
         mock_module.kv_cache = [(MagicMock(), MagicMock())]
         mock_module.populate_sink_kv = MagicMock()
 
+        # Setup mock KV cache config
+        mock_kv_cache_config = MagicMock()
+        mock_kv_cache_config.kv_cache_groups = []
+
+        # Setup runner attributes
+        setattr(runner, "kv_cache_config", mock_kv_cache_config)
+
         # Set up runner attributes
         runner.compilation_config = MagicMock()
         runner.compilation_config.static_forward_context = {
@@ -559,6 +566,13 @@ class TestNPUModelRunner:
         mock_module.kv_cache = mock_sink_kv_cache
         mock_populate_sink_kv = MagicMock()
         mock_module.populate_sink_kv = mock_populate_sink_kv
+
+         # Setup mock KV cache config
+        mock_kv_cache_config = MagicMock()
+        mock_kv_cache_config.kv_cache_groups = []
+
+        # Setup runner attributes
+        setattr(runner, "kv_cache_config", mock_kv_cache_config)
 
         # Call _kv_cache_sink_attn_after_wake_up
         runner._kv_cache_sink_attn_after_wake_up(mock_module)
@@ -1757,3 +1771,121 @@ class TestNPUModelRunner:
         # Test skip_eplb=False
         self.runner._dummy_run(num_tokens=10, skip_eplb=False)
         assert eplb_called["called"] is True
+    
+    def test_kv_cache_sink_attn_after_wake_up_normal_case(self, monkeypatch):
+        """Test _kv_cache_sink_attn_after_wake_up with normal StaticSinkAttention module.
+        
+        Verifies that the method correctly processes StaticSinkAttention modules,
+        calls populate_sink_kv, and invokes reinit_block_table_with_sink on builders
+        """
+        # Create a mock StaticSinkAttention module
+        class MockStaticSinkAttention:
+            def __init__(self):
+                self.kv_cache = [
+                    [torch.zeros((1, 2, 4, 8), dtype=torch.float16),
+                     torch.zeros((1, 2, 4, 8), dtype=torch.float16)]
+                ]
+                self.populate_sink_kv_called = False
+
+            def populate_sink_kv(self, k_cache, v_cache):
+                self.populate_sink_kv_called = True
+        mock_module = MockStaticSinkAttention()
+
+        # Setup mock KV cache config and attention groups
+        mock_kv_cache_config = MagicMock()
+        mock_kv_cache_config.kv_cache_groups = [MagicMock()]
+
+        # Create mock attention builder with reinit_block_table_with_sink method
+        mock_builder = MagicMock()
+        mock_builder.reinit_block_table_with_sink = MagicMock()
+
+        # Create mock attention group with metadata builders
+        mock_attn_group = MagicMock()
+        mock_attn_group.metadata_builders = [mock_builder]
+
+        # Setup runner attributes
+        setattr(self.runner, "kv_cache_config", mock_kv_cache_config)
+        setattr(self.runner, "attn_groups", [[mock_attn_group]])
+
+        # Call the method
+        self.runner._kv_cache_sink_attn_after_wake_up(mock_module)
+
+        # Verify populate_sink_kv was called
+        assert mock_module.populate_sink_kv_called is True
+
+        # Verify reinit_block_table_with_sink was called
+        mock_builder.reinit_block_table_with_sink.assert_called_once()
+
+    def test_kv_cache_sink_attn_after_wake_up_empty_kv_cache(self, monkeypatch):
+        """Test _kv_cache_sink_attn_after_wake_up with empty KV cache.
+        
+        Verifies that the method handles empty KV cache gracefully without errors.
+        """
+        # Create a mock StaticSinkAttention module with empty KV cache
+        class MockStaticSinkAttention:
+            def __init__(self):
+                self.kv_cache = [None]
+        
+        mock_module = MockStaticSinkAttention()
+
+        # Setup mock KV cache config and attention groups
+        mock_kv_cache_config = MagicMock()
+        mock_kv_cache_config.kv_cache_groups = [MagicMock()]
+
+        # Create mock attention builder with reinit_block_table_with_sink method
+        mock_builder = MagicMock()
+        mock_builder.reinit_block_table_with_sink = MagicMock()
+
+        # Create mock attention group with metadata builders
+        mock_attn_group = MagicMock()
+        mock_attn_group.metadata_builders = [mock_builder]
+
+        # Setup runner attributes
+        setattr(self.runner, "kv_cache_config", mock_kv_cache_config)
+        setattr(self.runner, "attn_groups", [[mock_attn_group]])
+
+        # Call the method - should not raise an error
+        self.runner._kv_cache_sink_attn_after_wake_up(mock_module)
+
+        # Verify reinit_block_table_with_sink was still called
+        mock_builder.reinit_block_table_with_sink.assert_called_once()
+
+    def test_kv_cache_sink_attn_after_wake_up_builder_without_reinit_method(self, monkeypatch):
+        """Test _kv_cache_sink_attn_after_wake_up with builder that doesn't have reinit method.
+        
+        Verifies that the method gracefully handles attention builders without errors.
+        """
+        # Create a mock StaticSinkAttention module with empty KV cache
+        class MockStaticSinkAttention:
+            def __init__(self):
+                self.kv_cache = [
+                    [torch.zeros((1, 2, 4, 8), dtype=torch.float16),
+                     torch.zeros((1, 2, 4, 8), dtype=torch.float16)]
+                ]
+                self.populate_sink_kv_called = False
+
+            def populate_sink_kv(self, k_cache, v_cache):
+                self.populate_sink_kv_called = True
+        
+        mock_module = MockStaticSinkAttention()
+
+        # Setup mock KV cache config and attention groups
+        mock_kv_cache_config = MagicMock()
+        mock_kv_cache_config.kv_cache_groups = [MagicMock()]
+
+        # Create mock attention builder without reinit_block_table_with_sink method
+        mock_builder = MagicMock()
+
+        # Create mock attention group with metadata builders
+        mock_attn_group = MagicMock()
+        mock_attn_group.metadata_builders = [mock_builder]
+
+        # Setup runner attributes
+        setattr(self.runner, "kv_cache_config", mock_kv_cache_config)
+        setattr(self.runner, "attn_groups", [[mock_attn_group]])
+
+        # Call the method - should not raise an error
+        self.runner._kv_cache_sink_attn_after_wake_up(mock_module)
+
+        # Verify populate_sink_kv was still called
+        assert mock_module.populate_sink_kv_called is True
