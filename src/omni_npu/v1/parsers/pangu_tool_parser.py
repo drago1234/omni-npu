@@ -15,11 +15,9 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               ExtractedToolCallInformation,
                                               FunctionCall, ToolCall,
                                               )
-from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
-    ToolParser)
-from vllm.entrypoints.openai.tool_parsers.utils import (find_common_prefix,
-                                                        is_complete_json,
-                                                        partial_json_loads)
+from vllm.tool_parsers.abstract_tool_parser import ToolParser
+from vllm.tool_parsers.utils import (find_common_prefix, is_complete_json,
+                                     partial_json_loads)
 from vllm.logger import logger
 from vllm.tokenizers import TokenizerLike
 

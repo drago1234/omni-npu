@@ -265,6 +265,7 @@ class NPUCommunicator(CudaCommunicator):
             hidden_states: torch.Tensor,
             router_logits: torch.Tensor,
             is_sequence_parallel: bool = False,
+            extra_tensors: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Dispatch the hidden states and router logits to the appropriate device.

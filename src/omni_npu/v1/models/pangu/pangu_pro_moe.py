@@ -10,7 +10,7 @@ import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention.backends.abstract import (
+from vllm.v1.attention.backend import (
     AttentionType,
 )
 from vllm.config import VllmConfig, get_current_vllm_config

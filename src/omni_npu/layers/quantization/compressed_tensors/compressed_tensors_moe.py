@@ -36,14 +36,16 @@ logger = init_logger(__name__)
 class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, NPUFusedMoEMethodBase):
     def __init__(
         self,
+        weight_quant,
         parent,
         layer,
     ):
-        super().__init__(parent, layer.moe_config)
+        super().__init__(weight_quant, parent, layer.moe_config)
         NPUFusedMoEMethodBase.__init__(self)
         self.init_eplb(layer)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
+        self.shared_experts_stream = named_stream("shared_experts_stream")
 
     def init_eplb(self, layer):
         self.enable_eplb = layer.enable_eplb
@@ -274,9 +276,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         shared_output = None
         if layer.shared_experts is not None:
             cur_stream = torch.npu.current_stream()
-            sub_stream = named_stream("moe_sub_stream")
-            sub_stream.wait_stream(cur_stream)
-            with torch.npu.stream(sub_stream):
+            self.shared_experts_stream.wait_stream(cur_stream)
+            with torch.npu.stream(self.shared_experts_stream):
                 if layer.shared_experts.gate_up_proj.tp_size > 1:
                     # Shared experts with TP>1 require full hidden_states;
                     # output is all-reduced later.
@@ -294,7 +295,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         )
 
         if layer.shared_experts is not None:
-            cur_stream.wait_stream(sub_stream)
+            cur_stream.wait_stream(self.shared_experts_stream)
             if layer.shared_experts.gate_up_proj.tp_size > 1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
@@ -412,10 +413,11 @@ class NPUCompressedTensorsW4A8Int4MoEMethod(NPUCompressedTensorsW8A8Int8MoEMetho
 
     def __init__(
         self,
+        weight_quant,
         parent,
         layer,
     ):
-        super().__init__(parent, layer)
+        super().__init__(weight_quant, parent, layer)
         STORAGE_BITS_NPU = 8
         WEIGHT_BITS = 4
         self.warm_up = True

@@ -4,7 +4,7 @@
 
 from omni_npu.v1.parsers.pangu_reasoning_parser import PanguReasoningParser
 from omni_npu.v1.parsers.pangu_tool_parser import PanguToolParser
-from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import ToolParserManager
+from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
 
 """

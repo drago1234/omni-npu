@@ -30,7 +30,6 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
-from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -44,17 +43,14 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
+from vllm.v1.attention.backend import AttentionType
+
 from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from vllm.model_executor.models.qwen2 import Qwen2MLP as Qwen3MLP
 from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
 
 logger = init_logger(__name__)
-
-# from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
-
-# class Qwen3MLP(FusedMLP):
-#     pass
 
 
 class Qwen3Attention(nn.Module):
@@ -115,7 +111,6 @@ class Qwen3Attention(nn.Module):
 
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position,
             rope_parameters=rope_parameters,
             dual_chunk_attention_config=dual_chunk_attention_config,
@@ -144,7 +139,7 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-
+        
         from vllm.forward_context import ForwardContext, get_forward_context
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -157,7 +152,7 @@ class Qwen3Attention(nn.Module):
             else:
                 meta = attn_metadata
             is_prefill = getattr(meta, 'num_prefills', 0) > 0
-        
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm

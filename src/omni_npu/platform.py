@@ -145,20 +145,13 @@ class NPUPlatform(Platform):
     def get_attn_backend_cls(
         cls,
         selected_backend,
-        head_size: int,
-        dtype: torch.dtype,
-        kv_cache_dtype: Optional[str],
-        block_size: int,
-        use_mla: bool,
-        has_sink: bool,
-        use_sparse: bool,
-        attn_type: str | None = None,
+        attn_selector_config,
     ) -> str:
         if "omni_models_v0" in os.environ.get("VLLM_PLUGINS", ""):
             return "omni_npu.v0.layers.attention.backend.attention.NPUAttentionBackend"
         else:
-            if use_mla:
-                if use_sparse:
+            if attn_selector_config.use_mla:
+                if attn_selector_config.use_sparse:
                     return "omni_npu.attention.backends.dsa.NPUDSABackend"
                 else:
                     return "omni_npu.attention.backends.mla.NPUMLABackend"

@@ -10,8 +10,7 @@ from typing import Optional
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding.common import (apply_rotary_emb_torch,
-                                                                rotate_gptj,
+from vllm.model_executor.layers.rotary_embedding.common import (rotate_gptj,
                                                                 rotate_neox)
 
 logger = init_logger(__name__)

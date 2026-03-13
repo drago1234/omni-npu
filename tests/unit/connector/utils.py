@@ -14,6 +14,17 @@ from vllm.v1.request import Request
 from vllm import SamplingParams
 
 
+def _mock_with_dafault_value(cls):
+    mock_obj = MagicMock()
+
+    for k, v in cls.__dict__.items():
+        if k.startswith("__"):
+            continue
+        setattr(mock_obj, k, v)
+    
+    return mock_obj
+
+
 def create_vllm_config(
     kv_role: str="kv_producer",
     kv_connector: str = "LLMDataDistConnector",
@@ -31,7 +42,7 @@ def create_vllm_config(
         enable_chunked_prefill=enable_chunked_prefill,
         is_encoder_decoder=False,
     )
-    model_config = MagicMock()
+    model_config = _mock_with_dafault_value(ModelConfig)
     model_config.max_model_len = max_model_len
     model_config.is_encoder_decoder = False
     model_config.is_multimodal_model = False
@@ -67,7 +78,13 @@ def create_scheduler(
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
-                ["layer"], FullAttentionSpec(block_size, 1, 1, torch.float32, False)
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32
+                )
             )
         ],
     )

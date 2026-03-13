@@ -31,7 +31,7 @@ import torch.distributed as dist
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention.layer import Attention
-from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_pp_group, get_tp_group

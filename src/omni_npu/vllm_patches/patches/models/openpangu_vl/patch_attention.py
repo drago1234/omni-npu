@@ -10,13 +10,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase 
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.attention.backends.abstract import (
+from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionType,
 )
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-from vllm.attention.selector import get_attn_backend
+from vllm.v1.attention.selector import get_attn_backend
 from vllm.attention.layer import Attention, _init_kv_cache_quant
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch

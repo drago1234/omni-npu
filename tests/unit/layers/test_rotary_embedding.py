@@ -15,8 +15,8 @@ from vllm.config import (
 )
 platforms.current_platform = NPUPlatform()
 
+from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from omni_npu.layers.rotary_embedding.common import apply_rotary_emb_full_dim
-from vllm.model_executor.layers.rotary_embedding.common import apply_rotary_emb_torch
 from omni_npu.layers.rotary_embedding.deepseek_scaling_rope import (
     NPUDeepseekScalingRotaryEmbedding,
 )
@@ -94,14 +94,14 @@ def _reference_forward_partial_dim(
     query = query.view(num_tokens, -1, layer.head_size)
     query_rot = query[..., : layer.rotary_dim]
     query_pass = query[..., layer.rotary_dim :]
-    query_rot = apply_rotary_emb_torch(query_rot, cos, sin, layer.is_neox_style)
+    query_rot = ApplyRotaryEmb.forward_static(query_rot, cos, sin, layer.is_neox_style)
     query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
     key_shape = key.shape
     key = key.view(num_tokens, -1, layer.head_size)
     key_rot = key[..., : layer.rotary_dim]
     key_pass = key[..., layer.rotary_dim :]
-    key_rot = apply_rotary_emb_torch(key_rot, cos, sin, layer.is_neox_style)
+    key_rot = ApplyRotaryEmb.forward_static(key_rot, cos, sin, layer.is_neox_style)
     key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
     return query, key
 
@@ -158,7 +158,7 @@ def _reference_forward_partial_dim(
         ),
     ],
 )
-def test_get_cos_sin_matches_cache(layer_factory):
+def test_get_cos_sin_matches_cache(default_vllm_config, layer_factory):
     device = _require_npu()
     layer = layer_factory().to(device)
     positions = torch.tensor([0, 3, 7], device=device)
@@ -208,7 +208,7 @@ def test_get_cos_sin_matches_cache(layer_factory):
         ),
     ],
 )
-def test_get_cos_sin_no_offsets_matches_cache(layer_factory):
+def test_get_cos_sin_no_offsets_matches_cache(default_vllm_config, layer_factory):
     device = _require_npu()
     layer = layer_factory().to(device)
     positions = torch.tensor([0, 3, 7], device=device)
@@ -221,7 +221,7 @@ def test_get_cos_sin_no_offsets_matches_cache(layer_factory):
     assert torch.allclose(sin, expected_sin)
 
 
-def test_linear_scaling_get_cos_sin_with_offsets_uses_cache_slice():
+def test_linear_scaling_get_cos_sin_with_offsets_uses_cache_slice(default_vllm_config):
     device = _require_npu()
     layer = NPULinearScalingRotaryEmbedding(
         head_size=8,
@@ -245,7 +245,7 @@ def test_linear_scaling_get_cos_sin_with_offsets_uses_cache_slice():
     assert torch.allclose(sin, expected_sin)
 
 
-def test_linear_scaling_multi_factor_cache_offsets():
+def test_linear_scaling_multi_factor_cache_offsets(default_vllm_config):
     device = _require_npu()
     layer = NPULinearScalingRotaryEmbedding(
         head_size=8,
@@ -267,7 +267,7 @@ def test_linear_scaling_multi_factor_cache_offsets():
     assert layer.sin_cached.shape[0] == 4 + 8 + 16
 
 
-def test_linear_scaling_get_cos_sin_multi_factor_offsets_match_cache():
+def test_linear_scaling_get_cos_sin_multi_factor_offsets_match_cache(default_vllm_config):
     device = _require_npu()
     layer = NPULinearScalingRotaryEmbedding(
         head_size=8,
@@ -291,7 +291,7 @@ def test_linear_scaling_get_cos_sin_multi_factor_offsets_match_cache():
         assert torch.allclose(sin, expected_sin)
 
 
-def test_linear_scaling_get_cos_sin_defaults_to_first_factor():
+def test_linear_scaling_get_cos_sin_defaults_to_first_factor(default_vllm_config):
     device = _require_npu()
     layer = NPULinearScalingRotaryEmbedding(
         head_size=8,
@@ -347,7 +347,7 @@ def test_linear_scaling_get_cos_sin_defaults_to_first_factor():
         ),
     ],
 )
-def test_forward_oot_rotary_dim_128_matches_reference(layer_factory):
+def test_forward_oot_rotary_dim_128_matches_reference(default_vllm_config, layer_factory):
     device = _require_npu()
     torch.manual_seed(0)
     layer = layer_factory().to(device)
@@ -364,7 +364,7 @@ def test_forward_oot_rotary_dim_128_matches_reference(layer_factory):
     assert torch.allclose(out_k, exp_k, atol=1e-4, rtol=1e-4)
 
 
-def test_forward_oot_rotary_dim_lt_head_size_matches_reference():
+def test_forward_oot_rotary_dim_lt_head_size_matches_reference(default_vllm_config):
     device = _require_npu()
     torch.manual_seed(1)
     layer = NPURotaryEmbedding(
@@ -388,7 +388,7 @@ def test_forward_oot_rotary_dim_lt_head_size_matches_reference():
     assert torch.allclose(out_k, exp_k, atol=1e-4, rtol=1e-4)
 
 
-def test_forward_oot_rotary_dim_lt_head_size_gptj_matches_reference():
+def test_forward_oot_rotary_dim_lt_head_size_gptj_matches_reference(default_vllm_config):
     device = _require_npu()
     torch.manual_seed(4)
     layer = NPURotaryEmbedding(
@@ -412,7 +412,7 @@ def test_forward_oot_rotary_dim_lt_head_size_gptj_matches_reference():
     assert torch.allclose(out_k, exp_k, atol=1e-4, rtol=1e-4)
 
 
-def test_forward_oot_small_ops_matches_reference():
+def test_forward_oot_small_ops_matches_reference(default_vllm_config):
     device = _require_npu()
     torch.manual_seed(2)
     layer = NPURotaryEmbedding(
@@ -436,7 +436,7 @@ def test_forward_oot_small_ops_matches_reference():
     assert torch.allclose(out_k, exp_k, atol=1e-4, rtol=1e-4)
 
 
-def test_cached_cos_sin_mixin_branches_shape():
+def test_cached_cos_sin_mixin_branches_shape(default_vllm_config):
     device = _require_npu()
     layer = NPURotaryEmbedding(
         head_size=8,
@@ -491,7 +491,7 @@ def test_cached_cos_sin_mixin_branches_shape():
         ),
     ],
 )
-def test_forward_oot_rotary_dim_128_gptj_matches_reference(layer_factory):
+def test_forward_oot_rotary_dim_128_gptj_matches_reference(default_vllm_config, layer_factory):
     device = _require_npu()
     torch.manual_seed(3)
     layer = layer_factory().to(device)
@@ -543,7 +543,7 @@ def test_forward_oot_rotary_dim_128_gptj_matches_reference(layer_factory):
         ),
     ],
 )
-def test_forward_oot_key_none_matches_reference(layer_factory):
+def test_forward_oot_key_none_matches_reference(default_vllm_config, layer_factory):
     device = _require_npu()
     torch.manual_seed(5)
     layer = layer_factory().to(device)

@@ -39,7 +39,7 @@ if not (hasattr(torch, "npu") and torch.npu.device_count() > 0):
 from types import SimpleNamespace
 
 from omni_npu.attention.backends.mla import NPUMLAImpl, NPUMLAMetadataBuilder
-from vllm.attention.backends.abstract import AttentionType
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -274,7 +274,9 @@ def _reference_full_prefill_over_context_plus_suffix(
 
 @pytest.mark.integration
 @pytest.mark.parametrize("batch_size", [1, 8])
-def test_mla_chunked_prefill_matches_full_attention(monkeypatch: pytest.MonkeyPatch, batch_size: int) -> None:
+def test_mla_chunked_prefill_matches_full_attention(
+        default_vllm_config, monkeypatch: pytest.MonkeyPatch,
+        batch_size: int) -> None:
     """
     Scenario:
     - Each sequence has a cached prefix (context_len) already present in paged KV-cache.
@@ -480,14 +482,11 @@ def test_mla_chunked_prefill_matches_full_attention(monkeypatch: pytest.MonkeyPa
     query_start_loc = query_start_loc_cpu.to(device)
     seq_lens_cpu = torch.full((batch_size,), total_seq_len, dtype=torch.int32, device="cpu")
     seq_lens = seq_lens_cpu.to(device)
-    num_computed_tokens_cpu = torch.full((batch_size,), context_len, dtype=torch.int32, device="cpu")
 
     common_attn_metadata = CommonAttentionMetadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens_cpu,
-        num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_reqs=batch_size,
         num_actual_tokens=total_q,
         max_query_len=suffix_len,

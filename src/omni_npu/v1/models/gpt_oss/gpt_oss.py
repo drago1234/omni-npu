@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from transformers import GptOssConfig, PretrainedConfig
 
-from vllm.attention.backends.abstract import AttentionType
+from vllm.v1.attention.backend import AttentionType
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -108,7 +108,6 @@ class GptOssAttention(nn.Module):
         rope_params["rope_type"] = "yarn"
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=config.max_position_embeddings,
             dtype=torch.float32,
             rope_parameters=rope_params,

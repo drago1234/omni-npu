@@ -12,10 +12,11 @@ from vllm.entrypoints.chat_utils import  ChatCompletionMessageParam, ChatTemplat
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
-    ErrorResponse, CompletionRequest, RequestResponseMetadata, CompletionResponse, ResponsesRequest,
+    ErrorResponse, ResponsesRequest,
 )
-from vllm.entrypoints.openai.serving_engine import OpenAIServing, TextTokensPrompt, RequestPrompt, ChatLikeRequest
-from vllm.entrypoints.openai.tool_parsers import ToolParser
+from vllm.entrypoints.openai.serving_engine import OpenAIServing, ChatLikeRequest
+from vllm.inputs.data import PromptType, TokensPrompt
+from vllm.tool_parsers import ToolParser
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreRequest
 from vllm.lora.request import LoRARequest
@@ -23,11 +24,9 @@ from vllm.outputs import RequestOutput, CompletionOutput
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.request import Request
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.inputs import PromptType
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
@@ -40,7 +39,7 @@ _original_generate = AsyncLLM.generate
 async def to_async_iterator(input: RequestOutput) -> AsyncIterator[RequestOutput]:
     yield input
 
-class PrefilledTextPrompt(TextTokensPrompt):
+class PrefilledTextPrompt(TokensPrompt):
     """
     This is used when the model supports reusing prefilled tokens.
     """
@@ -58,7 +57,7 @@ class OpenAIServingChatPatch(VLLMPatch):
         request_id: str,
         model_name: str,
         conversation: list,
-        tokenizer: TokenizerLike,
+        tokenizer: TokenizerLike | None,
         request_metadata,
     ) -> ErrorResponse | ChatCompletionResponse:
         final_res: RequestOutput | None = None
@@ -116,16 +115,22 @@ class OpenAIServingChatPatch(VLLMPatch):
             tool_dicts: list[dict[str, Any]] | None = None,
             documents: list[dict[str, str]] | None = None,
             chat_template_kwargs: dict[str, Any] | None = None,
+            default_chat_template_kwargs: dict[str, Any] | None = None,
             tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
             add_special_tokens: bool = False,
     ):
-        conversation, [request_prompt], [engine_prompt] =await _original_preprocess_chat(self, request, tokenizer, messages, chat_template, chat_template_content_format,
-                                                                                    add_generation_prompt, continue_final_message, tool_dicts, documents,
-                                                                                    chat_template_kwargs, tool_parser, add_special_tokens)
-        reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS", "0") == "1"
+        conversation, [engine_prompt] = await _original_preprocess_chat(
+            self, request, tokenizer, messages, chat_template,
+            chat_template_content_format, add_generation_prompt,
+            continue_final_message, tool_dicts, documents,
+            chat_template_kwargs, default_chat_template_kwargs, tool_parser,
+            add_special_tokens)
+        reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS",
+                                           "0") == "1"
         if reuse_prefilled_tokens:
             if request.kv_transfer_params and "prefilled_token" in request.kv_transfer_params:
-                new_tokens = tokenizer.convert_ids_to_tokens(request.kv_transfer_params["prefilled_token"][0])
+                new_tokens = tokenizer.convert_ids_to_tokens(
+                    request.kv_transfer_params["prefilled_token"][0])
                 delta_text = tokenizer.convert_tokens_to_string([new_tokens])
                 # If the decoded text ends with '�', it indicates an incomplete UTF-8 sequence — abandon reuse.
                 # If the prefilled side has already triggered a stop reason, we also fall back to normal generation.
@@ -133,9 +138,11 @@ class OpenAIServingChatPatch(VLLMPatch):
                         request.kv_transfer_params["prefilled_token"][0] == tokenizer.eos_token_id:
                     request.kv_transfer_params.pop("prefilled_token", None)
                 else:
-                    engine_prompt["prefilled_token_ids"] = request.kv_transfer_params["prefilled_token"]
+                    engine_prompt[
+                        "prefilled_token_ids"] = request.kv_transfer_params[
+                            "prefilled_token"]
                     engine_prompt["prefilled_texts"] = delta_text
-        return conversation, [request_prompt], [engine_prompt]
+        return conversation, [engine_prompt]
 
 @register_patch("PrefilledTokenSkipOpenAIServing", OpenAIServing)
 class OpenAIServingPatch(VLLMPatch):
@@ -153,18 +160,20 @@ class OpenAIServingPatch(VLLMPatch):
         tool_dicts: list[dict[str, Any]] | None = None,
         documents: list[dict[str, str]] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
         tool_parser=None,
         add_special_tokens: bool = False,
     ):
-        conversation, [request_prompt], [engine_prompt] =await _original_preprocess_chat(self, request, tokenizer, messages, chat_template, chat_template_content_format,
-                                                                                    add_generation_prompt, continue_final_message, tool_dicts, documents,
-                                                                                    chat_template_kwargs, tool_parser, add_special_tokens)
+        conversation, [engine_prompt] = await _original_preprocess_chat(
+            self, request, tokenizer, messages, chat_template,
+            chat_template_content_format, add_generation_prompt,
+            continue_final_message, tool_dicts, documents,
+            chat_template_kwargs, default_chat_template_kwargs, tool_parser,
+            add_special_tokens)
         if request.kv_transfer_params and "prompt_token_ids" in request.kv_transfer_params:
             engine_prompt = PrefilledTextPrompt(
                 prompt_token_ids=request.kv_transfer_params["prompt_token_ids"])
-            if isinstance(request_prompt, str):
-                self._validate_input(request, request.kv_transfer_params["prompt_token_ids"], request_prompt)
-        return conversation, [request_prompt], [engine_prompt]
+        return conversation, [engine_prompt]
 
 
 @register_patch("PrefilledTokenSkipScheduler", Scheduler)

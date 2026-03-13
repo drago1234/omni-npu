@@ -4,7 +4,7 @@
 import torch
 import torch_npu
 import torch.nn.functional as F
-from vllm.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 def causal_conv1d_ref(
     x: torch.Tensor,

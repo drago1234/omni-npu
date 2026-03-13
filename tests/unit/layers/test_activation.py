@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import pytest
 import unittest
 from unittest.mock import patch, MagicMock
 import torch
 from omni_npu.layers.activation import NPUSiluAndMul
 
 
+@pytest.mark.usefixtures("default_vllm_config")
 class TestNPUSiluAndMul(unittest.TestCase):
     def setUp(self):
         """Create unit test environment"""

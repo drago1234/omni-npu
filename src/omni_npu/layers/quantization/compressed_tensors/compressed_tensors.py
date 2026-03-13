@@ -213,7 +213,8 @@ class NPUCompressedTensorsConfig(CompressedTensorsConfig):
         )
         weight_num_bits = self._get_weight_num_bits("mlp.experts", weight_quant)
         if self._is_dynamic_token_w8a8(weight_quant, input_quant, weight_num_bits):
-            return NPUCompressedTensorsW8A8Int8MoEMethod(self, layer)
+            return NPUCompressedTensorsW8A8Int8MoEMethod(
+                weight_quant, input_quant, layer)
         elif self._is_dynamic_token_w4a8_int(weight_quant, input_quant, weight_num_bits):
             layer.weight_num_bits = 4
             if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):

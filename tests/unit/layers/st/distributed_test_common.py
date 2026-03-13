@@ -13,6 +13,8 @@ import torch
 import unittest
 from unittest.mock import Mock, patch
 
+from vllm.config import VllmConfig, set_current_vllm_config
+
 TEST_SEED = 0
 
 def parse_ascend_devices():
@@ -90,7 +92,8 @@ def _persistent_worker_loop(device: int, rank: int, world_size: int, temp_file_p
             
             try:
                 torch.manual_seed(TEST_SEED)
-                func(device, rank, world_size, *args, **kwargs)
+                with set_current_vllm_config(VllmConfig()):
+                    func(device, rank, world_size, *args, **kwargs)
                 result_queue.put(None) 
             except Exception:
                 tb = traceback.format_exc()

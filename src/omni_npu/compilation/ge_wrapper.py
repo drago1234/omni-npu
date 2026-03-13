@@ -11,7 +11,7 @@ from vllm.logger import init_logger
 from omni_npu.compilation.ge_compile_config import get_torchair_config
 
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
-from vllm.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.forward_context import get_forward_context
 
 logger = init_logger(__name__)

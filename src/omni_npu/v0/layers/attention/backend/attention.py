@@ -17,23 +17,24 @@ import torchair as tng
 import torch
 import torch_npu
 
-from vllm.attention.backends.abstract import (
+from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionLayer,
     AttentionType,
-)
-from vllm.platforms import current_platform
-from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder as V1AttentionMetadataBuilder,
     CommonAttentionMetadata,
     AttentionCGSupport,
-    split_decodes_and_prefills,
 )
+from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.config import get_current_vllm_config
 
+from omni_npu.attention.backends.utils import register_attention_backend
+
 NZ_DIM = 16
+VLLM_NPU_ATTN = "VLLM_NPU_ATTN_V0"
 
 
 @dataclass
@@ -95,7 +96,7 @@ class NPUAttentionMetadataBuilder(V1AttentionMetadataBuilder[NPUMetadata]):
                                        num_prefills=num_prefills)
         return attn_metadata
 
-
+@register_attention_backend(VLLM_NPU_ATTN)
 class NPUAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -105,7 +106,7 @@ class NPUAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "VLLM_NPU_ATTN"
+        return VLLM_NPU_ATTN
 
     @staticmethod
     def get_impl_cls() -> type["NPUAttentionBackendImpl"]:

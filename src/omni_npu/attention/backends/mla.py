@@ -15,7 +15,10 @@ import torch
 import torch_npu
 
 from vllm.platforms import current_platform
-from vllm.attention.backends.abstract import AttentionLayer, AttentionType
+from vllm.v1.attention.backend import (AttentionLayer, AttentionType,
+                                       AttentionCGSupport,
+                                       CommonAttentionMetadata)
+from vllm.forward_context import get_forward_context
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
@@ -28,28 +31,30 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonPrefillMetadata,
     QueryLenSupport,
 )
-from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import AttentionSpec
-
+from vllm.distributed.parallel_state import get_tp_group
 from omni_npu.connector.utils import TP_Convertor
+from vllm.v1.kv_cache_interface import AttentionSpec
 from omni_npu.attention import ops
 from vllm.forward_context import get_forward_context
 from omni_npu.compilation.utils import (
     capture_multi_fia_graph_size,
     capture_multi_fia_sink_graph_size,
 )
+from omni_npu.attention.backends.utils import register_attention_backend
 
 import omni_training_custom_ops
 import omni_custom_ops
 
 
 logger = init_logger(__name__)
+NPUMLA = "NPUMLA"
 
 
+@register_attention_backend(NPUMLA)
 class NPUMLABackend(MLACommonBackend):
     @staticmethod
     def get_name() -> str:
-        return "NPUMLA"
+        return NPUMLA
 
     @staticmethod
     def get_metadata_cls() -> type["NPUMLAMetadata"]:
@@ -133,8 +138,8 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     def _build_decode(
         self,
         block_table_tensor: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
         seq_lens_device: torch.Tensor,
+        max_seq_len: int,
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
@@ -142,7 +147,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
     ) -> NPUMLADecodeMetadata:
         return NPUMLADecodeMetadata(
             block_table=block_table_tensor,
-            seq_lens=seq_lens_cpu.tolist(),
+            seq_lens=seq_lens_device.cpu().tolist(),
             query_cumlens=query_start_loc_cpu[1:].tolist(),
             dcp_tot_seq_lens=dcp_tot_seq_lens_device
         )

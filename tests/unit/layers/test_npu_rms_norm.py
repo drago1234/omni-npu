@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import pytest
 import unittest
 from unittest.mock import MagicMock, patch
 import torch
 from omni_npu.layers.npu_rms_norm import NPURMSNorm
 
 
+@pytest.mark.usefixtures("default_vllm_config")
 class TestNPURMSNorm(unittest.TestCase):
     def setUp(self):
         """initialize the test environment"""

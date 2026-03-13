@@ -11,7 +11,7 @@ from omni_npu.attention.backends.attention import (
     NPUAttentionBackendImpl,
     NPUMetadata,
 )
-from vllm.attention.backends.abstract import AttentionType
+from vllm.v1.attention.backend import AttentionType
 
 # Skip all tests if NPU is not available
 from integration.utils.common_utils import (

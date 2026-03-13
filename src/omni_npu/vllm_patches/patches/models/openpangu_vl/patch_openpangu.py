@@ -5,8 +5,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention.layer import AttentionType
-from vllm.attention.layers.static_sink_attention import StaticSinkAttention
+from vllm.v1.attention.backend import AttentionType
+from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkAttention
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,

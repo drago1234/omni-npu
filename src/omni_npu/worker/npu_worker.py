@@ -8,9 +8,9 @@ import torch
 import torch_npu
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
-from vllm.model_executor import set_random_seed
+from vllm.utils.torch_utils import set_random_seed
 from vllm.platforms import current_platform
 from vllm.tasks import SupportedTask
 from vllm.distributed.kv_transfer import (
@@ -26,6 +26,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.workspace import init_workspace_manager
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
@@ -110,6 +111,10 @@ class NPUWorker(WorkerBase):
             self.requested_memory = total * self.cache_config.gpu_memory_utilization
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
+
+        # Initialize workspace manager
+        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
         self.model_runner = NPUModelRunner(self.vllm_config, self.device)  # type: ignore
@@ -213,7 +218,7 @@ class NPUWorker(WorkerBase):
         else:
             from contextlib import nullcontext
             context = nullcontext()
-        with context:
+        with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:

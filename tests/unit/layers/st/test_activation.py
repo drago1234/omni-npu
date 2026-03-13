@@ -23,7 +23,7 @@ def _swiglu_ref(x: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
-def test_silu_and_mul_matches_swiglu_reference(npu_device):
+def test_silu_and_mul_matches_swiglu_reference(default_vllm_config, npu_device):
     mod = NPUSiluAndMul().to(npu_device)
     x = torch.randn(2, 8, device=npu_device, dtype=torch.float16)
 
@@ -34,7 +34,7 @@ def test_silu_and_mul_matches_swiglu_reference(npu_device):
     assert torch.allclose(out, expected, atol=1e-3, rtol=1e-3)
 
 
-def test_silu_and_mul_quant_path_uses_dequant_kernel(npu_device):
+def test_silu_and_mul_quant_path_uses_dequant_kernel(default_vllm_config, npu_device):
     mod = NPUSiluAndMul().to(npu_device)
     tokens = 3
     hidden = 4  # output hidden; input last dim = 2 * hidden for SwiGLU

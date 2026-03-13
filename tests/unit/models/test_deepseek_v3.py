@@ -1,3 +1,4 @@
+import pytest
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -455,6 +456,7 @@ class _FakePPGroup:
         self.is_last_rank = is_last_rank
 
 
+@pytest.mark.usefixtures("default_vllm_config")
 class TestInitHeavyPaths(unittest.TestCase):
     def test_moe_init_success_and_invalid_activation(self):
         class _FakeReplicatedLinear(nn.Module):

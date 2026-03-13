@@ -44,7 +44,7 @@ def rmsnorm_golden(
 @pytest.mark.parametrize("with_quant", [True, False])
 @pytest.mark.parametrize("y_transform", [""])
 def test_npurmsnorm_basic(
-    npu_device, load_bias_env, with_residual, with_quant, y_transform
+    default_vllm_config, npu_device, load_bias_env, with_residual, with_quant, y_transform
 ):
     """
     Runs the NPURMSNorm logic on actual NPU hardware and compares against a Reference.

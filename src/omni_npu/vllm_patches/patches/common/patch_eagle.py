@@ -17,7 +17,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.v1.attention.backends.utils import (
+from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -146,8 +146,6 @@ class EagleProposerPatch(VLLMPatch):
             query_start_loc=common_attn_metadata.query_start_loc,
             seq_lens=common_attn_metadata.seq_lens,
             query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens_cpu=common_attn_metadata.seq_lens_cpu,
-            num_computed_tokens_cpu=common_attn_metadata.num_computed_tokens_cpu,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=new_query_len_per_req.max().item(),
@@ -162,7 +160,11 @@ class EagleProposerPatch(VLLMPatch):
         token_indices_to_sample = common_attn_metadata.query_start_loc[1:actual_num_reqs+1] - 1 \
             - num_rejected_tokens_gpu
 
-        return spec_common_attn_metadata, token_indices_to_sample
+        return (
+            spec_common_attn_metadata,
+            token_indices_to_sample,
+            num_rejected_tokens_gpu,
+        )
 
     @torch.inference_mode()
     def dummy_run(
@@ -427,6 +429,7 @@ class EagleProposerPatch(VLLMPatch):
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
@@ -480,8 +483,7 @@ class EagleProposerPatch(VLLMPatch):
             per_layer_attn_metadata[layer_name] = draft_indexer_metadata
 
         num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
-            num_tokens_unpadded=num_tokens,
-            num_tokens_padded=num_tokens,
+            num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
         )
 
         # Adapt start: get token info from target model batch descriptor
@@ -591,8 +593,7 @@ class EagleProposerPatch(VLLMPatch):
         draft_token_ids_list = [draft_token_ids]
 
         batch_size_dp_padded, batch_size_across_dp = self._pad_batch_across_dp(
-            num_tokens_unpadded=batch_size,
-            num_tokens_padded=batch_size,
+            num_tokens_unpadded=batch_size, num_tokens_padded=batch_size
         )
 
         if (
@@ -614,6 +615,17 @@ class EagleProposerPatch(VLLMPatch):
         common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
             self.token_arange_np[: batch_size + 1]
         ).clone()
+
+        # In padded drafter batch, we need to adjust the sequence lengths
+        # to remove the "padding" (i.e. rejected tokens).
+        # Only apply this adjustment when we have rejected tokens
+        # (i.e., not the first proposal).
+        if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
+            common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
+            # Invalidate the CPU-side shadows to avoid H<>D sync.
+            common_attn_metadata._seq_lens_cpu = None
+            common_attn_metadata._num_computed_tokens_cpu = None
+
         for token_index in range(self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
@@ -646,34 +658,35 @@ class EagleProposerPatch(VLLMPatch):
             # of main model.
             # Increment the sequence lengths.
             common_attn_metadata.seq_lens += 1
-            # This is an out-of-place operation to avoid modifying the original tensor.
-            common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu + 1
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
-
             common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_max_model_len, 1)
 
-            common_attn_metadata.num_computed_tokens_cpu = (
-                common_attn_metadata.seq_lens_cpu - 1
-            )
+            # Also update the CPU-side shadow; NOTE: this is hacky and should be
+            # removed in when common_attn_metadata.seq_lens_cpu is deprecated.
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu += 1
+            if common_attn_metadata._num_computed_tokens_cpu is not None:
+                common_attn_metadata._num_computed_tokens_cpu += 1
 
             # Compute the slot mapping.
+            block_size = attn_metadata_builder.kv_cache_spec.block_size
             if self.uses_mrope:
                 # all dimensions of positions are the same
-                block_numbers = clamped_positions[0] // self.block_size
+                block_numbers = clamped_positions[0] // block_size
             else:
-                block_numbers = clamped_positions // self.block_size
+                block_numbers = clamped_positions // block_size
             block_ids = common_attn_metadata.block_table_tensor.gather(
                 dim=1, index=block_numbers.view(-1, 1)
             )
             block_ids = block_ids.view(-1)
             if self.uses_mrope:
                 common_attn_metadata.slot_mapping = (
-                    block_ids * self.block_size + clamped_positions[0] % self.block_size
+                    block_ids * block_size + clamped_positions[0] % block_size
                 )
             else:
                 common_attn_metadata.slot_mapping = (
-                    block_ids * self.block_size + clamped_positions % self.block_size
+                    block_ids * block_size + clamped_positions % block_size
                 )
             # Mask out the slot mappings that exceed the max model length.
             # Otherwise, the KV cache will be inadvertently updated with the

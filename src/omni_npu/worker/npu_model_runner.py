@@ -21,7 +21,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     prepare_communication_buffer_for_model,
 )
-from vllm.attention.backends.abstract import (
+from vllm.v1.attention.backend import (
     AttentionMetadata,
 )
 from vllm.utils.math_utils import cdiv
@@ -37,11 +37,14 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
 )
+from vllm.model_executor.models.interfaces import supports_mm_encoder_only
+from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.compilation.cuda_graph import CUDAGraphStat
 
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
@@ -288,19 +291,29 @@ class NPUModelRunner(GPUModelRunner):
         use_cascade_attn: bool,
         allow_microbatching: bool = True,
         force_eager: bool = False,
+        # For cudagraph capture TODO(lucas): Refactor how we capture cudagraphs (will
+        # be improved in model runner v2)
         force_uniform_decode: bool | None = None,
         force_has_lora: bool | None = None,
+        num_encoder_reqs: int = 0,
     ) -> tuple[
-        CUDAGraphMode, BatchDescriptor, UBatchSlices | None, torch.Tensor | None
+        CUDAGraphMode,
+        BatchDescriptor,
+        bool,
+        torch.Tensor | None,
+        CUDAGraphStat | None,
     ]:
-        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
-        uniform_decode = (
-            (
-                (max_num_scheduled_tokens == self.uniform_decode_query_len)
-                and (num_tokens_padded == max_num_scheduled_tokens * num_reqs)
-            )
-            if force_uniform_decode is None
-            else force_uniform_decode
+        uniform_decode = self._is_uniform_decode(
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            uniform_decode_query_len=self.uniform_decode_query_len,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            force_uniform_decode=force_uniform_decode,
+        )
+        # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
+        # is present). Also, chunked-prefill is disabled, so batch are uniform.
+        has_encoder_output = (
+            self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
         has_lora = (
@@ -309,59 +322,97 @@ class NPUModelRunner(GPUModelRunner):
             else force_has_lora
         )
 
+        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         dispatch_cudagraph = (
-            lambda num_tokens: self.cudagraph_dispatcher.dispatch(
+            lambda num_tokens, disable_full: self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
-                use_cascade_attn=use_cascade_attn,
                 uniform_decode=uniform_decode,
+                disable_full=disable_full,
             )
             if not force_eager
             else (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
         )
 
-        cudagraph_mode, batch_desc = dispatch_cudagraph(num_tokens_padded)
-        num_tokens_padded = batch_desc.num_tokens
+        cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+            num_tokens_padded, use_cascade_attn or has_encoder_output
+        )
+        num_tokens_padded = batch_descriptor.num_tokens
+        if self.compilation_config.pass_config.enable_sp:
+            assert (
+                batch_descriptor.num_tokens
+                % self.vllm_config.parallel_config.tensor_parallel_size
+                == 0
+            ), (
+                "Sequence parallelism requires num_tokens to be "
+                "a multiple of tensor parallel size"
+            )
 
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
-        ubatch_slices, num_tokens_across_dp = None, None
+        should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             # Disable DP padding when running eager to avoid excessive padding when
             # running prefills. This lets us set cudagraph_mode="NONE" on the prefiller
             # in a P/D setup and still use CUDA graphs (enabled by this padding) on the
             # decoder.
+
+            # Adapt start: Add padding for EP
             allow_dp_padding = (
                 self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
                 or self.parallel_config.enable_expert_parallel
             )
+            # Adapt end: Add padding for EP
 
-            ubatch_slices, num_tokens_across_dp = coordinate_batch_across_dp(
-                num_tokens_unpadded=num_tokens_padded,
-                parallel_config=self.parallel_config,
-                allow_microbatching=allow_microbatching,
-                allow_dp_padding=allow_dp_padding,
-                num_tokens_padded=num_tokens_padded,
-                uniform_decode=uniform_decode,
-                num_scheduled_tokens_per_request=num_scheduled_tokens_np,
+            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+                coordinate_batch_across_dp(
+                    num_tokens_unpadded=num_tokens,
+                    parallel_config=self.parallel_config,
+                    allow_microbatching=allow_microbatching,
+                    allow_dp_padding=allow_dp_padding,
+                    num_tokens_padded=num_tokens_padded,
+                    uniform_decode=uniform_decode,
+                    num_scheduled_tokens_per_request=num_scheduled_tokens_np,
+                    cudagraph_mode=cudagraph_mode.value,
+                )
             )
 
-            # Extract DP padding if there is any
+            # Extract DP-synced values
             if num_tokens_across_dp is not None:
                 dp_rank = self.parallel_config.data_parallel_rank
                 num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
-
-                # Re-dispatch with DP padding
-                cudagraph_mode, batch_desc = dispatch_cudagraph(num_tokens_padded)
+                # Re-dispatch with DP padding so we have the correct batch_descriptor
+                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                    num_tokens_padded,
+                    disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value,
+                )
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
-                assert batch_desc.num_tokens == num_tokens_padded
+                assert batch_descriptor.num_tokens == num_tokens_padded
 
+        cudagraph_stats = None
+        if self.vllm_config.observability_config.cudagraph_metrics:
+            cudagraph_stats = CUDAGraphStat(
+                num_unpadded_tokens=num_tokens,
+                num_padded_tokens=batch_descriptor.num_tokens,
+                num_paddings=batch_descriptor.num_tokens - num_tokens,
+                runtime_mode=str(cudagraph_mode),
+            )
+
+        # Adapt start: MTP extra property.
+        # Add `batch_descriptor` and `cudagraph_mode` for latter use in mtp.
         if self.speculative_config and isinstance(self.drafter, EagleProposer):
-            self.drafter.batch_desc = batch_desc
+            self.drafter.batch_desc = batch_descriptor
             self.drafter.target_model_cuda_graph_mode = cudagraph_mode
+        # Adapt end: MTP extra property.
 
-        return cudagraph_mode, batch_desc, ubatch_slices, num_tokens_across_dp
+        return (
+            cudagraph_mode,
+            batch_descriptor,
+            should_ubatch,
+            num_tokens_across_dp,
+            cudagraph_stats,
+        )
 
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
@@ -472,6 +523,11 @@ class NPUModelRunner(GPUModelRunner):
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
         """
+        if supports_mm_encoder_only(self.model):
+            # The current dummy run only covers LM execution, so we can skip it.
+            # mm encoder dummy run may need to add in the future.
+            return torch.tensor([]), torch.tensor([])
+
         assert (
             cudagraph_runtime_mode is None
             or cudagraph_runtime_mode.valid_runtime_modes()
@@ -528,7 +584,7 @@ class NPUModelRunner(GPUModelRunner):
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
-        _cudagraph_mode, batch_desc, ubatch_slices, num_tokens_across_dp = (
+        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs,
@@ -562,6 +618,18 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs_padded = (
             batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         )
+        ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+            should_ubatch,
+            num_scheduled_tokens,
+            num_tokens_padded,
+            num_reqs_padded,
+            self.vllm_config.parallel_config.num_ubatches,
+        )
+        logger.debug(
+            "ubatch_slices: %s, ubatch_slices_padded: %s",
+            ubatch_slices,
+            ubatch_slices_padded,
+        )
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
@@ -583,11 +651,12 @@ class NPUModelRunner(GPUModelRunner):
             self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
 
+            pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             attn_metadata, _ = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs_padded,
                 max_query_len=max_query_len,
-                ubatch_slices=ubatch_slices,
+                ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
             )
 
@@ -600,10 +669,10 @@ class NPUModelRunner(GPUModelRunner):
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            model_kwargs = self._init_model_kwargs(num_tokens_padded)
+            model_kwargs = self._init_model_kwargs()
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
-                input_ids = None
-                inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
+                input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
+
                 model_kwargs = {
                     **model_kwargs,
                     **self._dummy_mm_kwargs(num_reqs),
@@ -611,7 +680,7 @@ class NPUModelRunner(GPUModelRunner):
             elif self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
-                model_kwargs = self._init_model_kwargs(num_tokens_padded)
+                model_kwargs = self._init_model_kwargs()
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
@@ -639,16 +708,16 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_padded, None, False
                 )
 
-            if ubatch_slices is not None:
+            if ubatch_slices_padded is not None:
                 # Adjust values to reflect a single ubatch.
                 # TODO(sage,lucas): this is cruft that should be addressed in
                 #  the padding refactor.
-                num_tokens_padded = ubatch_slices[0].num_tokens
+                num_tokens_padded = ubatch_slices_padded[0].num_tokens
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
             with (
-                self.maybe_randomize_inputs(input_ids),
+                self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -656,7 +725,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
-                    ubatch_slices=ubatch_slices,
+                    ubatch_slices=ubatch_slices_padded,
                 ),
             ):
                 if self.router_sliding_window > 1:
@@ -678,11 +747,18 @@ class NPUModelRunner(GPUModelRunner):
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
-                # enable mtp acl graph mode
+                # Adapt start: enable mtp acl graph mode
                 use_cudagraphs = (
-                    cudagraph_runtime_mode.has_mode(CUDAGraphMode.FULL)
-                    and not self.speculative_config.enforce_eager
-                )
+                    (
+                        is_graph_capturing
+                        and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    )
+                    or (
+                        not is_graph_capturing
+                        and cudagraph_runtime_mode != CUDAGraphMode.NONE
+                    )
+                ) and not self.speculative_config.enforce_eager
+                # Adapt end: enable mtp acl graph mode
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
@@ -691,7 +767,7 @@ class NPUModelRunner(GPUModelRunner):
                 if self.compilation_config.cudagraph_specialize_lora and activate_lora:
                     use_cudagraphs = False
 
-                # Adapt start : to pass attn_metadata and batch_desc
+                # Adapt start: to pass attn_metadata and batch_desc
                 self.drafter.dummy_run(
                     attn_metadata,
                     num_tokens_padded,
@@ -700,7 +776,18 @@ class NPUModelRunner(GPUModelRunner):
                     batch_descriptor=batch_desc,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                 )
-                # Adapt end : to pass attn_metadata and batch_desc
+                # Adapt end: to pass attn_metadata and batch_desc
+
+        # We register layerwise NVTX hooks here after the first dynamo tracing is
+        # done to avoid nvtx operations in hook functions being traced by
+        # torch dynamo and causing graph breaks.
+        # Note that for DYNAMO_ONCE and VLLM_COMPILE mode,
+        # compiled model's dynamo tracing is only done once and the compiled model's
+        # __call__ function is replaced by calling the compiled function.
+        # So it's safe to register hooks here. Hooks will be registered to
+        # both compiled and uncompiled models but they will never
+        # be called on the compiled model execution path.
+        self._register_layerwise_nvtx_hooks()
 
         # This is necessary to avoid blocking DP.
         # For dummy runs, we typically skip EPLB since we don't have any real
@@ -761,7 +848,8 @@ class NPUModelRunner(GPUModelRunner):
     def kv_cache_after_wake_up(self) -> None:
         attn_layers = self.compilation_config.static_forward_context
         if self.model_config.enable_sleep_mode:
-            from vllm.attention.layers import StaticSinkAttention
+            from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkAttention
+            # TODO: StaticSinkMLAAttention cannot find in vLLM.
             from vllm.attention.layers.static_sink_attention import StaticSinkMLAAttention
             for name, module in attn_layers.items():
                 if isinstance(module, (StaticSinkAttention, StaticSinkMLAAttention)):

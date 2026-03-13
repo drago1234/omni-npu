@@ -24,7 +24,8 @@ def _make_module(monkeypatch: pytest.MonkeyPatch, name: str) -> types.ModuleType
 
 
 class DummyCompressedTensorsW8A8Int8MoEMethod:
-    def __init__(self, parent, moe_config):
+    def __init__(self, weight_quant, parent, moe_config):
+        self.weight_quant = weight_quant
         self.moe = parent
         self.moe_config = moe_config
         self.static_input_scales = False
@@ -79,18 +80,10 @@ class DummyStrategyImpl:
 
 
 class DummyNPUFusedMoE:
-    @staticmethod
     def select_experts(
-        router_logits,
-        top_k,
-        use_grouped_topk=False,
-        renormalize=False,
-        topk_group=None,
-        num_expert_group=None,
-        custom_routing_function=None,
-        scoring_func="softmax",
-        routed_scaling_factor=1.0,
-        e_score_correction_bias=None,
+        self,
+        hidden_states,
+        router_logits
     ):
         num_tokens = router_logits.shape[0]
         topk_weights = torch.ones(num_tokens, top_k, dtype=torch.float32)
@@ -125,6 +118,20 @@ class MockMoELayer(torch.nn.Module):
         self.quant_config = object()
         self.gate = None
         self.shared_experts = None
+        self.activation = "silu"
+        self.global_num_experts = -1
+        self.apply_router_weight_on_input = False
+        self.expert_map = None
+
+    def select_experts(
+        self,
+        hidden_states,
+        router_logits
+    ):
+        batch = router_logits.shape[0]
+        weights = torch.ones(batch, self.top_k, dtype=torch.float32)
+        ids = torch.zeros(batch, self.top_k, dtype=torch.int32)
+        return weights, ids
 
 
 @pytest.fixture

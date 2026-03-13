@@ -12,8 +12,7 @@ from omni_npu.attention.backends.mla import (
     NPUMLAImpl,
     NPUMLAMetadata,
 )
-from vllm.attention.backends.abstract import AttentionType
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionType, CommonAttentionMetadata
 
 from integration.utils.common_utils import (
     skipif_no_npu,

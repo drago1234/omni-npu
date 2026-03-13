@@ -43,7 +43,7 @@ from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
     RowParallelFlashCommLinear,
 )
-from vllm.model_executor.layers.rotary_embedding.common import apply_rotary_emb_torch
+from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
 from vllm.config import CacheConfig
 
@@ -126,6 +126,11 @@ class DummyModelConfig:
     max_model_len = MAX_POS
 
 
+class DummyAttentionConfig:
+    def __init__(self):
+        self.backend = "dummy"
+
+
 class DummyVllmConfig:
     def __init__(self) -> None:
         self.compilation_config = DummyCompilationConfig()
@@ -133,12 +138,14 @@ class DummyVllmConfig:
         self.scheduler_config = DummySchedulerConfig()
         self.cache_config = CacheConfig(block_size=BLOCK_SIZE)
         self.model_config = DummyModelConfig()
+        self.attention_config = DummyAttentionConfig()
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     # NPU rotary embedding returns cos/sin with extra singleton dims:
     # - common shapes are [T, 1, 1, D] or [T, 1, D]
-    # vLLM's `apply_rotary_emb_torch` expects cos/sin shaped [T, D/2] for GPT-J style.
+    # vLLM's `ApplyRotaryEmb.forward_static` expects cos/sin shaped [T, D/2]
+    # for GPT-J style.
     #
     # NPURotaryEmbedding builds interleaved cos/sin for GPT-J style (D, not D/2),
     # so we take every other element (even indices) to get the half-dim cache.
@@ -159,9 +166,9 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     sin = sin.to(x.dtype)
     if x.dim() == 2:
         x = x.unsqueeze(1)
-        out = apply_rotary_emb_torch(x, cos, sin, is_neox_style=False).squeeze(1)
+        out = ApplyRotaryEmb.forward_static(x, cos, sin, is_neox_style=False).squeeze(1)
         return out
-    return apply_rotary_emb_torch(x, cos, sin, is_neox_style=False)
+    return ApplyRotaryEmb.forward_static(x, cos, sin, is_neox_style=False)
 
 
 def _assert_allclose(actual: torch.Tensor,
@@ -619,6 +626,7 @@ def _reference_decode(
 @pytest.mark.integration
 @pytest.mark.parametrize("batch_size,seq_len", [(1, 16), (8, 160)])
 def test_npu_mla_prefill_matches_reference(
+    default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,
     batch_size: int,
     seq_len: int,
@@ -680,6 +688,7 @@ def test_npu_mla_prefill_matches_reference(
 @pytest.mark.integration
 @pytest.mark.parametrize("batch_size,seq_len", [(1, 16), (8, 160)])
 def test_npu_mla_decode_matches_reference(
+    default_vllm_config,
     monkeypatch: pytest.MonkeyPatch,
     batch_size: int,
     seq_len: int,

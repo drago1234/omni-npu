@@ -58,7 +58,7 @@ def _build_wrapper(q_lora_rank):
     return wrapper
 
 
-def test_forward_oot_with_q_lora_rank():
+def test_forward_oot_with_q_lora_rank(default_vllm_config):
     wrapper = _build_wrapper(q_lora_rank=4)
 
     tokens = 3
@@ -86,7 +86,7 @@ def test_forward_oot_with_q_lora_rank():
     assert torch.allclose(output, torch.ones_like(output))
 
 
-def test_forward_oot_without_q_lora_rank():
+def test_forward_oot_without_q_lora_rank(default_vllm_config):
     wrapper = _build_wrapper(q_lora_rank=None)
 
     tokens = 2
@@ -108,6 +108,7 @@ def test_forward_oot_without_q_lora_rank():
 
 
 def test_forward_oot_sparse_indexer_uses_context(
+    default_vllm_config,
     monkeypatch: pytest.MonkeyPatch
 ):
     wrapper = _build_wrapper(q_lora_rank=4)

@@ -45,7 +45,7 @@ from vllm.model_executor.layers.rotary_embedding.common import (yarn_find_correc
                                                          yarn_get_mscale,
                                                          rotate_neox,
                                                          rotate_gptj)
-from vllm.model_executor.layers.rotary_embedding.common import apply_rotary_emb_torch as _apply_rotary_emb_torch
+from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from omni_npu.v0.layers.utils import ConditionalTNGScope
 from omni_npu.v0.models.config_loader.loader import model_extra_config
 
@@ -634,7 +634,7 @@ class QwenMRotaryEmbedding(GPUMRotaryEmbedding):
         query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., :self.rotary_dim]
         query_pass = query[..., self.rotary_dim:]
-        query_rot = _apply_rotary_emb_torch(
+        query_rot = ApplyRotaryEmb.forward_static(
             query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
@@ -642,7 +642,7 @@ class QwenMRotaryEmbedding(GPUMRotaryEmbedding):
         key = key.reshape(num_tokens, -1, self.head_size)
         key_rot = key[..., :self.rotary_dim]
         key_pass = key[..., self.rotary_dim:]
-        key_rot = _apply_rotary_emb_torch(
+        key_rot = ApplyRotaryEmb.forward_static(
             key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key

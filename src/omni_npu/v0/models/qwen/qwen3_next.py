@@ -14,7 +14,7 @@ from torch.library import Library
 from transformers.activations import ACT2FN
 from transformers import PretrainedConfig
 
-from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (

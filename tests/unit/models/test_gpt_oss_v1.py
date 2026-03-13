@@ -26,8 +26,23 @@ def test_gpt_oss_model_load_weights_remap_and_permute(monkeypatch, moe_name_styl
     if not hasattr(torch.npu, "is_available"):
         torch.npu.is_available = lambda: False
     torch_npu_mod = types.ModuleType("torch_npu")
-    torch_npu_mod.__spec__ = importlib.machinery.ModuleSpec("torch_npu", loader=None)
+    torch_npu_mod.__spec__ = importlib.machinery.ModuleSpec("torch_npu",
+                                                            loader=None)
+    npu_fusion_attention_mod = types.ModuleType(
+        "torch_npu.npu_fusion_attention")
+    npu_c_mod = types.ModuleType("torch_npu._C")
+    npu_task_group_handle_mod = types.ModuleType(
+        "torch_npu._C._NPUTaskGroupHandle")
+    torch_npu_mod.npu_fusion_attention = npu_fusion_attention_mod
+    npu_c_mod._NPUTaskGroupHandle = npu_task_group_handle_mod
+    torch_npu_mod._C = npu_c_mod
     monkeypatch.setitem(sys.modules, "torch_npu", torch_npu_mod)
+    monkeypatch.setitem(sys.modules, "torch_npu.npu_fusion_attention",
+                        npu_fusion_attention_mod)
+    monkeypatch.setitem(sys.modules, "torch_npu._C", npu_c_mod)
+    monkeypatch.setitem(sys.modules, "torch_npu._C._NPUTaskGroupHandle",
+                        npu_task_group_handle_mod)
+
     omni_pkg = types.ModuleType("omni_npu")
     omni_pkg.__path__ = [str(repo_root / "src" / "omni_npu")]
     monkeypatch.setitem(sys.modules, "omni_npu", omni_pkg)

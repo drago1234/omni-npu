@@ -116,7 +116,7 @@ def _mock_npu_apply_rotary_pos_emb(monkeypatch: pytest.MonkeyPatch):
     _patch_fake_npu_apply_rotary_pos_emb(monkeypatch)
 
 
-def test_set_cos_sin_cache_matches_formula():
+def test_set_cos_sin_cache_matches_formula(default_vllm_config):
     device = _require_npu()
     layer = NPUDeepseekScalingRotaryEmbedding(
         head_size=8,
@@ -149,7 +149,7 @@ def test_set_cos_sin_cache_matches_formula():
 
 @pytest.mark.parametrize("is_neox_style", [True, False])
 def test_forward_oot_full_rotary_dim_matches_expected(
-    is_neox_style: bool,
+    default_vllm_config, is_neox_style: bool,
 ):
     device = _require_npu()
     torch.manual_seed(0)
@@ -176,8 +176,7 @@ def test_forward_oot_full_rotary_dim_matches_expected(
     assert torch.allclose(out_k, exp_k, atol=1e-4, rtol=1e-4)
 
 
-def test_forward_oot_with_offsets_matches_expected(
-):
+def test_forward_oot_with_offsets_matches_expected(default_vllm_config):
     device = _require_npu()
     torch.manual_seed(1)
     layer = NPUDeepseekScalingRotaryEmbedding(
@@ -206,6 +205,7 @@ def test_forward_oot_with_offsets_matches_expected(
 
 @pytest.mark.parametrize("is_neox_style", [True, False])
 def test_forward_oot_partial_rotary_dim_keeps_passthrough(
+    default_vllm_config,
     is_neox_style: bool,
 ):
     device = _require_npu()

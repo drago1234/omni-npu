@@ -14,8 +14,10 @@ import math
 import torch
 import torch_npu
 
-from vllm.attention.backends.abstract import AttentionLayer, AttentionType
-from vllm.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backend import (AttentionLayer, AttentionType,
+                                       AttentionCGSupport,
+                                       CommonAttentionMetadata)
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -28,19 +30,21 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonBaseImpl,
     QueryLenSupport,
 )
-from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.attention.backends.utils import register_attention_backend
 
 
 logger = init_logger(__name__)
+NPUDSA = "NPUDSA"
 
 
+@register_attention_backend(NPUDSA)
 class NPUDSABackend(MLACommonBackend):
     @staticmethod
     def get_name() -> str:
-        return "NPUDSA"
+        return NPUDSA
 
     @staticmethod
     def get_metadata_cls() -> type["NPUDSAMetadata"]:
@@ -124,8 +128,8 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
     def _build_decode(
         self,
         block_table_tensor: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
         seq_lens_device: torch.Tensor,
+        max_seq_len: int,
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,

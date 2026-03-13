@@ -1,3 +1,4 @@
+import pytest
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -459,7 +460,7 @@ class TestDeepSeekMultiTokenPredictorInitForwardLogits(unittest.TestCase):
         self.assertEqual(tuple(logits.shape), (B, vllm_config.model_config.hf_config.vocab_size))
         self.assertGreater(len(pred.logits_processor.calls), 0)
 
-
+@pytest.mark.usefixtures("default_vllm_config")
 class TestDeepSeekMTPInitSetMoEForward(unittest.TestCase):
     @patch.object(deepseek_mtp_mod, "ParallelLMHead", _FakeParallelLMHead)
     @patch.object(deepseek_mtp_mod, "RMSNorm", _FakeRMSNorm)

@@ -6,7 +6,8 @@ from unittest.mock import MagicMock
 from typing import Any
 
 import torch
-from vllm.config import VllmConfig, SchedulerConfig, ModelConfig, CacheConfig, KVTransferConfig, DeviceConfig
+from vllm.config import (VllmConfig, SchedulerConfig, ModelConfig, CacheConfig,
+                         KVTransferConfig, DeviceConfig, ParallelConfig)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, FullAttentionSpec
@@ -68,11 +69,13 @@ def create_vllm_config(
         kv_role=kv_role,
         enable_permute_local_kv=enable_permute_local_kv,
     )
+    parallel_config = ParallelConfig()
     vllm_config = VllmConfig(
         scheduler_config=scheduler_config,
         cache_config=cache_config,
         kv_transfer_config=kv_transfer_config,
         device_config=DeviceConfig("cpu"),
+        parallel_config=parallel_config,
     )
     vllm_config.model_config = model_config
     return vllm_config
@@ -100,14 +103,14 @@ def check_interface_exists(class_path: str, method_name: str) -> tuple[bool, str
         cls = get_class_from_path(class_path)
     except (ImportError, AttributeError) as e:
         return False, f"Failed to import class {class_path}: {e}"
-    
+
     if not hasattr(cls, method_name):
         return False, f"Class {class_path} does not have method {method_name}"
-    
+
     method = getattr(cls, method_name)
     if not callable(method):
         return False, f"{method_name} of class {class_path} is not callable"
-    
+
     return True, ""
 
 
@@ -122,21 +125,21 @@ def check_method_signature(
     exists, error_msg = check_interface_exists(class_path, method_name)
     if not exists:
         return False, error_msg
-    
+
     try:
         cls = get_class_from_path(class_path)
         method = getattr(cls, method_name)
         sig = inspect.signature(method)
     except Exception as e:
         return False, f"Failed to get method signature: {e}"
-    
+
     # Get parameter list (excluding self)
     actual_params = [
         name
         for name, param in sig.parameters.items()
         if name != "self"
     ]
-    
+
     # Check parameter count
     if len(actual_params) < len(expected_params):
         missing = set(expected_params) - set(actual_params)
@@ -145,7 +148,7 @@ def check_method_signature(
             f"Insufficient parameters: expected {len(expected_params)} parameters {expected_params}, "
             f"but only {len(actual_params)} parameters {actual_params}, missing: {missing}",
         )
-    
+
     # Check parameter names and order (only check first N, as new parameters may be added)
     for i, expected_param in enumerate(expected_params):
         if i >= len(actual_params):
@@ -159,7 +162,7 @@ def check_method_signature(
                 False,
                 f"Parameter {i+1} mismatch: expected '{expected_param}', got '{actual_params[i]}'",
             )
-    
+
     return True, ""
 
 
@@ -174,7 +177,7 @@ def check_return_type(
     exists, error_msg = check_interface_exists(class_path, method_name)
     if not exists:
         return False, error_msg
-    
+
     try:
         cls = get_class_from_path(class_path)
         method = getattr(cls, method_name)
@@ -182,15 +185,15 @@ def check_return_type(
         actual_return = sig.return_annotation
     except Exception as e:
         return False, f"Failed to get return type: {e}"
-    
+
     # Skip check if no expected return type
     if expected_return_type is None:
         return True, ""
-    
+
     # Skip check if actual method has no return type annotation
     if actual_return == inspect.Signature.empty:
         return True, ""  # No type annotation, cannot check
-    
+
     # Process actual return type: if it's a type object, get its name
     if isinstance(actual_return, type):
         # For built-in types (e.g., int, str), use __name__
@@ -201,9 +204,9 @@ def check_return_type(
         # If string representation is <class 'int'> format, extract type name
         if actual_return_str.startswith("<class '") and actual_return_str.endswith("'>"):
             actual_return_str = actual_return_str[8:-2]
-    
+
     expected_return_str = str(expected_return_type)
-    
+
     # Simple string matching
     if actual_return_str != expected_return_str:
         # Try more lenient matching (handle different Union type representations)
@@ -218,7 +221,7 @@ def check_return_type(
             False,
             f"Return type mismatch: expected {expected_return_str}, got {actual_return_str}",
         )
-    
+
     return True, ""
 
 
@@ -230,24 +233,24 @@ def check_interface_snapshot(snapshot: dict[str, Any]) -> tuple[bool, str]:
     """
     class_path = snapshot["class_path"]
     method_name = snapshot["method_name"]
-    
+
     # Check if interface exists
     exists, error_msg = check_interface_exists(class_path, method_name)
     if not exists:
         return False, f"Interface does not exist: {error_msg}"
-    
+
     # Check method signature
     is_match, error_msg = check_method_signature(
         class_path, method_name, snapshot["params"]
     )
     if not is_match:
         return False, f"Method signature changed: {error_msg}"
-    
+
     # Check return type
     is_match, error_msg = check_return_type(
         class_path, method_name, snapshot.get("return_type")
     )
     if not is_match:
         return False, f"Return type changed: {error_msg}"
-    
+
     return True, ""

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 import pytest
+
 from omni_npu.platform import NPUPlatform, ConfigUpdater
 from tests.unit.platform.utils import create_vllm_config
 
@@ -151,80 +152,88 @@ class TestNPUPlatform:
         """
         # Test use_mla=True, use_sparse=True (without VLLM_PLUGINS, covers line 161)
         monkeypatch.delenv("VLLM_PLUGINS", raising=False)
+        from vllm.v1.attention.selector import AttentionSelectorConfig
+
         result = NPUPlatform.get_attn_backend_cls(
-            selected_backend="test",
-            head_size=64,
-            dtype=torch.float16,
-            kv_cache_dtype="float16",
-            block_size=16,
-            use_mla=True,
-            has_sink=False,
-            use_sparse=True,
-        )
+            "test",
+            AttentionSelectorConfig(
+                head_size=64,
+                dtype=torch.float16,
+                kv_cache_dtype="float16",
+                block_size=16,
+                use_mla=True,
+                has_sink=False,
+                use_sparse=True,
+            ))
         assert result == "omni_npu.attention.backends.dsa.NPUDSABackend"
 
         # Test use_mla=True, use_sparse=False
         result = NPUPlatform.get_attn_backend_cls(
-            selected_backend="test",
-            head_size=64,
-            dtype=torch.float16,
-            kv_cache_dtype="float16",
-            block_size=16,
-            use_mla=True,
-            has_sink=False,
-            use_sparse=False,
-        )
+            "test",
+            AttentionSelectorConfig(
+                head_size=64,
+                dtype=torch.float16,
+                kv_cache_dtype="float16",
+                block_size=16,
+                use_mla=True,
+                has_sink=False,
+                use_sparse=False,
+            ))
         assert result == "omni_npu.attention.backends.mla.NPUMLABackend"
 
         # Test use_mla=False
         result = NPUPlatform.get_attn_backend_cls(
-            selected_backend="test",
-            head_size=64,
-            dtype=torch.float16,
-            kv_cache_dtype="float16",
-            block_size=16,
-            use_mla=False,
-            has_sink=False,
-            use_sparse=False,
-        )
+            "test",
+            AttentionSelectorConfig(
+                head_size=64,
+                dtype=torch.float16,
+                kv_cache_dtype="float16",
+                block_size=16,
+                use_mla=False,
+                has_sink=False,
+                use_sparse=False,
+            ))
         assert result == "omni_npu.attention.backends.attention.NPUAttentionBackend"
-        
+
         # Test with VLLM_PLUGINS containing "omni_custom_models" (covers lines 150-157)
         monkeypatch.setenv("VLLM_PLUGINS", "omni_custom_models")
         result = NPUPlatform.get_attn_backend_cls(
-            selected_backend="test",
-            head_size=64,
-            dtype=torch.float16,
-            kv_cache_dtype="float16",
-            block_size=16,
-            use_mla=True,
-            has_sink=False,
-            use_sparse=True,
-        )
+            "test",
+            AttentionSelectorConfig(
+                head_size=64,
+                dtype=torch.float16,
+                kv_cache_dtype="float16",
+                block_size=16,
+                use_mla=True,
+                has_sink=False,
+                use_sparse=True,
+            ))
         assert result == "omni_npu.attention.backends.dsa.NPUDSABackend"
-        
+
         result = NPUPlatform.get_attn_backend_cls(
-            selected_backend="test",
-            head_size=64,
-            dtype=torch.float16,
-            kv_cache_dtype="float16",
-            block_size=16,
-            use_mla=True,
-            has_sink=False,
-            use_sparse=False,
-        )
+            "test",
+            AttentionSelectorConfig(
+                head_size=64,
+                dtype=torch.float16,
+                kv_cache_dtype="float16",
+                block_size=16,
+                use_mla=True,
+                has_sink=False,
+                use_sparse=False,
+            ))
         assert result == "omni_npu.attention.backends.mla.NPUMLABackend"
-        
+
         result = NPUPlatform.get_attn_backend_cls(
-            selected_backend="test",
-            head_size=64,
-            dtype=torch.float16,
-            kv_cache_dtype="float16",
-            block_size=16,
-            use_mla=False,
-            has_sink=False,
-            use_sparse=False,
-        )
+            "test",
+            AttentionSelectorConfig(
+                head_size=64,
+                dtype=torch.float16,
+                kv_cache_dtype="float16",
+                block_size=16,
+                use_mla=False,
+                has_sink=False,
+                use_sparse=False,
+            ))
         assert result == "omni_npu.attention.backends.attention.NPUAttentionBackend"
 
     def test_simple_compile_backend(self):
@@ -339,7 +348,7 @@ class TestNPUPlatform:
     def test_is_sleep_mode_available(self, monkeypatch):
         """Test the is_sleep_mode_available method of NPUPlatform."""
         platform = NPUPlatform()
-        
+
         assert platform.is_sleep_mode_available() is True
 
 
@@ -451,16 +460,15 @@ class TestConfigUpdater:
             "vllm.utils.torch_utils.supports_dynamo",
             lambda: False,
         )
-        
+
         # Mock logger.warning to verify it's called (covers line 42)
         warning_called = {"called": False}
         def mock_warning(msg):
             warning_called["called"] = True
-        
+
         monkeypatch.setattr("omni_npu.platform.logger.warning", mock_warning)
 
         vllm_config.additional_config = None
         ConfigUpdater.update_vllm_config(vllm_config)
         assert vllm_config.npu_compilation_config.use_gegraph is False
         assert warning_called["called"] is True
-

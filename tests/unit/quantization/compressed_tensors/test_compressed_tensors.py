@@ -70,7 +70,8 @@ class DummyNPUCompressedTensorsW8A8Int8(DummyCompressedTensorsScheme):
 
 
 class DummyNPUCompressedTensorsW8A8Int8MoEMethod:
-    def __init__(self, parent, layer):
+    def __init__(self, weight_quant, parent, layer):
+        self.weight_quant = weight_quant
         self.parent = parent
         self.layer = layer
 

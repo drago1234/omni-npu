@@ -14,7 +14,6 @@ import torch_npu
 
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
-from vllm.model_executor.layers.rotary_embedding.common import apply_rotary_emb_torch
 from vllm.logger import init_logger
 logger = init_logger(__name__)
 

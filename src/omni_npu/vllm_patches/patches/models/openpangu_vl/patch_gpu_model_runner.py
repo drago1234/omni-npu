@@ -27,7 +27,7 @@ from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-from vllm.attention.backends.abstract import AttentionBackend
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,

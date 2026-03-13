@@ -38,7 +38,7 @@ def test_worker_wrapper_base_contract():
 
     # 锁定构造函数签名（参数名 + 默认值 + 注解）
     sig = inspect.signature(cls.__init__)
-    assert list(sig.parameters.keys()) == ["self", "vllm_config", "rpc_rank", "global_rank"]
+    assert list(sig.parameters.keys()) == ["self", "rpc_rank", "global_rank"]
 
     p = sig.parameters
     assert p["rpc_rank"].default == 0

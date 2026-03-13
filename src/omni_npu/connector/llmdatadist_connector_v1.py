@@ -36,7 +36,7 @@ from .llmdatadist_manager_v1 import LLMDataDistConfig, LLMDataDistManager
 from .utils import get_config_from_dict_or_env, TP_Convertor
 
 if TYPE_CHECKING:
-    from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.v1.attention.backend import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
