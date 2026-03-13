@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Tuple, ClassVar
 import math
-
+import os
 import torch
 import torch_npu
 
@@ -249,10 +249,9 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         value = value.view(-1, self.num_kv_heads*value.shape[-1]).contiguous()
 
         # npu kv rmsnorm not enable, use the default methods
-        if (
-            self.kv_sharing_target_layer_name is None
-            and not getattr(model_extra_config.operator_opt_config, 'enable_kv_rmsnorm_rope_cache', False)
-        ):
+        has_custom_models = "omni_custom_models" in os.environ.get("VLLM_PLUGINS", "")
+        kv_rmsnorm_enabled = getattr(model_extra_config.operator_opt_config, 'enable_kv_rmsnorm_rope_cache', False)
+        if self.kv_sharing_target_layer_name is None and not (kv_rmsnorm_enabled and has_custom_models):
             # update kv cache
             slots = attn_metadata.slot_mapping.view(-1, 1)
             torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, key.shape[-1]), slots, key)
