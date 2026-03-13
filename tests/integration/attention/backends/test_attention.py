@@ -95,6 +95,7 @@ class TestNPUAttentionBackendDefaultImplIntegration(unittest.TestCase):
             max_seq_len=max(seq_lens),
             uniform=True,
         )
+        mock_ctx.capturing = False
 
         with patch('omni_npu.attention.backends.attention.get_forward_context', return_value=mock_ctx):
             result = impl.forward(

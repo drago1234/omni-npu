@@ -105,6 +105,8 @@ class DummyForwardContext:
         self.attn_metadata = attn_metadata
         self.virtual_engine = 0
         self.batch_descriptor = None
+        self.no_compile_layers = {}
+        self.capturing = False
 
 
 class DummyCompilationConfig:
@@ -473,6 +475,10 @@ def _build_module(
     _transpose_flashcomm_weights(module)
     _reset_mla_impl_weights(module)
     module.eval()
+
+    # Add module to the forward context's no_compile_layers for npu_mla_forward
+    ctx.no_compile_layers[module.prefix] = module
+
     return module
 
 

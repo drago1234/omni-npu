@@ -177,6 +177,8 @@ class NPUModelRunner(GPUModelRunner):
         """
         if self.router_sliding_window > 1:
             self._build_conv_context()
+        forward_context = get_forward_context()
+        forward_context.capturing = False
         return self.model(
             input_ids=input_ids,
             positions=positions,
@@ -385,16 +387,19 @@ class NPUModelRunner(GPUModelRunner):
         logger.debug(f"<<< {self.compilation_config.cudagraph_mode.has_full_cudagraphs()=}")
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
+            self.draft_update_stream: torch.npu.Stream = torch.npu.Stream()
             set_graph_params(self.compilation_config.cudagraph_capture_sizes)
             self.model = ACLGraphWrapper(self.model.runnable,
                                          self.vllm_config,
-                                         runtime_mode=CUDAGraphMode.FULL)
+                                         runtime_mode=CUDAGraphMode.FULL,
+                                         update_stream=self.update_stream)
             logger.debug("<<< Wrapped original model with ACLGraphWrapper")
             if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
                 self.drafter.model = ACLGraphWrapper(
                     self.drafter.model,
                     self.vllm_config,
-                    runtime_mode=CUDAGraphMode.FULL
+                    runtime_mode=CUDAGraphMode.FULL,
+                    update_stream=self.draft_update_stream
                 )
                 logger.debug("<<< Wrapped drafter model with ACLGraphWrapper")
 
@@ -656,6 +661,8 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 if self.router_sliding_window > 1:
                     self._build_conv_context(dummy=True)
+                forward_context = get_forward_context()
+                forward_context.capturing = False
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,

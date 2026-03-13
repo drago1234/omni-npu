@@ -206,3 +206,7 @@ class NPUPlatform(Platform):
         Returns if the sleep mode is available for the current platform.
         """
         return True
+    
+    @classmethod
+    def opaque_attention_op(cls) -> bool:
+        return True

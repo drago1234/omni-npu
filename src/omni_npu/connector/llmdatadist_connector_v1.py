@@ -131,6 +131,7 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.host_port += dp_rank
         self.is_prefill = vllm_config.kv_transfer_config.kv_role == "kv_producer"
+        self._connector_metadata: Optional[DatadistConnectorMetadata] = DatadistConnectorMetadata()
 
         if role == KVConnectorRole.SCHEDULER:
             if self.is_prefill:

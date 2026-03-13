@@ -24,6 +24,38 @@ from tests.unit.platform.utils import create_vllm_config
 from unittest.mock import MagicMock
 
 
+@contextmanager
+def mock_forward_context():
+    """Helper context manager to mock forward context for tests."""
+    # Create a mock forward context object
+    mock_ctx = SimpleNamespace(capturing=False, num_tokens=10, batch_descriptor=None)
+
+    # Mock get_forward_context to return the mock context
+    import omni_npu.worker.npu_model_runner as runner_module
+    original_get = runner_module.get_forward_context
+    original_set = runner_module.set_forward_context
+
+    def mock_set_forward_context(*args, **kwargs):
+        # Store the mock context so get_forward_context can return it
+        runner_module._mock_forward_context = mock_ctx
+        # Return a context manager that does nothing
+        return nullcontext()
+
+    def mock_get_forward_context():
+        return mock_ctx
+
+    runner_module.set_forward_context = mock_set_forward_context
+    runner_module.get_forward_context = mock_get_forward_context
+
+    try:
+        yield
+    finally:
+        runner_module.set_forward_context = original_set
+        runner_module.get_forward_context = original_get
+        if hasattr(runner_module, '_mock_forward_context'):
+            delattr(runner_module, '_mock_forward_context')
+
+
 class TestNPUModelRunner:
 
     def setup_method(self):
@@ -242,8 +274,9 @@ class TestNPUModelRunner:
         # Call _model_forward
         input_ids = torch.tensor([[1, 2, 3]], device=self.npu_device)
         positions = torch.tensor([[0, 1, 2]], device=self.npu_device)
-        result = runner._model_forward(input_ids=input_ids,
-                                       positions=positions)
+        with mock_forward_context():
+            result = runner._model_forward(input_ids=input_ids,
+                                        positions=positions)
 
         # Verify _build_conv_context was called
         mock_build_conv_context.assert_called_once()
@@ -871,7 +904,7 @@ class TestNPUModelRunner:
         wrapped_model = SimpleNamespace(unwrap=lambda: self.runner.model)
         monkeypatch.setattr(
             "omni_npu.worker.npu_model_runner.ACLGraphWrapper",
-            lambda model, vllm_config, runtime_mode: wrapped_model,
+            lambda model, vllm_config, runtime_mode, update_stream: wrapped_model,
         )
         monkeypatch.setattr(
             "omni_npu.worker.npu_model_runner.set_graph_params",
@@ -1312,14 +1345,11 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
         monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group",
                             lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_model_runner.set_forward_context",
-            lambda *args, **kwargs: nullcontext())
-
-        hidden_states, logits = self.runner._dummy_run(num_tokens=10,
-                                                       create_mixed_batch=True,
-                                                       uniform_decode=False,
-                                                       skip_eplb=True)
+        with mock_forward_context():
+            hidden_states, logits = self.runner._dummy_run(num_tokens=10,
+                                                        create_mixed_batch=True,
+                                                        uniform_decode=False,
+                                                        skip_eplb=True)
         assert hidden_states is not None
         assert logits is not None
 
@@ -1405,13 +1435,10 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
         monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group",
                             lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_model_runner.set_forward_context",
-            lambda *args, **kwargs: nullcontext())
-
-        hidden_states, logits = self.runner._dummy_run(num_tokens=10,
-                                                       uniform_decode=True,
-                                                       skip_eplb=True)
+        with mock_forward_context():
+            hidden_states, logits = self.runner._dummy_run(num_tokens=10,
+                                                        uniform_decode=True,
+                                                        skip_eplb=True)
         assert hidden_states is not None
         assert logits is not None
 
@@ -1476,16 +1503,14 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
         monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group",
                             lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_model_runner.set_forward_context",
-            lambda *args, **kwargs: nullcontext())
 
         # Test line 317: when cudagraph_runtime_mode is None, it uses _cudagraph_mode
-        hidden_states1, logits1 = self.runner._dummy_run(num_tokens=10,
-                                                         force_attention=True,
-                                                         skip_eplb=True)
-        assert hidden_states1 is not None
-        assert logits1 is not None
+        with mock_forward_context():
+            hidden_states1, logits1 = self.runner._dummy_run(num_tokens=10,
+                                                            force_attention=True,
+                                                            skip_eplb=True)
+            assert hidden_states1 is not None
+            assert logits1 is not None
 
         # Test line 319: when cudagraph_runtime_mode matches _cudagraph_mode, no assertion
         hidden_states2, logits2 = self.runner._dummy_run(
@@ -1495,7 +1520,6 @@ class TestNPUModelRunner:
             cudagraph_runtime_mode=mock_mode)
         assert hidden_states2 is not None
         assert logits2 is not None
-
         # Test line 319: when cudagraph_runtime_mode doesn't match, assertion should fail
         mock_mode2 = MagicMock()
         with pytest.raises(AssertionError,
@@ -1545,30 +1569,28 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
         monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group",
                             lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_model_runner.set_forward_context",
-            lambda *args, **kwargs: nullcontext())
 
-        hidden_states, logits = self.runner._dummy_run(num_tokens=10,
-                                                       skip_eplb=True)
-        assert hidden_states is not None
-        assert logits is not None
+        with mock_forward_context():
+            hidden_states, logits = self.runner._dummy_run(num_tokens=10,
+                                                        skip_eplb=True)
+            assert hidden_states is not None
+            assert logits is not None
 
-        # Test line 375-377: enable_prompt_embeds branch (when supports_mm_inputs=False)
-        self.runner.supports_mm_inputs = False
-        self.runner.enable_prompt_embeds = True
-        self.runner.inputs_embeds = SimpleNamespace(gpu=torch.zeros(10, 10))
-        hidden_states2, logits2 = self.runner._dummy_run(num_tokens=10,
-                                                         skip_eplb=True)
-        assert hidden_states2 is not None
+            # Test line 375-377: enable_prompt_embeds branch (when supports_mm_inputs=False)
+            self.runner.supports_mm_inputs = False
+            self.runner.enable_prompt_embeds = True
+            self.runner.inputs_embeds = SimpleNamespace(gpu=torch.zeros(10, 10))
+            hidden_states2, logits2 = self.runner._dummy_run(num_tokens=10,
+                                                            skip_eplb=True)
+            assert hidden_states2 is not None
 
-        # Test line 383: uses_mrope branch
-        self.runner.uses_mrope = True
-        self.runner.mrope_positions = SimpleNamespace(
-            gpu=torch.zeros(1, 10, dtype=torch.long))
-        hidden_states3, logits3 = self.runner._dummy_run(num_tokens=10,
-                                                         skip_eplb=True)
-        assert hidden_states3 is not None
+            # Test line 383: uses_mrope branch
+            self.runner.uses_mrope = True
+            self.runner.mrope_positions = SimpleNamespace(
+                gpu=torch.zeros(1, 10, dtype=torch.long))
+            hidden_states3, logits3 = self.runner._dummy_run(num_tokens=10,
+                                                            skip_eplb=True)
+            assert hidden_states3 is not None
 
         # Test line 385: uses_xdrope_dim > 0 branch
         self.runner.uses_mrope = False
@@ -1686,10 +1708,6 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "eplb_step", lambda **kwargs: None)
         monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group",
                             lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_model_runner.set_forward_context",
-            lambda *args, **kwargs: nullcontext())
-
         # Mock CUDAGraphMode
         mock_cudagraph_mode = MagicMock()
         mock_cudagraph_mode.has_mode = lambda mode: True  # PIECEWISE mode
@@ -1699,20 +1717,21 @@ class TestNPUModelRunner:
             "omni_npu.worker.npu_model_runner.CUDAGraphMode.PIECEWISE",
             MagicMock())
 
-        hidden_states, logits = self.runner._dummy_run(num_tokens=10,
-                                                       skip_eplb=True)
-        assert hidden_states is not None
-        assert logits is not None
-        self.runner.drafter.dummy_run.assert_called_once()
+        with mock_forward_context():
+            hidden_states, logits = self.runner._dummy_run(num_tokens=10,
+                                                        skip_eplb=True)
+            assert hidden_states is not None
+            assert logits is not None
+            self.runner.drafter.dummy_run.assert_called_once()
 
-        # Test line 450: cudagraph_specialize_lora and activate_lora branch
-        self.runner.compilation_config.cudagraph_specialize_lora = True
-        # Call _dummy_run with activate_lora=True to trigger line 450
-        hidden_states2, logits2 = self.runner._dummy_run(num_tokens=10,
-                                                         skip_eplb=True,
-                                                         activate_lora=True)
-        assert hidden_states2 is not None
-        assert logits2 is not None
+            # Test line 450: cudagraph_specialize_lora and activate_lora branch
+            self.runner.compilation_config.cudagraph_specialize_lora = True
+            # Call _dummy_run with activate_lora=True to trigger line 450
+            hidden_states2, logits2 = self.runner._dummy_run(num_tokens=10,
+                                                            skip_eplb=True,
+                                                            activate_lora=True)
+            assert hidden_states2 is not None
+            assert logits2 is not None
 
     def test_dummy_run_skip_eplb(self, monkeypatch):
         """Test _dummy_run with skip_eplb=True (covers line 469)."""
@@ -1760,18 +1779,16 @@ class TestNPUModelRunner:
         monkeypatch.setattr(self.runner, "eplb_step", mock_eplb_step)
         monkeypatch.setattr("omni_npu.worker.npu_model_runner.get_pp_group",
                             lambda: SimpleNamespace(is_first_rank=True))
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_model_runner.set_forward_context",
-            lambda *args, **kwargs: nullcontext())
 
-        # Test skip_eplb=True
-        self.runner._dummy_run(num_tokens=10, skip_eplb=True)
-        assert eplb_called["called"] is False
+        with mock_forward_context():
+            # Test skip_eplb=True
+            self.runner._dummy_run(num_tokens=10, skip_eplb=True)
+            assert eplb_called["called"] is False
 
-        # Test skip_eplb=False
-        self.runner._dummy_run(num_tokens=10, skip_eplb=False)
-        assert eplb_called["called"] is True
-    
+            # Test skip_eplb=False
+            self.runner._dummy_run(num_tokens=10, skip_eplb=False)
+            assert eplb_called["called"] is True    
+
     def test_kv_cache_sink_attn_after_wake_up_normal_case(self, monkeypatch):
         """Test _kv_cache_sink_attn_after_wake_up with normal StaticSinkAttention module.
         

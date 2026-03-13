@@ -9,6 +9,7 @@ import torch
 from vllm.attention.backends.abstract import AttentionType
 
 utils_mod_patcher = None
+forward_context_mod_patcher = None
 NPUAttentionBackendImpl = None
 NPUAttentionMetadata = None
 NPUMLABackend = None
@@ -19,7 +20,7 @@ make_fake_metadata = None
 
 
 def setup_module():
-    global NPUMLAImpl, NPUMLAMetadata, NPUMLABackend, NPUMLAMetadataBuilder, NPUMLADecodeMetadata, make_fake_metadata, utils_mod_patcher
+    global NPUMLAImpl, NPUMLAMetadata, NPUMLABackend, NPUMLAMetadataBuilder, NPUMLADecodeMetadata, make_fake_metadata, utils_mod_patcher, forward_context_mod_patcher
     try:
         # Define a TypeVar for the metadata type
         MetadataT = TypeVar('MetadataT')
@@ -37,7 +38,7 @@ def setup_module():
                 self.layer_names = layer_names
                 self.vllm_config = vllm_config
                 self.device = device
-            
+
             def _init_reorder_batch_threshold(self, *args, **kwargs):
                 self.reorder_batch_threshold = 0
 
@@ -54,6 +55,22 @@ def setup_module():
                 'vllm.v1.attention.backends.utils': utils_mod
         })
         utils_mod_patcher.start()
+
+        # Mock forward context with capturing=False
+        mock_forward_ctx = MagicMock()
+        mock_forward_ctx.capturing = False
+        mock_forward_ctx.batch_descriptor = None
+        mock_forward_ctx.no_compile_layers = {}
+
+        forward_ctx_mod = types.ModuleType('vllm.forward_context')
+        forward_ctx_mod.get_forward_context = MagicMock(return_value=mock_forward_ctx)
+        forward_ctx_mod.set_forward_context = MagicMock(return_value=MagicMock())
+        forward_ctx_mod.BatchDescriptor = MagicMock()
+        forward_ctx_mod.capturing = False
+        forward_context_mod_patcher = patch.dict('sys.modules', {
+            'vllm.forward_context': forward_ctx_mod
+        })
+        forward_context_mod_patcher.start()
 
         from omni_npu.attention.backends.mla import (
             NPUMLAImpl as __impl,
@@ -136,6 +153,8 @@ def setup_module():
 def teardown_module():
     if utils_mod_patcher is not None:
         utils_mod_patcher.stop()
+    if forward_context_mod_patcher is not None:
+        forward_context_mod_patcher.stop()
 
 
 @pytest.mark.unit
@@ -672,10 +691,15 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
             )
             sink_out = torch.randn(num_heads, T, v_head_dim, dtype=dtype, device=device)
+            mock_ctx = MagicMock()
+            mock_ctx.capturing = False
             with patch(
                 "torch.ops.custom.npu_fused_infer_attention_sink",
                 return_value=(sink_out.transpose(0, 1).contiguous(),),
-            ) as mock_sink_op:
+            ) as mock_sink_op, patch(
+                "omni_npu.attention.backends.mla.get_forward_context",
+                return_value=mock_ctx,
+            ):
                 o = impl._forward_decode(decode_ql_nope, decode_q_pe, kv_cache, metadata, MagicMock())
             mock_sink_op.assert_called_once()
             kwargs = mock_sink_op.call_args.kwargs
@@ -841,10 +865,16 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             )
             # npu_fused_infer_attention_sink returns (T, N, D), impl transposes to (N, T, D)
             sink_out = torch.randn(num_heads, T, v_head_dim, dtype=dtype, device=device)
+
+            mock_ctx = MagicMock()
+            mock_ctx.capturing = False
             with patch(
                 "torch.ops.custom.npu_fused_infer_attention_sink",
                 return_value=(sink_out.transpose(0, 1).contiguous(),),
-            ) as mock_sink_op:
+            ) as mock_sink_op, patch(
+                "omni_npu.attention.backends.mla.get_forward_context",
+                return_value=mock_ctx,
+            ):
                 o = impl._forward_decode(decode_ql_nope, decode_q_pe, kv_cache, metadata, MagicMock())
             mock_sink_op.assert_called_once()
             kwargs = mock_sink_op.call_args.kwargs
@@ -884,8 +914,10 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             max_seq_len=prompt_len,
             uniform=True,
         )
+        mock_ctx.capturing = False
         with patch('vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size', return_value=64), \
-            patch('omni_npu.attention.backends.mla.get_current_vllm_config', return_value=None):
+            patch('omni_npu.attention.backends.mla.get_current_vllm_config', return_value=None), \
+            patch('omni_npu.attention.backends.mla.get_forward_context', return_value=mock_ctx):
             global NPUMLAImpl
             impl = NPUMLAImpl(
                 num_heads=num_heads,
@@ -1141,6 +1173,10 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             print([it.shape for it in local_out])
             return torch.zeros_like(local_out[0]), None
 
+        mock_ctx = MagicMock()
+        mock_ctx.batch_descriptor = MagicMock()
+        mock_ctx.capturing = False
+
         with patch(
             "vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size",
             return_value=64,
@@ -1150,6 +1186,9 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
         ), patch(
             "omni_npu.attention.backends.mla.get_tp_group",
             return_value=mock_tp_group,
+        ), patch(
+            "omni_npu.attention.backends.mla.get_forward_context",
+            return_value=mock_ctx,
         ), patch(
             "torch.distributed.all_to_all_single",
             side_effect=mock_all_to_all_single,

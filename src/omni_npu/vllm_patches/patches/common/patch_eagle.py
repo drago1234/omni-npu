@@ -9,7 +9,7 @@ from vllm.config import (
     CUDAGraphMode,
     get_layers_from_vllm_config,
 )
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import set_forward_context, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -212,6 +212,8 @@ class EagleProposerPatch(VLLMPatch):
                 else CUDAGraphMode.NONE,
                 batch_descriptor=batch_descriptor
             ):
+                forward_context = get_forward_context()
+                forward_context.capturing = False
                 if self.supports_mm_inputs:
                     input_ids = None
                     inputs_embeds = self.inputs_embeds[:num_input_tokens]
@@ -517,6 +519,8 @@ class EagleProposerPatch(VLLMPatch):
             cudagraph_runtime_mode=self.target_model_cuda_graph_mode, # Adapt : get cudagraph mode from model runner
             batch_descriptor=self.batch_desc, # Adapt : get batch_descriptor from model runner
         ):
+            forward_context = get_forward_context()
+            forward_context.capturing = False
         # End Adapt
             ret_hidden_states = self.model(
                 input_ids=input_ids,
@@ -706,6 +710,8 @@ class EagleProposerPatch(VLLMPatch):
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
             ):
+                forward_context = get_forward_context()
+                forward_context.capturing = False
                 ret_hidden_states = self.model(
                     input_ids=input_ids,
                     positions=self._get_positions(input_batch_size),

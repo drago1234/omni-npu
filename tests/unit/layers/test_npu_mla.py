@@ -97,19 +97,19 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         cos = torch.zeros((3, 1, 1, 4), dtype=torch.float32)
         sin = torch.zeros((3, 1, 1, 4), dtype=torch.float32)
 
-        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
+        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
         self.assertTrue(torch.equal(out, torch.tensor([1])))
 
         m._forward_prefill.reset_mock()
-        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=object(), decode=None), virtual_engine=0)
+        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=object(), decode=None), virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
         self.assertTrue(torch.equal(out, torch.tensor([1])))
 
         m._forward_decode.reset_mock()
-        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=None, decode=object()), virtual_engine=0)
+        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=None, decode=object()), virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
         self.assertTrue(torch.equal(out, torch.tensor([2])))
@@ -122,7 +122,7 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         sin = torch.zeros((2, 1, 1, 4), dtype=torch.float32)
 
         meta = SimpleNamespace(prefill=None, decode=object())
-        fc = SimpleNamespace(attn_metadata={f"{m.prefix}.attn": meta}, virtual_engine=0)
+        fc = SimpleNamespace(attn_metadata={f"{m.prefix}.attn": meta}, virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
 
@@ -135,7 +135,7 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         hs = torch.randn((2, 16), dtype=torch.float32)
         cos = torch.zeros((2, 1, 1, 4), dtype=torch.float32)
         sin = torch.zeros((2, 1, 1, 4), dtype=torch.float32)
-        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
+        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
 
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc), patch.object(
             npu_mla_mod.torch_npu,
@@ -253,7 +253,7 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             decode=None,
             slot_mapping=torch.arange(bs, dtype=torch.int64),
         )
-        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0)
+        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0, capturing=False)
         fake_stream = _FakeStream()
 
         def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
@@ -300,7 +300,7 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             decode=_make_decode_meta(bs),
             slot_mapping=torch.arange(bs, dtype=torch.int64),
         )
-        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0)
+        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0, capturing=False)
 
         def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
             k_rope = torch.zeros((2, 1, 128, m.qk_rope_head_dim), dtype=torch.float32)

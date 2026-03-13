@@ -9,7 +9,7 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 
 from vllm.platforms import current_platform
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.config import VllmConfig, CacheConfig
+from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
@@ -31,7 +31,10 @@ except ImportError:
         pass
 
 from omni_npu.attention.backends.mla import NPUMLAImpl, NPUMLAMetadata
-from omni_npu.v1.layers.utils import yarn_get_mscale, named_stream
+from omni_npu.v1.layers.utils import (
+    yarn_get_mscale, 
+    named_stream,
+)
 from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
     RowParallelFlashCommLinear,
@@ -40,6 +43,13 @@ from omni_npu.v1.models.config_loader.loader import model_extra_config
 from omni_npu.attention import ops
 import omni_training_custom_ops
 import omni_custom_ops
+
+from omni_npu.compilation.utils import (
+    capture_multi_fia_graph_size,
+    capture_multi_fia_sink_graph_size,
+)
+
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 KVCACHE_NZ_DIM = 16
@@ -252,34 +262,22 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         # To enable dummy run with out weight
         self.post_weight_load()
 
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.quant_symbol:
-            hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
-            hidden_states = {'x_int8': hidden_states, 'pertoken_scale': pertoken_scale}
-
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        if isinstance(attn_metadata, dict):
-            attn_metadata = attn_metadata[f"{self.prefix}.attn"]
-
-        if self.param_sink_number > 0:
-            assert self.attn.sink_k_pe is not None and self.attn.sink_compressed_kv is not None, (
-                "sink_k_pe and sink_compressed_kv have not been prepared"
-            )
-            if not self.attn.sink_populated:
-                self_kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
-                if self_kv_cache is not None and len(self_kv_cache) > 0:
-                    self.attn.populate_sink_kv(self_kv_cache[0], self_kv_cache[1])
-
-        if attn_metadata is None or attn_metadata.prefill is not None:
-            return self._forward_prefill(hidden_states, cos, sin, attn_metadata)
-        else:
-            return self._forward_decode(hidden_states, cos, sin, attn_metadata)
+        return torch.ops.vllm.npu_mla_forward(
+            hidden_states=hidden_states, 
+            cos=cos,
+            sin=sin,
+            layer_name=self.prefix)
 
     def _forward_decode(
         self,
@@ -349,30 +347,54 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             query_heads = self.num_local_heads 
 
         NPUMLAImpl.ensure_decode_attn_mask()
+        num_tokens = q_nope.size(0)
+        forward_context = get_forward_context()
         if self.param_sink_number > 0:
             if self.sliding_window is not None:
                 window_size = self.sliding_window-1
             else:
                 window_size = NPUMLAImpl.MAX_WINDOW_SIZE
-            attn_output = torch.ops.custom.npu_fused_infer_attention_sink(
-                q_nope, kv_cache[0], kv_cache[0],
-                query_rope=q_pe,
-                key_rope=kv_cache[1],
-                num_query_heads=query_heads,
-                num_key_value_heads=1,
-                input_layout="TND",
-                softmax_scale=self.scaling,
-                block_table=attn_metadata.decode.block_table,
-                block_size=128,
-                actual_seq_qlen=attn_metadata.decode.query_cumlens,
-                actual_seq_kvlen=attn_metadata.decode.seq_lens,
-                atten_mask=NPUMLAImpl.DECORE_ATTN_MASK,
-                sparse_mode=4,
-                sink_number=self.param_sink_number,
-                pre_tokens=window_size,
-                next_tokens=0,
-            )[0].transpose(0, 1).contiguous() # TND -> NTD
+            kwargs = {
+                "query": q_nope, 
+                "key": kv_cache[0], 
+                "value": kv_cache[0],
+                "query_rope": q_pe,
+                "key_rope": kv_cache[1],
+                "num_query_heads": query_heads,
+                "num_key_value_heads": 1,
+                "input_layout": "TND",
+                "softmax_scale": self.scaling,
+                "block_table": attn_metadata.decode.block_table,
+                "block_size": 128,
+                "actual_seq_qlen": attn_metadata.decode.query_cumlens,
+                "actual_seq_kvlen": attn_metadata.decode.seq_lens,
+                "atten_mask": NPUMLAImpl.DECORE_ATTN_MASK,
+                "sparse_mode": 4,
+                "sink_number": self.param_sink_number,
+                "pre_tokens": window_size,
+                "next_tokens": 0,
+            }
+            attn_output_shape = (num_tokens, query_heads, self.kv_lora_rank)
+            attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
+            if forward_context.capturing:
+                capture_multi_fia_sink_graph_size(
+                    attn_output=attn_output,
+                    softmax_lse=softmax_lse ,
+                    num_tokens=num_tokens,
+                    const_args=kwargs)
+                attn_output = attn_output.transpose(0, 1).contiguous()
+            else:
+                attn_output = torch.ops.custom.npu_fused_infer_attention_sink(
+                    **kwargs
+                )[0].transpose(0, 1).contiguous() # TND -> NTD
         else:
+            sparse_mode = 3
+            input_layout = "TND_NTD"
+            attn_output_shape = (self.num_local_heads, num_tokens, self.kv_lora_rank)
+            attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
+            num_key_value_heads = 1
+            block_size = 128
             kwargs = {
                 "query": q_nope,
                 "key": k_nope,
@@ -380,19 +402,28 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 "query_rope": q_pe,
                 "key_rope": k_rope,
                 "num_heads": self.num_local_heads,
-                "num_key_value_heads": 1,
-                "input_layout": "TND_NTD",
-                "atten_mask": NPUMLAImpl.DECORE_ATTN_MASK,
-                "sparse_mode": 3,
+                "num_key_value_heads": num_key_value_heads,
+                "input_layout": input_layout,
+                "atten_mask": attn_mask,
+                "sparse_mode": sparse_mode,
                 "scale": self.scaling,
                 "antiquant_mode": 0,
                 "antiquant_scale": None,
                 "block_table": attn_metadata.decode.block_table,
-                "block_size": 128,
+                "block_size": block_size,
                 "actual_seq_lengths": attn_metadata.decode.query_cumlens,
                 "actual_seq_lengths_kv": attn_metadata.decode.seq_lens,
             }
-            attn_output = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
+            attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
+            if forward_context.capturing:
+                capture_multi_fia_graph_size(
+                    attn_output=attn_output,
+                    softmax_lse=softmax_lse ,
+                    num_tokens=num_tokens,
+                    const_args=kwargs)
+            else:
+                attn_output = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
 
         if self.param_sink_number > 0:
             attn_output = attn_output[:self.num_local_heads]
@@ -617,3 +648,51 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         result[..., 1::2] = x[..., half:]
         
         return result
+
+def npu_mla_forward(  
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    attn_metadata = forward_context.attn_metadata
+    if self.quant_symbol:
+        hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        hidden_states = {'x_int8': hidden_states, 'pertoken_scale': pertoken_scale}
+                
+    if isinstance(attn_metadata, dict):
+        attn_metadata = attn_metadata[f"{self.prefix}.attn"]
+
+    if self.param_sink_number > 0:
+        assert self.attn.sink_k_pe is not None and self.attn.sink_compressed_kv is not None, (
+            "sink_k_pe and sink_compressed_kv have not been prepared"
+        )
+        if not self.attn.sink_populated:
+            self_kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
+            if self_kv_cache is not None and len(self_kv_cache) > 0:
+                self.attn.populate_sink_kv(self_kv_cache[0], self_kv_cache[1])
+
+    if attn_metadata is None or attn_metadata.prefill is not None:
+        return self._forward_prefill(hidden_states, cos, sin, attn_metadata)
+    else:
+        return self._forward_decode(hidden_states, cos, sin, attn_metadata)
+    
+    
+def npu_mla_forward_fake(   
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="npu_mla_forward",
+    op_func=npu_mla_forward,
+    mutates_args=[],
+    fake_impl=npu_mla_forward_fake,
+    dispatch_key="PrivateUse1",
+)

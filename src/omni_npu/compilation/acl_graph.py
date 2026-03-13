@@ -96,12 +96,14 @@ class ACLGraphWrapper:
                  vllm_config: VllmConfig,
                  runtime_mode: CUDAGraphMode,
                  graph_pool: Any = None,
-                 cudagraph_options: Optional[CUDAGraphOptions] = None):
+                 cudagraph_options: Optional[CUDAGraphOptions] = None,
+                 update_stream: torch.npu.Stream = None):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.graph_pool = graph_pool
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
+        self.update_stream = update_stream
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
@@ -140,12 +142,9 @@ class ACLGraphWrapper:
         attn_metadata =  get_forward_context().attn_metadata
         asl = None
         aslkv = None
-        sink_len = None
-        is_gqa = False
         if attn_metadata is not None:
             for _, metadata in attn_metadata.items():
                 if not hasattr(metadata, "decode"):
-                    is_gqa = True
                     # GQA
                     if hasattr(metadata, "query_start_loc"):
                         asl = metadata.query_start_loc[1:]
@@ -155,7 +154,6 @@ class ACLGraphWrapper:
                     # MLA
                     asl = metadata.decode.query_cumlens
                     aslkv = metadata.decode.seq_lens
-                    sink_len = getattr(metadata.decode, "sink_len", None)
                     break
 
         if (
@@ -209,7 +207,7 @@ class ACLGraphWrapper:
                 # mind-exploding: carefully manage the reference and memory.
                 forward_context.capturing = True
                 logger.debug(f"<<< {asl=}, {aslkv=}")
-                with torch.npu.graph(aclgraph, pool=self.graph_pool, auto_dispatch_capture=True):
+                with torch.npu.graph(aclgraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's aclgraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.aclgraph_options.weak_ref_output:
@@ -221,6 +219,11 @@ class ACLGraphWrapper:
                         # any other acl graph.
                         output = weak_ref_tensors(output)
 
+            # here we always use weak ref for the workspaces
+            # to save memory
+            global _graph_params
+            weak_ref_workspaces(_graph_params)
+            
             # here we always use weak ref for the output
             # to save memory
             entry.output = weak_ref_tensors(output)
@@ -247,22 +250,12 @@ class ACLGraphWrapper:
 
         entry.aclgraph.replay()
         # Updates after replay to improve performance, temporal ordering ensured via inter-stream events.
-        if aslkv is not None:
-            ## NOTE: The parameter list should match.
-            # entry.aclgraph.update(cpu_update_input=[{"actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
-            if not isinstance(aslkv, torch.Tensor):
-                padding_lens = batch_descriptor.num_reqs
-                if padding_lens is None:
-                    padding_lens = min(self.vllm_config.scheduler_config.max_num_seqs, batch_descriptor.num_tokens)
-                aslkv = self._pad_list(aslkv, padding_lens, 0) # padding  aslkv to match gear
-                asl = self._pad_list(asl, padding_lens) # padding  asl to match gear
-                # FIXME: for TND FIA validation
-                if sink_len is None and (aslkv[-1] != 0 or (not is_gqa)):
-                    aslkv[-1] += batch_descriptor.num_tokens - asl[-1]  # extend for padding tokens
-                asl[-1] = batch_descriptor.num_tokens
-                entry.aclgraph.update(cpu_update_input=[{"actual_seq_qlen": asl, "actual_seq_kvlen": aslkv, "actual_seq_lengths": asl, "actual_seq_lengths_kv": aslkv}])
+        if self.vllm_config.model_config.use_mla:
+            self._update_mla_attn_params(self.update_stream, forward_context,
+                                   batch_descriptor.num_tokens)
         else:
-            raise RuntimeError(f"kv length is None. {(attn_metadata is None)=}")
+            self._update_attn_fia_params(self.update_stream, forward_context,
+                                    batch_descriptor.num_tokens)
         return entry.output
 
     def _pad_list(self, lst, n, v=None):
@@ -272,12 +265,315 @@ class ACLGraphWrapper:
             v = lst[-1]
         return (lst + [v] * (n - len(lst))) if len(lst) < n else lst[:n]
 
+    def _update_fia_params(self, forward_context, key):
+        sink_len = None
+        is_gqa = False
+        asl, aslkv = None, None
+        metadata = forward_context.attn_metadata[key]
+        if not hasattr(metadata, "decode"):
+            is_gqa = True
+            if hasattr(metadata, "query_start_loc"):
+                asl = metadata.query_start_loc[1:]
+                aslkv = metadata.seq_lens
+            
+        else:
+            asl = metadata.decode.query_cumlens
+            aslkv = metadata.decode.seq_lens
+            sink_len = getattr(metadata.decode, "sink_len", None)
+        
+        if aslkv is None:
+            return asl, aslkv
+        
+        if isinstance(aslkv, torch.Tensor):
+            return asl, aslkv
+        
+        batch_descriptor = forward_context.batch_descriptor
+        padding_lens = batch_descriptor.num_reqs
+        if padding_lens is None:
+            padding_lens = min(self.vllm_config.scheduler_config.max_num_seqs, batch_descriptor.num_tokens)
+        asl = self._pad_list(asl, padding_lens) # padding asl to match gear
+        aslkv = self._pad_list(aslkv, padding_lens, 0) # padding aslkv to match gear
+        if sink_len is None and (aslkv[-1] != 0 or (not is_gqa)):
+            aslkv[-1] += batch_descriptor.num_tokens - asl[-1]
+        asl[-1] = batch_descriptor.num_tokens
+        return asl, aslkv
+
+    def _update_attn_fia_params(self, update_stream, forward_context, runtime_shape):
+        if forward_context.attn_metadata is None:
+            raise RuntimeError(f"attn_metadata is None")
+        graph_params = get_graph_params()
+        attn_metadata = forward_context.attn_metadata
+        attn_keys = list(attn_metadata.keys())
+        num_layers = len(attn_keys)
+        if num_layers == 0:
+            return
+        with torch.npu.stream(update_stream):
+            for key, param, handle, event in zip(
+                attn_keys,
+                graph_params.attn_params[runtime_shape],
+                graph_params.handles[runtime_shape],
+                graph_params.events[runtime_shape],
+            ):
+                op_name = param["op_name"]
+                if op_name == "npu_fused_infer_attention_score":
+                    query = param["query"]
+                    key_cache = param["key"]
+                    value = param["value"]
+                    num_heads = param["num_heads"]
+                    num_kv_heads = param["num_key_value_heads"]
+                    input_layout = param["input_layout"]
+                    scale = param["scale"]
+                    block_tables = param["block_table"]
+                    block_size = param["block_size"]
+                    sparse_mode = param["sparse_mode"]
+                    attn_mask = param["atten_mask"]
+                    attn_output = param["attn_output"]
+                    softmax_lse = param["softmax_lse"]
+                    actual_seq_len, actual_seq_len_kv = self._update_fia_params(forward_context, key)
+                    if actual_seq_len_kv is None:
+                        raise RuntimeError(f"kv length is None. {(forward_context.attn_metadata[key] is None)=}")
+
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    torch_npu.npu_fused_infer_attention_score.out(
+                        query=query,
+                        key=key_cache,
+                        value=value,
+                        block_table=block_tables,
+                        atten_mask=attn_mask,
+                        input_layout=input_layout,
+                        block_size=block_size,
+                        actual_seq_lengths=actual_seq_len,
+                        actual_seq_lengths_kv=actual_seq_len_kv,
+                        num_key_value_heads=num_kv_heads,
+                        num_heads=num_heads,
+                        scale=scale,
+                        sparse_mode=sparse_mode,
+                        workspace=graph_params.workspaces.get(runtime_shape),
+                        out=[attn_output, softmax_lse],
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
+                    event.record(update_stream)
+                elif op_name == "npu_fused_infer_attention_score_v2":
+                    query = param["query"]
+                    key_cache = param["key"]
+                    value = param["value"]
+                    num_heads = param["num_query_heads"]
+                    num_kv_heads = param["num_key_value_heads"]
+                    input_layout = param["input_layout"]
+                    softmax_scale = param["softmax_scale"]
+                    block_tables = param["block_table"]
+                    block_size = param["block_size"]
+                    sparse_mode = param["sparse_mode"]
+                    attn_mask = param["atten_mask"]
+                    attn_output = param["attn_output"]
+                    softmax_lse = param["softmax_lse"]
+                    pre_tokens = param.get("pre_tokens", 2147483647)
+                    next_tokens = param.get("next_tokens", 2147483647)
+                    learnable_sink = param.get("learnable_sink", None)
+                    actual_seq_len, actual_seq_len_kv = self._update_fia_params(forward_context, key)
+                    if actual_seq_len_kv is None:
+                        raise RuntimeError(f"kv length is None. {(forward_context.attn_metadata[key] is None)=}")
+
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    torch_npu.npu_fused_infer_attention_score_v2.out(
+                        query=query,
+                        key=key_cache,
+                        value=value,
+                        block_table=block_tables,
+                        atten_mask=attn_mask,
+                        input_layout=input_layout,
+                        block_size=block_size,
+                        actual_seq_qlen=actual_seq_len,
+                        actual_seq_kvlen=actual_seq_len_kv,
+                        num_key_value_heads=num_kv_heads,
+                        num_query_heads=num_heads,
+                        softmax_scale=softmax_scale,
+                        sparse_mode=sparse_mode,
+                        pre_tokens=pre_tokens,
+                        next_tokens=next_tokens,
+                        learnable_sink=learnable_sink,
+                        workspace=graph_params.workspaces.get(runtime_shape),
+                        out=[attn_output, softmax_lse],
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
+                    event.record(update_stream)
+                elif op_name == "npu_fused_infer_attention_sink":
+                    query = param["query"]
+                    key_cache = param["key"]
+                    value = param["value"]
+                    num_heads = param["num_query_heads"]
+                    num_kv_heads = param["num_key_value_heads"]
+                    input_layout = param["input_layout"]
+                    softmax_scale = param["softmax_scale"]
+                    sink_number = param["sink_number"]
+                    pre_tokens = param["pre_tokens"]
+                    next_tokens = param["next_tokens"]
+                    attn_output = param["attn_output"]
+                    softmax_lse = param["softmax_lse"]
+                    sparse_mode = param["sparse_mode"]
+                    attn_mask = param["atten_mask"]
+                    block_tables = param["block_table"]
+                    block_size = param["block_size"]
+                    actual_seq_len, actual_seq_len_kv = self._update_fia_params(forward_context, key)
+                    if actual_seq_len_kv is None:
+                        raise RuntimeError(f"kv length is None. {(forward_context.attn_metadata[key] is None)=}")
+
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    torch.ops.custom.npu_fused_infer_attention_sink.out(
+                        query,
+                        key_cache,
+                        value,
+                        sink_number=sink_number,
+                        input_layout=input_layout,
+                        actual_seq_qlen=actual_seq_len,
+                        actual_seq_kvlen=actual_seq_len_kv,
+                        num_key_value_heads=num_kv_heads,
+                        num_query_heads=num_heads,
+                        softmax_scale=softmax_scale,
+                        pre_tokens=pre_tokens,
+                        next_tokens=next_tokens,
+                        sparse_mode=sparse_mode,
+                        atten_mask=attn_mask,
+                        block_table=block_tables,
+                        block_size=block_size,
+                        workspace=graph_params.workspaces.get(runtime_shape),
+                        out=[attn_output, softmax_lse],
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
+                    event.record(update_stream)
+                else:
+                    raise RuntimeError(f"Unsupported op name for attention: {(op_name)=}")
+
+    def _update_mla_attn_params(self, update_stream, forward_context, runtime_shape):
+        if forward_context.attn_metadata is None:
+            raise RuntimeError(f"attn_metadata is None")
+        graph_params = get_graph_params()
+        with torch.npu.stream(update_stream):
+            for key, param, handle, event in zip(
+                forward_context.attn_metadata,
+                graph_params.attn_params[runtime_shape],
+                graph_params.handles[runtime_shape],
+                graph_params.events[runtime_shape],
+            ):
+                op_name = param["op_name"]
+                if op_name == "npu_fused_infer_attention_score":
+                    query = param["query"]
+                    key_cache = param["key"]
+                    value = param["value"]
+                    query_rope = param["query_rope"]
+                    key_rope = param["key_rope"]
+                    num_heads = param["num_heads"]
+                    num_kv_heads = param["num_key_value_heads"]
+                    input_layout = param["input_layout"]
+                    scale = param["scale"]
+                    block_tables = param["block_table"]
+                    block_size = param["block_size"]
+                    sparse_mode = param["sparse_mode"]
+                    attn_mask = param["atten_mask"]
+                    attn_output = param["attn_output"]
+                    softmax_lse = param["softmax_lse"]
+                    pre_tokens = param.get("pre_tokens", 2147483647)
+                    next_tokens = param.get("next_tokens", 2147483647)
+                    antiquant_mode = param.get("antiquant_mode", 0)
+                    antiquant_scale = param.get("antiquant_scale", None)
+                    softmax_lse_flag = param.get("softmax_lse_flag", False)
+                    actual_seq_len, actual_seq_len_kv = self._update_fia_params(forward_context, key)
+                    if actual_seq_len_kv is None:
+                        raise RuntimeError(f"kv length is None. {(forward_context.attn_metadata[key] is None)=}")
+
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    torch_npu.npu_fused_infer_attention_score.out(
+                        query,
+                        key_cache,
+                        value,
+                        query_rope=query_rope,
+                        key_rope=key_rope,
+                        block_table=block_tables,
+                        atten_mask=attn_mask,
+                        input_layout=input_layout,
+                        block_size=block_size,
+                        actual_seq_lengths=actual_seq_len,
+                        actual_seq_lengths_kv=actual_seq_len_kv,
+                        num_key_value_heads=num_kv_heads,
+                        num_heads=num_heads,
+                        scale=scale,
+                        sparse_mode=sparse_mode,
+                        antiquant_mode=antiquant_mode,
+                        antiquant_scale=antiquant_scale,
+                        pre_tokens=pre_tokens,
+                        next_tokens=next_tokens,
+                        softmax_lse_flag=softmax_lse_flag,
+                        workspace=graph_params.workspaces.get(runtime_shape),
+                        out=[attn_output, softmax_lse],
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
+                    event.record(update_stream)
+                elif op_name == "npu_fused_infer_attention_sink":
+                    query = param["query"]
+                    key_cache = param["key"]
+                    value = param["value"]
+                    query_rope = param["query_rope"]
+                    key_rope = param["key_rope"]
+                    num_heads = param["num_query_heads"]
+                    num_kv_heads = param["num_key_value_heads"]
+                    input_layout = param["input_layout"]
+                    softmax_scale = param["softmax_scale"]
+                    sink_number = param["sink_number"]
+                    pre_tokens = param["pre_tokens"]
+                    next_tokens = param["next_tokens"]
+                    attn_output = param["attn_output"]
+                    softmax_lse = param["softmax_lse"]
+                    sparse_mode = param["sparse_mode"]
+                    attn_mask = param["atten_mask"]
+                    block_tables = param["block_table"]
+                    block_size = param["block_size"]
+                    actual_seq_len, actual_seq_len_kv = self._update_fia_params(forward_context, key)
+                    if actual_seq_len_kv is None:
+                        raise RuntimeError(f"kv length is None. {(forward_context.attn_metadata[key] is None)=}")
+
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    torch.ops.custom.npu_fused_infer_attention_sink.out(
+                        query,
+                        key_cache,
+                        value,
+                        query_rope=query_rope,
+                        key_rope=key_rope,
+                        sink_number=sink_number,
+                        input_layout=input_layout,
+                        actual_seq_qlen=actual_seq_len,
+                        actual_seq_kvlen=actual_seq_len_kv,
+                        num_key_value_heads=num_kv_heads,
+                        num_query_heads=num_heads,
+                        softmax_scale=softmax_scale,
+                        pre_tokens=pre_tokens,
+                        next_tokens=next_tokens,
+                        sparse_mode=sparse_mode,
+                        atten_mask=attn_mask,
+                        block_table=block_tables,
+                        block_size=block_size,
+                        workspace=graph_params.workspaces.get(runtime_shape),
+                        out=[attn_output, softmax_lse],
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
+                    event.record(update_stream)
+                else:
+                    raise RuntimeError(f"Unsupported op name for mla: {(op_name)=}")
+
+
+def weak_ref_workspaces(params):
+    if params is None:
+        return
+    for num_tokens in params.workspaces:
+        if params.workspaces[num_tokens] is None:
+            continue
+        params.workspaces[num_tokens] = weak_ref_tensors(params.workspaces[num_tokens])
+
 @dataclass
 class GraphParams:
     events: dict[int, list[torch.npu.ExternalEvent]]
     workspaces: dict[int, torch.Tensor]
     handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
-    attn_params: dict[int, list[tuple]]
+    attn_params: dict[int, list[dict]]
 
 _graph_params: Optional[GraphParams] = None
 

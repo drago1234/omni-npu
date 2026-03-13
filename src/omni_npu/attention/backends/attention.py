@@ -31,6 +31,11 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from omni_npu.compilation.utils import (
+    capture_multi_fia_graph_size,
+    capture_multi_fia_v2_graph_size,
+    capture_multi_fia_sink_graph_size,
+)
 
 from omni_npu.v1.models.config_loader.loader import model_extra_config
 import omni_custom_ops
@@ -226,6 +231,8 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
         attn_metadata: NPUMetadata,
         output: Optional[torch.Tensor] = None,
         trace_flag: bool = True,
+        output_scale: Optional[torch.Tensor] = None,
+        output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
@@ -252,25 +259,41 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             torch_npu.npu_scatter_nd_update_(kv_cache[1].view(-1, value.shape[-1]), slots, value)
 
         actual_seq_qlen = attn_metadata.query_start_loc[1:]
+        forward_context = get_forward_context()
         if self.sink_len > 0:
-            attn_output = torch.ops.custom.npu_fused_infer_attention_sink(
-                query[:actual_seq_qlen[-1]],
-                kv_cache[0],
-                kv_cache[1],
-                num_query_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="TND",
-                softmax_scale=self.scale,
-                block_table=attn_metadata.block_tables,
-                block_size=kv_cache[0].shape[1],
-                sparse_mode=self.sparse_mode,
-                pre_tokens=self.sliding_window if self.sliding_window is not None else 0,
-                next_tokens=0,
-                sink_number=self.sink_len,
-                atten_mask=NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
-                actual_seq_qlen=actual_seq_qlen,
-                actual_seq_kvlen=attn_metadata.seq_lens,
-            )[0]
+            input_layout = "TND"
+            next_tokens = 0
+            kwargs = {
+                "query": query[:actual_seq_qlen[-1]],
+                "key": kv_cache[0],
+                "value": kv_cache[1],
+                "num_query_heads": self.num_heads,
+                "num_key_value_heads": self.num_kv_heads,
+                "input_layout": input_layout,
+                "softmax_scale": self.scale,
+                "block_table": attn_metadata.block_tables,
+                "block_size": kv_cache[0].shape[1],
+                "sparse_mode": self.sparse_mode,
+                "pre_tokens": self.sliding_window if self.sliding_window is not None else 0,
+                "next_tokens": next_tokens,
+                "sink_number": self.sink_len,
+                "atten_mask": NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
+                "actual_seq_qlen": actual_seq_qlen,
+                "actual_seq_kvlen": attn_metadata.seq_lens,
+            }
+            attn_output_shape = (num_tokens, self.num_heads, self.head_size)
+            attn_output = torch.empty(attn_output_shape, dtype=query[:actual_seq_qlen[-1]].dtype, device=query[:actual_seq_qlen[-1]].device)
+            softmax_lse = torch.empty(num_tokens, dtype=query[:actual_seq_qlen[-1]].dtype, device=query[:actual_seq_qlen[-1]].device)
+            if forward_context.capturing:
+                capture_multi_fia_sink_graph_size(
+                    attn_output=attn_output,
+                    softmax_lse=softmax_lse ,
+                    num_tokens=num_tokens,
+                    const_args=kwargs)
+            else:
+                attn_output = torch.ops.custom.npu_fused_infer_attention_sink(
+                    **kwargs
+                )[0]
             output[:actual_seq_qlen[-1]].copy_(attn_output)
             return output
 
@@ -293,52 +316,87 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                 block_size = 0
                 sparse_mode = 3
                 atten_mask = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE
-            attn_output = torch_npu.npu_fused_infer_attention_score(
-                query,
-                key_cache,
-                value_cache,
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="BSND",
-                scale=self.scale,
-                block_table=block_table,
-                block_size=block_size,
-                sparse_mode=sparse_mode,
-                atten_mask=atten_mask,
-                actual_seq_lengths=actual_seq_qlen,
-                actual_seq_lengths_kv=attn_metadata.seq_lens,
-            )[0].view(-1, self.num_heads, self.head_size)
+
+            attn_output_shape = query.shape[:-1] + (self.head_size, )
+            attn_output = torch.empty(attn_output_shape, dtype=query.dtype, device=query.device)
+            softmax_lse = torch.empty(num_tokens, dtype=query.dtype, device=query.device)
+            input_layout = "BSND"
+            kwargs = {
+                "query": query,
+                "key": key_cache,
+                "value": value_cache,
+                "num_heads": self.num_heads,
+                "num_key_value_heads": self.num_kv_heads,
+                "input_layout": input_layout,
+                "scale": self.scale,
+                "block_table": block_table,
+                "block_size": block_size,
+                "sparse_mode": sparse_mode,
+                "atten_mask": atten_mask,
+                "actual_seq_lengths": actual_seq_qlen,
+                "actual_seq_lengths_kv": attn_metadata.seq_lens,
+            }
+
+            if forward_context.capturing and attn_metadata.num_prefills == 0:
+                num_tokens = query.shape[0]
+                capture_multi_fia_graph_size(
+                    attn_output=attn_output,
+                    softmax_lse=softmax_lse,
+                    num_tokens=num_tokens,
+                    const_args=kwargs,
+                )
+            else:
+                attn_output = torch_npu.npu_fused_infer_attention_score(**kwargs)[0]
+            attn_output = attn_output.view(-1, self.num_heads, self.head_size)
             output.copy_(attn_output)
             return output
-
-        fused_infer_attn_kwargs = {
+        input_layout = "TND"
+        sparse_mode = 3
+        atten_mask = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE
+        next_tokens = 0
+        kwargs = {
             "query": query[:actual_seq_qlen[-1]],
-            "key": kv_cache[0],
             "value": kv_cache[1],
             "num_query_heads": self.num_heads,
             "num_key_value_heads": self.num_kv_heads,
-            "input_layout": "TND",
-            "softmax_scale": self.scale,
+            "input_layout": input_layout,
             "block_table": attn_metadata.block_tables,
+        }
+        attn_output, softmax_lse = torch_npu._npu_fused_infer_attention_score_v2_infer_output(**kwargs)
+        
+        kwargs.update({
+            "key": kv_cache[0],
+            "softmax_scale": self.scale,
             "block_size": kv_cache[0].shape[1],
-            "sparse_mode": 3,
-            "atten_mask": NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE,
+            "sparse_mode": sparse_mode,
+            "atten_mask": atten_mask,
             "actual_seq_qlen": actual_seq_qlen,
             "actual_seq_kvlen": attn_metadata.seq_lens,
-        }
-        
+        })
         if self.sliding_window:
-            fused_infer_attn_kwargs.update({
-                "sparse_mode": 4,
+            sparse_mode = 4
+            kwargs.update({
+                "sparse_mode": sparse_mode,
                 "pre_tokens": self.sliding_window,
-                "next_tokens": 0,
+                "next_tokens": next_tokens,
             })
         if getattr(self, "attn_sinks", None) is not None:
-            fused_infer_attn_kwargs.update({
+            kwargs.update({
                 "learnable_sink": self.attn_sinks.view(self.num_heads),
             })
 
-        attn_output = torch_npu.npu_fused_infer_attention_score_v2(**fused_infer_attn_kwargs)[0]
+        forward_context = get_forward_context()
+        if forward_context.capturing:
+            capture_multi_fia_v2_graph_size(
+                attn_output=attn_output,
+                softmax_lse=softmax_lse,
+                num_tokens=num_tokens,
+                const_args=kwargs,
+            )
+        else:
+            attn_output = torch_npu.npu_fused_infer_attention_score_v2(
+                **kwargs,
+            )[0]
 
         output[:actual_seq_qlen[-1]].copy_(attn_output)
         return output

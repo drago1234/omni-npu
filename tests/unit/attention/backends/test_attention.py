@@ -87,10 +87,15 @@ def setup_module():
         distributed_mod_patcher.start()
 
 
+        # Mock forward context with capturing=False
+        mock_forward_ctx = MagicMock()
+        mock_forward_ctx.capturing = False
+        mock_forward_ctx.batch_descriptor = None
+
         forward_ctx_mod = types.ModuleType('vllm.forward_context')
-        forward_ctx_mod.get_forward_context = MagicMock(
-            batch_descriptor=None
-        )
+        forward_ctx_mod.get_forward_context = MagicMock(return_value=mock_forward_ctx)
+        forward_ctx_mod.BatchDescriptor = MagicMock()
+        forward_ctx_mod.capturing = False
         forward_context_mod_patcher = patch.dict('sys.modules', {
             'vllm.forward_context': forward_ctx_mod
         })

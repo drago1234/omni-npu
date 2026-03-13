@@ -33,6 +33,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from omni_npu.connector.utils import TP_Convertor
 from omni_npu.attention import ops
+from vllm.forward_context import get_forward_context
+from omni_npu.compilation.utils import (
+    capture_multi_fia_graph_size,
+    capture_multi_fia_sink_graph_size,
+)
 
 import omni_training_custom_ops
 import omni_custom_ops
@@ -670,48 +675,87 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         else:
             query_heads = self.num_heads           
 
+        num_tokens = decode_ql_nope.size(0)
+        forward_context = get_forward_context()
         if self.sink_len > 0:
             if self.sliding_window is not None:
                 window_size = self.sliding_window-1
             else:
                 window_size = NPUMLAImpl.MAX_WINDOW_SIZE
-            o = torch.ops.custom.npu_fused_infer_attention_sink(
-                decode_ql_nope, kv_cache[0], kv_cache[0],
-                query_rope=decode_q_pe,
-                key_rope=kv_cache[1],
-                num_query_heads=query_heads,
-                num_key_value_heads=1,
-                input_layout="TND",
-                softmax_scale=self.scale,
-                block_table=attn_metadata.decode.block_table,
-                block_size=128,
-                actual_seq_qlen=attn_metadata.decode.query_cumlens,
-                actual_seq_kvlen=attn_metadata.decode.seq_lens,
-                atten_mask=NPUMLAImpl.DECORE_ATTN_MASK,
-                sparse_mode=4,
-                sink_number=self.sink_len,
-                pre_tokens=window_size,
-                next_tokens=0,
-            )[0].transpose(0, 1).contiguous() # TND -> NTD
+            kwargs = {
+                "query": decode_ql_nope, 
+                "key": kv_cache[0], 
+                "value": kv_cache[0],
+                "query_rope": decode_q_pe,
+                "key_rope": kv_cache[1],
+                "num_query_heads": query_heads,
+                "num_key_value_heads": 1,
+                "input_layout": "TND",
+                "softmax_scale": self.scale,
+                "block_table": attn_metadata.decode.block_table,
+                "block_size": 128,
+                "actual_seq_qlen": attn_metadata.decode.query_cumlens,
+                "actual_seq_kvlen": attn_metadata.decode.seq_lens,
+                "atten_mask": NPUMLAImpl.DECORE_ATTN_MASK,
+                "sparse_mode": 4,
+                "sink_number": self.sink_len,
+                "pre_tokens": window_size,
+                "next_tokens": 0,
+            }
+            attn_output_shape = (num_tokens, query_heads, self.kv_lora_rank)
+            attn_output = torch.empty(attn_output_shape, dtype=decode_ql_nope.dtype, device=decode_ql_nope.device)
+            softmax_lse = torch.empty(num_tokens, dtype=decode_ql_nope.dtype, device=decode_ql_nope.device)
+            if forward_context.capturing:
+                capture_multi_fia_sink_graph_size(
+                    attn_output=attn_output,
+                    softmax_lse=softmax_lse ,
+                    num_tokens=num_tokens,
+                    const_args=kwargs)
+                o = attn_output.transpose(0, 1).contiguous()
+            else:
+                o = torch.ops.custom.npu_fused_infer_attention_sink(
+                    **kwargs
+                )[0].transpose(0, 1).contiguous() # TND -> NTD
         else:
-            # output shape: (N, T, D)
-            o = torch.ops.npu.npu_fused_infer_attention_score(
-                decode_ql_nope, kv_cache[0], kv_cache[0],
-                query_rope=decode_q_pe,
-                key_rope=kv_cache[1],
-                num_heads=query_heads,
-                num_key_value_heads=1,
-                input_layout="TND_NTD",
-                scale=self.scale,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=attn_metadata.decode.block_table,
-                block_size=128,
-                actual_seq_lengths=attn_metadata.decode.query_cumlens,
-                actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
-                atten_mask = NPUMLAImpl.DECORE_ATTN_MASK,
-                sparse_mode = 3
-            )[0]
+            num_kv_heads = 1
+            input_layout = "TND_NTD"
+            attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
+            sparse_mode = 3
+            block_size = 128
+            attn_output_shape = (query_heads, num_tokens, self.kv_lora_rank)
+            attn_output = torch.empty(attn_output_shape, dtype=decode_ql_nope.dtype, device=decode_ql_nope.device)
+            softmax_lse = torch.empty(num_tokens, dtype=decode_ql_nope.dtype, device=decode_ql_nope.device)
+            kwargs = {
+                "query": decode_ql_nope,
+                "key": kv_cache[0],
+                "value": kv_cache[0],
+                "query_rope": decode_q_pe,
+                "key_rope": kv_cache[1],
+                "num_heads": query_heads,
+                "num_key_value_heads": num_kv_heads,
+                "input_layout": input_layout,
+                "scale": self.scale,
+                "antiquant_mode": 0,
+                "antiquant_scale": None,
+                "block_table": attn_metadata.decode.block_table,
+                "block_size": block_size,
+                "actual_seq_lengths": attn_metadata.decode.query_cumlens,
+                "actual_seq_lengths_kv": attn_metadata.decode.seq_lens,
+                "atten_mask":  attn_mask,
+                "sparse_mode":  sparse_mode
+            }
+            if forward_context.capturing:
+                capture_multi_fia_graph_size(
+                    attn_output=attn_output,
+                    softmax_lse=softmax_lse ,
+                    num_tokens=num_tokens,
+                    const_args=kwargs)
+                o = attn_output
+            else:
+                # output shape: (N, T, D)
+                o = torch.ops.npu.npu_fused_infer_attention_score(
+                    **kwargs
+                )[0]
 
         if self.sink_len > 0:
             o = o[:self.num_heads]
@@ -811,7 +855,6 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 attn_metadata,
                 layer._k_scale,
             )
-
         if has_decode:
             assert attn_metadata.decode is not None
             decode_q_nope, decode_q_pe = decode_q.split(
