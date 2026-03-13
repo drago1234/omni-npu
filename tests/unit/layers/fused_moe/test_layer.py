@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: MIT
 import importlib
 import sys
-import types
-from enum import Enum
-from pathlib import Path
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -13,458 +11,81 @@ import torch
 
 @pytest.fixture
 def layer_module(monkeypatch):
-    """Provide the fused MoE layer module with all heavy dependencies mocked."""
-    torch_npu = MagicMock()
-    torch_npu.npu_format_cast.side_effect = lambda tensor, fmt: tensor
-    torch_npu.npu_swiglu.side_effect = lambda tensor: tensor
-    torch_npu.npu = SimpleNamespace(get_device_name=MagicMock(return_value="FakeDevice"))
-
-    def _grouped_matmul(inputs, weights, **kwargs):
-        return [inputs[0]]
-
-    torch_npu.npu_grouped_matmul.side_effect = _grouped_matmul
-    torch_npu.npu_moe_gating_top_k.side_effect = (
-        lambda logits, k, **kwargs: (
-            torch.ones(logits.shape[:-1] + (k,), device=logits.device),
-            torch.zeros(logits.shape[:-1] + (k,), dtype=torch.int32, device=logits.device),
-            torch.arange(logits.shape[0] * k, device=logits.device, dtype=torch.int32).view(logits.shape[0], k),
+    torch_npu = sys.modules["torch_npu"]
+    torch_npu.npu_format_cast = MagicMock(side_effect=lambda tensor, _: tensor)
+    torch_npu.npu_grouped_matmul = MagicMock(
+        side_effect=lambda inputs, _weights, **kwargs: [inputs[0]]
+    )
+    torch_npu.npu_swiglu = MagicMock(side_effect=lambda tensor: tensor)
+    torch_npu.npu_moe_gating_top_k = MagicMock(
+        return_value=(
+            torch.ones(2, 1),
+            torch.zeros(2, 1, dtype=torch.int32),
+            torch.zeros(2, 1, dtype=torch.int32),
         )
     )
-    torch_npu.npu_moe_gating_top_k_softmax.side_effect = (
-        lambda logits, k, **kwargs: (
-            torch.ones(logits.shape[:-1] + (k,), device=logits.device),
-            torch.zeros(logits.shape[:-1] + (k,), dtype=torch.int32, device=logits.device),
-            torch.arange(logits.shape[0] * k, device=logits.device, dtype=torch.int32).view(logits.shape[0], k),
-        )
+    torch_npu.npu = SimpleNamespace(get_device_name=lambda _: "Ascend910C")
+
+    context_holder = SimpleNamespace(attn_metadata={})
+    monkeypatch.setattr(
+        sys.modules["vllm.distributed"],
+        "get_dp_group",
+        lambda: SimpleNamespace(
+            world_size=1,
+            all_gather=lambda tensor, dim=0: tensor,
+            reduce_scatter=lambda tensor, dim=0: tensor,
+        ),
+        raising=False,
     )
-
-    if not hasattr(torch, "npu"):
-        monkeypatch.setattr(torch, "npu", SimpleNamespace(config=SimpleNamespace()))
-    elif not hasattr(torch.npu, "config"):
-        monkeypatch.setattr(torch.npu, "config", SimpleNamespace())
-    torch.npu.config.allow_internal_format = False
-
-    vllm_module = types.ModuleType("vllm")
-    logger_module = types.ModuleType("vllm.logger")
-    logger_module.init_logger = lambda name: MagicMock()
-
-    distributed_module = types.ModuleType("vllm.distributed")
-    distributed_module.get_dp_group = lambda: SimpleNamespace(rank=0, world_size=1)
-    distributed_module.get_ep_group = lambda: SimpleNamespace(rank=0)
-    distributed_module.get_tp_group = lambda: SimpleNamespace(
-        all_gather=lambda x, dim=0: x,
-        all_reduce=lambda x: x,
+    monkeypatch.setattr(
+        sys.modules["vllm.distributed"],
+        "get_tp_group",
+        lambda: SimpleNamespace(all_reduce=lambda x: x),
+        raising=False,
     )
-    distributed_module.tensor_model_parallel_all_reduce = MagicMock(side_effect=lambda tensor: tensor)
-    distributed_module.tensor_model_parallel_all_gather = MagicMock(
-        side_effect=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim)
+    monkeypatch.setattr(
+        sys.modules["vllm.forward_context"],
+        "get_forward_context",
+        lambda: context_holder,
+        raising=False,
     )
-    distributed_module.get_tensor_model_parallel_world_size = MagicMock(return_value=1)
-    distributed_module.get_tensor_model_parallel_rank = MagicMock(return_value=0)
-
-    platforms_module = types.ModuleType("vllm.platforms")
-    platforms_module.current_platform = SimpleNamespace(device_type="cpu")
-
-    context_holder = SimpleNamespace(attn_metadata=None, batch_descriptor=None)
-    forward_context_module = types.ModuleType("vllm.forward_context")
-    forward_context_module.get_forward_context = lambda: context_holder
-
-    rotary_embedding_module = types.ModuleType("vllm.model_executor.layers.rotary_embedding")
-
-    model_executor_module = types.ModuleType("vllm.model_executor")
-    model_executor_module.__path__ = []
-    layers_module = types.ModuleType("vllm.model_executor.layers")
-    layers_module.__path__ = []
-    fused_moe_pkg = types.ModuleType("vllm.model_executor.layers.fused_moe")
-    fused_moe_pkg.__path__ = []
-
-    class DummyFusedMoEConfig:
-        pass
-
-    fused_moe_pkg.FusedMoEConfig = DummyFusedMoEConfig
-
-    fused_moe_config_module = types.ModuleType(
-        "vllm.model_executor.layers.fused_moe.config"
-    )
-    fused_moe_config_module.FusedMoEConfig = DummyFusedMoEConfig
-
-    fused_layer_base = types.ModuleType("vllm.model_executor.layers.fused_moe.layer")
-
-    class DummyFusedMoE:
-        register_oot = classmethod(lambda cls, sub: sub)
-
-        def __init__(self):
-            self.moe_parallel_config = SimpleNamespace(
-                use_ep=False, use_sync_weight_loader=False
-            )
-            self.quant_method = MagicMock()
-
-        def ensure_moe_quant_config_init(self):
-            return None
-
-        def _maybe_init_expert_routing_tables(self):
-            return "routing"
-
-    class DummyUnquantizedFusedMoEMethod:
-        register_oot = classmethod(lambda cls, sub: sub)
-
-        def __init__(self):
-            self.moe = MagicMock(
-                moe_parallel_config=SimpleNamespace(
-                    use_ep=True, use_sync_weight_loader=False
-                )
-            )
-            self.moe_quant_config = MagicMock()
-            self.fused_experts = MagicMock()
-
-        def process_weights_after_loading(self, layer):
-            self.processed = True
-
-    class DummyFusedMoeWeightScaleSupported(Enum):
-        CHANNEL = "channel"
-        GROUP = "group"
-        BLOCK = "block"
-        TENSOR = "tensor"
-
-    fused_layer_base.FusedMoE = DummyFusedMoE
-    fused_layer_base.UnquantizedFusedMoEMethod = DummyUnquantizedFusedMoEMethod
-    fused_layer_base.FusedMoeWeightScaleSupported = DummyFusedMoeWeightScaleSupported
-    
-    modular_kernel_module = types.ModuleType("vllm.model_executor.layers.fused_moe.modular_kernel")
-
-    class DummyPrepareFinalize:
-        pass
-
-    class DummyPermuteExpertsUnpermute:
-        pass
-
-    modular_kernel_module.FusedMoEPrepareAndFinalize = DummyPrepareFinalize
-    modular_kernel_module.FusedMoEPermuteExpertsUnpermute = DummyPermuteExpertsUnpermute
-
-    fused_moe_modular_method_module = types.ModuleType("vllm.model_executor.layers.fused_moe.fused_moe_modular_method")
-
-    class DummyFusedMoEModularMethod:
-        register_oot = classmethod(lambda cls, sub: sub)
-
-        def __init__(self, old_quant_method=None, experts=None):
-            self.old_quant_method = old_quant_method
-            self.experts = experts
-            self.fused_experts = getattr(old_quant_method, "fused_experts", MagicMock())
-
-        @classmethod
-        def make(cls, fused_moe, old_quant_method, prepare_finalize, unused):
-            inst = cls(old_quant_method, None)
-            inst.prepare_finalize = prepare_finalize
-            inst.fused_moe = fused_moe
-            return inst
-
-    fused_moe_modular_method_module.FusedMoEModularMethod = DummyFusedMoEModularMethod
-
-    shared_fused_moe_module = types.ModuleType("vllm.model_executor.layers.fused_moe.shared_fused_moe")
-
-    class DummySharedFusedMoE:
-        register_oot = classmethod(lambda cls, sub: sub)
-
-    shared_fused_moe_module.SharedFusedMoE = DummySharedFusedMoE
-
-    fused_moe_module = types.ModuleType("omni_npu.layers.fused_moe.fused_moe")
-    fused_experts_tp = MagicMock(return_value=torch.tensor([42.0]))
-    moe_infer_fusion = MagicMock(return_value=torch.tensor([24.0]))
-    fused_experts_allgather_ep_unquant = MagicMock(return_value=torch.tensor([12.0]))
-    fused_moe_module.fused_experts_tp = fused_experts_tp
-    fused_moe_module.moe_infer_fusion = moe_infer_fusion
-    fused_moe_module.fused_experts_allgather_ep_unquant = fused_experts_allgather_ep_unquant
-
-    npu_prepare_module = types.ModuleType("omni_npu.layers.fused_moe.npu_moe_prepare_finalize")
-
-    class DummyNpuPrepareAndFinalize:
-        def __init__(self, moe):
-            self.moe = moe
-
-    npu_prepare_module.NpuMoEPrepareAndFinalize = DummyNpuPrepareAndFinalize
-
-    npu_permute_module = types.ModuleType("omni_npu.layers.fused_moe.npu_moe_permute_unpermute")
-
-    class DummyNpuPermuteExpertsUnpermute:
-        def __init__(self, moe_quant_config, layer):
-            self.moe_quant_config = moe_quant_config
-            self.layer = layer
-
-    npu_permute_module.NPUFusedMoEPermuteExpertsUnpermute = DummyNpuPermuteExpertsUnpermute
-
-    monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
-    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
-    monkeypatch.setitem(sys.modules, "vllm.logger", logger_module)
-    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
-    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
-    monkeypatch.setitem(sys.modules, "vllm.forward_context", forward_context_module)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.model_executor.layers.rotary_embedding",
-        rotary_embedding_module,
-    )
-    monkeypatch.setitem(sys.modules, "vllm.model_executor", model_executor_module)
-    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers", layers_module)
-    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe", fused_moe_pkg)
-    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe.layer", fused_layer_base)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.model_executor.layers.fused_moe.config",
-        fused_moe_config_module,
-    )
-    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe.modular_kernel", modular_kernel_module)
-    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe.fused_moe_modular_method", fused_moe_modular_method_module)
-    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.fused_moe.shared_fused_moe", shared_fused_moe_module)
-    monkeypatch.setitem(sys.modules, "omni_npu.layers.fused_moe.fused_moe", fused_moe_module)
-    monkeypatch.setitem(sys.modules, "omni_npu.layers.fused_moe.npu_moe_prepare_finalize", npu_prepare_module)
-    monkeypatch.setitem(sys.modules, "omni_npu.layers.fused_moe.npu_moe_permute_unpermute", npu_permute_module)
-
-    for parent, child in (
-        (vllm_module, logger_module),
-        (vllm_module, platforms_module),
-        (vllm_module, distributed_module),
-        (vllm_module, forward_context_module),
-        (model_executor_module, layers_module),
-        (layers_module, fused_moe_pkg),
-        (fused_moe_pkg, fused_layer_base),
-        (fused_moe_pkg, modular_kernel_module),
-        (fused_moe_pkg, fused_moe_modular_method_module),
-        (fused_moe_pkg, shared_fused_moe_module),
-    ):
-        setattr(parent, child.__name__.split(".")[-1], child)
-
-    layers_pkg_name = "omni_npu.layers"
-    if layers_pkg_name not in sys.modules:
-        layers_pkg = types.ModuleType(layers_pkg_name)
-        layers_pkg.__path__ = [
-            str(Path(__file__).resolve().parents[4] / "src" / "omni_npu" / "layers")
-        ]
-        monkeypatch.setitem(sys.modules, layers_pkg_name, layers_pkg)
 
     sys.modules.pop("omni_npu.layers.fused_moe.layer", None)
     module = importlib.import_module("omni_npu.layers.fused_moe.layer")
     importlib.reload(module)
-
-    if not hasattr(module.NPUUnquantizedFusedMoEMethod, "is_a2_device"):
-        module.NPUUnquantizedFusedMoEMethod.is_a2_device = False
-    if not hasattr(module.NPUUnquantizedFusedMoEMethod, "dp_size"):
-        module.NPUUnquantizedFusedMoEMethod.dp_size = 1
-    if not hasattr(module.NPUUnquantizedFusedMoEMethod, "tp_size"):
-        module.NPUUnquantizedFusedMoEMethod.tp_size = 1
-
-    stubs = SimpleNamespace(
-        torch_npu=torch_npu,
-        fused_experts_tp=fused_experts_tp,
-        moe_infer_fusion=moe_infer_fusion,
-        fused_experts_allgather_ep_unquant=fused_experts_allgather_ep_unquant,
-        distributed=distributed_module,
-        context_holder=context_holder,
-    )
-    return module, stubs
+    return module, torch_npu, context_holder
 
 
-@pytest.mark.unit
-def test_forward_oot_uses_all2all_path(layer_module):
-    module, stubs = layer_module
-    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
-    method.moe = MagicMock(
-        moe_parallel_config=SimpleNamespace(use_ep=True, use_sync_weight_loader=False)
-    )
-    method.moe_quant_config = MagicMock()
-    method.fused_experts = MagicMock()
-    layer = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=True), shared_experts=None)
-
-    module.get_tensor_model_parallel_world_size = MagicMock(return_value=2)
-    module.get_tensor_model_parallel_rank = MagicMock(return_value=0)
-    module.tensor_model_parallel_all_gather = MagicMock(
-        side_effect=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim)
-    )
-    module.NPUFusedMoE.select_experts = MagicMock(
-        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32))
-    )
-    module.moe_infer_fusion = MagicMock(return_value=torch.ones(1, 3))
-    stubs.context_holder.attn_metadata = None
-
-    hidden = torch.ones(2, 3)
-    logits = torch.ones(2, 2)
-
-    output = method.forward_oot(layer, hidden, logits, top_k=1, renormalize=False)
-
-    assert output.shape == (1, 3)
-    module.moe_infer_fusion.assert_called_once()
-
-
-@pytest.mark.unit
-def test_forward_oot_returns_shared_output_and_reduces(layer_module):
-    module, stubs = layer_module
-    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
-    method.is_a2_device = False
-    method.dp_size = 1
-    method.tp_size = 2
-    method.moe = MagicMock(
-        moe_parallel_config=SimpleNamespace(use_ep=True, use_sync_weight_loader=False)
-    )
-    method.moe_quant_config = MagicMock()
-    method.fused_experts = MagicMock(return_value=torch.ones(1, 2))
-
-    layer = SimpleNamespace(
-        moe_parallel_config=SimpleNamespace(use_ep=True),
-        shared_experts=MagicMock(return_value=torch.full((1, 2), 5.0)),
-        w13_weight=None,
-        w2_weight=None,
-    )
-
-    module.get_tensor_model_parallel_world_size = MagicMock(return_value=2)
-    module.get_tensor_model_parallel_rank = MagicMock(return_value=0)
-    module.tensor_model_parallel_all_gather = MagicMock(
-        side_effect=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim)
-    )
-    module.tensor_model_parallel_all_reduce = MagicMock(side_effect=lambda tensor: tensor + 1)
-    module.NPUFusedMoE.select_experts = MagicMock(
-        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32))
-    )
-    stubs.context_holder.attn_metadata = {0: SimpleNamespace(num_prefills=0)}
-    stubs.torch_npu.npu.get_device_name.return_value = "FakeDevice"
-
-    hidden = torch.ones(2, 2)
-    logits = torch.ones(2, 2)
-    share_output, expert_output = method.forward_oot(layer, hidden, logits, top_k=1, renormalize=True)
-
-    assert torch.equal(share_output, torch.full((1, 2), 6.0))
-    assert expert_output.shape == (2, 2)
-    module.tensor_model_parallel_all_reduce.assert_called_once()
-    method.fused_experts.assert_called_once()
-
-
-@pytest.mark.unit
-def test_forward_oot_uses_allgather_ep_path(layer_module):
-    module, stubs = layer_module
-    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
-    method.is_a2_device = True
-    method.dp_size = 1
-    method.tp_size = 2
-    method.moe = MagicMock(
-        moe_parallel_config=SimpleNamespace(use_ep=True, use_sync_weight_loader=False)
-    )
-    method.moe_quant_config = MagicMock()
-    method.fused_experts = MagicMock()
-    layer = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=True), shared_experts=None)
-
-    module.get_tensor_model_parallel_world_size = MagicMock(return_value=2)
-    module.get_tensor_model_parallel_rank = MagicMock(return_value=0)
-    module.get_tp_group = MagicMock(
-        return_value=SimpleNamespace(all_reduce=MagicMock(side_effect=lambda tensor: tensor))
-    )
-    module.tensor_model_parallel_all_gather = MagicMock(
-        side_effect=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim)
-    )
-    module.NPUFusedMoE.select_experts = MagicMock(
-        return_value=(torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32))
-    )
-    stubs.context_holder.attn_metadata = {0: SimpleNamespace(num_prefills=0)}
-    stubs.torch_npu.npu.get_device_name.return_value = "Ascend910B"
-    stubs.fused_experts_allgather_ep_unquant.reset_mock()
-
-    output = method.forward_oot(
-        layer, torch.ones(2, 3), torch.ones(2, 2), top_k=1, renormalize=False
-    )
-
-    assert torch.equal(output, stubs.fused_experts_allgather_ep_unquant.return_value)
-    stubs.fused_experts_allgather_ep_unquant.assert_called_once()
-    module.get_tp_group.return_value.all_reduce.assert_called_once()
-    module.tensor_model_parallel_all_gather.assert_not_called()
-
-
-@pytest.mark.unit
-def test_forward_oot_uses_fused_experts_tp_when_not_ep(layer_module):
-    module, stubs = layer_module
-    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
-    method.is_a2_device = False
-    method.dp_size = 1
-    method.tp_size = 1
-    method.moe = MagicMock(
-        moe_parallel_config=SimpleNamespace(
-            use_ep=False, use_sync_weight_loader=False
+class _DummyStrategy:
+    def prepare_permute(self, layer, x, topk_ids):
+        return SimpleNamespace(
+            hidden_states_sorted_by_experts=x,
+            expert_tokens=torch.tensor([x.shape[0]], dtype=torch.int64),
+            dynamic_scale=None,
         )
-    )
-    method.moe_quant_config = MagicMock()
 
-    layer = SimpleNamespace(moe_parallel_config=SimpleNamespace(use_ep=False))
-    module.NPUFusedMoE.select_experts = MagicMock(
-        return_value=(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32))
-    )
-    stubs.context_holder.attn_metadata = None
-    stubs.fused_experts_tp.reset_mock()
-
-    result = method.forward_oot(layer, torch.ones(1, 2), torch.ones(1, 2), top_k=1, renormalize=False)
-
-    assert torch.equal(result, stubs.fused_experts_tp.return_value)
-    stubs.fused_experts_tp.assert_called_once()
+    def unpermute_finalize(self, layer, hidden_states, topk_ids, topk_weights, result):
+        return hidden_states
 
 
-@pytest.mark.unit
-def test_gmm_expert_invokes_grouped_matmul_and_swiglu(layer_module):
-    module, stubs = layer_module
-    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
-    layer = SimpleNamespace(
-        moe_parallel_config=SimpleNamespace(use_ep=True),
-        w13_weight=torch.ones(1, 1, 1),
-        w2_weight=torch.ones(1, 1, 1),
-    )
-
-    stubs.torch_npu.npu_grouped_matmul.reset_mock()
-    stubs.torch_npu.npu_swiglu.reset_mock()
-    output = method.gmm_expert(layer, torch.ones(1, 1), expert_tokens=[0])
-
-    assert isinstance(output, torch.Tensor)
-    stubs.torch_npu.npu_grouped_matmul.assert_called()
-    stubs.torch_npu.npu_swiglu.assert_called_once()
+class _DummyStream:
+    def wait_stream(self, _other):
+        return None
 
 
-@pytest.mark.unit
-def test_maybe_all_reduce_tensor_model_parallel(layer_module):
-    module, stubs = layer_module
-    fused = module.NPUFusedMoE.__new__(module.NPUFusedMoE)
-    fused.moe_parallel_config = SimpleNamespace(use_ep=True)
-    module.tensor_model_parallel_all_reduce = MagicMock()
-    tensor = torch.tensor([1.0])
-
-    result_no_reduce = fused.maybe_all_reduce_tensor_model_parallel(tensor)
-    assert torch.equal(result_no_reduce, tensor)
-    module.tensor_model_parallel_all_reduce.assert_not_called()
-
-    fused.moe_parallel_config.use_ep = False
-    module.tensor_model_parallel_all_reduce = MagicMock(return_value=torch.tensor([2.0]))
-    reduced = fused.maybe_all_reduce_tensor_model_parallel(tensor)
-    module.tensor_model_parallel_all_reduce.assert_called_once_with(tensor)
-    assert torch.equal(reduced, torch.tensor([2.0]))
-
-
-@pytest.mark.unit
-def test_maybe_init_modular_kernel_wraps_quant_method(layer_module):
-    module, stubs = layer_module
-    fused = module.NPUFusedMoE.__new__(module.NPUFusedMoE)
-    fused.ensure_moe_quant_config_init = MagicMock()
-    fused._maybe_init_expert_routing_tables = MagicMock(return_value="routing")
-    original_quant = MagicMock(maybe_make_prepare_finalize=MagicMock(return_value="prepare"))
-    fused.quant_method = original_quant
-    module.FusedMoEModularMethod.make = MagicMock(return_value="wrapped")
-
-    fused.maybe_init_modular_kernel()
-
-    module.FusedMoEModularMethod.make.assert_called_once_with(fused, original_quant, "prepare", None)
-    assert fused.quant_method == "wrapped"
+@contextmanager
+def _stream_ctx(_stream):
+    yield
 
 
 @pytest.mark.unit
 def test_select_experts_profile_mode(layer_module):
-    module, stubs = layer_module
-    stubs.context_holder.attn_metadata = None
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = None
     module.get_ep_group = MagicMock(return_value=SimpleNamespace(rank=1))
-    logits = torch.zeros(2, 4, dtype=torch.float32)
 
     topk_weights, topk_ids = module.NPUFusedMoE.select_experts(
-        router_logits=logits,
+        router_logits=torch.zeros(2, 4),
         top_k=2,
         use_grouped_topk=False,
         renormalize=False,
@@ -472,74 +93,478 @@ def test_select_experts_profile_mode(layer_module):
 
     assert topk_weights.shape == (2, 2)
     assert topk_ids.shape == (2, 2)
-    assert torch.all(topk_ids < logits.shape[1])
+    assert torch.all(topk_ids < 4)
 
 
 @pytest.mark.unit
-def test_select_experts_grouped_topk(layer_module):
-    module, stubs = layer_module
-    stubs.context_holder.attn_metadata = {}
-    stubs.torch_npu.npu_moe_gating_top_k.reset_mock()
-    logits = torch.zeros(1, 3)
+def test_select_experts_grouped_topk_requires_group_args(layer_module):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
 
-    module.NPUFusedMoE.select_experts(
-        router_logits=logits,
-        top_k=1,
-        use_grouped_topk=True,
-        renormalize=False,
-        topk_group=2,
-        num_expert_group=2,
+    with pytest.raises(ValueError, match="topk_group is None"):
+        module.NPUFusedMoE.select_experts(
+            router_logits=torch.zeros(1, 4),
+            top_k=1,
+            use_grouped_topk=True,
+            renormalize=False,
+            topk_group=None,
+            num_expert_group=2,
+        )
+
+
+@pytest.mark.unit
+def test_apply_experts_uses_grouped_matmul_twice(layer_module):
+    module, torch_npu, _ = layer_module
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    layer = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+        w13_weight=torch.ones(2, 4, 4),
+        w2_weight=torch.ones(2, 4, 4),
+    )
+    prepare_result = module.PreparePermuteResult(
+        hidden_states_sorted_by_experts=torch.ones(3, 4),
+        expert_tokens=torch.tensor([2, 1], dtype=torch.int64),
+        dynamic_scale=None,
     )
 
-    stubs.torch_npu.npu_moe_gating_top_k.assert_called_once()
+    out = method.apply_experts(layer, prepare_result)
+    assert out.shape == (3, 4)
+    assert torch_npu.npu_grouped_matmul.call_count == 2
 
 
 @pytest.mark.unit
-def test_select_experts_custom_routing(layer_module):
-    module, stubs = layer_module
-    stubs.context_holder.attn_metadata = {}
-    logits = torch.zeros(1, 2)
+def test_maybe_all_reduce_tensor_model_parallel(layer_module):
+    module, _, _ = layer_module
+    fused = module.NPUFusedMoE.__new__(module.NPUFusedMoE)
+    fused.moe_parallel_config = SimpleNamespace(use_ep=True)
+    module.tensor_model_parallel_all_reduce = MagicMock(return_value=torch.tensor([9.0]))
 
-    def custom_route(gating_output, topk, renormalize):
-        return torch.full((1, topk), 0.5), torch.ones((1, topk), dtype=torch.int32)
+    x = torch.tensor([1.0])
+    assert torch.equal(fused.maybe_all_reduce_tensor_model_parallel(x), x)
+    module.tensor_model_parallel_all_reduce.assert_not_called()
+
+    fused.moe_parallel_config.use_ep = False
+    y = fused.maybe_all_reduce_tensor_model_parallel(x)
+    module.tensor_model_parallel_all_reduce.assert_called_once_with(x)
+    assert torch.equal(y, torch.tensor([9.0]))
+
+
+@pytest.mark.unit
+def test_select_experts_custom_routing_function(layer_module):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    custom_fn = MagicMock(
+        return_value=(
+            torch.full((2, 1), 0.5, dtype=torch.float32),
+            torch.ones(2, 1, dtype=torch.int32),
+        )
+    )
 
     topk_weights, topk_ids = module.NPUFusedMoE.select_experts(
-        router_logits=logits,
+        router_logits=torch.zeros(2, 4),
         top_k=1,
         use_grouped_topk=False,
         renormalize=True,
-        custom_routing_function=custom_route,
+        custom_routing_function=custom_fn,
     )
 
-    assert torch.equal(topk_weights, torch.full((1, 1), 0.5))
-    assert torch.equal(topk_ids, torch.ones((1, 1), dtype=torch.int32))
+    custom_fn.assert_called_once()
+    assert torch.equal(topk_weights, torch.full((2, 1), 0.5, dtype=torch.float32))
+    assert torch.equal(topk_ids, torch.ones(2, 1, dtype=torch.int32))
 
 
 @pytest.mark.unit
-def test_maybe_make_prepare_finalize_and_select_gemm_impl(layer_module):
-    module, stubs = layer_module
+def test_apply_slices_and_gathers_on_all2all(layer_module, monkeypatch):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
     method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
-    method.moe = MagicMock()
-    method.moe_quant_config = MagicMock()
-    prepare = method.maybe_make_prepare_finalize(routing_tables=None)
-    assert isinstance(prepare, module.NpuMoEPrepareAndFinalize)
+    method.tp_size = 2
+    method.tp_rank = 1
+    method.select_communication_strategy = MagicMock(return_value=("all2all", _DummyStrategy()))
+    method.apply_prepare_permute = MagicMock(
+        return_value=module.PreparePermuteResult(
+            hidden_states_sorted_by_experts=torch.ones(2, 4),
+            expert_tokens=torch.tensor([2], dtype=torch.int64),
+            dynamic_scale=None,
+        )
+    )
+    method.apply_experts = MagicMock(return_value=torch.full((2, 4), 3.0))
+    method.apply_unpermute_finalize = MagicMock(return_value=torch.full((2, 4), 4.0))
+    monkeypatch.setattr(
+        module,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: torch.cat([x, x], dim=dim),
+    )
+    monkeypatch.setattr(
+        module.NPUFusedMoE,
+        "select_experts",
+        MagicMock(
+            return_value=(
+                torch.ones(2, 1, dtype=torch.float32),
+                torch.zeros(2, 1, dtype=torch.int32),
+            )
+        ),
+    )
 
-    layer = SimpleNamespace()
-    gemm_impl = method.select_gemm_impl(prepare_finalize=prepare, layer=layer)
-    assert isinstance(gemm_impl, module.NPUFusedMoEPermuteExpertsUnpermute)
+    layer = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+        gate=None,
+        shared_experts=None,
+    )
+    output = method.apply(
+        layer=layer,
+        hidden_states=torch.arange(12, dtype=torch.float32).view(3, 4),
+        router_logits=torch.zeros(3, 2, dtype=torch.float32),
+        top_k=1,
+        renormalize=False,
+    )
+
+    assert output.shape == (3, 4)
+    assert method.apply_prepare_permute.call_args.args[2].shape == (2, 4)
 
 
 @pytest.mark.unit
-def test_npu_fused_moe_modular_method_delegates(layer_module):
-    module, stubs = layer_module
-    old_quant = MagicMock()
-    old_quant.apply = MagicMock(return_value="applied")
-    old_quant.gmm_expert = MagicMock(return_value="gmm")
+def test_apply_with_gate_and_shared_experts_adds_plugin_output(layer_module, monkeypatch):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    method.tp_size = 1
+    method.tp_rank = 0
+    method.select_communication_strategy = MagicMock(return_value=("agrs", _DummyStrategy()))
+    method.apply_prepare_permute = MagicMock(
+        return_value=module.PreparePermuteResult(
+            hidden_states_sorted_by_experts=torch.ones(2, 4),
+            expert_tokens=torch.tensor([2], dtype=torch.int64),
+            dynamic_scale=None,
+        )
+    )
+    method.apply_experts = MagicMock(return_value=torch.full((2, 4), 2.0))
+    method.apply_unpermute_finalize = MagicMock(return_value=torch.full((2, 4), 3.0))
+    monkeypatch.setattr(module, "named_stream", lambda _name: _DummyStream())
+    monkeypatch.setattr(module.torch.npu, "current_stream", lambda: _DummyStream(), raising=False)
+    monkeypatch.setattr(module.torch.npu, "stream", _stream_ctx, raising=False)
+    monkeypatch.setenv("VLLM_PLUGINS", "omni_custom_models")
+    monkeypatch.setattr(
+        module.NPUFusedMoE,
+        "select_experts",
+        MagicMock(
+            return_value=(
+                torch.ones(2, 1, dtype=torch.float32),
+                torch.zeros(2, 1, dtype=torch.int32),
+            )
+        ),
+    )
 
-    method = module.NPUFusedMoEModularMethod(old_quant, experts="experts")
+    def _gate(x):
+        return torch.zeros(x.shape[0], 2, dtype=torch.float32), None
 
-    assert method.apply("input") == "applied"
-    old_quant.apply.assert_called_once_with("input")
-    assert method.gmm_expert("a", "b") == "gmm"
-    old_quant.gmm_expert.assert_called_once_with("a", "b")
-    assert old_quant.fused_experts is method.fused_experts
+    shared = lambda x: torch.full_like(x, 5.0)
+    shared.gate_up_proj = SimpleNamespace(tp_size=1)
+    layer = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+        gate=_gate,
+        shared_experts=shared,
+    )
+    output = method.apply(
+        layer=layer,
+        hidden_states=torch.ones(2, 4, dtype=torch.float32),
+        router_logits=None,
+        top_k=1,
+        renormalize=False,
+    )
+    monkeypatch.delenv("VLLM_PLUGINS", raising=False)
+
+    assert isinstance(output, tuple)
+    shared_output, routed_output = output
+    assert torch.equal(shared_output, torch.full((2, 4), 5.0))
+    assert torch.equal(routed_output, torch.full((2, 4), 8.0))
+
+
+@pytest.mark.unit
+def test_apply_shared_experts_reduce_branch(layer_module, monkeypatch):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    method.tp_size = 2
+    method.tp_rank = 1
+    method.select_communication_strategy = MagicMock(return_value=("all2all", _DummyStrategy()))
+    method.apply_prepare_permute = MagicMock(
+        return_value=module.PreparePermuteResult(
+            hidden_states_sorted_by_experts=torch.ones(2, 4),
+            expert_tokens=torch.tensor([2], dtype=torch.int64),
+            dynamic_scale=None,
+        )
+    )
+    method.apply_experts = MagicMock(return_value=torch.full((2, 4), 2.0))
+    method.apply_unpermute_finalize = MagicMock(return_value=torch.full((2, 4), 1.0))
+    monkeypatch.setattr(module, "named_stream", lambda _name: _DummyStream())
+    monkeypatch.setattr(module.torch.npu, "current_stream", lambda: _DummyStream(), raising=False)
+    monkeypatch.setattr(module.torch.npu, "stream", _stream_ctx, raising=False)
+    monkeypatch.setattr(
+        module,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: torch.cat([x, x], dim=dim),
+    )
+    all_reduce_mock = MagicMock(return_value=torch.full((2, 4), 6.0))
+    monkeypatch.setattr(module, "tensor_model_parallel_all_reduce", all_reduce_mock)
+    monkeypatch.setattr(
+        module.NPUFusedMoE,
+        "select_experts",
+        MagicMock(
+            return_value=(
+                torch.ones(2, 1, dtype=torch.float32),
+                torch.zeros(2, 1, dtype=torch.int32),
+            )
+        ),
+    )
+
+    hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
+    shared = MagicMock(return_value=torch.full((3, 4), 6.0))
+    shared.gate_up_proj = SimpleNamespace(tp_size=2)
+    layer = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+        gate=None,
+        shared_experts=shared,
+    )
+    output = method.apply(
+        layer=layer,
+        hidden_states=hidden_states,
+        router_logits=torch.zeros(3, 2, dtype=torch.float32),
+        top_k=1,
+        renormalize=False,
+    )
+
+    assert isinstance(output, tuple)
+    all_reduce_mock.assert_called_once()
+    assert shared.call_count == 1
+    assert torch.equal(shared.call_args.args[0], hidden_states)
+
+
+@pytest.mark.unit
+def test_weight_loader_handles_transposed_weights(layer_module, monkeypatch):
+    module, _, _ = layer_module
+    super_weight_loader = MagicMock(return_value=True)
+    monkeypatch.setattr(module.FusedMoE, "weight_loader", super_weight_loader, raising=False)
+    fused = module.NPUFusedMoE.__new__(module.NPUFusedMoE)
+
+    param = torch.nn.Parameter(torch.arange(32, dtype=torch.float32).view(2, 4, 4))
+    setattr(param, "is_weight_transposed", True)
+    original = param.data.clone()
+
+    result = fused.weight_loader(
+        param=param,
+        loaded_weight=torch.zeros(2, 3, 4),
+        weight_name="w13_weight",
+        shard_id="0",
+        expert_id=0,
+        return_success=True,
+    )
+
+    assert result is True
+    assert param.shape == original.shape
+    assert super_weight_loader.call_count == 1
+
+
+@pytest.mark.unit
+def test_forward_uses_expert_mask_when_rocm_enabled(layer_module):
+    module, _, _ = layer_module
+    fused = module.NPUFusedMoE.__new__(module.NPUFusedMoE)
+    fused.quant_method = SimpleNamespace(apply=MagicMock(return_value=torch.ones(1, 2)))
+    fused.top_k = 2
+    fused.renormalize = False
+    fused.use_grouped_topk = False
+    fused.global_num_experts = 4
+    fused.expert_map = torch.tensor([0, 1])
+    fused.expert_mask = torch.tensor([1, 0])
+    fused.rocm_aiter_fmoe_enabled = True
+    fused.topk_group = None
+    fused.num_expert_group = None
+    fused.custom_routing_function = None
+    fused.scoring_func = "softmax"
+    fused.routed_scaling_factor = 1.0
+    fused.e_score_correction_bias = None
+    fused.activation = "silu"
+    fused.apply_router_weight_on_input = False
+    fused.enable_eplb = False
+
+    out = fused.forward(
+        hidden_states=torch.ones(1, 2, dtype=torch.float32),
+        router_logits=torch.zeros(1, 4, dtype=torch.float32),
+    )
+
+    assert torch.equal(out, torch.ones(1, 2))
+    kwargs = fused.quant_method.apply.call_args.kwargs
+    assert torch.equal(kwargs["expert_map"], fused.expert_mask)
+
+
+@pytest.mark.unit
+def test_unquantized_method_init_sets_tp_info(layer_module, monkeypatch):
+    module, _, _ = layer_module
+    monkeypatch.setattr(
+        module.UnquantizedFusedMoEMethod,
+        "__init__",
+        lambda self, moe: setattr(self, "_moe", moe),
+        raising=False,
+    )
+    module.get_tensor_model_parallel_world_size = lambda: 4
+    module.get_tensor_model_parallel_rank = lambda: 2
+
+    method = module.NPUUnquantizedFusedMoEMethod(SimpleNamespace())
+    assert method.tp_size == 4
+    assert method.tp_rank == 2
+
+
+@pytest.mark.unit
+def test_apply_slice_path_without_padding_slices_router_logits(layer_module, monkeypatch):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    method.tp_size = 2
+    method.tp_rank = 1
+    method.select_communication_strategy = MagicMock(return_value=("all2all", _DummyStrategy()))
+    method.apply_prepare_permute = MagicMock(
+        return_value=module.PreparePermuteResult(
+            hidden_states_sorted_by_experts=torch.ones(2, 4),
+            expert_tokens=torch.tensor([2], dtype=torch.int64),
+            dynamic_scale=None,
+        )
+    )
+    method.apply_experts = MagicMock(return_value=torch.full((2, 4), 2.0))
+    method.apply_unpermute_finalize = MagicMock(return_value=torch.full((2, 4), 3.0))
+    monkeypatch.setattr(
+        module,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: torch.cat([x, x], dim=dim),
+    )
+    select_mock = MagicMock(
+        return_value=(
+            torch.ones(2, 1, dtype=torch.float32),
+            torch.zeros(2, 1, dtype=torch.int32),
+        )
+    )
+    monkeypatch.setattr(module.NPUFusedMoE, "select_experts", select_mock)
+
+    layer = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(use_ep=True),
+        gate=None,
+        shared_experts=None,
+    )
+    router_logits = torch.arange(16, dtype=torch.float32).view(4, 4)
+    out = method.apply(
+        layer=layer,
+        hidden_states=torch.arange(16, dtype=torch.float32).view(4, 4),
+        router_logits=router_logits,
+        top_k=1,
+        renormalize=False,
+    )
+
+    assert out.shape == (4, 4)
+    assert select_mock.call_args.kwargs["router_logits"].shape == (2, 4)
+
+
+@pytest.mark.unit
+def test_process_weights_after_loading_transposes_and_marks(layer_module, monkeypatch):
+    module, torch_npu, _ = layer_module
+    monkeypatch.setattr(
+        module.UnquantizedFusedMoEMethod,
+        "process_weights_after_loading",
+        lambda self, layer: None,
+        raising=False,
+    )
+    method = module.NPUUnquantizedFusedMoEMethod.__new__(module.NPUUnquantizedFusedMoEMethod)
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(torch.randn(2, 3, 4)),
+        w2_weight=torch.nn.Parameter(torch.randn(2, 5, 6)),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.w13_weight.shape == (2, 4, 3)
+    assert layer.w2_weight.shape == (2, 6, 5)
+    assert getattr(layer.w13_weight, "is_weight_transposed", False) is True
+    assert getattr(layer.w2_weight, "is_weight_transposed", False) is True
+    assert torch_npu.npu_format_cast.call_count == 2
+
+
+@pytest.mark.unit
+def test_fused_moe_init_sets_gate_and_strategy_selector(layer_module, monkeypatch):
+    module, _, _ = layer_module
+    selector_mock = MagicMock()
+
+    def _fake_super_init(self, *args, **kwargs):
+        self.quant_method = SimpleNamespace(make_communication_strategy_selector=selector_mock)
+
+    monkeypatch.setattr(module.FusedMoE, "__init__", _fake_super_init, raising=False)
+    gate_obj = object()
+    fused = module.NPUFusedMoE(gate=gate_obj)
+
+    assert fused.gate is gate_obj
+    assert fused.is_internal_router is True
+    selector_mock.assert_called_once_with(fused)
+
+
+@pytest.mark.unit
+def test_weight_loader_handles_non_full_load_transposed_branch(layer_module, monkeypatch):
+    module, _, _ = layer_module
+    super_weight_loader = MagicMock(return_value=True)
+    monkeypatch.setattr(module.FusedMoE, "weight_loader", super_weight_loader, raising=False)
+    fused = module.NPUFusedMoE.__new__(module.NPUFusedMoE)
+
+    param = torch.nn.Parameter(torch.arange(32, dtype=torch.float32).view(2, 4, 4))
+    setattr(param, "is_weight_transposed", True)
+    result = fused.weight_loader(
+        param=param,
+        loaded_weight=torch.zeros(3, 4),
+        weight_name="w2_weight",
+        shard_id="0",
+        expert_id=1,
+        return_success=True,
+    )
+
+    assert result is True
+    assert param.shape == (2, 4, 4)
+    assert super_weight_loader.call_count == 1
+
+
+@pytest.mark.unit
+def test_maybe_init_modular_kernel_returns_none(layer_module):
+    module, _, _ = layer_module
+    fused = module.NPUFusedMoE.__new__(module.NPUFusedMoE)
+    assert fused.maybe_init_modular_kernel() is None
+
+
+@pytest.mark.unit
+def test_select_experts_grouped_topk_requires_num_expert_group(layer_module):
+    module, _, context_holder = layer_module
+    context_holder.attn_metadata = {}
+
+    with pytest.raises(ValueError, match="num_expert_group is None"):
+        module.NPUFusedMoE.select_experts(
+            router_logits=torch.zeros(1, 4),
+            top_k=1,
+            use_grouped_topk=True,
+            renormalize=False,
+            topk_group=1,
+            num_expert_group=None,
+        )
+
+
+@pytest.mark.unit
+def test_select_experts_default_path_with_renormalize(layer_module):
+    module, torch_npu, context_holder = layer_module
+    context_holder.attn_metadata = {}
+    torch_npu.npu_moe_gating_top_k.return_value = (
+        torch.tensor([[2.0, 1.0]], dtype=torch.float32),
+        torch.tensor([[0, 1]], dtype=torch.int32),
+        torch.tensor([[0, 1]], dtype=torch.int32),
+    )
+
+    weights, ids = module.NPUFusedMoE.select_experts(
+        router_logits=torch.zeros(1, 4),
+        top_k=2,
+        use_grouped_topk=False,
+        renormalize=True,
+    )
+
+    assert torch.allclose(weights.sum(dim=-1), torch.ones(1))
+    assert ids.shape == (1, 2)

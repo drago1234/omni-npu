@@ -48,7 +48,7 @@ from vllm.model_executor.models.utils import (
 )
 
 from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
-from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
+from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 from omni_npu.v1.models.config_loader.loader import model_extra_config
@@ -136,7 +136,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self.experts = NPUFusedMoEV1(
+        self.experts = NPUSharedFusedMoE(
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
@@ -241,12 +241,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         shared_output, final_hidden_states = fused_moe_out
-        if self.shared_experts is None:
-            assert shared_output is None
-
-        if shared_output is not None:
-            final_hidden_states += shared_output
-
+        
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0

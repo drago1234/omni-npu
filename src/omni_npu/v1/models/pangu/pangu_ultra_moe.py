@@ -47,7 +47,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
-from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
+from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
 from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
 from omni_npu.v1.layers.vocab_parallel_embedding import NPUVocabParallelEmbedding
 from omni_npu.v1.models.config_loader.loader import model_extra_config
@@ -193,9 +193,8 @@ class OpenPanguMoE(nn.Module):
                 is_sequence_parallel=self.is_sequence_parallel,
             )
         else:
-            self.experts = NPUFusedMoEV1(
+            self.experts = NPUSharedFusedMoE(
                 shared_experts=self.shared_experts,
-                gate=self.gate,
                 num_experts=config.n_routed_experts,
                 top_k=config.num_experts_per_tok,
                 hidden_size=config.hidden_size,

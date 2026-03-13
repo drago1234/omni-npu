@@ -4,7 +4,6 @@ import sys
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from pathlib import Path
 
 import pytest
 import torch
@@ -14,35 +13,23 @@ import torch
 def fused_module(monkeypatch):
     torch_npu = MagicMock()
     torch_npu.npu_moe_gating_top_k_softmax = MagicMock()
-    torch_npu.npu_moe_init_routing_v2 = MagicMock()
     torch_npu.npu_moe_finalize_routing = MagicMock(side_effect=lambda *args, **kwargs: args[0])
     torch_npu.npu_moe_init_routing = MagicMock()
     torch_npu.npu_moe_compute_expert_tokens = MagicMock()
     torch_npu.npu_dynamic_quant = MagicMock()
-    torch_npu.npu_grouped_matmul = MagicMock(side_effect=lambda inputs, weights, **kwargs: [inputs[0]])
-    torch_npu.npu_swiglu = MagicMock(side_effect=lambda x, **kwargs: x)
-    torch_npu.npu_dequant_swiglu_quant = MagicMock(
-        side_effect=lambda **kwargs: (kwargs["x"], torch.ones(kwargs["x"].shape[0]))
-    )
-    torch_npu.npu_grouped_matmul_finalize_routing = MagicMock(return_value=torch.full((2, 2), 9.0))
-    torch_npu.npu_moe_re_routing = MagicMock()
 
     platforms_module = types.ModuleType("vllm.platforms")
     platforms_module.current_platform = SimpleNamespace(device_type="cpu")
 
     distributed_module = types.ModuleType("vllm.distributed")
-    fake_device_group = SimpleNamespace()
-    distributed_module.get_ep_group = lambda: SimpleNamespace(
-        world_size=1, device_group=fake_device_group
-    )
-    distributed_module.get_tp_group = lambda: SimpleNamespace(world_size=1)
+    distributed_module.get_ep_group = lambda: SimpleNamespace(world_size=1)
     distributed_module.get_dp_group = lambda: SimpleNamespace(
-        world_size=1, device_group=fake_device_group, rank=0, rank_in_group=0
+        world_size=1,
+        all_gather=lambda tensor, dim=0: tensor,
+        reduce_scatter=lambda tensor, dim=0: tensor,
     )
-    distributed_module.tensor_model_parallel_all_reduce = lambda x, *args, **kwargs: x
-    distributed_module.tensor_model_parallel_all_gather = lambda x, *args, **kwargs: x
+    distributed_module.get_tp_group = lambda: SimpleNamespace(all_reduce=lambda x: x)
     distributed_module.get_tensor_model_parallel_world_size = lambda: 1
-    distributed_module.get_tensor_model_parallel_rank = lambda: 0
 
     monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
     monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
@@ -94,13 +81,6 @@ def fused_module(monkeypatch):
     monkeypatch.setattr(torch, "ones", _safe_ones)
     monkeypatch.setattr(torch, "zeros", _safe_zeros)
     monkeypatch.setattr(torch, "full", _safe_full)
-    monkeypatch.setattr(
-        torch.distributed,
-        "all_to_all_single",
-        lambda output, input, *args, **kwargs: output.copy_(input),
-        raising=False,
-    )
-
     sys.modules.pop("omni_npu.layers.fused_moe.fused_moe", None)
     module = importlib.import_module("omni_npu.layers.fused_moe.fused_moe")
     importlib.reload(module)
@@ -128,7 +108,7 @@ def test_fused_topk_renormalizes(fused_module):
 
 @pytest.mark.unit
 def test_grouped_topk_sigmoid_and_bias(fused_module):
-    module, stubs = fused_module
+    module, _ = fused_module
     gating_output = torch.tensor([[0.0, 1.0, -1.0, 0.5]])
     bias = torch.tensor([0.1, 0.2, 0.3, 0.4])
 
@@ -149,7 +129,7 @@ def test_grouped_topk_sigmoid_and_bias(fused_module):
 
 @pytest.mark.unit
 def test_grouped_topk_invalid_scoring_func_raises(fused_module):
-    module, stubs = fused_module
+    module, _ = fused_module
     with pytest.raises(ValueError, match="Unsupported scoring function"):
         module.grouped_topk(
             gating_output=torch.zeros(1, 2),
@@ -178,7 +158,7 @@ def test_fused_experts_tp_no_quant(fused_module):
         expanded_expert_idx,
     )
     stubs.torch_npu.npu_moe_compute_expert_tokens.return_value = torch.tensor([1, 2])
-    layer.quant_method.gmm_expert.return_value = torch.full((3, 2), 5.0)
+    layer.quant_method.apply_experts.return_value = torch.full((3, 2), 5.0)
     stubs.torch_npu.npu_moe_finalize_routing.side_effect = None
     stubs.torch_npu.npu_moe_finalize_routing.return_value = torch.full((3, 2), 6.0)
 
@@ -189,7 +169,7 @@ def test_fused_experts_tp_no_quant(fused_module):
         topk_weights=torch.ones(3, 1),
     )
 
-    layer.quant_method.gmm_expert.assert_called_once()
+    layer.quant_method.apply_experts.assert_called_once()
     assert torch.equal(output, torch.full((3, 2), 6.0))
 
 
@@ -211,7 +191,7 @@ def test_fused_experts_tp_with_quant(fused_module):
     )
     stubs.torch_npu.npu_moe_compute_expert_tokens.return_value = torch.tensor([1, 2])
     stubs.torch_npu.npu_dynamic_quant.return_value = (sorted_tokens, torch.ones(3))
-    layer.quant_method.gmm_expert.return_value = torch.full((3, 2), 5.0)
+    layer.quant_method.apply_experts.return_value = torch.full((3, 2), 5.0)
     stubs.torch_npu.npu_moe_finalize_routing.side_effect = None
     stubs.torch_npu.npu_moe_finalize_routing.return_value = torch.full((3, 2), 6.0)
 
@@ -222,166 +202,6 @@ def test_fused_experts_tp_with_quant(fused_module):
         topk_weights=torch.ones(3, 1),
     )
 
-    layer.quant_method.gmm_expert.assert_called_once()
+    layer.quant_method.apply_experts.assert_called_once()
     stubs.torch_npu.npu_dynamic_quant.assert_called_once()
     assert torch.equal(output, torch.full((3, 2), 6.0))
-
-
-@pytest.mark.unit
-def test_fused_experts_allgather_ep_unquant(fused_module):
-    module, stubs = fused_module
-    layer = SimpleNamespace(
-        global_num_experts=4,
-        ep_rank=0,
-        local_num_experts=2,
-        moe_parallel_config=SimpleNamespace(use_ep=True),
-        w13_weight=torch.ones(1, 2, 2),
-        w2_weight=torch.ones(1, 2, 2),
-        quant_method=MagicMock(),
-    )
-    sorted_tokens = torch.ones(5, 2)
-    expanded_x_idx = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
-    expert_tokens = torch.tensor([2, 1], dtype=torch.int32)
-    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
-        sorted_tokens,
-        expanded_x_idx,
-        expert_tokens,
-        None,
-    )
-    gmm_out = torch.full((5, 2), 4.0)
-    layer.quant_method.gmm_expert.return_value = gmm_out
-    stubs.torch_npu.npu_moe_finalize_routing.side_effect = None
-    stubs.torch_npu.npu_moe_finalize_routing.return_value = torch.full((5, 2), 7.0)
-
-    output = module.fused_experts_allgather_ep_unquant(
-        layer=layer,
-        x=torch.ones(5, 2),
-        topk_weights=torch.ones(5, 1),
-        topk_ids=torch.zeros(5, 1, dtype=torch.int32),
-    )
-    assert torch.equal(output, torch.full((5, 2), 7.0))
-
-
-@pytest.mark.unit
-def test_fused_experts_allgather_ep_quant_int8(fused_module):
-    module, stubs = fused_module
-    layer = SimpleNamespace(
-        global_num_experts=4,
-        ep_rank=0,
-        local_num_experts=2,
-        dp_size=1,
-        w13_weight=torch.ones(1, 2, 2),
-        w2_weight=torch.ones(1, 2, 2),
-        w13_weight_scale=torch.ones(1, 2),
-        w2_weight_scale=torch.ones(1),
-        quant_config=object(),
-        weight_num_bits=8
-    )
-    sorted_tokens = torch.ones(2, 2)
-    expanded_x_idx = torch.tensor([0, 1], dtype=torch.int32)
-    expert_tokens = torch.tensor([1, 1], dtype=torch.int32)
-    dynamic_quant_scale = torch.ones(2)
-    stubs.torch_npu.npu_dynamic_quant.return_value = (sorted_tokens, torch.ones(2))
-    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
-        sorted_tokens,
-        expanded_x_idx,
-        expert_tokens,
-        dynamic_quant_scale,
-    )
-
-    output = module.fused_experts_allgather_ep(
-        layer=layer,
-        x=torch.ones(2, 2),
-        topk_weights=torch.ones(2, 1),
-        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
-        share_experts_output=None,
-        is_prefill=False,
-    )
-
-    assert output.shape == (2, 2)
-    stubs.torch_npu.npu_dequant_swiglu_quant.assert_called_once()
-    stubs.torch_npu.npu_grouped_matmul_finalize_routing.assert_called_once()
-
-
-@pytest.mark.unit
-def test_fused_experts_allgather_ep_quant_int4(fused_module):
-    module, stubs = fused_module
-    layer = SimpleNamespace(
-        global_num_experts=4,
-        ep_rank=0,
-        local_num_experts=2,
-        dp_size=1,
-        w13_weight=torch.ones(1, 2, 2),
-        w2_weight=torch.ones(1, 2, 2),
-        w13_weight_int4_scale=torch.ones(1, 2),
-        w2_weight_int4_scale=torch.ones(1, 2),
-        w13_weight_bias=torch.ones(2),
-        w2_weight_bias=torch.ones(2),
-        quant_config=object(),
-        weight_num_bits=4
-    )
-    sorted_tokens = torch.ones(2, 2)
-    expanded_x_idx = torch.tensor([0, 1], dtype=torch.int32)
-    expert_tokens = torch.tensor([1, 1], dtype=torch.int32)
-    dynamic_quant_scale = torch.ones(2)
-    stubs.torch_npu.npu_dynamic_quant.return_value = (sorted_tokens, torch.ones(2))
-    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
-        sorted_tokens,
-        expanded_x_idx,
-        expert_tokens,
-        dynamic_quant_scale,
-    )
-
-    output = module.fused_experts_allgather_ep(
-        layer=layer,
-        x=torch.ones(2, 2),
-        topk_weights=torch.ones(2, 1),
-        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
-        share_experts_output=None,
-        is_prefill=False,
-    )
-
-    assert output.shape == (2, 2)
-    stubs.torch_npu.npu_dequant_swiglu_quant.assert_called_once()
-    stubs.torch_npu.npu_grouped_matmul_finalize_routing.assert_called_once()
-
-
-@pytest.mark.unit
-def test_moe_infer_fusion_runs_routing(fused_module):
-    module, stubs = fused_module
-    layer = SimpleNamespace(
-        moe_config=SimpleNamespace(num_experts=4),
-        ep_size=1,
-        quant_config=None,
-        enable_eplb=False,
-        quant_method=MagicMock(),
-        w13_weight=torch.zeros(1, 1, 1),
-    )
-    expanded_x = torch.ones(2, 2)
-    expanded_row_idx = torch.zeros(2, 1, dtype=torch.int32)
-    tokens_per_expert = torch.tensor([1, 1], dtype=torch.int32)
-    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
-        expanded_x,
-        expanded_row_idx,
-        tokens_per_expert,
-        None,
-    )
-    stubs.torch_npu.npu_moe_re_routing.return_value = (
-        expanded_x,
-        None,
-        torch.tensor([0, 1], dtype=torch.int32),
-        torch.tensor([1, 1], dtype=torch.int32),
-    )
-    layer.quant_method.gmm_expert.return_value = expanded_x
-    stubs.torch_npu.npu_moe_finalize_routing.side_effect = None
-    stubs.torch_npu.npu_moe_finalize_routing.return_value = torch.full((2, 2), 8.0)
-
-    output = module.moe_infer_fusion(
-        layer=layer,
-        x=torch.ones(2, 2),
-        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
-        topk_weights=torch.ones(2, 1),
-    )
-
-    assert torch.equal(output, torch.full((2, 2), 8.0))
-    layer.quant_method.gmm_expert.assert_called_once()

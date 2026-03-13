@@ -45,7 +45,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from omni_npu.attention.backends.attention import NPUAttentionBackend
-from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
+from omni_npu.layers.fused_moe.layer import NPUFusedMoE
 from omni_npu.v1.layers.linear import (
     QKVParallelFlashCommLinear,
     RowParallelFlashCommLinear,
@@ -174,8 +174,7 @@ class GptOssMoE(nn.Module):
             prefix=f"{prefix}.router",
         )
 
-        self.experts = NPUFusedMoEV1(
-            shared_experts=None,
+        self.experts = NPUFusedMoE(
             gate=self.router,
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -201,7 +200,7 @@ class GptOssMoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        _, out = self.experts(hidden_states=hidden_states, router_logits=None)
+        out = self.experts(hidden_states=hidden_states, router_logits=None)
 
         if self.is_sequence_parallel:
             out = tensor_model_parallel_all_gather(out.contiguous(), 0)

@@ -498,7 +498,7 @@ class TestInitHeavyPaths(unittest.TestCase):
         with patch.object(deepseek_v3_mod, "ReplicatedLinear", _FakeReplicatedLinear), patch.object(
             deepseek_v3_mod, "DeepseekV2MLP", _FakeDeepseekV2MLP
         ), patch.object(
-            deepseek_v3_mod, "NPUFusedMoEV1", _FakeNPUFusedMoE
+            deepseek_v3_mod, "NPUSharedFusedMoE", _FakeNPUFusedMoE
         ), patch.object(
             deepseek_v3_mod, "get_tensor_model_parallel_world_size", return_value=1
         ), patch.object(

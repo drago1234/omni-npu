@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 import importlib
-import importlib.util
-from pathlib import Path
 import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,10 +16,12 @@ pytestmark = pytest.mark.unit
 def prepare_module(monkeypatch):
     torch_npu = MagicMock()
     torch_npu.npu_moe_init_routing_v2 = MagicMock()
+    torch_npu.npu_dynamic_quant = MagicMock()
     torch_npu.npu_moe_re_routing = MagicMock()
     torch_npu.npu_moe_finalize_routing = MagicMock()
     torch_npu.npu_moe_distribute_dispatch_v2 = MagicMock()
     torch_npu.npu_moe_distribute_combine_v2 = MagicMock()
+    torch_npu.npu = SimpleNamespace(get_device_name=lambda _: "Ascend910C")
 
     class DummyBackend:
         def get_hccl_comm_name(self, rank_in_group):
@@ -37,35 +38,31 @@ def prepare_module(monkeypatch):
         device_group=DummyDeviceGroup(),
         all_gather=lambda tensor, dim=0: torch.cat([tensor, tensor], dim=dim),
     )
-    world_group = SimpleNamespace(
-        world_size=2,
-        rank=1,
-        rank_in_group=1,
-        device_group=DummyDeviceGroup(),
-    )
-
     context_holder = SimpleNamespace(attn_metadata=None)
-    import vllm.distributed as distributed_module
-    import vllm.forward_context as forward_context_module
-    import vllm.platforms as platforms_module
-
     monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
-    monkeypatch.setattr(
-        platforms_module,
-        "current_platform",
-        SimpleNamespace(device_type="cpu"),
-        raising=False,
+    distributed_module = types.ModuleType("vllm.distributed")
+    distributed_module.get_ep_group = lambda: ep_group
+    distributed_module.get_dp_group = lambda: SimpleNamespace(
+        world_size=1,
+        all_gather=lambda tensor, dim=0: tensor,
+        reduce_scatter=lambda tensor, dim=0: tensor,
     )
-    monkeypatch.setattr(
-        distributed_module, "get_ep_group", lambda: ep_group, raising=False
-    )
+    distributed_module.get_tp_group = lambda: SimpleNamespace(all_reduce=lambda x: x)
+    distributed_module.get_tensor_model_parallel_world_size = lambda: 1
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
 
-    monkeypatch.setattr(
-        forward_context_module,
-        "get_forward_context",
-        lambda: context_holder,
-        raising=False,
-    )
+    forward_context_module = types.ModuleType("vllm.forward_context")
+    forward_context_module.get_forward_context = lambda: context_holder
+    monkeypatch.setitem(sys.modules, "vllm.forward_context", forward_context_module)
+
+    platforms_module = types.ModuleType("vllm.platforms")
+    platforms_module.current_platform = SimpleNamespace(device_type="cpu")
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
+
+    math_utils_module = types.ModuleType("vllm.utils.math_utils")
+    math_utils_module.cdiv = lambda a, b: (a + b - 1) // b
+    monkeypatch.setitem(sys.modules, "vllm.utils.math_utils", math_utils_module)
+
     monkeypatch.setattr(
         torch.distributed,
         "all_to_all_single",
@@ -73,21 +70,10 @@ def prepare_module(monkeypatch):
         raising=False,
     )
 
-    module_name = "omni_npu.v1.layers.fused_moe.fused_moe_prepare_permute_unpermute_finalize"
+    module_name = "omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize"
     sys.modules.pop(module_name, None)
-    module_path = (
-        Path(__file__).resolve().parents[4]
-        / "src"
-        / "omni_npu"
-        / "v1"
-        / "layers"
-        / "fused_moe"
-        / "fused_moe_prepare_permute_unpermute_finalize.py"
-    )
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    module = importlib.import_module(module_name)
+    importlib.reload(module)
 
     stubs = SimpleNamespace(
         torch_npu=torch_npu,
@@ -143,6 +129,7 @@ def test_all2all_prepare_permute_no_quant(prepare_module):
     assert result.expert_tokens.equal(tokens_per_local_expert)
     assert stubs.torch_npu.npu_moe_init_routing_v2.call_args.kwargs["quant_mode"] == -1
 
+
 def test_agrs_prepare_permute_with_quant(prepare_module):
     module, stubs = prepare_module
     layer = SimpleNamespace(
@@ -153,27 +140,15 @@ def test_agrs_prepare_permute_with_quant(prepare_module):
         quant_method=MagicMock(),
         w13_weight=torch.zeros(2, 1, 1),  # shape: (local_num_experts, ...)
     )
-    
-    # 准备输入数据
     x = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32)
-    topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
-    
-    # 模拟 npu_dynamic_quant 的返回值
-    x_int8 = x.to(torch.int8)  # 模拟量化后的张量
-    x_scale = torch.tensor([0.1, 0.1], dtype=torch.float32)  # 模拟缩放因子
-    
+    x_int8 = x.to(torch.int8)
+    x_scale = torch.tensor([0.1, 0.1], dtype=torch.float32)
+
     stubs.torch_npu.npu_dynamic_quant.return_value = (x_int8, x_scale)
-    
-    # 模拟 all_gather 后的数据
-    # all_gather 后数据会重复（因为是模拟）
-    x_int8_gathered = torch.cat([x_int8, x_int8], dim=0)
-    x_scale_gathered = torch.cat([x_scale, x_scale], dim=0)
-    topk_ids_gathered = torch.cat([topk_ids, topk_ids], dim=0)
-    
-    # 模拟 npu_moe_init_routing_v2 的返回值
+
     expanded_x = torch.tensor([[2.0, 2.0, 2.0], [2.0, 2.0, 2.0]], dtype=torch.float32)
     expanded_row_idx = torch.tensor([0, 1], dtype=torch.int32)
-    expert_tokens = torch.tensor([1, 1, 0, 0], dtype=torch.int32)  # 4个专家，前2个有token
+    expert_tokens = torch.tensor([1, 1, 0, 0], dtype=torch.int32)
     expanded_scale = torch.tensor([0.1, 0.1], dtype=torch.float32)
 
     stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
@@ -182,8 +157,6 @@ def test_agrs_prepare_permute_with_quant(prepare_module):
         expert_tokens,
         expanded_scale,
     )
-    
-    # 创建handler并调用prepare_permute
     handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
     result = handler.prepare_permute(
         layer=layer,
@@ -223,6 +196,7 @@ def test_all2all_unpermute_finalize_reorders_and_finalizes(prepare_module):
     topk_weights = torch.ones(2, 1, dtype=torch.float32)
 
     output = handler.unpermute_finalize(
+        layer=layer,
         hidden_states=hidden_states,
         topk_ids=torch.zeros(2, 1, dtype=torch.int32),
         topk_weights=topk_weights,
@@ -242,10 +216,7 @@ def test_dispatch_prepare_permute_passes_quant_mode_and_mask(prepare_module):
     layer = SimpleNamespace(
         global_num_experts=4,
         local_num_experts=2,
-        quant_method=SimpleNamespace(
-            moe_quant_config=SimpleNamespace(use_int8_w8a8=True),
-            num_of_redundant_experts=0,
-        ),
+        quant_config=object(),
     )
     stubs.context_holder.attn_metadata = {
         0: SimpleNamespace(decode=SimpleNamespace(mc2_mask=torch.tensor([1, 0, 1], dtype=torch.bool)))
@@ -279,10 +250,7 @@ def test_dispatch_unpermute_finalize_passes_counts_and_mask(prepare_module):
     layer = SimpleNamespace(
         global_num_experts=4,
         local_num_experts=2,
-        quant_method=SimpleNamespace(
-            moe_quant_config=SimpleNamespace(use_int8_w8a8=False),
-            num_of_redundant_experts=0,
-        ),
+        quant_config=None,
     )
     stubs.context_holder.attn_metadata = SimpleNamespace(
         decode=SimpleNamespace(mc2_mask=torch.tensor([1, 1], dtype=torch.bool))
@@ -299,6 +267,7 @@ def test_dispatch_unpermute_finalize_passes_counts_and_mask(prepare_module):
     )
 
     output = handler.unpermute_finalize(
+        layer=layer,
         hidden_states=torch.ones(2, 2),
         topk_ids=torch.zeros(2, 1, dtype=torch.int32),
         topk_weights=torch.ones(2, 1, dtype=torch.float32),
@@ -311,3 +280,96 @@ def test_dispatch_unpermute_finalize_passes_counts_and_mask(prepare_module):
     assert kwargs["tp_send_counts"] is prepare_result.tp_recv_counts
     assert torch.equal(kwargs["x_active_mask"], torch.tensor([1, 1], dtype=torch.bool))
 
+
+def test_agrs_unpermute_finalize_quant_masks_out_of_range_experts(prepare_module):
+    module, stubs = prepare_module
+    layer = SimpleNamespace(
+        global_num_experts=4,
+        local_num_experts=2,
+        quant_config=object(),
+    )
+    stubs.torch_npu.npu_moe_finalize_routing.return_value = torch.ones(2, 2, dtype=torch.float32)
+    handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
+    prepare_result = module.AGRSPreparePermuteResult(
+        hidden_states_sorted_by_experts=torch.zeros(2, 2),
+        expert_tokens=torch.tensor([1, 1], dtype=torch.int32),
+        dynamic_scale=torch.ones(2),
+        expert_range=[2, 4],
+        expanded_row_idx=torch.tensor([0, 1], dtype=torch.int32),
+        gathered_topk_ids=torch.tensor([[0], [3]], dtype=torch.int32),
+        dtype=torch.float16,
+    )
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    hidden_states = torch.ones(2, 2, dtype=torch.float32)
+
+    y = handler.unpermute_finalize(
+        layer=layer,
+        hidden_states=hidden_states,
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+        topk_weights=topk_weights,
+        agrs_prepare_permute_result=prepare_result,
+    )
+
+    assert y.dtype == torch.float16
+    scales = stubs.torch_npu.npu_moe_finalize_routing.call_args.kwargs["scales"]
+    assert torch.equal(scales, torch.tensor([[0.0], [1.0]], dtype=torch.float32))
+
+
+def test_strategy_selector_a2_tp_dp_branches(prepare_module):
+    module, stubs = prepare_module
+    layer = SimpleNamespace(global_num_experts=4)
+    stubs.torch_npu.npu.get_device_name = lambda _: "Ascend910B"
+    module.get_tensor_model_parallel_world_size = lambda: 2
+    module.get_dp_group = lambda: SimpleNamespace(world_size=2)
+    module.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata={0: SimpleNamespace(decode_threshold=4)}
+    )
+
+    selector = module.CommunicationStrategySelector(layer)
+    strategy_small, _ = selector.select_communication_strategy(num_tokens=4)
+    strategy_large, _ = selector.select_communication_strategy(num_tokens=8)
+
+    assert strategy_small == "agrs"
+    assert strategy_large == "all2all"
+
+
+def test_strategy_selector_a2_tp_only_always_agrs(prepare_module):
+    module, stubs = prepare_module
+    layer = SimpleNamespace(global_num_experts=4)
+    stubs.torch_npu.npu.get_device_name = lambda _: "Ascend910B"
+    module.get_tensor_model_parallel_world_size = lambda: 1
+    module.get_dp_group = lambda: SimpleNamespace(world_size=2)
+    module.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata={0: SimpleNamespace(decode_threshold=0)}
+    )
+
+    selector = module.CommunicationStrategySelector(layer)
+    strategy, _ = selector.select_communication_strategy(num_tokens=999)
+
+    assert strategy == "agrs"
+
+
+def test_strategy_selector_returns_dispatch_for_small_token_on_non_a2(prepare_module):
+    module, _ = prepare_module
+    layer = SimpleNamespace(global_num_experts=4)
+
+    selector = module.CommunicationStrategySelector(layer)
+    strategy, _ = selector.select_communication_strategy(num_tokens=4)
+    assert strategy == "dispatch_combine"
+
+
+def test_strategy_selector_non_a2_tp_dp_branches(prepare_module):
+    module, _ = prepare_module
+    layer = SimpleNamespace(global_num_experts=4)
+    module.get_tensor_model_parallel_world_size = lambda: 2
+    module.get_dp_group = lambda: SimpleNamespace(world_size=2)
+    module.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata={0: SimpleNamespace(decode_threshold=16)}
+    )
+
+    selector = module.CommunicationStrategySelector(layer)
+    strategy_small, _ = selector.select_communication_strategy(num_tokens=8)
+    strategy_large, _ = selector.select_communication_strategy(num_tokens=200)
+
+    assert strategy_small == "agrs"
+    assert strategy_large == "all2all"

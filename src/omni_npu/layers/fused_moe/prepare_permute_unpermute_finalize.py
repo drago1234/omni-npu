@@ -1,0 +1,401 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import torch
+import torch.distributed as dist
+import torch_npu
+
+from vllm.distributed import (
+    get_ep_group,
+    get_dp_group,
+    get_tp_group,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.forward_context import get_forward_context
+from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
+
+DEFAULT_ALL2ALL_THRESHOLD = 64
+
+
+@dataclass
+class PreparePermuteResult:
+    hidden_states_sorted_by_experts: torch.Tensor
+    expert_tokens: torch.Tensor
+    dynamic_scale: Optional[torch.Tensor]
+    avg_tokens_per_expert: Optional[torch.Tensor] = None
+
+
+@dataclass
+class All2AllPreparePermuteResult(PreparePermuteResult):
+    input_splits: List[int] = field(default_factory=list)
+    output_splits: List[int] = field(default_factory=list)
+    expanded_x: Optional[torch.Tensor] = None
+    expanded_row_idx: Optional[torch.Tensor] = None
+    gathered_idxs_unsort: Optional[torch.Tensor] = None
+
+
+@dataclass
+class DispatchCombinePreparePermuteResult(PreparePermuteResult):
+    tp_recv_counts: Optional[torch.Tensor] = None
+    ep_recv_counts: Optional[torch.Tensor] = None
+    expand_idx: Optional[torch.Tensor] = None
+
+
+@dataclass
+class AGRSPreparePermuteResult(PreparePermuteResult):
+    expert_range: Optional[List[int]] = None
+    expanded_row_idx: Optional[torch.Tensor] = None
+    gathered_topk_ids: Optional[torch.Tensor] = None
+    dtype: Optional[torch.dtype] = None
+
+
+class FusedMoEPreparePermuteAndUnpermuteFinalize(ABC):
+    def __init__(self, layer):
+        self.num_experts = layer.global_num_experts
+        self.ep_size = get_ep_group().world_size
+        self.ep_rank = get_ep_group().rank
+
+    @abstractmethod
+    def prepare_permute(
+        self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor
+    ) -> PreparePermuteResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def unpermute_finalize(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        prepare_and_permute_result: PreparePermuteResult,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
+    def prepare_permute(
+        self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor
+    ) -> All2AllPreparePermuteResult:
+        x = x.view(-1, x.shape[-1])
+        topk_ids = topk_ids.int()
+        max_num_deployed_expert = layer.w13_weight.shape[0] * self.ep_size
+        quant_mode = 1 if layer.quant_config is not None else -1
+
+        expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = (
+            torch_npu.npu_moe_init_routing_v2(
+                x,
+                expert_idx=topk_ids,
+                scale=None,
+                expert_num=max_num_deployed_expert,
+                active_expert_range=[0, max_num_deployed_expert],
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_num=topk_ids.numel(),
+                drop_pad_mode=0,
+                row_idx_type=0,
+                quant_mode=quant_mode,
+            )
+        )
+
+        tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
+        dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
+        combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
+        combine_tokens = combine_tokens.view(2, self.ep_size, -1).sum(2)
+        all_tokens = combine_tokens[0].sum()
+        combine_tokens_cpu = combine_tokens.cpu().tolist()
+        input_splits = combine_tokens_cpu[1]
+        output_splits = combine_tokens_cpu[0]
+        gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
+        dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits)
+
+        if layer.quant_config is None:
+            gathered_pertoken_scale = None
+        else:
+            gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
+            dist.all_to_all_single(
+                gathered_pertoken_scale, pertoken_scale, output_splits, input_splits
+            )
+
+        hidden_states_sorted_by_experts, gathered_pertoken_scale, gathered_idxs_unsort, tokens_per_local_expert = (
+            torch_npu.npu_moe_re_routing(
+                gathered_tokens,
+                tokens_per_expert_group.view(self.ep_size, -1),
+                per_token_scales=gathered_pertoken_scale,
+            )
+        )
+
+        return All2AllPreparePermuteResult(
+            gathered_idxs_unsort=gathered_idxs_unsort,
+            expanded_x=expanded_x,
+            expanded_row_idx=expanded_row_idx,
+            input_splits=input_splits,
+            output_splits=output_splits,
+            hidden_states_sorted_by_experts=hidden_states_sorted_by_experts,
+            expert_tokens=tokens_per_local_expert,
+            dynamic_scale=gathered_pertoken_scale,
+        )
+
+    def unpermute_finalize(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        all2all_prepare_permute_result: All2AllPreparePermuteResult,
+    ) -> torch.Tensor:
+        gathered_idxs_unsort = all2all_prepare_permute_result.gathered_idxs_unsort
+        expanded_x = all2all_prepare_permute_result.expanded_x
+        input_splits = all2all_prepare_permute_result.input_splits
+        output_splits = all2all_prepare_permute_result.output_splits
+        expanded_row_idx = all2all_prepare_permute_result.expanded_row_idx
+        new_x = torch.index_select(
+            hidden_states, 0, gathered_idxs_unsort.to(torch.float32).argsort().to(torch.int32)
+        )
+        gathered_tokens = new_x.new_empty(*expanded_x.shape)
+        dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits)
+        return torch_npu.npu_moe_finalize_routing(
+            gathered_tokens,
+            skip1=None,
+            skip2=None,
+            bias=None,
+            scales=topk_weights.to(gathered_tokens.dtype),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=None,
+            drop_pad_mode=2,
+        )
+
+
+class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
+    def prepare_permute(
+        self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor
+    ) -> AGRSPreparePermuteResult:
+        x = x.view(-1, x.shape[-1])
+        topk_ids = topk_ids.int()
+        max_num_deployed_expert = layer.w13_weight.shape[0] * self.ep_size
+        experts_start_idx = self.ep_rank * layer.w13_weight.shape[0]
+        experts_end_idx = experts_start_idx + layer.w13_weight.shape[0]
+        expert_range = [experts_start_idx, experts_end_idx]
+
+        if layer.quant_config is None:
+            gathered_x = get_dp_group().all_gather(x, dim=0)
+            gathered_topk_ids = get_dp_group().all_gather(topk_ids, dim=0)
+            expanded_x, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
+                gathered_x,
+                gathered_topk_ids,
+                active_num=gathered_topk_ids.numel(),
+                expert_capacity=-1,
+                expert_num=max_num_deployed_expert,
+                drop_pad_mode=0,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                quant_mode=-1,
+                active_expert_range=expert_range,
+                row_idx_type=0,
+            )
+            dynamic_scale = None
+        else:
+            x_int8, x_scale = torch_npu.npu_dynamic_quant(x)
+            x_int8 = get_dp_group().all_gather(x_int8, dim=0)
+            x_scale = get_dp_group().all_gather(x_scale, dim=0)
+            gathered_topk_ids = get_dp_group().all_gather(topk_ids, dim=0)
+            expanded_x, expanded_row_idx, expert_tokens, dynamic_scale = torch_npu.npu_moe_init_routing_v2(
+                x_int8,
+                gathered_topk_ids,
+                scale=x_scale,
+                offset=None,
+                active_num=gathered_topk_ids.numel(),
+                expert_num=max_num_deployed_expert,
+                expert_capacity=-1,
+                drop_pad_mode=0,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=expert_range,
+                quant_mode=-1,
+                row_idx_type=0,
+            )
+        if layer.quant_config is not None:
+            expanded_row_idx = torch.clamp(expanded_row_idx, min=0, max=expanded_row_idx.shape[0] - 1)
+        return AGRSPreparePermuteResult(
+            hidden_states_sorted_by_experts=expanded_x,
+            expert_tokens=expert_tokens,
+            dynamic_scale=dynamic_scale,
+            avg_tokens_per_expert=None,
+            expert_range=expert_range,
+            expanded_row_idx=expanded_row_idx,
+            gathered_topk_ids=gathered_topk_ids,
+            dtype=x.dtype,
+        )
+
+    def unpermute_finalize(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        agrs_prepare_permute_result: AGRSPreparePermuteResult,
+    ) -> torch.Tensor:
+        expanded_row_idx = agrs_prepare_permute_result.expanded_row_idx
+        gathered_topk_ids = agrs_prepare_permute_result.gathered_topk_ids
+
+        gathered_topk_weights = get_dp_group().all_gather(topk_weights, dim=0)
+
+        if layer.quant_config is not None:
+            expert_range = agrs_prepare_permute_result.expert_range
+            valid_mask = (gathered_topk_ids >= expert_range[0]) & (
+                gathered_topk_ids < expert_range[1]
+            )
+            gathered_topk_weights = gathered_topk_weights * valid_mask.to(gathered_topk_weights.dtype)
+            y = torch_npu.npu_moe_finalize_routing(
+                hidden_states.float(),
+                skip1=None,
+                skip2=None,
+                bias=None,
+                scales=gathered_topk_weights.float(),
+                expanded_src_to_dst_row=expanded_row_idx,
+                export_for_source_row=gathered_topk_ids,
+                drop_pad_mode=2,
+            ).to(agrs_prepare_permute_result.dtype)
+        else:
+            y = torch_npu.npu_moe_finalize_routing(
+                hidden_states.unsqueeze(0),
+                skip1=None,
+                skip2=None,
+                bias=None,
+                scales=gathered_topk_weights,
+                expanded_src_to_dst_row=expanded_row_idx,
+                export_for_source_row=gathered_topk_ids,
+                drop_pad_mode=3,
+            )
+        y = get_dp_group().reduce_scatter(y, dim=0)
+        return get_tp_group().all_reduce(y)
+
+
+class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
+    def __init__(self, layer):
+        super().__init__(layer)
+        self.moe_all_to_all_group = get_ep_group().device_group
+        self.moe_all_to_all_group_name = self.moe_all_to_all_group._get_backend(
+            torch.device(current_platform.device_type)
+        ).get_hccl_comm_name(get_ep_group().rank_in_group)
+
+    def _get_mc2_mask(self, num_tokens: int) -> torch.Tensor | None:
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = next(iter(attn_metadata.values()), None) if attn_metadata else None
+        if hasattr(attn_metadata, "decode") and attn_metadata.decode is not None:
+            mc2_mask = getattr(attn_metadata.decode, "mc2_mask", None)
+            if mc2_mask is not None:
+                mc2_mask = mc2_mask[:num_tokens]
+            return mc2_mask
+        return None
+
+    def prepare_permute(
+        self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor
+    ) -> DispatchCombinePreparePermuteResult:
+        quant_mode = 2 if layer.quant_config is not None else 0
+        output = torch_npu.npu_moe_distribute_dispatch_v2(
+            x=x,
+            expert_ids=topk_ids,
+            expert_shard_type=0,
+            shared_expert_rank_num=0,
+            moe_expert_num=self.num_experts,
+            global_bs=0,
+            scales=None,
+            quant_mode=quant_mode,
+            group_ep=self.moe_all_to_all_group_name,
+            ep_world_size=self.ep_size,
+            ep_rank_id=self.ep_rank,
+            x_active_mask=self._get_mc2_mask(topk_ids.shape[0]),
+        )
+        expand_x, dynamic_scale, expand_idx, expert_token_nums, ep_recv_counts, tp_recv_counts = output[0:6]
+        return DispatchCombinePreparePermuteResult(
+            hidden_states_sorted_by_experts=expand_x,
+            expert_tokens=expert_token_nums.to(torch.int64),
+            tp_recv_counts=tp_recv_counts,
+            ep_recv_counts=ep_recv_counts,
+            expand_idx=expand_idx,
+            dynamic_scale=dynamic_scale,
+        )
+
+    def unpermute_finalize(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        dispatch_combine_prepare_permute_result: DispatchCombinePreparePermuteResult,
+    ) -> torch.Tensor:
+        return torch_npu.npu_moe_distribute_combine_v2(
+            expand_x=hidden_states,
+            expert_ids=topk_ids,
+            assist_info_for_combine=dispatch_combine_prepare_permute_result.expand_idx,
+            expert_scales=topk_weights.to(torch.float32),
+            expert_shard_type=0,
+            shared_expert_rank_num=0,
+            moe_expert_num=self.num_experts,
+            global_bs=0,
+            ep_send_counts=dispatch_combine_prepare_permute_result.ep_recv_counts,
+            group_ep=self.moe_all_to_all_group_name,
+            ep_world_size=self.ep_size,
+            ep_rank_id=self.ep_rank,
+            tp_send_counts=dispatch_combine_prepare_permute_result.tp_recv_counts,
+            x_active_mask=self._get_mc2_mask(topk_ids.shape[0]),
+        )
+
+
+class CommunicationStrategySelector:
+    all2all_threshold: int = DEFAULT_ALL2ALL_THRESHOLD
+
+    def __init__(self, moe: torch.nn.Module):
+        device_name = torch_npu.npu.get_device_name(0)
+        self.is_a2_device = device_name.startswith("Ascend910B")
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.dp_size = get_dp_group().world_size
+
+        self.prepare_permute_and_unpermute_finalize_dict = {
+            "all2all": All2AllPrepPmtAndUnpmtFinal(moe),
+            "agrs": AGRSPrepPmtAndUnpmtFinal(moe),
+            "dispatch_combine": DispatchCombinePrepPmtAndUnpmtFinal(moe),
+        }
+
+    def select_communication_strategy(self, num_tokens: int):
+        forward_ctx = get_forward_context()
+        attn_metadata = forward_ctx.attn_metadata
+        decode_threshold = 0
+        if attn_metadata is not None:
+            attn_metadata = next(iter(attn_metadata.values()), None)
+            decode_threshold = getattr(attn_metadata, "decode_threshold", 0)
+
+        if self.is_a2_device:
+            # TP or DP only
+            if self.tp_size == 1 or self.dp_size == 1:
+                strategy = "agrs"
+            else:
+                # TP + DP
+                if num_tokens <= decode_threshold:
+                    strategy = "agrs"
+                else:
+                    strategy = "all2all"
+        else:
+            # TP or DP only
+            if self.dp_size == 1 or self.tp_size == 1:
+                # tokens per rank
+                local_num_tokens = cdiv(num_tokens, self.tp_size)
+                if local_num_tokens > self.all2all_threshold:
+                    strategy = "all2all"
+                else:
+                    strategy = "dispatch_combine"
+            else:
+                # TP + DP
+                if num_tokens <= decode_threshold:
+                    strategy = "agrs"
+                else:
+                    strategy = "all2all"
+
+        return strategy, self.prepare_permute_and_unpermute_finalize_dict[strategy]

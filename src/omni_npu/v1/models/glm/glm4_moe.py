@@ -76,7 +76,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
-from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
+from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
 
 logger = init_logger(__name__)
 
@@ -224,9 +224,9 @@ class Glm4MoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.experts = NPUFusedMoEV1(
+        self.experts = NPUSharedFusedMoE(
             shared_experts=None,
-            gate=None,
+            gate=self.gate,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -254,16 +254,12 @@ class Glm4MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states.to(dtype=torch.float32))
-
         fused_moe_out = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, router_logits=None
         )
 
         if self.shared_experts is not None:
-            shared_output, final_hidden_states = fused_moe_out
-            assert shared_output is None
+            final_hidden_states = fused_moe_out
             shared_output = self.shared_experts(hidden_states)
             final_hidden_states = (
                 final_hidden_states * self.routed_scaling_factor + shared_output

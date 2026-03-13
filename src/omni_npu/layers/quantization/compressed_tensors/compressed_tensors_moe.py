@@ -1,51 +1,49 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import Optional, Callable, Union
+from typing import Optional, Callable, Union, Dict
+import os
 
 import torch
 import torch_npu
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_rank,
+    get_dp_group
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Int8MoEMethod
 from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSupported
-from vllm.model_executor.layers.fused_moe.modular_kernel import (
-    FusedMoEPermuteExpertsUnpermute,
-    FusedMoEPrepareAndFinalize,
-)
 from vllm.distributed import get_world_group
 from vllm.config import get_current_vllm_config
 
-from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
-from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
 from omni_npu.layers.fused_moe.layer import NPUFusedMoE
-from omni_npu.layers.fused_moe.fused_moe import moe_infer_fusion, fused_experts_tp, fused_experts_allgather_ep
-from omni_npu.layers.fused_moe.config import int4_w4a8_moe_quant_config
+from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp
+from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
+from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteResult
+from omni_npu.layers.utils import named_stream
 
 
 torch.npu.config.allow_internal_format = True
 logger = init_logger(__name__)
 
 
-class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
+class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, NPUFusedMoEMethodBase):
     def __init__(
         self,
         parent,
         layer,
     ):
         super().__init__(parent, layer.moe_config)
+        NPUFusedMoEMethodBase.__init__(self)
         self.init_eplb(layer)
-        device_name = torch_npu.npu.get_device_name(0)
-        self.is_a2_device = device_name.startswith("Ascend910B")
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
 
     def init_eplb(self, layer):
         self.enable_eplb = layer.enable_eplb
@@ -178,20 +176,10 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         layer.w13_weight_scale = torch.nn.Parameter(layer.w13_weight_scale.to(torch.float32).squeeze(-1), requires_grad=False)
         layer.w2_weight_scale = torch.nn.Parameter(layer.w2_weight_scale.to(torch.bfloat16).squeeze(-1), requires_grad=False)
 
-    def maybe_make_prepare_finalize(self, routing_tables) -> Optional[FusedMoEPrepareAndFinalize]:
-        return NpuMoEPrepareAndFinalize(self.moe)
-
-    def select_gemm_impl(
-        self,
-        prepare_finalize: FusedMoEPrepareAndFinalize,
-        layer: torch.nn.Module,
-    ) -> FusedMoEPermuteExpertsUnpermute:
-        return NPUFusedMoEPermuteExpertsUnpermute(self.moe_quant_config, layer)
-
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,
         renormalize: bool,
@@ -211,23 +199,44 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        use_allgather_ep = self.is_a2_device and layer.moe_parallel_config.use_ep
-        tp_size = get_tensor_model_parallel_world_size()  # attn tp size
-        hidden_states = x
-        global_num_experts = global_num_experts + get_world_group().world_size * self.num_of_redundant_experts
+        # TODO: Support TP-only mode
+        if not layer.moe_parallel_config.use_ep:
+            return fused_experts_tp(
+                layer=layer,
+                x=x_slice,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
 
-        if not use_allgather_ep and layer.moe_parallel_config.use_ep and tp_size > 1:
-            tp_rank = get_tensor_model_parallel_rank()
-            t_ori = x.shape[0]
-            t_pad = -(t_ori // -tp_size) * tp_size
-            t_local = t_pad // tp_size
-            num_pads = t_pad - t_ori
-            # pad
-            hidden_states = torch.nn.functional.pad(x, (0, 0, 0, num_pads), value=0)
-            router_logits = torch.nn.functional.pad(router_logits, (0, 0, 0, num_pads), value=0)
-            # deduplicate
-            hidden_states = hidden_states[tp_rank * t_local: (tp_rank + 1) * t_local]
-            router_logits = router_logits[tp_rank * t_local: (tp_rank + 1) * t_local]
+        orig_num_tokens = hidden_states.shape[0]
+        strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
+
+        is_need_slice = self.tp_size > 1 and (strategy == "all2all" or strategy == "dispatch_combine")
+        x_slice = hidden_states
+        if is_need_slice:
+            padded_num_tokens = -(orig_num_tokens // -self.tp_size) * self.tp_size
+            local_num_tokens = padded_num_tokens // self.tp_size
+            num_pads = padded_num_tokens - orig_num_tokens
+
+            if num_pads > 0:
+                x_slice = torch.nn.functional.pad(
+                    x_slice, (0, 0, 0, num_pads), value=0
+                )
+
+            start = self.tp_rank * local_num_tokens
+            end = (self.tp_rank + 1) * local_num_tokens
+            x_slice = x_slice[start:end]
+
+        if layer.gate is not None:
+            router_logits, _ = layer.gate(x_slice)
+        else:
+            assert router_logits is not None, "Expected gate or router_logits must be provided."
+            if is_need_slice:
+                if num_pads > 0:
+                    router_logits = torch.nn.functional.pad(
+                        router_logits, (0, 0, 0, num_pads), value=0
+                    )
+                router_logits = router_logits[start:end]
 
         topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
@@ -244,7 +253,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
         if enable_eplb:
             _, topk_ids, _ = self.planner.plan(
                 layer_idx_moe=self.moe_layer_idx,
-                tokens=x,
+                tokens=x_slice,
                 token_expert_ids=topk_ids,
                 token_expert_scores=topk_weights,
                 top_k=top_k,
@@ -253,126 +262,144 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
             layer.planner = self.planner
             layer.moe_layer_idx = self.moe_layer_idx
 
-        attn_metadata = get_forward_context().attn_metadata
-        is_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
-        if use_allgather_ep:
-            output = fused_experts_allgather_ep(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation=activation,
-                is_prefill=is_prefill,
-            )
-            output = tensor_model_parallel_all_reduce(output)
-            return output
-        elif layer.moe_parallel_config.use_ep:
-            share_output = None
-            if layer.shared_experts is not None:
-                share_output = layer.shared_experts(x)
-            if is_prefill:
-                output = moe_infer_fusion(
-                    layer=layer,
-                    x=hidden_states,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                )
-            else:
-                output = self.fused_experts(
-                    hidden_states=hidden_states,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    inplace=True,
-                    activation=activation,
-                    apply_router_weight_on_input=apply_router_weight_on_input,
-                    global_num_experts=global_num_experts,
-                    expert_map=expert_map,
-                )
-                if enable_eplb:
-                    group_list = self.fused_experts.prepare_finalize.expert_token_nums
-                    self.planner.record_activation(self.moe_layer_idx, group_list, support_multi_stream=False)
+        prepare_permute_result = self.apply_prepare_permute(
+            strategy_impl, layer, x_slice, topk_ids
+        )
+        output = self.apply_experts(
+            layer=layer,
+            prepare_permute_result=prepare_permute_result,
+            activation=activation,
+        )
 
-            if tp_size > 1:
-                output = tensor_model_parallel_all_gather(output, dim=0)[:t_ori]
-                if share_output is not None:
-                    share_output = tensor_model_parallel_all_reduce(share_output)
-            if share_output is not None:
-                return share_output, output
-            return output
-        else:
-            return fused_experts_tp(
-                layer=layer,
-                x=x,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-            )
+        shared_output = None
+        if layer.shared_experts is not None:
+            cur_stream = torch.npu.current_stream()
+            sub_stream = named_stream("moe_sub_stream")
+            sub_stream.wait_stream(cur_stream)
+            with torch.npu.stream(sub_stream):
+                if layer.shared_experts.gate_up_proj.tp_size > 1:
+                    # Shared experts with TP>1 require full hidden_states;
+                    # output is all-reduced later.
+                    shared_output = layer.shared_experts(hidden_states)
+                else:
+                    shared_output = layer.shared_experts(x_slice)
 
-    def gmm_expert(self, layer, h, expert_tokens, dynamic_scale=None, avg_tokens_per_expert=None):
-        # no need to transpose weight here if weight_nz enabled
-        hidden_size = h.size(-1)
-        pertoken_scale = dynamic_scale
+        routed_output = self.apply_unpermute_finalize(
+            strategy_impl,
+            layer,
+            output,
+            topk_ids,
+            topk_weights,
+            prepare_permute_result,
+        )
+
+        if layer.shared_experts is not None:
+            cur_stream.wait_stream(sub_stream)
+            if layer.shared_experts.gate_up_proj.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
+                routed_output = routed_output + shared_output
+
+        if is_need_slice:
+            routed_output = tensor_model_parallel_all_gather(routed_output, dim=0)[:orig_num_tokens]
+
+        if shared_output is not None:
+            return shared_output, routed_output
+        return routed_output
+
+    def apply_experts(
+        self,
+        layer: torch.nn.Module,
+        prepare_permute_result: PreparePermuteResult,
+        activation: str = "silu",
+    ) -> torch.Tensor:
+        hidden_states = prepare_permute_result.hidden_states_sorted_by_experts
+        expert_tokens = prepare_permute_result.expert_tokens
+        avg_tokens_per_expert = prepare_permute_result.avg_tokens_per_expert or [0]
+        pertoken_scale = prepare_permute_result.dynamic_scale
+
+        if layer.quant_config is None:
+            gate_up_proj = torch_npu.npu_grouped_matmul(
+                [hidden_states],
+                [layer.w13_weight],
+                bias=None,
+                group_list=expert_tokens,
+                split_item=3,
+                output_dtype=hidden_states.dtype,
+                group_type=0,
+                group_list_type=1,
+            )[0]
+            intermediate_hidden_states = torch_npu.npu_swiglu(gate_up_proj)
+            return torch_npu.npu_grouped_matmul(
+                [intermediate_hidden_states],
+                [layer.w2_weight],
+                bias=None,
+                group_list=expert_tokens,
+                split_item=3,
+                output_dtype=hidden_states.dtype,
+                group_type=0,
+                group_list_type=1,
+            )[0]
+
+        if pertoken_scale is None:
+            raise ValueError("Quantized path requires dynamic per-token scale.")
         if pertoken_scale.dim() > 1:
             pertoken_scale = pertoken_scale.reshape(-1)
-            h = h.view(-1, hidden_size)
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-        if not layer.moe_parallel_config.use_ep:
-            w1_scale = layer.w13_weight_scale.to(torch.bfloat16)
-            w2_scale = layer.w2_weight_scale.to(torch.bfloat16)
-            gate_up_proj = \
-                torch_npu.npu_grouped_matmul([h], [layer.w13_weight], scale=[w1_scale],
-                                             per_token_scale=[pertoken_scale],
-                                             bias=None, group_list=expert_tokens, split_item=3,
-                                             output_dtype=torch.bfloat16,
-                                             group_type=0,
-                                             group_list_type=0)[0]
-
-            gate_up_proj = torch_npu.npu_swiglu(gate_up_proj)
-            gate_up_proj, pertoken_scale = torch_npu.npu_dynamic_quant(gate_up_proj)  # , smooth_scales=scale_2)
-
-            out_hidden = torch_npu.npu_grouped_matmul([gate_up_proj], [layer.w2_weight], scale=[w2_scale],
-                                                      per_token_scale=[pertoken_scale],
-                                                      bias=None, group_list=expert_tokens, split_item=3,
-                                                      output_dtype=torch.bfloat16,
-                                                      group_type=0,
-                                                      group_list_type=0)[0]
-        else:
-            avg_tokens_per_expert = avg_tokens_per_expert or [0]
-            bias = None
-            scale = None
-            per_token_scale = None
-            output_dtype = torch.int32
-            mm1_mm3 = torch_npu.npu_grouped_matmul([h], [layer.w13_weight],
-                                                   bias=bias, scale=scale, per_token_scale=per_token_scale,
-                                                   group_list=expert_tokens, split_item=3, group_type=0,
-                                                   group_list_type=1, act_type=0, output_dtype=output_dtype)[0]
-
-            weight_scale = layer.w13_weight_scale
-            pertoken_scale = pertoken_scale.squeeze(0)
-            # dequant_swiglu_quant
-            quant_scale = torch.ones((expert_tokens.shape[0], weight_scale.shape[-1] // 2),
-                                        dtype=torch.float32, device=current_platform.device_type)
-            intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(mm1_mm3, weight_scale=weight_scale,
-                                                                                activation_scale=pertoken_scale,
-                                                                                bias=None, quant_scale=quant_scale,
-                                                                                quant_offset=None,
-                                                                                group_index=expert_tokens,
-                                                                                activate_left=True, quant_mode=1)
-
-            if pertoken_scale.dim() > 1:
-                inter_size = intermediate_h.size(-1)
-                pertoken_scale = pertoken_scale.reshape(-1)
-                intermediate_h = intermediate_h.view(-1, inter_size)
-            # gmm2: down
-            w2_scale = [layer.w2_weight_scale.to(torch.bfloat16)]
-            out_hidden = torch_npu.npu_grouped_matmul([intermediate_h], [layer.w2_weight], bias=None,
-                                                      scale=w2_scale, per_token_scale=[pertoken_scale],
-                                                      group_list=expert_tokens, split_item=3,
-                                                      output_dtype=torch.bfloat16, group_type=0,
-                                                      group_list_type=1, tuning_config=avg_tokens_per_expert)[0]
-
-        return out_hidden
+        gate_up_proj = torch_npu.npu_grouped_matmul(
+            [hidden_states],
+            [layer.w13_weight],
+            bias=None,
+            scale=None,
+            per_token_scale=None,
+            group_list=expert_tokens,
+            split_item=3,
+            output_dtype=torch.int32,
+            group_type=0,
+            group_list_type=1,
+            act_type=0,
+        )[0]
+        quant_scale = torch.ones(
+            (expert_tokens.shape[0], layer.w13_weight_scale.shape[-1] // 2),
+            dtype=torch.float32,
+            device=current_platform.device_type,
+        )
+        has_bias = getattr(getattr(self, "moe", None), "has_bias", False)
+        dequant_swiglu_quant_kwargs: Dict[str, object] = {
+            "x": gate_up_proj,
+            "weight_scale": layer.w13_weight_scale,
+            "activation_scale": pertoken_scale,
+            "bias": getattr(layer, "w13_bias", None) if has_bias else None,
+            "quant_offset": None,
+            "quant_scale": quant_scale,
+            "group_index": expert_tokens,
+            "activate_left": True,
+            "quant_mode": 1,
+        }
+        if activation == "swigluoai":
+            dequant_swiglu_quant_kwargs.update({
+                "swiglu_mode": 1,
+                "clamp_limit": getattr(layer, "swiglu_limit", 7.0),
+                "glu_alpha": getattr(layer, "glu_alpha", 1.702),
+                "glu_bias": getattr(layer, "glu_bias", 1.0),
+            })
+        intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+            **dequant_swiglu_quant_kwargs
+        )
+        return torch_npu.npu_grouped_matmul(
+            [intermediate_h],
+            [layer.w2_weight],
+            bias=None,
+            scale=[layer.w2_weight_scale.to(torch.bfloat16)],
+            per_token_scale=[pertoken_scale],
+            group_list=expert_tokens,
+            split_item=3,
+            output_dtype=torch.bfloat16,
+            group_type=0,
+            group_list_type=1,
+            tuning_config=avg_tokens_per_expert,
+        )[0]
 
     @property
     def supports_eplb(self) -> bool:

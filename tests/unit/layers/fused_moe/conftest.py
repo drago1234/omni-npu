@@ -37,6 +37,7 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     _ensure_module(monkeypatch, "torch_npu")
 
     vllm_module = _ensure_module(monkeypatch, "vllm")
+    vllm_module.__path__ = []
     logger_module = _ensure_module(monkeypatch, "vllm.logger")
     logger_module.init_logger = lambda name: SimpleNamespace(
         debug=lambda *args, **kwargs: None,
@@ -63,28 +64,15 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     model_executor_module.__path__ = []
     layers_module = _ensure_module(monkeypatch, "vllm.model_executor.layers")
     layers_module.__path__ = []
+    model_executor_utils_module = _ensure_module(monkeypatch, "vllm.model_executor.utils")
+    model_executor_utils_module.set_weight_attrs = (
+        lambda param, attrs: [setattr(param, k, v) for k, v in attrs.items()]
+    )
 
-    activation_module = _ensure_module(monkeypatch, "vllm.model_executor.layers.activation")
-
-    class SiluAndMul(_Registerable):
-        pass
-
-    activation_module.SiluAndMul = SiluAndMul
-
-    layernorm_module = _ensure_module(monkeypatch, "vllm.model_executor.layers.layernorm")
-
-    class RMSNorm(_Registerable):
-        variance_epsilon = 1e-5
-        weight = SimpleNamespace(data=None)
-
-    layernorm_module.RMSNorm = RMSNorm
-
-    mla_module = _ensure_module(monkeypatch, "vllm.model_executor.layers.mla")
-
-    class MultiHeadLatentAttentionWrapper(_Registerable):
-        pass
-
-    mla_module.MultiHeadLatentAttentionWrapper = MultiHeadLatentAttentionWrapper
+    vllm_utils_module = _ensure_module(monkeypatch, "vllm.utils")
+    vllm_utils_module.__path__ = []
+    math_utils_module = _ensure_module(monkeypatch, "vllm.utils.math_utils")
+    math_utils_module.cdiv = lambda a, b: (a + b - 1) // b
 
     fused_moe_pkg = _ensure_module(monkeypatch, "vllm.model_executor.layers.fused_moe")
     fused_moe_pkg.__path__ = []
@@ -118,43 +106,6 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
 
     fused_moe_config_module.FusedMoEQuantConfig = FusedMoEQuantConfig
 
-    modular_kernel_module = _ensure_module(monkeypatch, "vllm.model_executor.layers.fused_moe.modular_kernel")
-
-    class FusedMoEPermuteExpertsUnpermute(_Registerable):
-        pass
-
-    class FusedMoEPrepareAndFinalize(_Registerable):
-        pass
-
-    modular_kernel_module.FusedMoEPermuteExpertsUnpermute = FusedMoEPermuteExpertsUnpermute
-    modular_kernel_module.FusedMoEPrepareAndFinalize = FusedMoEPrepareAndFinalize
-    if not hasattr(modular_kernel_module, "ExpertTokensMetadata"):
-        class ExpertTokensMetadata:
-            def __init__(self, expert_num_tokens, expert_num_tokens_cpu=None):
-                self.expert_num_tokens = expert_num_tokens
-                self.expert_num_tokens_cpu = expert_num_tokens_cpu
-        modular_kernel_module.ExpertTokensMetadata = ExpertTokensMetadata
-    if not hasattr(modular_kernel_module, "FusedMoEActivationFormat"):
-        class FusedMoEActivationFormat:
-            Standard = "standard"
-        modular_kernel_module.FusedMoEActivationFormat = FusedMoEActivationFormat
-    if not hasattr(modular_kernel_module, "PrepareResultType"):
-        modular_kernel_module.PrepareResultType = tuple
-    if not hasattr(modular_kernel_module, "TopKWeightAndReduce"):
-        modular_kernel_module.TopKWeightAndReduce = object
-
-    fused_moe_modular_method_module = _ensure_module(
-        monkeypatch,
-        "vllm.model_executor.layers.fused_moe.fused_moe_modular_method",
-    )
-
-    class FusedMoEModularMethod(_Registerable):
-        @classmethod
-        def make(cls, *args, **kwargs):
-            return cls()
-
-    fused_moe_modular_method_module.FusedMoEModularMethod = FusedMoEModularMethod
-
     shared_fused_moe_module = _ensure_module(monkeypatch, "vllm.model_executor.layers.fused_moe.shared_fused_moe")
 
     class SharedFusedMoE(_Registerable):
@@ -182,14 +133,11 @@ def _stub_fused_moe_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     vllm_module.platforms = platforms_module
     vllm_module.forward_context = forward_context_module
     vllm_module.model_executor = model_executor_module
+    vllm_module.utils = vllm_utils_module
     model_executor_module.layers = layers_module
-    layers_module.activation = activation_module
-    layers_module.layernorm = layernorm_module
-    layers_module.mla = mla_module
+    model_executor_module.utils = model_executor_utils_module
     layers_module.fused_moe = fused_moe_pkg
     fused_moe_pkg.layer = fused_moe_layer_module
-    fused_moe_pkg.modular_kernel = modular_kernel_module
-    fused_moe_pkg.fused_moe_modular_method = fused_moe_modular_method_module
     fused_moe_pkg.shared_fused_moe = shared_fused_moe_module
 
 

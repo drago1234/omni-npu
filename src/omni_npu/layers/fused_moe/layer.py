@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import Optional, Callable
-from functools import lru_cache
+import os
+from typing import Optional, Callable, Union
 
 import torch, torch_npu
 
 from vllm.logger import init_logger
 from vllm.distributed import (
-    get_dp_group,
-    get_tp_group,
     get_ep_group,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_gather,
@@ -23,45 +21,29 @@ from vllm.model_executor.layers.fused_moe.layer import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
-from vllm.model_executor.layers.fused_moe.modular_kernel import (
-    FusedMoEPermuteExpertsUnpermute,
-    FusedMoEPrepareAndFinalize
-)
-from vllm.model_executor.layers.fused_moe.fused_moe_modular_method import (
-    FusedMoEModularMethod,
-)
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
 from omni_npu.layers.utils import named_stream
-from omni_npu.layers.fused_moe.fused_moe import (
-    fused_experts_tp, 
-    moe_infer_fusion, 
-    fused_experts_allgather_ep_unquant
-)
-from omni_npu.layers.fused_moe.npu_moe_prepare_finalize import NpuMoEPrepareAndFinalize
-from omni_npu.layers.fused_moe.npu_moe_permute_unpermute import NPUFusedMoEPermuteExpertsUnpermute
+from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp
+from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteResult
+from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
 
 
 torch.npu.config.allow_internal_format = True
 logger = init_logger(__name__)
 
-@lru_cache(maxsize=None)
-def _get_npu_device_name(device_id: int) -> str:
-    return torch_npu.npu.get_device_name(device_id)
 
 @UnquantizedFusedMoEMethod.register_oot
-class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodBase):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
-        device_name = _get_npu_device_name(device_id=0)
-        self.is_a2_device = device_name.startswith("Ascend910B")
-        self.dp_size = get_dp_group().world_size
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
 
-    def forward_oot(
+    def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         top_k: int,
         renormalize: bool,
@@ -80,57 +62,45 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Attention metadata is used to decide whether we can use all-to-all for
-        # MoE inference (prefill stage) or should fall back to other paths.
-        forward_ctx = get_forward_context()
-        attn_metadata = forward_ctx.attn_metadata
-        batch_descriptor = forward_ctx.batch_descriptor
-        if attn_metadata is None:
-            use_all2all = True
-        else:
-            # Use the first metadata entry and guard empty metadata.
-            attn_meta = next(iter(attn_metadata.values()), None)
-            decode_threshold = getattr(attn_meta, "decode_threshold", None)
-            if decode_threshold is not None and batch_descriptor is not None:
-                use_all2all = batch_descriptor.num_tokens > decode_threshold
-            else:
-                num_prefills = getattr(attn_meta, "num_prefills", 0)
-                use_all2all = num_prefills > 0
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        # TODO: Support TP-only mode
+        if not layer.moe_parallel_config.use_ep:
+            return fused_experts_tp(
+                layer=layer,
+                x=x_slice,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
 
+        orig_num_tokens = hidden_states.shape[0]
+        strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
 
-        # For Ascend910B in prefill stage, only use the use_all2all-based EP when dp_size > 1.
-        use_all2all = False if (self.is_a2_device and self.dp_size == 1) else use_all2all
-        # For Ascend910B in decode stage, use the allgather-based EP kernel.
-        use_allgather_ep = self.is_a2_device and not use_all2all
-
-        hidden_states = x
-        orig_num_tokens = x.shape[0]
-        did_tp_padding = False
-
-        # When EP is enabled and TP>1, we split tokens across TP ranks before
-        # routing to avoid duplicated work. This is NOT used for the allgather
-        # EP kernel.
-        if layer.moe_parallel_config.use_ep and self.tp_size > 1 and not use_allgather_ep:
-            tp_rank = get_tensor_model_parallel_rank()
-
+        is_need_slice = self.tp_size > 1 and (strategy == "all2all" or strategy == "dispatch_combine")
+        x_slice = hidden_states
+        if is_need_slice:
             padded_num_tokens = -(orig_num_tokens // -self.tp_size) * self.tp_size
             local_num_tokens = padded_num_tokens // self.tp_size
             num_pads = padded_num_tokens - orig_num_tokens
 
             if num_pads > 0:
-                hidden_states = torch.nn.functional.pad(
-                    hidden_states, (0, 0, 0, num_pads), value=0
-                )
-                router_logits = torch.nn.functional.pad(
-                    router_logits, (0, 0, 0, num_pads), value=0
+                x_slice = torch.nn.functional.pad(
+                    x_slice, (0, 0, 0, num_pads), value=0
                 )
 
-            start = tp_rank * local_num_tokens
-            end = (tp_rank + 1) * local_num_tokens
-            hidden_states = hidden_states[start:end]
-            router_logits = router_logits[start:end]
-            did_tp_padding = True
+            start = self.tp_rank * local_num_tokens
+            end = (self.tp_rank + 1) * local_num_tokens
+            x_slice = x_slice[start:end]
+
+        if layer.gate is not None:
+            router_logits, _ = layer.gate(x_slice)
+        else:
+            assert router_logits is not None, "Expected gate or router_logits must be provided."
+            if is_need_slice:
+                if num_pads > 0:
+                    router_logits = torch.nn.functional.pad(
+                        router_logits, (0, 0, 0, num_pads), value=0
+                    )
+                router_logits = router_logits[start:end]
 
         topk_weights, topk_ids = NPUFusedMoE.select_experts(
             router_logits=router_logits,
@@ -145,84 +115,50 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        # Non-EP: fallback to TP implementation.
-        if not self.moe.moe_parallel_config.use_ep:
-            return fused_experts_tp(
-                layer=layer, x=x, topk_ids=topk_ids, topk_weights=topk_weights
-            )
+        prepare_permute_result = self.apply_prepare_permute(
+            strategy_impl, layer, x_slice, topk_ids
+        )
+        output = self.apply_experts(
+            layer=layer,
+            prepare_permute_result=prepare_permute_result,
+            activation=activation,
+        )
 
+        shared_output = None
         if layer.shared_experts is not None:
-            cur_stream = named_stream("current")
+            cur_stream = torch.npu.current_stream()
             sub_stream = named_stream("moe_sub_stream")
             sub_stream.wait_stream(cur_stream)
             with torch.npu.stream(sub_stream):
-                shared_output = layer.shared_experts(x)  
-        else:
-            shared_output = None
+                if layer.shared_experts.gate_up_proj.tp_size > 1:
+                    # Shared experts with TP>1 require full hidden_states;
+                    # output is all-reduced later.
+                    shared_output = layer.shared_experts(hidden_states)
+                else:
+                    shared_output = layer.shared_experts(x_slice)
 
-
-        # EP execution path selection.
-        if use_all2all:
-            output = moe_infer_fusion(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
-        elif use_allgather_ep:
-            if self.dp_size > 1:
-                hidden_states = get_dp_group().all_gather(hidden_states, dim=0)
-                topk_weights = get_dp_group().all_gather(topk_weights, dim=0)
-                topk_ids = get_dp_group().all_gather(topk_ids, dim=0)
-            output = fused_experts_allgather_ep_unquant(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-            )
-        else:
-            output = self.fused_experts(
-                hidden_states=hidden_states,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=True,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-            )
-
-        # TP post-processing (merge results from different TP ranks).
-        if self.tp_size > 1:
-            if use_allgather_ep:
-                if self.dp_size > 1:
-                    output = get_dp_group().reduce_scatter(output,dim=0)
-                output = get_tp_group().all_reduce(output)
-            else:
-                output = tensor_model_parallel_all_gather(output, dim=0)
-                if did_tp_padding:
-                    output = output[:orig_num_tokens]
-
-            if layer.shared_experts is not None:
-                cur_stream.wait_stream(sub_stream)
-                shared_output = tensor_model_parallel_all_reduce(shared_output)
+        routed_output = self.apply_unpermute_finalize(
+            strategy_impl,
+            layer,
+            output,
+            topk_ids,
+            topk_weights,
+            prepare_permute_result,
+        )
 
         if layer.shared_experts is not None:
             cur_stream.wait_stream(sub_stream)
-            return shared_output, output
-        return output
+            if layer.shared_experts.gate_up_proj.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
+                routed_output = routed_output + shared_output
 
-    def maybe_make_prepare_finalize(self, routing_tables) -> Optional[FusedMoEPrepareAndFinalize]:
-        return NpuMoEPrepareAndFinalize(self.moe)
+        if is_need_slice:
+            routed_output = tensor_model_parallel_all_gather(routed_output, dim=0)[:orig_num_tokens]
 
-    def select_gemm_impl(
-        self,
-        prepare_finalize: FusedMoEPrepareAndFinalize,
-        layer: torch.nn.Module,
-    ) -> FusedMoEPermuteExpertsUnpermute:
-        return NPUFusedMoEPermuteExpertsUnpermute(self.moe_quant_config, layer)
+        if shared_output is not None:
+            return shared_output, routed_output
+        return routed_output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
@@ -233,14 +169,27 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         set_weight_attrs(layer.w13_weight, {"is_weight_transposed": True})
         set_weight_attrs(layer.w2_weight, {"is_weight_transposed": True})
 
-    def gmm_expert(self, layer, h, expert_tokens, dynamic_scale=None, avg_tokens_per_expert=None):
+    def apply_experts(
+        self,
+        layer: torch.nn.Module,
+        prepare_permute_result: PreparePermuteResult,
+        activation: str = "silu",
+    ) -> torch.Tensor:
+        hidden_states = prepare_permute_result.hidden_states_sorted_by_experts
+        expert_tokens = prepare_permute_result.expert_tokens.to(torch.int64)
         group_list_type = int(layer.moe_parallel_config.use_ep)
-        mm1_mm3 = torch_npu.npu_grouped_matmul([h], [layer.w13_weight],
-                                               group_list=expert_tokens, split_item=3, group_type=0,
-                                               group_list_type=group_list_type)[0]
-        intermediate_h = torch_npu.npu_swiglu(mm1_mm3)
-        out_hidden = torch_npu.npu_grouped_matmul(
-            [intermediate_h],
+        gate_up_proj = torch_npu.npu_grouped_matmul(
+            [hidden_states],
+            [layer.w13_weight],
+            bias=None,
+            group_list=expert_tokens,
+            split_item=3,
+            group_type=0,
+            group_list_type=group_list_type,
+        )[0]
+        intermediate_hidden_states = torch_npu.npu_swiglu(gate_up_proj)
+        return torch_npu.npu_grouped_matmul(
+            [intermediate_hidden_states],
             [layer.w2_weight],
             bias=None,
             group_list=expert_tokens,
@@ -248,11 +197,23 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             group_type=0,
             group_list_type=group_list_type
         )[0]
-        return out_hidden
 
 
 @FusedMoE.register_oot
 class NPUFusedMoE(FusedMoE):
+    def __init__(self, *args, gate=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._gate = gate
+        self.quant_method.make_communication_strategy_selector(self)
+
+    @property
+    def gate(self):
+        return self._gate
+
+    @property
+    def is_internal_router(self) -> bool:
+        return self.gate is not None
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -318,18 +279,31 @@ class NPUFusedMoE(FusedMoE):
         return tensor_model_parallel_all_reduce(final_hidden_states)
 
     def maybe_init_modular_kernel(self) -> None:
-        self.ensure_moe_quant_config_init()
-        routing_tables = self._maybe_init_expert_routing_tables()
-        prepare_finalize = self.quant_method.maybe_make_prepare_finalize(
-            routing_tables=routing_tables
+        return None
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: Optional[torch.Tensor]):
+        return self.quant_method.apply(
+            layer=self, 
+            hidden_states=hidden_states, 
+            router_logits=router_logits,
+            top_k=self.top_k,
+            renormalize=self.renormalize,
+            use_grouped_topk=self.use_grouped_topk,
+            global_num_experts=self.global_num_experts,
+            expert_map=self.expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            custom_routing_function=self.custom_routing_function,
+            scoring_func=self.scoring_func,
+            routed_scaling_factor=self.routed_scaling_factor,
+            e_score_correction_bias=self.e_score_correction_bias,
+            activation=self.activation,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+            enable_eplb=self.enable_eplb,
+            expert_load_view=getattr(self, "expert_load_view", None),
+            logical_to_physical_map=getattr(self, "logical_to_physical_map", None),
+            logical_replica_count=getattr(self, "logical_replica_count", None),
         )
-        if prepare_finalize is not None:
-            logger.debug(
-                "%s for %s(%s)", prepare_finalize.__class__.__name__, self, id(self)
-            )
-            self.quant_method = FusedMoEModularMethod.make(
-                self, self.quant_method, prepare_finalize, None
-            )
 
     @staticmethod
     def select_experts(
@@ -396,17 +370,3 @@ class NPUFusedMoE(FusedMoE):
 @SharedFusedMoE.register_oot
 class NPUSharedFusedMoE(SharedFusedMoE, NPUFusedMoE):
     pass
-
-
-@FusedMoEModularMethod.register_oot
-class NPUFusedMoEModularMethod(FusedMoEModularMethod):
-
-    def __init__(self, old_quant_method, experts):
-        super().__init__(old_quant_method, experts)
-        self.old_quant_method.fused_experts = self.fused_experts
-
-    def apply(self, *args, **kwargs):
-        return self.old_quant_method.apply(*args, **kwargs)
-
-    def gmm_expert(self, *args, **kwargs):
-        return self.old_quant_method.gmm_expert(*args, **kwargs)

@@ -76,7 +76,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 
-from omni_npu.v1.layers.fused_moe.layer import NPUFusedMoEV1
+from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 logger = init_logger(__name__)
@@ -172,7 +172,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        self.experts = NPUFusedMoEV1(
+        self.experts = NPUSharedFusedMoE(
             shared_experts=None,
             gate=self.gate,
             num_experts=self.n_routed_experts,
@@ -201,10 +201,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        # router_logits: (num_tokens, n_experts)
-        _, final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=None
-        )
+        fused_out = self.experts(hidden_states=hidden_states, router_logits=None)
+        if isinstance(fused_out, tuple):
+            _, final_hidden_states = fused_out
+        else:
+            final_hidden_states = fused_out
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
