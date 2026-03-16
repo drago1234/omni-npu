@@ -68,7 +68,7 @@ class mlaPatch(VLLMPatch):
                 self.topk_tokens = self.indexer.topk_tokens
                 self.topk_indices_buffer = mla_modules.topk_indices_buffer
                 
-            from vllm.attention.layers.static_sink_attention import StaticSinkMLAAttention
+            from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention
             self.mla_attn = StaticSinkMLAAttention(
                 num_heads=self.num_heads,
                 scale=scale,

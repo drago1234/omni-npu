@@ -23,7 +23,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.logger import init_logger
 logger = init_logger(__name__)
 try: # UT won't include pangu_sink_swa_mla patches
-    from vllm.attention.layers.static_sink_attention import StaticSinkMLAAttention, PanguSinkAttentionBase
+    from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention, PanguSinkAttentionBase
     from vllm.model_executor.layers.mome import AggregateConv
 except ImportError:
     logger.warning("PanguSinkAttentionBase has not being defined, skipping...")

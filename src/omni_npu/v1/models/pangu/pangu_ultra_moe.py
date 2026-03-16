@@ -163,7 +163,7 @@ class OpenPanguMoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                disable_tp=self.is_sequence_parallel if config.model_type == "openpangu_v2" else True,
+                disable_tp=True,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
@@ -173,6 +173,7 @@ class OpenPanguMoE(nn.Module):
         if config.model_type == "openpangu_v2":
             self.experts = SharedFusedMoE(
                 shared_experts=self.shared_experts,
+                gate=self.gate,
                 num_experts=config.n_routed_experts,
                 top_k=config.num_experts_per_tok,
                 hidden_size=config.hidden_size,
@@ -186,14 +187,14 @@ class OpenPanguMoE(nn.Module):
                 prefix=f"{prefix}.experts",
                 scoring_func="sigmoid",
                 # we do scaling outside, set factor to 1.0 to avoid double mul
-                routed_scaling_factor=1.0,
+                routed_scaling_factor=self.routed_scaling_factor,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 enable_eplb=self.enable_eplb,
                 num_redundant_experts=self.n_redundant_experts,
                 is_sequence_parallel=self.is_sequence_parallel,
             )
         else:
-            self.experts = NPUSharedFusedMoE(
+            self.experts = SharedFusedMoE(
                 shared_experts=self.shared_experts,
                 num_experts=config.n_routed_experts,
                 top_k=config.num_experts_per_tok,
@@ -224,35 +225,18 @@ class OpenPanguMoE(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
-        if self.model_type == "openpangu_v2":
-            router_logits, _ = self.gate(hidden_states)
-            fused_moe_out = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
-        else:
-            fused_moe_out = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
-            )
+
+        fused_moe_out = self.experts(
+            hidden_states=hidden_states, router_logits=hidden_states
+        )
 
         shared_output, final_hidden_states = fused_moe_out
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states *= self.routed_scaling_factor
-        elif self.shared_experts is not None:
-            assert shared_output is not None
-            shared_output *= 1.0 / self.routed_scaling_factor
-        if self.shared_experts is not None:
-            assert shared_output is not None
-            final_hidden_states += shared_output
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
-                final_hidden_states
-            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -662,6 +646,7 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
         stacked_params_mapping.extend(mla_params_mapping)
 
         expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

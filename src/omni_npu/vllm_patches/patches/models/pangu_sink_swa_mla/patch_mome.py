@@ -13,6 +13,7 @@ from vllm.model_executor import layers
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.forward_context import get_forward_context
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
@@ -21,7 +22,6 @@ logger = init_logger(__name__)
 dynamic_module = types.ModuleType("mome")
 sys.modules[layers.__name__ + ".mome"] = dynamic_module
 layers.mome = dynamic_module
-
 
 @register_patch("MoMEPatch", layers)
 class MoMEPatch(VLLMPatch):

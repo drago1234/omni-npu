@@ -94,6 +94,65 @@ def _patched_mark_dynamic():
     _dec_mododule._support_torch_compile = new_torch_compile["_support_torch_compile"]
     logger.debug("<<< _patched_mark_dynamic applied!")
 
+
+def _patch_piecewise_backend():
+    import vllm.compilation.piecewise_backend as _piecewise_module
+    from vllm.config.utils import Range
+
+    if getattr(_piecewise_module.PiecewiseBackend, "_omni_npu_patched", False):
+        return
+
+    original_call = _piecewise_module.PiecewiseBackend.__call__
+
+    def _infer_runtime_shape_from_args(args):
+        for arg in args:
+            if hasattr(arg, "shape") and len(arg.shape) > 0:
+                return int(arg.shape[0])
+        return None
+
+    def _get_fallback_range_entry(self, args):
+        runtime_shape = _infer_runtime_shape_from_args(args)
+        if runtime_shape is not None:
+            range_entry = self._find_range_for_shape(runtime_shape)
+            if range_entry is not None:
+                return range_entry
+
+            range = Range(start=runtime_shape, end=runtime_shape)
+            if range not in self.range_entries:
+                self.range_entries[range] = _piecewise_module.RangeEntry(
+                    compile_range=range
+                )
+                self.to_be_compiled_ranges.add(range)
+            return self.range_entries[range]
+
+        if self.compile_sizes:
+            range = Range(start=self.compile_sizes[0], end=self.compile_sizes[0])
+            return self.range_entries[range]
+
+        if self.compile_ranges:
+            return self.range_entries[self.compile_ranges[0]]
+
+        raise RuntimeError(
+            "Cannot determine fallback compile range for piecewise graph"
+        )
+
+    @functools.wraps(original_call)
+    def _patched_call(self, *args):
+        if not self.sym_shape_indices:
+            logger.warning_once(
+                "PiecewiseBackend received a graph without SymInt inputs; "
+                "falling back to a single compiled variant."
+            )
+            range_entry = _get_fallback_range_entry(self, args)
+            self._maybe_compile_for_range_entry(range_entry, args)
+            return range_entry.runnable(*args)
+
+        return original_call(self, *args)
+
+    _piecewise_module.PiecewiseBackend.__call__ = _patched_call
+    _piecewise_module.PiecewiseBackend._omni_npu_patched = True
+    logger.debug("<<< PiecewiseBackend.__call__ patched!")
+
 def patch_compile_decorators():
     import os
     use_gegraph = os.getenv("TORCH_COMPILE_GE", "False").lower() == "true"
@@ -101,6 +160,7 @@ def patch_compile_decorators():
         logger.debug("<<< patch_compile_decorators:use ge graph!")
         _dec_mododule._support_torch_compile = support_ge_compile
     else:
+        _patch_piecewise_backend()
         _patched_mark_dynamic()
         _original_decorator = _dec_mododule._support_torch_compile
         def _patched_support_torch_compile(cls, *args, **kwargs):
