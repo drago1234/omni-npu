@@ -150,12 +150,20 @@ class NPUAttentionBackend(AttentionBackend):
     def reshape_kv_cache(
         raw_tensor: torch.Tensor,
         num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        dtype: torch.dtype = torch.bfloat16,
-        head_size_v: int | None = None,
+        kv_cache_spec: AttentionSpec,
     ) -> Tuple[torch.Tensor, ...]:
+        block_size = kv_cache_spec.block_size
+        num_kv_heads = kv_cache_spec.num_kv_heads
+        head_size = kv_cache_spec.head_size
+        dtype = kv_cache_spec.dtype
+        if (hasattr(kv_cache_spec, "head_size_v")
+            and kv_cache_spec.head_size_v is not None
+            and kv_cache_spec.head_size_v != kv_cache_spec.head_size
+        ):
+            head_size_v = kv_cache_spec.head_size_v
+        else:
+            head_size_v = None
+
         raw_tensor = raw_tensor.view(dtype=dtype)
         shape = NPUAttentionBackend.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
         if head_size_v is None or head_size == head_size_v:

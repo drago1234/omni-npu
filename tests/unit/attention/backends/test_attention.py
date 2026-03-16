@@ -17,6 +17,7 @@ import types
 import torch_npu
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionImpl, AttentionLayer, AttentionType
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 
 def create_mock_modules(name: str, pure_mock: bool = False):
@@ -122,7 +123,7 @@ def npu_attention_classes(monkeypatch):
     monkeypatch.setitem(sys.modules,
                         "vllm.distributed.parallel_state.get_pcp_group",
                         lambda: fake_pcp)
-    
+
     mock_forward_ctx = MagicMock()
     mock_forward_ctx.capturing = False
     mock_forward_ctx.batch_descriptor = None
@@ -191,8 +192,14 @@ class TestNPUAttentionBackendDefault(unittest.TestCase):
         self.assertEqual(shape, (10, 16, 512))  # 4 * 128 = 512
 
         raw = torch.randn(2 * 10 * 16 * 512, dtype=torch.bfloat16)
+        kv_cache_spec = AttentionSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
         k_cache, v_cache = self.impl_interface_cls.reshape_kv_cache(
-            raw, num_blocks=10, block_size=16, num_kv_heads=4, head_size=128, dtype=torch.bfloat16
+            raw, num_blocks=10, kv_cache_spec=kv_cache_spec,
         )
         self.assertEqual(k_cache.shape, (10, 16, 512))
         self.assertEqual(v_cache.shape, (10, 16, 512))

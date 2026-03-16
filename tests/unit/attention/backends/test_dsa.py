@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm.v1.kv_cache_interface import AttentionSpec
 import omni_npu.attention.backends.dsa as mla_mod
 
 
@@ -20,13 +21,16 @@ class TestNPUDSABackend(unittest.TestCase):
 
         raw = torch.zeros((total,), dtype=torch.bfloat16)
 
-        out = mla_mod.NPUDSABackend.reshape_kv_cache(
-            raw_tensor=raw,
-            num_blocks=num_blocks,
+        kv_cache_spec = AttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
             head_size=128,
             dtype=torch.bfloat16,
+        )
+        out = mla_mod.NPUDSABackend.reshape_kv_cache(
+            raw_tensor=raw,
+            num_blocks=num_blocks,
+            kv_cache_spec=kv_cache_spec,
         )
         self.assertEqual(len(out), 3)
         self.assertEqual(tuple(out[0].shape), shapes[0])
@@ -35,14 +39,17 @@ class TestNPUDSABackend(unittest.TestCase):
 
     def test_reshape_kv_cache_raises_when_numel_mismatch(self):
         raw = torch.zeros((123,), dtype=torch.bfloat16)
+        kv_cache_spec = AttentionSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
         with self.assertRaises(RuntimeError):
             _ = mla_mod.NPUDSABackend.reshape_kv_cache(
                 raw_tensor=raw,
                 num_blocks=1,
-                block_size=1,
-                num_kv_heads=1,
-                head_size=128,
-                dtype=torch.bfloat16,
+                kv_cache_spec=kv_cache_spec,
             )
 
 

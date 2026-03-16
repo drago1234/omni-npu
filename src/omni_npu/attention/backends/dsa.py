@@ -62,11 +62,10 @@ class NPUDSABackend(MLACommonBackend):
     def reshape_kv_cache(
         raw_tensor: torch.Tensor,
         num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        dtype: torch.dtype = torch.bfloat16,
+        kv_cache_spec: AttentionSpec,
     ) -> Tuple[torch.Tensor, ...]:
+        block_size = kv_cache_spec.block_size
+        dtype = kv_cache_spec.dtype
         raw_tensor = raw_tensor.view(dtype=dtype)
         shapes = [(num_blocks, block_size, 1, 512), (num_blocks, block_size, 1, 64), (num_blocks, block_size, 1, 128)]
         sizes = [math.prod(shape) for shape in shapes]

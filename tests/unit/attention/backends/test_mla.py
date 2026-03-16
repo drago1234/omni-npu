@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionImpl, AttentionLayer, AttentionType
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 
 @pytest.fixture(scope="module")
@@ -209,13 +210,16 @@ class TestNPUAttentionBackendMLAUtilsFunc(unittest.TestCase):
         total_bytes = total_bf16_elements * 2
         raw_tensor = torch.empty(total_bytes, dtype=torch.uint8)
 
-        result = backend.reshape_kv_cache(
-            raw_tensor=raw_tensor,
-            num_blocks=num_blocks,
+        kv_cache_spec = AttentionSpec(
             block_size=block_size,
             num_kv_heads=8,
             head_size=128,
             dtype=dtype,
+        )
+        result = backend.reshape_kv_cache(
+            raw_tensor=raw_tensor,
+            num_blocks=num_blocks,
+            kv_cache_spec=kv_cache_spec,
         )
 
         self.assertIsInstance(result, tuple)

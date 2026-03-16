@@ -218,18 +218,10 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     kwargs = {}
-                    if (hasattr(kv_cache_spec, "head_size_v")
-                        and kv_cache_spec.head_size_v is not None
-                        and kv_cache_spec.head_size_v != kv_cache_spec.head_size
-                    ):
-                        kwargs = {"head_size_v": kv_cache_spec.head_size_v}
                     kv_cache_tensors = attn_backend.reshape_kv_cache(
                         raw_tensor,
                         num_blocks,
-                        kv_cache_spec.block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        dtype=kv_cache_spec.dtype,
+                        kv_cache_spec,
                         **kwargs,
                     )
                     kv_caches[layer_name] = kv_cache_tensors

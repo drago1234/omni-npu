@@ -70,7 +70,7 @@ class TestNPUModelRunner:
 
     def test_npu_runner_init(self, monkeypatch):
         """Test NPUModelRunner initialization.
-        
+
         Verifies that the runner is properly initialized with correct device,
         buffer types and shapes, and NPU-specific components.
         """
@@ -319,11 +319,10 @@ class TestNPUModelRunner:
                 self.reshape_kv_cache_called = False
                 self.kwargs = {}
 
-            def reshape_kv_cache(self, raw_tensor, num_blocks, block_size,
-                                 num_kv_heads, head_size, dtype, **kwargs):
+            def reshape_kv_cache(self, raw_tensor, num_blocks, kv_cache_spec):
                 self.reshape_kv_cache_called = True
-                self.kwargs = kwargs
-                return torch.ones(3, 3, dtype=dtype)
+                self.head_size_v = kv_cache_spec.head_size_v
+                return torch.ones(3, 3, dtype=kv_cache_spec.dtype)
 
         backend = DummyBackend()
 
@@ -360,8 +359,7 @@ class TestNPUModelRunner:
 
         # Verify reshape_kv_cache was called with head_size_v in kwargs
         assert backend.reshape_kv_cache_called
-        assert "head_size_v" in backend.kwargs
-        assert backend.kwargs["head_size_v"] == 8
+        assert backend.head_size_v == 8
 
     @pytest.mark.skip(reason="Skipping test_load_model_with_gegraph due to mock conflicts")
     def test_load_model_with_gegraph(self, monkeypatch):
@@ -617,7 +615,7 @@ class TestNPUModelRunner:
 
     def test_reshape_kv_cache_tensors(self, monkeypatch):
         """Test _reshape_kv_cache_tensors method.
-        
+
         Verifies that KV cache tensors are properly reshaped using the backend,
         with correct parameters passed and results returned.
         """
@@ -635,12 +633,11 @@ class TestNPUModelRunner:
             def __init__(self):
                 self.output = None
 
-            def reshape_kv_cache(self, raw_tensor, num_blocks, block_size,
-                                 num_kv_heads, head_size, dtype):
-                self.output = (raw_tensor, num_blocks, block_size,
-                               num_kv_heads, head_size, dtype)
+            def reshape_kv_cache(self, raw_tensor, num_blocks, kv_cache_spec):
+                self.output = (raw_tensor, num_blocks, kv_cache_spec.block_size,
+                               kv_cache_spec.num_kv_heads, kv_cache_spec.head_size, kv_cache_spec.dtype)
                 # Return an easily identifiable tensor
-                return torch.ones(3, 3, dtype=dtype)
+                return torch.ones(3, 3, dtype=kv_cache_spec.dtype)
 
         backend = DummyBackend()
 
@@ -691,7 +688,7 @@ class TestNPUModelRunner:
 
     def test_get_kv_cache_spec(self, monkeypatch):
         """Test get_kv_cache_spec method with MLA configuration.
-        
+
         Verifies that when use_mla is True and index_topk is present,
         MLAAttentionSpec is correctly created for each attention layer.
         """
@@ -780,7 +777,7 @@ class TestNPUModelRunner:
 
     def test_load_model(self, monkeypatch):
         """Test load_model method calls super().load_model and possible ACLGraphWrapper wrapping.
-        
+
         Verifies that load_model properly delegates to parent class and handles
         compilation configuration.
         """
@@ -888,7 +885,7 @@ class TestNPUModelRunner:
 
     def test_load_model_with_cudagraph(self, monkeypatch):
         """Test load_model creates ACLGraphWrapper when cudagraph is enabled.
-        
+
         Verifies that when cudagraph mode is enabled, the model is wrapped
         with ACLGraphWrapper and update_stream is properly set.
         """
@@ -1011,7 +1008,7 @@ class TestNPUModelRunner:
     def test_reshape_kv_cache_tensors_skip_runner_only_layers(
             self, monkeypatch):
         """Test runner_only_attn_layers skip logic (covers line 88).
-        
+
         Verifies that layers in runner_only_attn_layers are skipped during
         KV cache tensor reshaping.
         """
@@ -1059,7 +1056,7 @@ class TestNPUModelRunner:
 
     def test_reshape_kv_cache_tensors_mamba_spec(self, monkeypatch):
         """Test MambaSpec branch (covers lines 104-107).
-        
+
         Verifies that when MambaSpec is encountered, a NotImplementedError
         is raised as Mamba functionality is still in progress.
         """
@@ -1096,7 +1093,7 @@ class TestNPUModelRunner:
 
     def test_reshape_kv_cache_tensors_unknown_spec(self, monkeypatch):
         """Test unknown spec type (covers line 107 else branch).
-        
+
         Verifies that when an unknown spec type is encountered,
         a NotImplementedError is raised.
         """
@@ -1135,7 +1132,7 @@ class TestNPUModelRunner:
     def test_reshape_kv_cache_tensors_hybrid_attention_mamba(
             self, monkeypatch):
         """Test hybrid attention and mamba layout update (covers line 110, 120).
-        
+
         Note: Since MambaSpec raises an exception in the code logic, has_mamba
         is difficult to set to True in practice. This test directly mocks the
         method's internal state to test _update_hybrid_attention_mamba_layout calls.
@@ -1221,12 +1218,7 @@ class TestNPUModelRunner:
                     if isinstance(kv_cache_spec, AttentionSpec):
                         has_attn = True
                         kv_cache_tensors = attn_backend.reshape_kv_cache(
-                            raw_tensor,
-                            64,
-                            kv_cache_spec.block_size,
-                            kv_cache_spec.num_kv_heads,
-                            kv_cache_spec.head_size,
-                            dtype=kv_cache_spec.dtype,
+                            raw_tensor, 64, kv_cache_spec,
                         )
                         kv_caches[layer_name] = kv_cache_tensors
                     elif isinstance(kv_cache_spec, MambaSpec):
@@ -1254,7 +1246,7 @@ class TestNPUModelRunner:
 
     def test_get_kv_cache_spec_fallback(self, monkeypatch):
         """Test get_kv_cache_spec fallback branch (covers line 130).
-        
+
         Verifies that when use_mla is False, the method falls back to
         calling super().get_kv_cache_spec().
         """
@@ -1278,7 +1270,7 @@ class TestNPUModelRunner:
 
     def test_get_model_with_acl_graph_wrapper(self, monkeypatch):
         """Test get_model with ACLGraphWrapper branch (covers line 187).
-        
+
         Verifies that when model is wrapped with ACLGraphWrapper,
         get_model correctly unwraps and returns the underlying model.
         """
@@ -1797,11 +1789,11 @@ class TestNPUModelRunner:
 
             # Test skip_eplb=False
             self.runner._dummy_run(num_tokens=10, skip_eplb=False)
-            assert eplb_called["called"] is True    
+            assert eplb_called["called"] is True
 
     def test_kv_cache_sink_attn_after_wake_up_normal_case(self, monkeypatch):
         """Test _kv_cache_sink_attn_after_wake_up with normal StaticSinkAttention module.
-        
+
         Verifies that the method correctly processes StaticSinkAttention modules,
         calls populate_sink_kv, and invokes reinit_block_table_with_sink on builders
         """
@@ -1845,14 +1837,14 @@ class TestNPUModelRunner:
 
     def test_kv_cache_sink_attn_after_wake_up_empty_kv_cache(self, monkeypatch):
         """Test _kv_cache_sink_attn_after_wake_up with empty KV cache.
-        
+
         Verifies that the method handles empty KV cache gracefully without errors.
         """
         # Create a mock StaticSinkAttention module with empty KV cache
         class MockStaticSinkAttention:
             def __init__(self):
                 self.kv_cache = [None]
-        
+
         mock_module = MockStaticSinkAttention()
 
         # Setup mock KV cache config and attention groups
@@ -1879,7 +1871,7 @@ class TestNPUModelRunner:
 
     def test_kv_cache_sink_attn_after_wake_up_builder_without_reinit_method(self, monkeypatch):
         """Test _kv_cache_sink_attn_after_wake_up with builder that doesn't have reinit method.
-        
+
         Verifies that the method gracefully handles attention builders without errors.
         """
         # Create a mock StaticSinkAttention module with empty KV cache
@@ -1893,7 +1885,7 @@ class TestNPUModelRunner:
 
             def populate_sink_kv(self, k_cache, v_cache):
                 self.populate_sink_kv_called = True
-        
+
         mock_module = MockStaticSinkAttention()
 
         # Setup mock KV cache config and attention groups
