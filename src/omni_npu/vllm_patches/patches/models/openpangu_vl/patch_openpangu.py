@@ -6,7 +6,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.v1.attention.backend import AttentionType
-from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkAttention
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -258,7 +257,10 @@ class openpanguPatch(VLLMPatch):
             else:
                 sliding_window = None
 
-            self.attn = StaticSinkAttention(
+            # Resolve StaticSinkAttention at runtime so we pick patched symbol.
+            from vllm.attention import layer as attn_layer
+
+            self.attn = attn_layer.StaticSinkAttention(
                 self.num_heads,
                 self.head_dim,
                 self.scaling,
@@ -608,6 +610,7 @@ class OpenPanguModelPatch(VLLMPatch):
         has_experts = hasattr(self.config, "n_routed_experts")
         if has_experts:
             expert_merge_mapping = SharedFusedMoE.make_expert_params_mapping(
+                self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",

@@ -213,4 +213,12 @@ class GPUModelRunner(VLLMPatch):
 
             return mm_embeds, is_mm_embed
         else:
-            _original_gather_mm_embeddings(self, scheduler_output, shift_computed_tokens)
+            # Ensure multimodal attributes are initialized before calling original method
+            if not hasattr(self, 'is_mm_embed_idx'):
+                self.is_mm_embed_idx = 0
+            if not hasattr(self, 'is_mm_embed_buffers'):
+                self.is_mm_embed_buffers = [
+                    self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+                    self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+                ]
+            return _original_gather_mm_embeddings(self, scheduler_output, shift_computed_tokens)

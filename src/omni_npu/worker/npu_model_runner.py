@@ -76,6 +76,9 @@ class NPUModelRunner(GPUModelRunner):
         with switch_torch_device():
             super().__init__(vllm_config, device)
 
+        # is_mm_prefix_lm is used in _build_attention_metadata
+        self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
+
         # enable mtp acl graph mode
         if self.speculative_config and isinstance(self.drafter, EagleProposer):
             if self.compilation_config.mode == CompilationMode.VLLM_COMPILE:

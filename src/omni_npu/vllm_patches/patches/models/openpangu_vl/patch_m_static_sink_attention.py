@@ -5,9 +5,9 @@ import sys
 import torch
 import torch_npu
 
-from vllm.attention.selector import get_attn_backend
+from vllm.v1.attention.selector import get_attn_backend
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.attention.backends.abstract import (
+from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     AttentionType,
@@ -25,7 +25,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     SinkFullAttentionSpec,
 )
-from vllm.attention import layers
+import vllm.attention.layer as layers
+
 from vllm.platforms import current_platform
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
@@ -133,6 +134,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
             sink_len: int,
             attn_backend: type[AttentionBackend] | None = None,
             cache_config: CacheConfig | None = None,
+            quant_config=None,
             **kwargs,
         ):
             dtype = torch.get_default_dtype()
@@ -159,6 +161,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
                 head_size=head_size,
                 scale=scale,
                 cache_config=cache_config,
+                quant_config=quant_config,
                 attn_backend=attn_backend,
                 **kwargs,
             )
@@ -188,7 +191,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
                 forward_context: ForwardContext = get_forward_context()
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
                 if self_kv_cache is not None and len(self_kv_cache) > 0:
-                    torch.ops.vllm.maybe_populate_sink(self_kv_cache[0], self_kv_cache[1], self.layer_name)
+                    torch.ops.vllm.maybe_populate_sink_npu(self_kv_cache[0], self_kv_cache[1], self.layer_name)
 
             return super().forward(query, key, value, output_shape)
 
@@ -256,7 +259,7 @@ class maybe_populate_sinkPatch(VLLMPatch):
 
 
     direct_register_custom_op(
-        op_name="maybe_populate_sink",
+        op_name="maybe_populate_sink_npu",
         op_func=maybe_populate_sink,
         mutates_args=["self_k_cache", "self_v_cache"],
         fake_impl=maybe_populate_sink_fake,

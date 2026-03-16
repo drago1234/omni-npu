@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from vllm.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.platforms import current_platform
 from vllm.attention.utils.kv_sharing_utils import validate_kv_sharing_target
 import vllm.envs as envs
@@ -84,9 +84,16 @@ class AttentionPatch(VLLMPatch):
             f"num_heads ({num_heads}) is not divisible by num_kv_heads ({num_kv_heads})"
         )
 
+        self.quant_config = quant_config
+        self.layer_name = prefix
+
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(
-            self, quant_config, prefix, kv_cache_dtype, calculate_kv_scales
+            self,
+            self.quant_config,
+            self.layer_name,
+            kv_cache_dtype,
+            calculate_kv_scales,
         )
 
         self.num_heads = num_heads
@@ -173,7 +180,7 @@ class AttentionPatch(VLLMPatch):
         self.query_quant = None
         if (
             self.kv_cache_dtype.startswith("fp8")
-            and self.impl.supports_quant_query_input()
+            and self.impl.supports_quant_query_input
         ):
             self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
 
@@ -208,7 +215,7 @@ class AttentionPatch(VLLMPatch):
             assert self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
 
             # check if query quantization is supported
-            if self.impl.supports_quant_query_input():
+            if self.impl.supports_quant_query_input:
                 query, _ = self.query_quant(query, self._q_scale)
 
         if self.use_output:
