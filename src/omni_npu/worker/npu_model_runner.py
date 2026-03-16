@@ -30,6 +30,8 @@ from vllm.forward_context import BatchDescriptor, set_forward_context, get_forwa
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.models.utils import extract_layer_index
+
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -255,13 +257,28 @@ class NPUModelRunner(GPUModelRunner):
             layer_type = cast(type[Any], AttentionLayerBase)
             attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
             for layer_name, attn_module in attn_layers.items():
-                kv_cache_spec[layer_name] = MLAAttentionSpec(
-                    block_size=self.vllm_config.cache_config.block_size,
-                    num_kv_heads=1,
-                    head_size=attn_module.head_size + indexer_head_size,
-                    dtype=kv_cache_dtype_str_to_dtype(self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config),
-                    cache_dtype_str=self.vllm_config.cache_config.cache_dtype
-                )
+                config = self.vllm_config.model_config.hf_config
+                is_dsa = not hasattr(config, "dsa_layers") or extract_layer_index(layer_name) in config.dsa_layers
+                head_size = (attn_module.head_size if hasattr(attn_module, 'head_size') else attn_module.head_dim) + \
+                    (indexer_head_size if is_dsa else 0)
+                if not getattr(attn_module, 'sink_len', 0):
+                    kv_cache_spec[layer_name] = MLAAttentionSpec(
+                        block_size=self.vllm_config.cache_config.block_size,
+                        num_kv_heads=1,
+                        head_size=head_size,
+                        dtype=kv_cache_dtype_str_to_dtype(self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config),
+                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                    )
+                else:
+                    from vllm.v1.kv_cache_interface import SinkMLAAttentionSpec
+                    kv_cache_spec[layer_name] = SinkMLAAttentionSpec(
+                        block_size=self.vllm_config.cache_config.block_size,
+                        num_kv_heads=1,
+                        head_size=head_size,
+                        dtype=kv_cache_dtype_str_to_dtype(self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config),
+                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                        sink_len=attn_module.sink_len,
+                    )
             return kv_cache_spec
         else:
             return super().get_kv_cache_spec()

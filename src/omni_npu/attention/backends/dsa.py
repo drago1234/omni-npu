@@ -154,8 +154,8 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             metadata.slot_mapping = self._align_slot_mapping(metadata.slot_mapping, metadata.num_reqs)
 
         if metadata.prefill is not None:
-            metadata.prefill.seq_lens = metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1]
             metadata.prefill.query_cumlens = torch.cumsum(metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1], dim=0)
+            metadata.prefill.seq_lens = common_attn_metadata.seq_lens[-metadata.prefill.query_cumlens.shape[0]:]
 
         if metadata.prefill is not None and metadata.prefill.chunked_context is not None:
             raise RuntimeError(f"Chunked prefill is not enabled yet.")
@@ -233,6 +233,9 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
                 "NPUDSAImpl"
             )
 
+    def update_sink_kv(self, sink_k_pe: torch.Tensor, sink_compressed_kv: torch.Tensor) -> None:
+        self.sink_len = sink_compressed_kv.shape[0]
+
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         x = x.transpose(0, 1)
         x = x.view(self.num_heads, -1, self.kv_lora_rank)
@@ -266,21 +269,23 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]],
         attn_metadata: NPUDSAMetadata,
     ):
-        if attn_metadata.prefill is not None:
-            metadata = attn_metadata.prefill
-        else:
-            metadata = attn_metadata.decode
-
-        actual_seq_lens_query = metadata.query_cumlens.to(torch.int32)
-        actual_seq_lens_key = metadata.seq_lens.to(torch.int32)
-        block_table = metadata.block_table
-
+        block_table, actual_seq_lens_key, actual_seq_lens_query = \
+            self.get_args_from_attn_metadata(attn_metadata)
         bs = q_nope.shape[0]
-        return torch_npu.npu_sparse_flash_attention(
+        sparse_indices = self.indexer.topk_indices_buffer[:bs].view(
+            bs, 1, self.indexer.topk_tokens)
+
+        if self.sink_len:
+            sink_indices = torch.arange(self.sink_len, device=sparse_indices.device,
+                                        dtype=sparse_indices.dtype).expand(bs, 1, self.sink_len)
+            mask = (sparse_indices != -1).to(sparse_indices.dtype)
+            sparse_indices = torch.concat((sink_indices, sparse_indices + mask * self.sink_len), dim=2)
+
+        return torch.ops.custom.npu_sparse_flash_attention_enhance(
             query=q_nope,
             key=kv_cache[0],
             value=kv_cache[0],
-            sparse_indices=self.indexer.topk_indices_buffer[:bs].view(bs, 1, self.indexer.topk_tokens),
+            sparse_indices=sparse_indices,
             scale_value=self.scale,
             sparse_block_size=1,
             block_table=block_table,
@@ -354,42 +359,43 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
             and attn_metadata.num_decode_tokens is not None
         )
 
-        has_decode = attn_metadata.num_decodes > 0
-        has_prefill = attn_metadata.num_prefills > 0
-        num_decode_tokens = attn_metadata.num_decode_tokens
-
-        decode_q = q[:num_decode_tokens]
-        prefill_q = q[num_decode_tokens:]
-
         # write the latent and rope to kv cache
         if k_nope.numel() > 0:
             slots = attn_metadata.slot_mapping.view(-1, 1)
             torch_npu.npu_scatter_nd_update_(k_nope.view(-1, k_nope.shape[-1]), slots, k_c_normed)
             torch_npu.npu_scatter_nd_update_(k_rope.view(-1, k_rope.shape[-1]), slots, k_pe.squeeze(1))
 
-        if has_prefill:
-            assert attn_metadata.prefill is not None
-            # do attn absorb prolog
-            q_nope, q_pe = self._absorb_prolog(prefill_q)
+        # do attn absorb prolog
+        q_nope, q_pe = self._absorb_prolog(q)
+        # call attn
+        attn_out = self._apply_sparse_attention(
+            q_nope, q_pe, kv_cache, attn_metadata
+        )
+        # v_up projection
+        self._v_up_proj(attn_out, out=output)
 
-            # call prefill attn
-            attn_out = self._apply_sparse_attention(
-                q_nope, q_pe, kv_cache, attn_metadata
-            )
-
-            # v_up projection
-            self._v_up_proj(attn_out, out=output[num_decode_tokens:])
-
-        if has_decode:
-            assert attn_metadata.decode is not None
-            # do attn absorb prolog
-            q_nope, q_pe = self._absorb_prolog(decode_q)
-
-            # call decode attn
-            attn_out = self._apply_sparse_attention(
-                q_nope, q_pe, kv_cache, attn_metadata
-            )
-
-            # v_up projection
-            self._v_up_proj(attn_out, out=output[:num_decode_tokens])
         return output_padded
+
+    @staticmethod
+    def get_args_from_attn_metadata(attn_metadata: NPUDSAMetadata):
+        if attn_metadata.num_decodes > 0:
+            decode_block_table = attn_metadata.decode.block_table
+            decode_seq_lens = attn_metadata.decode.seq_lens
+        else:
+            decode_block_table = torch.empty((0, attn_metadata.prefill.block_table.shape[1]),
+                device=attn_metadata.prefill.block_table.device, dtype=attn_metadata.prefill.block_table.dtype)
+            decode_seq_lens = torch.empty((0,),
+                device=attn_metadata.prefill.seq_lens.device, dtype=attn_metadata.prefill.seq_lens.dtype)
+        if attn_metadata.num_prefills > 0:
+            prefill_block_table = attn_metadata.prefill.block_table
+            prefill_seq_lens = attn_metadata.prefill.seq_lens
+        else:
+            prefill_block_table = torch.empty((0, attn_metadata.decode.block_table.shape[1]),
+                device=attn_metadata.decode.block_table.device, dtype=attn_metadata.decode.block_table.dtype)
+            prefill_seq_lens = torch.empty((0,),
+                device=attn_metadata.decode.seq_lens.device, dtype=attn_metadata.decode.seq_lens.dtype)
+
+        block_table = torch.concat((decode_block_table, prefill_block_table))
+        actual_seq_lens_key = torch.concat((decode_seq_lens, prefill_seq_lens)).to(torch.int32)
+        actual_seq_lens_query = attn_metadata.query_start_loc.to(torch.int32)[1:]
+        return (block_table, actual_seq_lens_key, actual_seq_lens_query)

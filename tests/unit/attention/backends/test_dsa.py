@@ -110,13 +110,14 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
                 self.num_actual_tokens = 0
                 self.num_reqs = 0
                 self.slot_mapping = torch.tensor([], dtype=torch.long)
+                self.seq_lens = torch.tensor([2, 3], dtype=torch.long)
 
         fake_meta = _Meta()
 
         fake_opt_cfg = SimpleNamespace(use_omni_cache=False)
         with patch.object(mla_mod.MLACommonMetadataBuilder, "build", return_value=fake_meta), \
              patch.object(mla_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True):
-            out = b.build(common_prefix_len=0, common_attn_metadata=MagicMock(), fast_build=False)
+            out = b.build(common_prefix_len=0, common_attn_metadata=fake_meta, fast_build=False)
 
         self.assertIs(out, fake_meta)
         self.assertTrue(torch.equal(out.prefill.seq_lens, torch.tensor([2, 3], dtype=torch.long)))
@@ -323,8 +324,253 @@ class TestNPUDSAImplForward(unittest.TestCase):
             )
 
         self.assertEqual(scatter_calls["n"], 2, "should scatter into k_nope and k_rope once each")
-        self.assertEqual(impl._apply_sparse_attention.call_count, 2, "prefill + decode should call attention twice")
+        self.assertEqual(impl._apply_sparse_attention.call_count, 1, "prefill + decode should call attention once")
         self.assertIs(out, output, "should return padded output tensor")
+
+    def test_forward_with_both_prefill_and_decode_with_sink(self):
+        """Test forward() when both prefill and decode paths are present."""
+        impl = self._new_impl_stub()
+
+        class _Decode:
+            def __init__(self):
+                self.query_cumlens = torch.tensor([1, 1], dtype=torch.int32)
+                self.seq_lens = torch.tensor([5, 6], dtype=torch.int32)
+                self.block_table = torch.zeros((2, 4), dtype=torch.int32)
+                self.dcp_tot_seq_lens = None
+                self.mc2_mask = None
+
+        class _Prefill:
+            def __init__(self):
+                self.query_cumlens = torch.tensor([3], dtype=torch.int32)
+                self.seq_lens = torch.tensor([7], dtype=torch.int32)
+                self.block_table = torch.zeros((1, 4), dtype=torch.int32)
+                self.query_start_loc = torch.tensor([0, 3], dtype=torch.long)
+                self.chunked_context = None
+
+        meta = SimpleNamespace()
+        meta.num_actual_tokens = 5
+        meta.num_decodes = 2
+        meta.num_prefills = 1
+        meta.num_decode_tokens = 2
+        meta.decode = _Decode()
+        meta.prefill = _Prefill()
+        meta.slot_mapping = torch.tensor([0, 1, 2, 3, 4], dtype=torch.long)
+
+        # inputs: 2 decode tokens + 3 prefill tokens = 5 total tokens
+        q = torch.randn((5, impl.num_heads, impl.qk_nope_head_dim + impl.qk_rope_head_dim), dtype=torch.float32)
+        k_c_normed = torch.randn((5, impl.qk_nope_head_dim + impl.v_head_dim), dtype=torch.float32)
+        k_pe = torch.randn((5, 1, impl.qk_rope_head_dim), dtype=torch.float32)
+
+        # kv cache
+        k_nope = torch.zeros((15, impl.qk_nope_head_dim + impl.v_head_dim), dtype=torch.float32)
+        k_rope = torch.zeros((15, impl.qk_rope_head_dim), dtype=torch.float32)
+        kv_cache = (k_nope, k_rope, torch.zeros((1,), dtype=torch.float32))
+
+        # sink
+        impl.sink_len = 128
+
+        # output: matching the input size
+        output = torch.zeros((5, impl.num_heads * impl.v_head_dim), dtype=torch.float32)
+
+        # track scatter calls
+        scatter_calls = {"n": 0}
+
+        def _fake_scatter(dst, slots, src):
+            scatter_calls["n"] += 1
+            return dst
+
+        def _fake_attn(q_nope, q_pe, kv_cache_arg, attn_meta_arg):
+            return torch.randn((q_nope.shape[0], impl.num_heads, impl.kv_lora_rank), dtype=torch.float32)
+
+        impl._apply_sparse_attention = MagicMock(side_effect=_fake_attn)
+
+        with patch.object(mla_mod.torch_npu, "npu_scatter_nd_update_", side_effect=_fake_scatter):
+            out = mla_mod.NPUDSAImpl.forward(
+                impl,
+                layer=MagicMock(),
+                q=q,
+                k_c_normed=k_c_normed,
+                k_pe=k_pe,
+                kv_cache=kv_cache,
+                attn_metadata=meta,
+                output=output,
+            )
+
+        # Verify scatter was called twice (for k_nope and k_rope)
+        self.assertEqual(scatter_calls["n"], 2, "should scatter into k_nope and k_rope once each")
+
+        # Verify both decode and prefill attention paths were called
+        self.assertEqual(impl._apply_sparse_attention.call_count, 1, "total attention calls should be 1")
+
+        # Verify the output tensor is returned correctly
+        self.assertIs(out, output, "should return the same output tensor")
+
+
+class TestNPUDSAImplUpdateSinkKV(unittest.TestCase):
+    def test_update_sink_kv_sets_sink_len_correctly(self):
+        """Test update_sink_kv correctly sets sink_len from sink_compressed_kv shape."""
+        # Create minimal impl stub
+        impl = SimpleNamespace()
+        impl.qk_nope_head_dim = 4
+        impl.qk_rope_head_dim = 2
+        impl.v_head_dim = 4
+        sink_len = 128
+
+        # Create test sink data
+        sink_k_pe = torch.randn((sink_len, 1, impl.qk_rope_head_dim), dtype=torch.float32)
+        sink_compressed_kv = torch.randn((sink_len, impl.qk_nope_head_dim + impl.v_head_dim), dtype=torch.float32)
+
+        # Call update_sink_kv
+        mla_mod.NPUDSAImpl.update_sink_kv(impl, sink_k_pe, sink_compressed_kv)
+
+        # Verify sink_len is set correctly
+        self.assertEqual(impl.sink_len, sink_len, "sink_len should be set to the first dimension of sink_compressed_kv")
+
+
+class TestNPUDSAImplApplySparseAttention(unittest.TestCase):
+    def test_apply_sparse_attention(self):
+        """Test _apply_sparse_attention with basic functionality including sink."""
+        # Add indexer to impl
+        indexer = SimpleNamespace()
+        indexer.topk_tokens = 8
+        indexer.topk_indices_buffer = torch.zeros((16, indexer.topk_tokens), dtype=torch.int32)
+
+        impl = SimpleNamespace()
+        impl.num_heads = 2
+        impl.scale = 1.0
+        impl.sink_len = 128
+        impl.qk_nope_head_dim = 4
+        impl.qk_lora_rank = 3
+        impl.kv_lora_rank = 3
+        impl.indexer = indexer
+        # Add static method reference
+        impl.get_args_from_attn_metadata = mla_mod.NPUDSAImpl.get_args_from_attn_metadata.__get__(None, mla_mod.NPUDSAImpl)
+
+        # Create test inputs
+        num_tokens = 4
+        q_nope = torch.randn((num_tokens, impl.num_heads, impl.qk_nope_head_dim), dtype=torch.float32)
+        q_pe = torch.randn((num_tokens, 1, 4), dtype=torch.float32)
+        k_nope = torch.randn((16, impl.qk_nope_head_dim), dtype=torch.float32)
+        k_rope = torch.randn((16, 4), dtype=torch.float32)
+        kv_cache = (k_nope, k_rope)
+
+        # Create metadata
+        class _Decode:
+            def __init__(self):
+                self.query_cumulens = torch.tensor([1, 1], dtype=torch.int32)
+                self.seq_lens = torch.tensor([5, 6], dtype=torch.int32)
+                self.block_table = torch.zeros((2, 4), dtype=torch.int32)
+                self.dcp_tot_seq_lens = None
+                self.mc2_mask = None
+
+        class _Prefill:
+            def __init__(self):
+                self.query_cumulens = torch.tensor([2], dtype=torch.int32)
+                self.seq_lens = torch.tensor([7], dtype=torch.int32)
+                self.block_table = torch.zeros((1, 4), dtype=torch.int32)
+                self.query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
+                self.chunked_context = None
+
+        meta = SimpleNamespace()
+        meta.num_actual_tokens = 4
+        meta.num_decodes = 2
+        meta.num_prefills = 1
+        meta.num_decode_tokens = 2
+        meta.query_start_loc = torch.tensor([0, 1, 2, 4], dtype=torch.int32)
+        meta.decode = _Decode()
+        meta.prefill = _Prefill()
+
+        # Verify get_args_from_attn_metadata works correctly
+        block_table, actual_seq_lens_key, actual_seq_lens_query = \
+            impl.get_args_from_attn_metadata(meta)
+
+        # Verify block_table concatenation (decode + prefill)
+        self.assertEqual(block_table.shape[0], 3, "block_table should have 3 rows (2 decode + 1 prefill)")
+        self.assertEqual(block_table.shape[1], 4, "block_table should have 4 columns")
+
+        # Verify seq_lens concatenation
+        self.assertEqual(len(actual_seq_lens_key), 3, "actual_seq_lens_key should have 3 elements")
+
+        # Verify query_start_loc slicing [1:]
+        self.assertEqual(len(actual_seq_lens_query), 3, "actual_seq_lens_query should have 3 elements")
+
+        # Now test _apply_sparse_attention by mocking the custom operation
+        mock_attn_func = MagicMock()
+
+        def mock_sparse_flash_attention_enhance(**kwargs):
+            # Verify block_table and seq_lens are passed correctly
+            self.assertEqual(kwargs["block_table"].shape[0], 3, "block_table should have 3 rows")
+            self.assertEqual(len(kwargs["actual_seq_lengths_kv"]), 3, "actual_seq_lengths_kv should have 3 elements")
+            self.assertEqual(len(kwargs["actual_seq_lengths_query"]), 3, "actual_seq_lengths_query should have 3 elements")
+            # Verify sparse_indices includes sink tokens
+            self.assertEqual(kwargs["sparse_indices"].shape[2], 8 + 128,
+                           "sparse_indices should have sink length (128) + original topk tokens (8)")
+            return [torch.randn((num_tokens, impl.num_heads, impl.kv_lora_rank), dtype=torch.float32)]
+
+        mock_attn_func.side_effect = mock_sparse_flash_attention_enhance
+
+        with patch.object(mla_mod.torch.ops, "custom", create=True):
+            mla_mod.torch.ops.custom.npu_sparse_flash_attention_enhance = mock_attn_func
+
+            result = mla_mod.NPUDSAImpl._apply_sparse_attention(
+                impl, q_nope, q_pe, kv_cache, meta
+            )
+
+        # Verify output shape
+        expected_shape = (num_tokens, impl.num_heads, impl.kv_lora_rank)
+        self.assertEqual(result.shape, expected_shape)
+        self.assertTrue(mock_attn_func.called, "custom attention function should be called")
+
+
+class TestNPUDSAImplGetArgsFromAttnMetadata(unittest.TestCase):
+    """Test the static get_args_from_attn_metadata method."""
+
+    def test_get_args_both_decode_and_prefill(self):
+        """Test get_args_from_attn_metadata with both decode and prefill."""
+        # Create metadata
+        class _Decode:
+            def __init__(self):
+                self.query_cumulens = torch.tensor([1, 1], dtype=torch.int32)
+                self.seq_lens = torch.tensor([5, 6], dtype=torch.int32)
+                self.block_table = torch.zeros((2, 4), dtype=torch.int32)
+                self.dcp_tot_seq_lens = None
+                self.mc2_mask = None
+
+        class _Prefill:
+            def __init__(self):
+                self.query_cumulens = torch.tensor([2], dtype=torch.int32)
+                self.seq_lens = torch.tensor([7], dtype=torch.int32)
+                self.block_table = torch.zeros((1, 4), dtype=torch.int32)
+                self.query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
+                self.chunked_context = None
+
+        meta = SimpleNamespace()
+        meta.num_decodes = 2
+        meta.num_prefills = 1
+        meta.query_start_loc = torch.tensor([0, 1, 2, 4], dtype=torch.int32)
+        meta.decode = _Decode()
+        meta.prefill = _Prefill()
+
+        # Call the static method
+        block_table, actual_seq_lens_key, actual_seq_lens_query = \
+            mla_mod.NPUDSAImpl.get_args_from_attn_metadata(meta)
+
+        # Verify block_table concatenation (decode + prefill)
+        self.assertEqual(block_table.shape[0], 3, "block_table should have 3 rows (2 decode + 1 prefill)")
+        self.assertEqual(block_table.shape[1], 4, "block_table should have 4 columns")
+
+        # Verify seq_lens concatenation
+        self.assertEqual(len(actual_seq_lens_key), 3, "actual_seq_lens_key should have 3 elements")
+        self.assertTrue(torch.equal(actual_seq_lens_key[:2], torch.tensor([5, 6], dtype=torch.int32)),
+                       "first two elements should be decode seq_lens")
+        self.assertTrue(torch.equal(actual_seq_lens_key[2:], torch.tensor([7], dtype=torch.int32)),
+                       "last element should be prefill seq_lens")
+
+        # Verify query_start_loc slicing [1:]
+        self.assertEqual(len(actual_seq_lens_query), 3, "actual_seq_lens_query should have 3 elements")
+        expected_query_lens = torch.tensor([1, 2, 4], dtype=torch.int32)
+        self.assertTrue(torch.equal(actual_seq_lens_query, expected_query_lens),
+                       "actual_seq_lens_query should be query_start_loc[1:]")
 
 
 if __name__ == "__main__":

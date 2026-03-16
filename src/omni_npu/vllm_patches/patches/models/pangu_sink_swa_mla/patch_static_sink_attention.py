@@ -17,16 +17,103 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
-
 from vllm.model_executor.layers.attention import static_sink_attention
-from vllm.model_executor.layers.attention.static_sink_attention import (
-    create_static_sink_attention_backend,
-)
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
 logger = init_logger(__name__)
+
+
+@register_patch("create_static_sink_attention_backendPatch", layers)
+class create_static_sink_attention_backendPatch(VLLMPatch):
+    _attr_names_to_apply = ['create_static_sink_attention_backend']
+
+    # patch start
+    @functools.lru_cache
+    def create_static_sink_attention_backend(
+        underlying_attn_backend: type[AttentionBackend],
+        sink_len: int = 0,
+    ) -> type[AttentionBackend]:
+        prefix = "StaticSink_"
+        underlying_builder = underlying_attn_backend.get_builder_cls()
+        class StaticSinkAttentionBuilder(underlying_builder):  # type: ignore
+            def __init__(
+                self,
+                kv_cache_spec: AttentionSpec,
+                layer_names: list[str],
+                vllm_config: VllmConfig,
+                device: torch.device,
+            ):
+                super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+                model_config = vllm_config.model_config
+                scheduler_config = vllm_config.scheduler_config
+                self.sink_len = sink_len
+                self.block_size = vllm_config.cache_config.block_size
+                self.num_sink_blocks = self.sink_len // vllm_config.cache_config.block_size
+                self.max_num_blocks = cdiv(
+                    model_config.max_model_len, vllm_config.cache_config.block_size
+                )
+                self.scheduler_config = scheduler_config
+                self.device = device
+                self.block_table_with_sink = torch.zeros(
+                    (
+                        scheduler_config.max_num_seqs,
+                        self.max_num_blocks + self.num_sink_blocks,
+                    ),
+                    device=device,
+                    dtype=torch.int32,
+                )
+                self.block_table_with_sink[:, : self.num_sink_blocks] = torch.arange(
+                    1,
+                    self.num_sink_blocks + 1,
+                    device=device,
+                    dtype=torch.int32,
+                )
+            def reinit_block_table_with_sink(self):
+                self.block_table_with_sink[:, :] = torch.zeros(
+                    (
+                        self.scheduler_config.max_num_seqs,
+                        self.max_num_blocks + self.num_sink_blocks,
+                    ),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                self.block_table_with_sink[:, : self.num_sink_blocks] = torch.arange(
+                    1,
+                    self.num_sink_blocks + 1,
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+            def build(
+                self,
+                common_prefix_len: int,
+                common_attn_metadata: CommonAttentionMetadata,
+                fast_build: bool = False,
+            ) -> AttentionMetadata:
+                if common_attn_metadata.block_table_tensor[0, 0] != 1:
+                    max_num_blocks = cdiv(common_attn_metadata.max_seq_len, self.block_size)
+                    num_reqs = common_attn_metadata.num_reqs
+                    self.block_table_with_sink[
+                        :num_reqs, self.num_sink_blocks : self.num_sink_blocks + max_num_blocks
+                    ] = common_attn_metadata.block_table_tensor[:, :max_num_blocks]
+                    common_attn_metadata.block_table_tensor = self.block_table_with_sink[:num_reqs]
+
+                    zero_mask = common_attn_metadata.seq_lens.eq(0)
+                    common_attn_metadata.seq_lens.add_(self.sink_len)
+                    common_attn_metadata.seq_lens.masked_fill_(zero_mask, 0)
+                    common_attn_metadata.max_seq_len += self.sink_len
+
+                return super().build(common_prefix_len, common_attn_metadata, fast_build)
+        attn_backend = subclass_attention_backend(
+            name_prefix=prefix,
+            attention_backend_cls=underlying_attn_backend,
+            builder_cls=StaticSinkAttentionBuilder,
+        )
+        return attn_backend
+    # patch end
+    
+    layers.static_sink_attention.create_static_sink_attention_backend = create_static_sink_attention_backend
 
 
 @register_patch("StaticSinkAttentionPatch", static_sink_attention)

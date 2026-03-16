@@ -152,6 +152,8 @@ class ACLGraphWrapper:
                         break
                 elif metadata.decode:
                     # MLA
+                    if isinstance(metadata.decode.query_cumlens, torch.Tensor):
+                        continue
                     asl = metadata.decode.query_cumlens
                     aslkv = metadata.decode.seq_lens
                     break

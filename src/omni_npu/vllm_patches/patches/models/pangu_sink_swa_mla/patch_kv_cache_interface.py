@@ -26,6 +26,10 @@ class SinkAttentionSpecPatch(VLLMPatch):
                 "All attention layers in the same KV cache group must use the same "
                 "quantization method."
             )
+            head_size_set = set(spec.head_size for spec in specs)
+            assert len(head_size_set) == 1, (
+                "All attention layers in the same KV cache group must use the same head_size."
+            )
             return cls(
                 block_size=specs[0].block_size,
                 num_kv_heads=specs[0].num_kv_heads,

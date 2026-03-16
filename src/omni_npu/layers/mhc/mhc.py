@@ -141,7 +141,7 @@ class NPUmHCModule(mHCModule):
                 x.view(-1, self.num_stream, self.hidden_size), self.phi.weight,
                 self._branch_alpha, self._branch_beta,
                 gamma=self.norm_gamma.view(self.num_stream, -1),
-                norm_eps=self.norm_eps, hc_eps=self.hc_eps
+                out_flag=1, norm_eps=self.hc_eps, hc_eps=self.hc_eps
             )
             h_res, _, _ = torch.ops.custom.npu_sinkhorn(h_res, num_iters=self.mhc_recur_norm, eps=self.hc_eps)
         return y, h_post, h_res
