@@ -3,6 +3,7 @@ import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+import os
 
 import torch
 
@@ -536,11 +537,24 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         cos = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
         sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
 
-        attn_metadata = SimpleNamespace(
-            prefill=_make_prefill_meta(bs),
-            decode=None,
-            slot_mapping=torch.arange(bs, dtype=torch.int64),
-        )
+        class _Prefill:
+            def __init__(self):
+                self.query_start_loc = torch.tensor([0, 2, 5], dtype=torch.long)
+                self.chunked_context = None
+                self.seq_lens = torch.tensor([2, 3], dtype=torch.long)
+                self.query_cumlens = torch.tensor([2, 5], dtype=torch.long)
+                self.prefix_meta = None
+                self.block_table = torch.zeros((2, 1), dtype=torch.int32)
+
+        class _Meta:
+            def __init__(self):
+                self.prefill = _Prefill()
+                self.decode = None
+                self.num_actual_tokens = 5
+                self.num_reqs = bs
+                self.slot_mapping = torch.arange(5, dtype=torch.int64)
+
+        attn_metadata = _Meta()
         fc = SimpleNamespace(attn_metadata=attn_metadata, virtual_engine=0)
 
         fake_omni_cache_obj = SimpleNamespace(
@@ -549,34 +563,69 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
                 torch.zeros((64, 1, 1, m.qk_rope_head_dim), dtype=torch.float32),
             ),
             synchronize_d2h=MagicMock(),
+            synchronize_h2d=MagicMock(),
         )
         fake_cache_mod = types.ModuleType("omni_cache.cache")
         fake_cache_mod.omni_cache = fake_omni_cache_obj
 
+        fake_operator_opt = SimpleNamespace(use_omni_cache=True)
+        fake_model_extra = SimpleNamespace(operator_opt_config=fake_operator_opt)
+
         class _FakeEvent:
             def __init__(self, *args, **kwargs):
                 pass
-
             def record(self, stream):
                 return None
 
-        def _fake_sparse_flash_attention(**kwargs):
-            B = kwargs["query"].shape[0]
-            N = kwargs["query"].shape[1]
-            return torch.zeros((B, N, m.kv_lora_rank), dtype=torch.float32), None
+        def _fake_npu_transpose_batchmatmul(q_nope, W_UK_T, perm_y=None):
+            num_heads, batch_size, _ = q_nope.shape
+            return torch.zeros((num_heads, batch_size, m.kv_lora_rank), dtype=q_nope.dtype)
 
-        with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
-             patch.object(npu_dsa_mod, "current_stream", return_value=object(), create=True), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
-             patch.object(torch, "npu", create=True) as torch_npu_ns, \
-             patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", side_effect=_fake_sparse_flash_attention, create=True) as mock_sparse, \
-             patch.dict(sys.modules, {"omni_cache.cache": fake_cache_mod}):
+        # q_nope: [num_heads, num_tokens, kv_lora_rank]
+        # output: [num_heads, num_tokens, kv_lora_rank] --> [num_tokens, num_heads, kv_lora_rank]
+        def _fake_npu_sparse_flash_attention(**kwargs):
+            query = kwargs["query"]  # [num_heads, num_tokens, kv_lora_rank]
+            num_heads, num_tokens, kv_lora_rank = query.shape
+            return torch.zeros((num_heads, num_tokens, kv_lora_rank), dtype=query.dtype), None
+
+        def _fake_npu_kv_rmsnorm_rope_cache(*args, **kwargs):
+            batch_size = args[0].shape[0] if args else 5
+            return (
+                torch.zeros((batch_size, 1, m.qk_rope_head_dim), dtype=torch.float32),
+                torch.zeros((batch_size, 1, m.kv_lora_rank), dtype=torch.float32),
+                None,
+                None,
+            )
+
+        def _fake_mla_epilog(attn_output):
+            # output: [num_tokens, num_local_heads * v_head_dim]
+            num_tokens = attn_output.shape[1] if attn_output.dim() == 3 else attn_output.shape[0]
+            return torch.zeros((num_tokens, m.num_local_heads * m.v_head_dim), dtype=torch.float32)
+
+        fake_stream = object()
+
+        with patch.object(npu_dsa_mod, "model_extra_config", fake_model_extra, create=True), \
+            patch("omni_npu.v1.layers.attention.npu_dsa.model_extra_config", fake_model_extra, create=True), \
+            patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
+            patch.object(npu_dsa_mod, "current_stream", return_value=fake_stream), \
+            patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", 
+                        side_effect=_fake_npu_transpose_batchmatmul, create=True), \
+            patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", 
+                        side_effect=lambda x, c, s: x, create=True), \
+            patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", 
+                        side_effect=_fake_npu_sparse_flash_attention, create=True), \
+            patch.object(npu_dsa_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", 
+                        side_effect=_fake_npu_kv_rmsnorm_rope_cache, create=True), \
+            patch.object(m, "_mla_epilog", _fake_mla_epilog), \
+            patch.object(torch, "npu", create=True) as torch_npu_ns, \
+            patch.dict(sys.modules, {"omni_cache.cache": fake_cache_mod}):
+            
             torch_npu_ns.Event = _FakeEvent
             out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=attn_metadata)
 
         self.assertEqual(tuple(out.shape), (bs, 8))
         self.assertTrue(fake_omni_cache_obj.synchronize_d2h.called)
+        self.assertTrue(fake_omni_cache_obj.synchronize_h2d.called)
 
     def test_forward_prefill_use_omni_cache_true_attn_metadata_none_does_not_import_omni_cache_and_skips_indexer(self):
         m = self._make_attn_impl_stub(use_omni_cache=True, use_mlaprolog=False, q_lora_rank=12)

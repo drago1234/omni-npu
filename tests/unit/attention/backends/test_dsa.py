@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
+import os
 
 import torch
 
@@ -21,17 +22,26 @@ class TestNPUDSABackend(unittest.TestCase):
 
         raw = torch.zeros((total,), dtype=torch.bfloat16)
 
-        kv_cache_spec = AttentionSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=128,
-            dtype=torch.bfloat16,
-        )
-        out = mla_mod.NPUDSABackend.reshape_kv_cache(
-            raw_tensor=raw,
-            num_blocks=num_blocks,
-            kv_cache_spec=kv_cache_spec,
-        )
+        mock_kv_transfer_config = MagicMock()
+        mock_kv_transfer_config.kv_role = "kv_producer"
+        
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.kv_transfer_config = mock_kv_transfer_config
+
+        with patch("omni_npu.attention.backends.dsa.get_current_vllm_config", 
+                return_value=mock_vllm_config):
+            kv_cache_spec = AttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.bfloat16,
+            )
+            out = mla_mod.NPUDSABackend.reshape_kv_cache(
+                raw_tensor=raw,
+                num_blocks=num_blocks,
+                kv_cache_spec=kv_cache_spec,
+            )
+        
         self.assertEqual(len(out), 3)
         self.assertEqual(tuple(out[0].shape), shapes[0])
         self.assertEqual(tuple(out[1].shape), shapes[1])
@@ -39,13 +49,24 @@ class TestNPUDSABackend(unittest.TestCase):
 
     def test_reshape_kv_cache_raises_when_numel_mismatch(self):
         raw = torch.zeros((123,), dtype=torch.bfloat16)
+        
+        # mock get_current_vllm_config
+        mock_kv_transfer_config = MagicMock()
+        mock_kv_transfer_config.kv_role = "kv_producer" 
+        
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.kv_transfer_config = mock_kv_transfer_config
+
         kv_cache_spec = AttentionSpec(
             block_size=1,
             num_kv_heads=1,
             head_size=128,
             dtype=torch.bfloat16,
         )
-        with self.assertRaises(RuntimeError):
+
+        with patch("omni_npu.attention.backends.dsa.get_current_vllm_config",
+                return_value=mock_vllm_config), \
+            self.assertRaises(RuntimeError):
             _ = mla_mod.NPUDSABackend.reshape_kv_cache(
                 raw_tensor=raw,
                 num_blocks=1,
@@ -116,8 +137,9 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
 
         fake_opt_cfg = SimpleNamespace(use_omni_cache=False)
         with patch.object(mla_mod.MLACommonMetadataBuilder, "build", return_value=fake_meta), \
-             patch.object(mla_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True):
-            out = b.build(common_prefix_len=0, common_attn_metadata=fake_meta, fast_build=False)
+            patch.object(mla_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True), \
+             patch.dict(os.environ, {"ENABLE_OMNI_CACHE": "1"}, clear=False): 
+            out = b.build(common_prefix_len=0, common_attn_metadata=MagicMock(), fast_build=False)
 
         self.assertIs(out, fake_meta)
         self.assertTrue(torch.equal(out.prefill.seq_lens, torch.tensor([2, 3], dtype=torch.long)))

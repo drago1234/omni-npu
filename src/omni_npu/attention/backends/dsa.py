@@ -8,7 +8,8 @@ import and use it. We can iterate later with true MLA specialization.
 """
 
 from dataclasses import dataclass
-from typing import ClassVar, Optional, Tuple
+import os
+from typing import ClassVar, Optional, Tuple, Any
 import math
 
 import torch
@@ -32,9 +33,9 @@ from vllm.v1.attention.backends.mla.common import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from omni_npu.v1.models.config_loader.loader import model_extra_config
 from omni_npu.attention.backends.utils import register_attention_backend
 
+ENABLE_OMNI_CACHE = int(os.getenv("ENABLE_OMNI_CACHE", "0")) == 1
 
 logger = init_logger(__name__)
 NPUDSA = "NPUDSA"
@@ -64,10 +65,14 @@ class NPUDSABackend(MLACommonBackend):
         num_blocks: int,
         kv_cache_spec: AttentionSpec,
     ) -> Tuple[torch.Tensor, ...]:
+        is_prefill = (get_current_vllm_config().kv_transfer_config.kv_role != "kv_consumer")
         block_size = kv_cache_spec.block_size
         dtype = kv_cache_spec.dtype
         raw_tensor = raw_tensor.view(dtype=dtype)
-        shapes = [(num_blocks, block_size, 1, 512), (num_blocks, block_size, 1, 64), (num_blocks, block_size, 1, 128)]
+        if ENABLE_OMNI_CACHE and not is_prefill:
+            shapes = [(num_blocks, block_size, 1, 128)] # for omni cache decode, only indexer is registered on device
+        else:
+            shapes = [(num_blocks, block_size, 1, 512), (num_blocks, block_size, 1, 64), (num_blocks, block_size, 1, 128)]
         sizes = [math.prod(shape) for shape in shapes]
         if raw_tensor.numel() != sum(sizes):
             raise RuntimeError(f"Raw tensor has {raw_tensor.numel()} elements, while"
@@ -81,6 +86,7 @@ class NPUDSAPrefillMetadata(MLACommonPrefillMetadata):
     query_cumlens: torch.Tensor = None
     seq_lens: torch.Tensor = None
 
+    prefix_meta: Optional[Any] = None
 
 @dataclass
 class NPUDSADecodeMetadata(MLACommonDecodeMetadata):
@@ -160,11 +166,38 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         if metadata.prefill is not None and metadata.prefill.chunked_context is not None:
             raise RuntimeError(f"Chunked prefill is not enabled yet.")
 
-        if model_extra_config.operator_opt_config.use_omni_cache:
+        if ENABLE_OMNI_CACHE:
             from omni_cache.cache import omni_cache
             from omni_cache.cache.omni_cache_define import PrefillOmniCache
+
+            # NOTE: APC related
+            if metadata.prefill is not None and self.vllm_config.kv_transfer_config is not None:
+                num_reqs = metadata.num_reqs
+                query_start_loc = common_attn_metadata.query_start_loc_cpu
+                query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+
+                query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+                query_lens = query_start_loc[1:] - query_start_loc[:-1]
+                query_lens_list = query_lens.tolist()
+                num_computed_tokens_cpu = common_attn_metadata.seq_lens_cpu - query_seq_lens_cpu
+                prefix_meta = omni_cache.get_prefill_prefix_copy_meta(
+                    # block_size=self.block_size,
+                    self.vllm_config, 
+                    kv_lens=num_computed_tokens_cpu[:num_reqs],
+                    query_lens_list=query_lens_list,
+                    block_tables=common_attn_metadata.block_table_tensor.cpu().numpy()[:num_reqs],
+                    # attn_state=self.runner.attn_state,
+                )
+                omni_cache.synchronize_h2d(
+                    prefix_meta=prefix_meta,
+                    layer_idx=0,
+                )
+                metadata.prefix_meta = prefix_meta
+
             if isinstance(omni_cache, PrefillOmniCache) :
                 omni_cache.init_batch_token_indices(common_attn_metadata.slot_mapping)
+        else:
+            metadata.prefix_meta = None
         return metadata
 
     def _generate_activate_mask(self, actual_seqs_num):

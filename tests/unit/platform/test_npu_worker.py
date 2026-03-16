@@ -514,10 +514,8 @@ class TestNpuWorker:
             "omni_npu.worker.npu_worker.NpuMemAllocator.get_instance",
             lambda: mock_allocator)
 
-        # Mock model_extra_config
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_worker.model_extra_config.operator_opt_config.use_omni_cache",
-            True)
+        # Test case 1: ENABLE_OMNI_CACHE=1 (原 use_omni_cache=True)
+        monkeypatch.setenv("ENABLE_OMNI_CACHE", "1")
 
         worker.initialize_from_config(mock_kv_cache_config)
 
@@ -529,10 +527,8 @@ class TestNpuWorker:
         worker.model_runner.initialize_omni_kv_cache.assert_called_once_with(
             mock_kv_cache_config)
 
-        # Test case: use_omni_cache is False
-        monkeypatch.setattr(
-            "omni_npu.worker.npu_worker.model_extra_config.operator_opt_config.use_omni_cache",
-            False)
+        # Test case 2: ENABLE_OMNI_CACHE=0 (原 use_omni_cache=False)
+        monkeypatch.setenv("ENABLE_OMNI_CACHE", "0")
         worker.initialize_from_config(mock_kv_cache_config)
         worker.model_runner.initialize_kv_cache.assert_called_once_with(
             mock_kv_cache_config)

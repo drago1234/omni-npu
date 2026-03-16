@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch_npu
@@ -29,6 +29,10 @@ from omni_npu.v1.layers.linear import (
 from omni_npu.v1.models.config_loader.loader import  model_extra_config
 from omni_npu.v1.utils import current_stream
 
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 class Indexer(torch.nn.Module):
     def __init__(
@@ -286,7 +290,15 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size() if not model_extra_config.operator_opt_config.enable_dsa else 1
         self.num_speculative_tokens = 0 if not vllm_config.speculative_config or not model_extra_config.operator_opt_config.mtp_remove_redundant_kv else vllm_config.speculative_config.num_speculative_tokens
         self.actual_seq_lengths = {}
-        for batch_size in (vllm_config.npu_compilation_config.decode_gear_list if vllm_config.npu_compilation_config.decode_gear_list is not None else [1]):
+
+        gear_list = [1]
+        if vllm_config.npu_compilation_config.decode_gear_list is not None:
+            gear_list = vllm_config.npu_compilation_config.decode_gear_list
+        elif vllm_config.compilation_config.cudagraph_capture_sizes is not None:
+            gear_list = vllm_config.compilation_config.cudagraph_capture_sizes
+
+        logger.warning(f"<<< {gear_list=}")
+        for batch_size in gear_list:
             self.actual_seq_lengths[batch_size] = (1 + self.num_speculative_tokens) * \
                                                   torch.arange(1, batch_size * self.tp_size // (
                                                               1 + self.num_speculative_tokens) + 1, dtype=torch.int64,
@@ -392,14 +404,8 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             from omni_cache.cache import omni_cache
             kv_cache = omni_cache.device_cache
 
-        if self.use_omni_cache or attn_metadata is None:
-            latent_cache = latent_cache.view(-1, latent_cache.size(-1))
-            k_nope, k_pe = torch.split(latent_cache, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-            k_pe = k_pe.view(k_pe.shape[0], 1, 1, k_pe.shape[-1])
-            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
-            k_pe = k_pe.squeeze(2)
-        elif attn_metadata is not None:
+        # if kv_cache is not None and isinstance(kv_cache, Tuple) and kv_cache[0].numel() > 0:
+        if attn_metadata is not None:
             k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
                 latent_cache.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim), # bnsd
                 self.kv_a_layernorm.weight,
@@ -415,6 +421,24 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 epsilon=self.kv_a_layernorm.variance_epsilon,
                 cache_mode="PA"
             )
+            if model_extra_config.operator_opt_config.use_omni_cache:
+                latent_cache = latent_cache.view(-1, latent_cache.size(-1))
+                kv_a, kv_rope = torch.split(latent_cache, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                kv_a = self.kv_a_layernorm(kv_a).unsqueeze(1)
+                kv_rope = kv_rope.view(kv_rope.shape[0], 1, 1, kv_rope.shape[-1])
+                kv_rope = torch_npu.npu_interleave_rope(kv_rope, cos, sin)
+                kv_rope = kv_rope.squeeze(2)
+        else:
+            latent_cache = latent_cache.view(-1, latent_cache.size(-1))
+            # adapt end
+            kv_a, _ = torch.split(latent_cache, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            latent_cache = latent_cache.unsqueeze(1)
+            kv_a = self.kv_a_layernorm(kv_a)
+            k_pe = latent_cache[:, :, self.kv_lora_rank:]
+            k_pe = k_pe.unsqueeze(2)
+            k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
+            k_pe = k_pe.squeeze(2)
+            k_nope = None
 
         topk_indices = None
         if attn_metadata is not None:
@@ -429,13 +453,17 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             main_stream = current_stream()
             kv_event = torch.npu.Event(blocking=False, enable_timing=False)
             kv_event.record(main_stream)
-            kv_states = [k_nope, k_pe, k_indexer]
+            kv_states = [kv_a, kv_rope, k_indexer]
             omni_cache.synchronize_d2h(
                 kv_states,
                 self.layer_idx,
                 kv_event
             )
-
+            # NOTE: APC related
+            omni_cache.synchronize_h2d(
+                prefix_meta=attn_metadata.prefill.prefix_meta,
+                layer_idx=self.layer_idx + 1,
+            )
         return self._mla_epilog(attn_output)
 
     def _forward_mlaprolog(
@@ -526,11 +554,17 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         # call decode attn
         if self.use_omni_cache and attn_metadata and False:
             from omni_cache.cache import omni_cache
+            headnum = omni_cache.headnum
+            s_block_size = omni_cache.s_block_size
+            topk = omni_cache.topk
+            selection_max_seq_len = omni_cache.selection_max_seq_len
+            s_max_block_num = omni_cache.s_max_block_num
+
             kv_actual_seqlen = torch_npu.npu_gather_selection_kv_cache(
-                selection_k_rope=omni_cache.selection_k_rope[self.layer_idx],
-                selection_kv_cache=omni_cache.selection_kv_cache[self.layer_idx],
-                selection_kv_block_table=omni_cache.selection_kv_block_table,
-                selection_kv_block_status=omni_cache.selection_kv_block_status_list[self.layer_idx],
+                selection_k_rope=omni_cache.selection_k_rope[self.layer_idx][:s_max_block_num * bsz * headnum],
+                selection_kv_cache=omni_cache.selection_kv_cache[self.layer_idx][:s_max_block_num * bsz * headnum],
+                selection_kv_block_table=omni_cache.selection_kv_block_table[:bsz * headnum],
+                selection_kv_block_status=omni_cache.selection_kv_block_status_list[self.layer_idx][:bsz],
                 selection_topk_indices=tok_indices.unsqueeze(1),
                 full_k_rope=k_pe.squeeze(-2),
                 full_kv_cache=k_nope.squeeze(-2),
@@ -539,18 +573,18 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 full_q_actual_seq=self.actual_seq_lengths[bs].to(torch.int32),
                 selection_topk_block_size=omni_cache.selection_topk_block_size)
 
-            selection_topk_indices = omni_cache.selection_topk_indices.clone()
+            selection_topk_indices = omni_cache.selection_topk_indices[:bsz].clone()
             bsz_seq_t, num_head_t, topk_len_t = selection_topk_indices.shape
             kv_actual_seqlen_t = kv_actual_seqlen.view(bsz_seq_t, num_head_t, 1)
             indices_t = torch.arange(topk_len_t, device=selection_topk_indices.device).view(1, 1, topk_len_t)
             mask_t = indices_t >= kv_actual_seqlen_t
             selection_topk_indices = torch.where(mask_t, -1, selection_topk_indices)
 
-            kv_dsa = omni_cache.selection_kv_cache[self.layer_idx].unsqueeze(-2)
+            kv_dsa = omni_cache.selection_kv_cache[self.layer_idx][:s_max_block_num * bsz * headnum].unsqueeze(-2)
             topk_indices_dsa = selection_topk_indices
-            block_table_dsa = omni_cache.selection_kv_block_table
+            block_table_dsa = omni_cache.selection_kv_block_table[:bsz * headnum]
             kv_actual_seqlen_dsa = kv_actual_seqlen
-            key_rope_dsa = omni_cache.selection_k_rope[self.layer_idx].unsqueeze(-2)
+            key_rope_dsa = omni_cache.selection_k_rope[self.layer_idx][:s_max_block_num * bsz * headnum].unsqueeze(-2)
         else:
             kv_dsa = k_nope
             topk_indices_dsa = tok_indices

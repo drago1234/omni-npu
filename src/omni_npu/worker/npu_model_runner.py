@@ -4,6 +4,7 @@
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import TYPE_CHECKING, Optional, Union, Any, cast, TypeAlias
+import os
 
 import torch
 import numpy as np
@@ -16,7 +17,7 @@ from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
 )
-from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import (
     get_pp_group,
     prepare_communication_buffer_for_model,
@@ -51,7 +52,6 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import ACLGraphWrapper, set_graph_params
-
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -262,6 +262,8 @@ class NPUModelRunner(GPUModelRunner):
                 head_size = (attn_module.head_size if hasattr(attn_module, 'head_size') else attn_module.head_dim) + \
                     (indexer_head_size if is_dsa else 0)
                 if not getattr(attn_module, 'sink_len', 0):
+                    if int(os.getenv("ENABLE_OMNI_CACHE", "0")) and self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
+                        head_size = indexer_head_size
                     kv_cache_spec[layer_name] = MLAAttentionSpec(
                         block_size=self.vllm_config.cache_config.block_size,
                         num_kv_heads=1,
@@ -842,21 +844,64 @@ class NPUModelRunner(GPUModelRunner):
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
-        from omni_cache.cache.omni_cache_define import create_omni_cache
-        create_omni_cache(
-            kv_cache_config=self.kv_cache_config,
-            vllm_config=self.vllm_config,
-            runner=self,
-        )
+        logger.warning(f"<<< {self.kv_cache_config=}")
+
+        if self.vllm_config.kv_transfer_config.kv_role == "kv_producer":
+            # In decode side, the omni cache will be created before load_model
+            # for registering larger host tensor.
+            from omni_cache.cache.omni_cache_define import create_omni_cache
+            create_omni_cache(
+                kv_cache_config=self.kv_cache_config,
+                vllm_config=self.vllm_config,
+                runner=self,
+            )
+
         from omni_cache.cache import omni_cache
-        get_kv_transfer_group().register_kv_caches(
-            omni_cache.MEMMAP_PATH,
-            omni_cache.dtype,
-            block_len_dtype=omni_cache.block_len_dtype,
-            omni_cache=omni_cache
-        )
         self.omni_cache = omni_cache
 
+        omni_cache.update_kv_cache_spec(kv_cache_config, self.vllm_config)
+        omni_cache.update_model_runner(self)
+        omni_cache.ensure_device_cache_initialized() # 
+        if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
+            from vllm.v1.worker.utils import bind_kv_cache
+            assert omni_cache.device_cache is not None
+            # replace kv_a and k_pe in device.kv_caches by host swap caches
+            num_layers = len(self.kv_caches)
+            if self.omni_cache.enable_dsa:
+                for i, layer_name in enumerate(list(omni_cache.device_cache.keys())):
+                    rest = omni_cache.device_cache[layer_name]
+                    t0, t1 = omni_cache.host_swap_tensor[i][0], omni_cache.host_swap_tensor[i][1]
+                    logger.warning(f"<<< before bind_kv_cache: {t0.shape=}, {t1.shape=}, {rest[0].shape=}")
+                    omni_cache.device_cache[layer_name] = (t0, t1, *rest)
+            bind_kv_cache(
+                omni_cache.device_cache,
+                self.vllm_config.compilation_config.static_forward_context,
+                self.kv_caches,
+            )
+
+        if has_kv_transfer_group:
+            get_kv_transfer_group().register_kv_caches(
+                omni_cache.MEMMAP_PATH,
+                omni_cache.dtype,
+                block_len_dtype=omni_cache.block_len_dtype,
+                omni_cache=omni_cache
+            )
+
+    def prepare_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_tokens_after_padding: int,
+    ) -> "InputBatch":
+        input_batch = super().prepare_inputs(scheduler_output, num_tokens_after_padding)
+
+        if (self.omni_cache.enable_dsa and 
+            self.omni_cache.enable_omni_cache):
+            from omni_cache.cache import omni_cache
+            from omni_cache.cache.omni_cache_define import DecodeOmniCache
+            # for update selection_kv_block workspace when using gather selection
+            DecodeOmniCache.maybe_update_selection_kv_block_status(input_batch, omni_cache)
+
+        return input_batch
     def kv_cache_after_wake_up(self) -> None:
         attn_layers = self.compilation_config.static_forward_context
         if self.model_config.enable_sleep_mode:
