@@ -167,7 +167,7 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if metadata.decode is not None and hasattr(self, "sink_len") and self.sink_len > 0:
             # for static sink attention, we need to add the sink length to the seq_lens
             metadata.decode.sink_len = self.sink_len
-            metadata.decode.seq_lens = [seq + self.sink_len for seq in metadata.decode.seq_lens]
+            metadata.decode.seq_lens = [self.sink_len if seq == 0 else seq for seq in metadata.decode.seq_lens]
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc_list = metadata.prefill.query_start_loc.tolist()
             metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:].cpu().tolist()
