@@ -398,14 +398,14 @@ class OpenPanguDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         
         hidden_states = self.self_attn(hidden_states, cos, sin)
-        
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.sandwich_norm:
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.attn_mhc_module.hc_post(hidden_states, residual, h_post, h_res)
         
         residual = hidden_states
         hidden_states, h_post, h_res = self.mlp_mhc_module.hc_pre(hidden_states)
-        if self.sandwich_norm:
-            hidden_states = self.pre_mlp_layernorm(hidden_states)
+
+        hidden_states = self.pre_mlp_layernorm(hidden_states)
         # Fully Connected
         
         hidden_states = self.mlp(hidden_states)

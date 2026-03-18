@@ -90,12 +90,14 @@ class NPUMLABackend(MLACommonBackend):
 class NPUMLAPrefillMetadata(MLACommonPrefillMetadata):
     query_cumlens: list[int] = None
     seq_lens: list[int] = None
+    slot_mapping: torch.Tensor = None
 
 
 @dataclass
 class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
     mc2_mask: torch.Tensor = None
+    slot_mapping: torch.Tensor = None
 
 
 @dataclass

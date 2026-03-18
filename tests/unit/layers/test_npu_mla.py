@@ -1,3 +1,4 @@
+import pytest
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -35,7 +36,7 @@ class _FakeLayerNorm:
 
 
 class _FakeAggregateConv:
-    def __call__(self, x):
+    def __call__(self, x, only_prefill=False, force_decode=False):
         return x
 
 
@@ -59,6 +60,7 @@ def _make_decode_meta(bs: int):
         query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
         seq_lens=torch.full((bs,), 8, dtype=torch.int32),
         block_table=torch.zeros((bs, 4), dtype=torch.int32),
+        slot_mapping=torch.arange(bs, dtype=torch.int64)
     )
 
 
@@ -68,10 +70,18 @@ def _make_prefill_meta(bs: int, *, max_query_len=2):
         query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
         max_query_len=max_query_len,
         query_start_loc=[0] + torch.arange(1, bs + 1, dtype=torch.int32).tolist(),
+        slot_mapping=torch.arange(bs, dtype=torch.int64)
     )
 
 
 class TestNPUMLAForwardRouting(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up the mock for npu_mla_forward to work on CPU backend."""
+        # Mock torch.ops.vllm.npu_mla_forward to call the actual npu_mla_forward function
+        torch.ops.vllm.npu_mla_forward = npu_mla_mod.npu_mla_forward
+    
     def _make_stub(self):
         m = SimpleNamespace()
         m.prefix = "layers.0"
@@ -103,13 +113,21 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         self.assertTrue(torch.equal(out, torch.tensor([1])))
 
         m._forward_prefill.reset_mock()
-        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=object(), decode=None), virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
+        prefill_meta = _make_prefill_meta(3, max_query_len=2)
+        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=prefill_meta, decode=None,
+            num_actual_tokens=3, num_decodes=0, num_prefills=1, num_decode_tokens=0,
+            slot_mapping=torch.arange(3, dtype=torch.int64)),
+            virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
         self.assertTrue(torch.equal(out, torch.tensor([1])))
 
         m._forward_decode.reset_mock()
-        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=None, decode=object()), virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
+        decode_meta = _make_decode_meta(2)
+        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=None, decode=decode_meta,
+            num_actual_tokens=2, num_decodes=2, num_prefills=0, num_decode_tokens=2,
+            slot_mapping=torch.arange(2, dtype=torch.int64)),
+            virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
         self.assertTrue(torch.equal(out, torch.tensor([2])))
@@ -121,7 +139,10 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         cos = torch.zeros((2, 1, 1, 4), dtype=torch.float32)
         sin = torch.zeros((2, 1, 1, 4), dtype=torch.float32)
 
-        meta = SimpleNamespace(prefill=None, decode=object())
+        decode_meta = _make_decode_meta(2)
+        meta = SimpleNamespace(prefill=None, decode=decode_meta, num_actual_tokens=2, 
+            num_decodes=2, num_prefills=0, num_decode_tokens=2, 
+            slot_mapping=torch.arange(2, dtype=torch.int64))
         fc = SimpleNamespace(attn_metadata={f"{m.prefix}.attn": meta}, virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
@@ -179,6 +200,7 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
 class TestNPUMLAPrefillDecode(unittest.TestCase):
     def _make_stub(self):
         m = SimpleNamespace()
+        m.prefix = "layers.0"
         m.hidden_size = 16
         m.q_lora_rank = 12
         # Align with implementation's fixed latent_cache last dim (576).
@@ -285,7 +307,7 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         ):
             torch_npu_ns.current_stream = lambda: fake_stream
             torch_npu_ns.stream = lambda _s: nullcontext()
-            out = npu_mla_mod.NPUDeepseekMLAAttention._forward_prefill(m, hs, cos, sin, attn_metadata=meta)
+            out = npu_mla_mod.NPUDeepseekMLAAttention._forward_prefill(m, hs, cos, sin, attn_metadata=meta.prefill)
 
         self.assertEqual(tuple(out.shape), (bs, 16))
 
@@ -331,9 +353,62 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             return_value=(torch.zeros((bs, m.num_local_heads, m.kv_lora_rank), dtype=torch.float32),),
             create=True,
          ):
-            out = npu_mla_mod.NPUDeepseekMLAAttention._forward_decode(m, hs, cos, sin, attn_metadata=meta)
+            out = npu_mla_mod.NPUDeepseekMLAAttention._forward_decode(m, hs, cos, sin, attn_metadata=meta.decode)
 
         self.assertEqual(tuple(out.shape), (bs, 16))
+
+    def test_forward_prefill_decode_mixed_both_paths(self):
+        """Test the case when both prefill and decode metadata are present."""
+        m = self._make_stub()
+        m._forward_prefill = MagicMock(return_value=torch.randn((3, 16), dtype=torch.float32))
+        m._forward_decode = MagicMock(return_value=torch.randn((2, 16), dtype=torch.float32))
+
+        num_decode_tokens = 2
+        num_prefill_tokens = 3
+        num_actual_tokens = num_decode_tokens + num_prefill_tokens
+
+        hs = torch.randn((num_actual_tokens, m.hidden_size), dtype=torch.float32)
+        cos = torch.zeros((num_actual_tokens, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        sin = torch.zeros((num_actual_tokens, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+
+        # Create metadata with both decode and prefill
+        prefill_meta = _make_prefill_meta(3, max_query_len=2)
+        decode_meta = _make_decode_meta(2)
+
+        meta = SimpleNamespace(
+            prefill=prefill_meta,
+            decode=decode_meta,
+            num_actual_tokens=num_actual_tokens,
+            num_decodes=2,
+            num_prefills=3,
+            num_decode_tokens=num_decode_tokens,
+            slot_mapping=torch.arange(num_actual_tokens, dtype=torch.int64),
+        )
+        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
+
+        with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
+            out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
+
+        # Verify that both forward_prefill and forward_decode were called with pd_mixed_flag=True
+        self.assertEqual(m._forward_prefill.call_count, 1)
+        self.assertEqual(m._forward_decode.call_count, 1)
+
+        # Check that prefill was called with the correct hidden_states and flags
+        prefill_call_args = m._forward_prefill.call_args
+        prefill_hs = prefill_call_args[0][0]
+        self.assertEqual(prefill_hs.shape[0], num_prefill_tokens)
+        pd_mixed_flag_prefill = prefill_call_args[1].get("pd_mixed_flag", False)
+        self.assertTrue(pd_mixed_flag_prefill)
+
+        # Check that decode was called with the correct hidden_states and flags
+        decode_call_args = m._forward_decode.call_args
+        decode_hs = decode_call_args[0][0]
+        self.assertEqual(decode_hs.shape[0], num_decode_tokens)
+        pd_mixed_flag_decode = decode_call_args[1].get("pd_mixed_flag", False)
+        self.assertTrue(pd_mixed_flag_decode)
+
+        # Verify output shape combines both outputs
+        self.assertEqual(out.shape, (num_actual_tokens, m.hidden_size))
 
 
 class TestNPUMLAInit(unittest.TestCase):
@@ -356,6 +431,7 @@ class TestNPUMLAInit(unittest.TestCase):
     @patch("omni_npu.v1.layers.attention.npu_mla.ColumnParallelFlashCommLinear")
     @patch("omni_npu.v1.layers.attention.npu_mla.ReplicatedLinear")
     @patch("omni_npu.v1.layers.attention.npu_mla.RMSNorm")
+    @pytest.mark.usefixtures("default_vllm_config")
     def test_init_basic_default_rope(
         self, mock_rms, mock_rep, mock_col, mock_row, mock_rope, mock_attn, mock_tp
     ):
@@ -392,6 +468,7 @@ class TestNPUMLAInit(unittest.TestCase):
     @patch("omni_npu.v1.layers.attention.npu_mla.ColumnParallelFlashCommLinear")
     @patch("omni_npu.v1.layers.attention.npu_mla.ReplicatedLinear")
     @patch("omni_npu.v1.layers.attention.npu_mla.RMSNorm")
+    @pytest.mark.usefixtures("default_vllm_config")
     def test_init_non_default_rope_rewrites_type_and_applies_yarn_scaling(
         self, mock_rms, mock_rep, mock_col, mock_row, mock_rope, mock_attn, mock_mscale, mock_tp
     ):

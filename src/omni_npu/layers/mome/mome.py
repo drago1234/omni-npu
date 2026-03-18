@@ -24,21 +24,30 @@ class NPUAggregateConv(AggregateConv):
         super().__init__(hidden_size, config, vllm_config, output_parallel, attn_prefix, padding)
         self.conv_weight = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, only_prefill=False, force_decode=False) -> torch.Tensor:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
             # V1 profile run
             return hidden_states
         attn_metadata = attn_metadata[self.attn_prefix]
-        cache_slot_id = forward_context.cache_slot_id
         batch_descriptor = forward_context.batch_descriptor
-        if attn_metadata.num_prefills > 0 or batch_descriptor.num_tokens > attn_metadata.num_decodes:
-            batch_size = len(attn_metadata.query_start_loc) - 1
+        if only_prefill:
+            query_start_loc = attn_metadata.prefill.query_start_loc
+            cache_slot_id = forward_context.cache_slot_id[attn_metadata.num_decodes:attn_metadata.num_reqs]
+            cache_idx_offset = attn_metadata.num_decodes
+        elif force_decode:
+            cache_slot_id = forward_context.cache_slot_id[:attn_metadata.num_decodes]
+        else:
+            query_start_loc = attn_metadata.query_start_loc
+            cache_slot_id = forward_context.cache_slot_id
+            cache_idx_offset = 0
+        if (attn_metadata.num_prefills > 0 or batch_descriptor.num_tokens > attn_metadata.num_decodes) and not force_decode:
+            batch_size = len(query_start_loc) - 1
             conv_output_list = []
             for i in range(batch_size):
-                s = attn_metadata.query_start_loc[i]
-                e = attn_metadata.query_start_loc[i + 1]
+                s = query_start_loc[i]
+                e = query_start_loc[i + 1]
                 local_input = hidden_states[s: e]
                 conv_input = torch.cat([self.cache_states[cache_slot_id[i]].contiguous(), local_input], dim=0)
                 conv_input_transpose = conv_input.unsqueeze(dim=1)
@@ -48,7 +57,7 @@ class NPUAggregateConv(AggregateConv):
                 if not self.padding and cache_slot_id[i] == 0:
                     conv_output[:self.cache_length] = 0
                 conv_output_list.append(conv_output)
-                self.cache_states[i + 1] = conv_input[-self.cache_length:, :]
+                self.cache_states[i + 1 + cache_idx_offset] = conv_input[-self.cache_length:, :]
             if e < hidden_states.shape[0]:
                 conv_output_list.append(hidden_states[e:])
             conv_output =  torch.cat(conv_output_list, dim=0)

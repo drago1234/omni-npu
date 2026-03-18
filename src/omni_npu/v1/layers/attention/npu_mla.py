@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch_npu
@@ -283,8 +283,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attn_metadata: Optional['NPUMLAMetadata'] = None,
+        attn_metadata: Optional['NPUMLADecodeMetadata'] = None,
+        pd_mixed_flag: bool = False,
     ) -> torch.Tensor:
+        force_decode = True if pd_mixed_flag else False
         kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
         nz_block_size = 16
 
@@ -293,13 +295,13 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
 
         if self.compresskv_conv is not None:
             kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            kv_c = self.compresskv_conv(kv_c) + kv_c
+            kv_c = self.compresskv_conv(kv_c, force_decode=force_decode) + kv_c
             if not self.rope_interleaved:
                 k_pe = self.even_odd_indexing(k_pe)
             kv = torch.cat([kv_c, k_pe], dim=-1)
 
         if self.qa_conv is not None:
-            q_lora = self.qa_conv(q_lora) + q_lora
+            q_lora = self.qa_conv(q_lora, force_decode=force_decode) + q_lora
         q_norm = self.q_a_layernorm(q_lora)
         q = self.q_b_proj(q_norm)[0]
 
@@ -363,10 +365,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 "num_key_value_heads": 1,
                 "input_layout": "TND",
                 "softmax_scale": self.scaling,
-                "block_table": attn_metadata.decode.block_table,
+                "block_table": attn_metadata.block_table,
                 "block_size": 128,
-                "actual_seq_qlen": attn_metadata.decode.query_cumlens,
-                "actual_seq_kvlen": attn_metadata.decode.seq_lens,
+                "actual_seq_qlen": attn_metadata.query_cumlens,
+                "actual_seq_kvlen": attn_metadata.seq_lens,
                 "atten_mask": NPUMLAImpl.DECORE_ATTN_MASK,
                 "sparse_mode": 4,
                 "sink_number": self.param_sink_number,
@@ -408,10 +410,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 "scale": self.scaling,
                 "antiquant_mode": 0,
                 "antiquant_scale": None,
-                "block_table": attn_metadata.decode.block_table,
+                "block_table": attn_metadata.block_table,
                 "block_size": block_size,
-                "actual_seq_lengths": attn_metadata.decode.query_cumlens,
-                "actual_seq_lengths_kv": attn_metadata.decode.seq_lens,
+                "actual_seq_lengths": attn_metadata.query_cumlens,
+                "actual_seq_lengths_kv": attn_metadata.seq_lens,
             }
             attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
@@ -432,7 +434,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         attn_output = torch_npu.npu_transpose_batchmatmul(attn_output, self.attn.impl.W_UV, perm_y=(1, 0, 2))
         attn_output = attn_output.reshape(bsz, 1, -1).view(-1, self.num_local_heads * self.v_head_dim)
         if self.o_conv is not None:
-            attn_output = self.o_conv(attn_output) + attn_output
+            attn_output = self.o_conv(attn_output, force_decode=force_decode) + attn_output
         return self.o_proj.forward(attn_output)[0]
 
     def _forward_prefill(
@@ -440,8 +442,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attn_metadata: Optional['NPUMLAMetadata'] = None,
+        attn_metadata: Optional[Union['NPUMLAPrefillMetadata', 'NPUMLAMetadata']] = None,
+        pd_mixed_flag: bool = False,
     ) -> torch.Tensor:
+        only_prefill = True if pd_mixed_flag else False
         q = self.q_a_proj(hidden_states)[0]
         attn_output = q.new_empty(
             q.shape[0],
@@ -452,19 +456,22 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             latent_cache = latent_cache.view(-1, 1, latent_cache.size(-1))
             kv_a, k_pe = torch.split(latent_cache, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            if self.compresskv_conv is not None:
+                kv_a = self.compresskv_conv(kv_a) + kv_a
             kv_a = self.kv_a_layernorm(kv_a)
             k_pe = k_pe.unsqueeze(2)
             k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
             k_pe = k_pe.squeeze(2)
             attn_output.fill_(0)
             attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
+            if self.o_conv is not None:
+                attn_output = self.o_conv(attn_output) + attn_output
             output = self.o_proj.forward(attn_output)[0]
             return output
 
-        prefill_metadata = attn_metadata.prefill
-        actual_seq_kvlen = prefill_metadata.seq_lens
-        actual_seq_qlen = prefill_metadata.query_cumlens
-        if prefill_metadata.max_query_len > 1:
+        actual_seq_kvlen = attn_metadata.seq_lens
+        actual_seq_qlen = attn_metadata.query_cumlens
+        if attn_metadata.max_query_len > 1:
             attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE
             sparse_mode = 3
         else:
@@ -476,7 +483,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         sub_stream.wait_stream(cur_stream)
 
         if self.qa_conv is not None:
-            q = self.qa_conv(q) + q
+            q = self.qa_conv(q, only_prefill=only_prefill) + q
         q = self.q_a_layernorm(q)
         if self.quant_symbol:
             q, pertoken_scale = torch_npu.npu_dynamic_quant(q)
@@ -485,7 +492,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             if self.compresskv_conv is not None:
                 kv_c, k_pe = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                kv_c = self.compresskv_conv(kv_c) + kv_c
+                kv_c = self.compresskv_conv(kv_c, only_prefill=only_prefill) + kv_c
                 if not self.rope_interleaved:
                     k_pe = self.even_odd_indexing(k_pe)
                 latent_cache = torch.cat([kv_c, k_pe], dim=-1)
@@ -529,13 +536,13 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 prefill_k_pe = self._insert_tensor_by_start_loc(
                     prefill_k_pe,
                     self.attn.sink_k_pe,
-                    attn_metadata.prefill.query_start_loc,
+                    attn_metadata.query_start_loc,
                 )
                 prefill_kv_a = prefill_kv_a.squeeze(2).squeeze(1)
                 prefill_kv_a = self._insert_tensor_by_start_loc(
                     prefill_kv_a,
                     self.attn.sink_compressed_kv,
-                    attn_metadata.prefill.query_start_loc,
+                    attn_metadata.query_start_loc,
                 )
             kv = self.kv_b_proj.forward(prefill_kv_a)[0]
 
@@ -597,7 +604,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
 
         attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
         if self.o_conv is not None:
-            attn_output = self.o_conv(attn_output) + attn_output
+            attn_output = self.o_conv(attn_output, only_prefill=only_prefill) + attn_output
         output = self.o_proj.forward(attn_output)[0]
         return output
 
@@ -673,10 +680,35 @@ def npu_mla_forward(
             if self_kv_cache is not None and len(self_kv_cache) > 0:
                 self.attn.populate_sink_kv(self_kv_cache[0], self_kv_cache[1])
 
-    if attn_metadata is None or attn_metadata.prefill is not None:
+    if attn_metadata is None:
         return self._forward_prefill(hidden_states, cos, sin, attn_metadata)
+
+    num_actual_toks = attn_metadata.num_actual_tokens
+    has_decode = attn_metadata.num_decodes > 0
+    has_prefill = attn_metadata.num_prefills > 0
+    num_decode_tokens = attn_metadata.num_decode_tokens
+
+    if has_decode and has_prefill:
+        prefill_hidden_states = hidden_states[num_decode_tokens:num_actual_toks, ...]
+        prefill_cos = cos[num_decode_tokens:num_actual_toks, ...]
+        prefill_sin = sin[num_decode_tokens:num_actual_toks, ...]
+        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_toks]
+        prefill_output = self._forward_prefill(prefill_hidden_states, prefill_cos, prefill_sin, attn_metadata.prefill, pd_mixed_flag=True)
+
+        decode_hidden_states = hidden_states[:num_decode_tokens]
+        decode_cos = cos[:num_decode_tokens]
+        decode_sin = sin[:num_decode_tokens]
+        attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
+        decode_output = self._forward_decode(decode_hidden_states, decode_cos, decode_sin, attn_metadata.decode, pd_mixed_flag=True)
+
+        return torch.cat([decode_output, prefill_output], dim=0)
+
+    if attn_metadata.prefill is not None:
+        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping
+        return self._forward_prefill(hidden_states, cos, sin, attn_metadata.prefill)
     else:
-        return self._forward_decode(hidden_states, cos, sin, attn_metadata)
+        attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping
+        return self._forward_decode(hidden_states, cos, sin, attn_metadata.decode)
     
     
 def npu_mla_forward_fake(   
