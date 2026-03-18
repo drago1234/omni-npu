@@ -1,3 +1,4 @@
+import functools
 from typing import cast
 
 import torch
@@ -13,11 +14,21 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionMetadata,
     AttentionType,
     MLAAttentionImpl,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.attention.backends.utils import (
+    CommonAttentionMetadata,
+    subclass_attention_backend,
+)
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+)
 from vllm.model_executor.layers.attention import static_sink_attention
+from vllm.utils.math_utils import cdiv
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
@@ -25,7 +36,7 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 logger = init_logger(__name__)
 
 
-@register_patch("create_static_sink_attention_backendPatch", layers)
+@register_patch("create_static_sink_attention_backendPatch", static_sink_attention)
 class create_static_sink_attention_backendPatch(VLLMPatch):
     _attr_names_to_apply = ['create_static_sink_attention_backend']
 
@@ -113,7 +124,7 @@ class create_static_sink_attention_backendPatch(VLLMPatch):
         return attn_backend
     # patch end
     
-    layers.static_sink_attention.create_static_sink_attention_backend = create_static_sink_attention_backend
+    static_sink_attention.create_static_sink_attention_backend = create_static_sink_attention_backend
 
 
 @register_patch("StaticSinkAttentionPatch", static_sink_attention)
@@ -198,7 +209,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
             )
             self.sink_len = sink_len
             self.sliding_window = sliding_window
-            self.attn_backend = create_static_sink_attention_backend(
+            self.attn_backend = static_sink_attention.create_static_sink_attention_backend(
                 self.attn_backend,
                 sink_len=self.sink_len,
             )
