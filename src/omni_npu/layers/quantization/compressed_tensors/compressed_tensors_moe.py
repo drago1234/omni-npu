@@ -267,10 +267,12 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         prepare_permute_result = self.apply_prepare_permute(
             strategy_impl, layer, x_slice, topk_ids
         )
+        use_grouped_matmul_finalize_routing = (strategy == "agrs" and prepare_permute_result.row_idx_type == 1)
         output = self.apply_experts(
             layer=layer,
             prepare_permute_result=prepare_permute_result,
             activation=activation,
+            use_grouped_matmul_finalize_routing=use_grouped_matmul_finalize_routing
         )
 
         shared_output = None
@@ -313,6 +315,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         layer: torch.nn.Module,
         prepare_permute_result: PreparePermuteResult,
         activation: str = "silu",
+        use_grouped_matmul_finalize_routing: bool = False
     ) -> torch.Tensor:
         hidden_states = prepare_permute_result.hidden_states_sorted_by_experts
         expert_tokens = prepare_permute_result.expert_tokens
@@ -388,6 +391,8 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         intermediate_h, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
             **dequant_swiglu_quant_kwargs
         )
+        if use_grouped_matmul_finalize_routing:
+            return intermediate_h, pertoken_scale
         return torch_npu.npu_grouped_matmul(
             [intermediate_h],
             [layer.w2_weight],

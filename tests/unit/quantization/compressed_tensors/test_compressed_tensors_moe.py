@@ -58,11 +58,13 @@ class DummyPreparePermuteResult:
         expert_tokens,
         dynamic_scale,
         avg_tokens_per_expert=None,
+        row_idx_type=0,
     ):
         self.hidden_states_sorted_by_experts = hidden_states_sorted_by_experts
         self.expert_tokens = expert_tokens
         self.dynamic_scale = dynamic_scale
         self.avg_tokens_per_expert = avg_tokens_per_expert
+        self.row_idx_type = row_idx_type
 
 
 class DummyStrategyImpl:
@@ -262,12 +264,13 @@ def _make_method(module, layer, has_bias=False):
     return module.NPUCompressedTensorsW8A8Int8MoEMethod(parent, layer)
 
 
-def _make_prepare_result(dynamic_scale=None):
+def _make_prepare_result(dynamic_scale=None, row_idx_type=0):
     return DummyPreparePermuteResult(
         hidden_states_sorted_by_experts=torch.ones(3, 4, dtype=torch.int8),
         expert_tokens=torch.tensor([1, 2], dtype=torch.int64),
         dynamic_scale=dynamic_scale,
         avg_tokens_per_expert=[1, 2],
+        row_idx_type=row_idx_type,
     )
 
 
@@ -407,6 +410,48 @@ def test_apply_experts_swigluoai_passes_kernel_kwargs(
     assert grouped_calls[1]["output_dtype"] == torch.bfloat16
 
 
+def test_apply_experts_grouped_finalize_returns_intermediate_and_scale(
+    compressed_moe_module, monkeypatch
+):
+    layer = MockMoELayer(use_ep=True)
+    layer.quant_config = object()
+    method = _make_method(compressed_moe_module, layer)
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        hidden_size=4,
+        intermediate_size_per_partition=3,
+        params_dtype=torch.float16,
+        weight_loader="mock_loader",
+    )
+    method.process_weights_after_loading(layer)
+
+    grouped_calls = []
+
+    def _fake_grouped_matmul(inputs, weights, **kwargs):
+        grouped_calls.append(kwargs)
+        return [torch.ones(inputs[0].shape[0], 6, dtype=torch.int32)]
+
+    intermediate_h = torch.ones(3, 3, dtype=torch.int8)
+    pertoken_scale = torch.ones(3, dtype=torch.float32)
+    dequant_mock = MagicMock(return_value=(intermediate_h, pertoken_scale))
+    monkeypatch.setattr(
+        compressed_moe_module.torch_npu, "npu_grouped_matmul", _fake_grouped_matmul
+    )
+    monkeypatch.setattr(
+        compressed_moe_module.torch_npu, "npu_dequant_swiglu_quant", dequant_mock
+    )
+
+    output = method.apply_experts(
+        layer,
+        _make_prepare_result(dynamic_scale=torch.ones(1, 3)),
+        use_grouped_matmul_finalize_routing=True,
+    )
+
+    assert output[0] is intermediate_h
+    assert output[1] is pertoken_scale
+    assert len(grouped_calls) == 1
+
 def test_apply_with_ep_returns_tuple_when_shared_experts_enabled(
     compressed_moe_module, monkeypatch
 ):
@@ -439,6 +484,32 @@ def test_apply_with_ep_returns_tuple_when_shared_experts_enabled(
     assert torch.equal(shared_output, torch.full((3, 4), 2.0))
     assert torch.equal(routed_output, torch.full((3, 4), 5.0))
 
+
+def test_apply_passes_grouped_finalize_flag_for_agrs_decode(compressed_moe_module):
+    layer = MockMoELayer(use_ep=True)
+    layer.quant_config = object()
+    method = _make_method(compressed_moe_module, layer)
+    method.select_communication_strategy = lambda n: (
+        "agrs",
+        DummyStrategyImpl(
+            _make_prepare_result(dynamic_scale=torch.ones(3), row_idx_type=1),
+            final_output=torch.full((3, 4), 4.0),
+        ),
+    )
+    method.apply_experts = MagicMock(
+        return_value=(torch.ones(3, 3, dtype=torch.int8), torch.ones(3))
+    )
+
+    output = method.apply(
+        layer=layer,
+        hidden_states=torch.randn(3, 4, dtype=torch.bfloat16),
+        router_logits=torch.randn(3, 2, dtype=torch.float32),
+        top_k=1,
+        renormalize=False,
+    )
+
+    assert method.apply_experts.call_args.kwargs["use_grouped_matmul_finalize_routing"] is True
+    assert torch.equal(output, torch.full((3, 4), 4.0))
 
 def test_apply_shared_experts_tp_gt_1_uses_full_hidden_states(
     compressed_moe_module, monkeypatch
@@ -566,4 +637,3 @@ def test_init_eplb_sets_redundant_experts(compressed_moe_module, monkeypatch):
 
     assert method.num_of_redundant_experts == 1
     assert layer.w13_weight.shape[0] == 3
-

@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union, Tuple
 
 import torch
 import torch.distributed as dist
@@ -20,6 +20,7 @@ from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 
 DEFAULT_ALL2ALL_THRESHOLD = 64
+GROUPED_FINALIZE_ROW_INDEX_STRIDE = 991
 
 
 @dataclass
@@ -52,6 +53,7 @@ class AGRSPreparePermuteResult(PreparePermuteResult):
     expanded_row_idx: Optional[torch.Tensor] = None
     gathered_topk_ids: Optional[torch.Tensor] = None
     dtype: Optional[torch.dtype] = None
+    row_idx_type: Optional[int] = 0
 
 
 class FusedMoEPreparePermuteAndUnpermuteFinalize(ABC):
@@ -172,16 +174,22 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
 
 
 class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
+    def __init__(self, layer):
+        super().__init__(layer)
+        device_name = torch_npu.npu.get_device_name(0)
+        self.is_a2_device = device_name.startswith("Ascend910B")
+
     def prepare_permute(
         self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor
     ) -> AGRSPreparePermuteResult:
+        self.batch_size = x.shape[0]
         x = x.view(-1, x.shape[-1])
         topk_ids = topk_ids.int()
         max_num_deployed_expert = layer.w13_weight.shape[0] * self.ep_size
         experts_start_idx = self.ep_rank * layer.w13_weight.shape[0]
         experts_end_idx = experts_start_idx + layer.w13_weight.shape[0]
         expert_range = [experts_start_idx, experts_end_idx]
-
+        row_idx_type = 0
         if layer.quant_config is None:
             gathered_x = get_dp_group().all_gather(x, dim=0)
             gathered_topk_ids = get_dp_group().all_gather(topk_ids, dim=0)
@@ -196,10 +204,14 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 expert_tokens_num_flag=True,
                 quant_mode=-1,
                 active_expert_range=expert_range,
-                row_idx_type=0,
+                row_idx_type=row_idx_type,
             )
             dynamic_scale = None
         else:
+            attn_metadata = get_forward_context().attn_metadata
+            is_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
+            if self.is_a2_device and not is_prefill:
+                row_idx_type = 1
             x_int8, x_scale = torch_npu.npu_dynamic_quant(x)
             x_int8 = get_dp_group().all_gather(x_int8, dim=0)
             x_scale = get_dp_group().all_gather(x_scale, dim=0)
@@ -217,7 +229,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 expert_tokens_num_flag=True,
                 active_expert_range=expert_range,
                 quant_mode=-1,
-                row_idx_type=0,
+                row_idx_type=row_idx_type,
             )
         if layer.quant_config is not None:
             expanded_row_idx = torch.clamp(expanded_row_idx, min=0, max=expanded_row_idx.shape[0] - 1)
@@ -230,37 +242,75 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             expanded_row_idx=expanded_row_idx,
             gathered_topk_ids=gathered_topk_ids,
             dtype=x.dtype,
+            row_idx_type=row_idx_type
         )
 
     def unpermute_finalize(
         self,
         layer: torch.nn.Module,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         agrs_prepare_permute_result: AGRSPreparePermuteResult,
+        pertoken_scale: torch.Tensor = None
     ) -> torch.Tensor:
         expanded_row_idx = agrs_prepare_permute_result.expanded_row_idx
         gathered_topk_ids = agrs_prepare_permute_result.gathered_topk_ids
+        row_idx_type = agrs_prepare_permute_result.row_idx_type
+        expert_tokens = agrs_prepare_permute_result.expert_tokens
 
         gathered_topk_weights = get_dp_group().all_gather(topk_weights, dim=0)
 
         if layer.quant_config is not None:
-            expert_range = agrs_prepare_permute_result.expert_range
-            valid_mask = (gathered_topk_ids >= expert_range[0]) & (
-                gathered_topk_ids < expert_range[1]
-            )
-            gathered_topk_weights = gathered_topk_weights * valid_mask.to(gathered_topk_weights.dtype)
-            y = torch_npu.npu_moe_finalize_routing(
-                hidden_states.float(),
-                skip1=None,
-                skip2=None,
-                bias=None,
-                scales=gathered_topk_weights.float(),
-                expanded_src_to_dst_row=expanded_row_idx,
-                export_for_source_row=gathered_topk_ids,
-                drop_pad_mode=2,
-            ).to(agrs_prepare_permute_result.dtype)
+            if row_idx_type == 1:
+                x, pertoken_scale = hidden_states
+                hidden_size = x.shape[1]
+                batch_size = self.batch_size
+                range1 = torch.arange(0, expanded_row_idx.shape[0], dtype=torch.int32, device="npu")
+                range2 = range1 * GROUPED_FINALIZE_ROW_INDEX_STRIDE
+                mask = (range1 >= torch.sum(expert_tokens)).to(torch.int32)
+                expanded_row_idx += range2 * mask
+                expanded_row_idx = expanded_row_idx % expanded_row_idx.shape[0]
+                expanded_row_idx = torch.clamp(expanded_row_idx, min=0, max=expanded_row_idx.shape[0] - 1)
+                sorted_topk_weight = torch.index_select(topk_weights.reshape(-1), 0, expanded_row_idx)
+                row_index = expanded_row_idx // topk_ids.shape[-1]
+                row_index = row_index.to(torch.int64)
+                share_experts_output = torch.zeros(
+                    (batch_size // layer.dp_size, hidden_size),
+                    dtype=torch.bfloat16,
+                    device=current_platform.device_type
+                )
+                y = torch_npu.npu_grouped_matmul_finalize_routing(
+                    x,
+                    layer.w2_weight,
+                    expert_tokens,
+                    scale=layer.w2_weight_scale.to(torch.float),
+                    bias=layer.w2_bias if hasattr(layer, "w2_bias") else None,
+                    pertoken_scale=pertoken_scale,
+                    shared_input=share_experts_output,
+                    logit=sorted_topk_weight,
+                    row_index=row_index,
+                    output_bs=batch_size,
+                    shared_input_weight=1.0,
+                    group_list_type=1,
+                    shared_input_offset=0
+                ).to(agrs_prepare_permute_result.dtype)
+            else:
+                expert_range = agrs_prepare_permute_result.expert_range
+                valid_mask = (gathered_topk_ids >= expert_range[0]) & (
+                    gathered_topk_ids < expert_range[1]
+                )
+                gathered_topk_weights = gathered_topk_weights * valid_mask.to(gathered_topk_weights.dtype)
+                y = torch_npu.npu_moe_finalize_routing(
+                    hidden_states.float(),
+                    skip1=None,
+                    skip2=None,
+                    bias=None,
+                    scales=gathered_topk_weights.float(),
+                    expanded_src_to_dst_row=expanded_row_idx,
+                    export_for_source_row=gathered_topk_ids,
+                    drop_pad_mode=2,
+                ).to(agrs_prepare_permute_result.dtype)
         else:
             y = torch_npu.npu_moe_finalize_routing(
                 hidden_states.unsqueeze(0),

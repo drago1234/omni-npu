@@ -19,6 +19,7 @@ def prepare_module(monkeypatch):
     torch_npu.npu_dynamic_quant = MagicMock()
     torch_npu.npu_moe_re_routing = MagicMock()
     torch_npu.npu_moe_finalize_routing = MagicMock()
+    torch_npu.npu_grouped_matmul_finalize_routing = MagicMock()
     torch_npu.npu_moe_distribute_dispatch_v2 = MagicMock()
     torch_npu.npu_moe_distribute_combine_v2 = MagicMock()
     torch_npu.npu = SimpleNamespace(get_device_name=lambda _: "Ascend910C")
@@ -169,6 +170,44 @@ def test_agrs_prepare_permute_with_quant(prepare_module):
     assert torch.equal(result.expert_tokens, expert_tokens)
     assert result.dtype == x.dtype
 
+
+def test_agrs_prepare_permute_quant_decode_on_a2_sets_row_idx_type(prepare_module):
+    module, stubs = prepare_module
+    stubs.torch_npu.npu.get_device_name = lambda _: "Ascend910B"
+    stubs.context_holder.attn_metadata = {0: SimpleNamespace(num_prefills=0)}
+    layer = SimpleNamespace(
+        global_num_experts=4,
+        local_num_experts=2,
+        ep_size=stubs.ep_group.world_size,
+        quant_config=object(),
+        quant_method=MagicMock(),
+        w13_weight=torch.zeros(2, 1, 1),
+    )
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    stubs.torch_npu.npu_dynamic_quant.return_value = (
+        x.to(torch.int8),
+        torch.tensor([0.1, 0.2], dtype=torch.float32),
+    )
+    stubs.torch_npu.npu_moe_init_routing_v2.return_value = (
+        torch.ones(2, 2, dtype=torch.float32),
+        torch.tensor([-3, 5], dtype=torch.int32),
+        torch.tensor([1, 1], dtype=torch.int32),
+        torch.tensor([0.1, 0.2], dtype=torch.float32),
+    )
+
+    handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
+    result = handler.prepare_permute(
+        layer=layer,
+        x=x,
+        topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+    )
+
+    assert handler.batch_size == 2
+    assert result.row_idx_type == 1
+    assert torch.equal(result.expanded_row_idx, torch.tensor([0, 1], dtype=torch.int32))
+    assert stubs.torch_npu.npu_moe_init_routing_v2.call_args.kwargs["row_idx_type"] == 1
+
+
 def test_all2all_unpermute_finalize_reorders_and_finalizes(prepare_module):
     module, stubs = prepare_module
     layer = SimpleNamespace(
@@ -314,6 +353,65 @@ def test_agrs_unpermute_finalize_quant_masks_out_of_range_experts(prepare_module
     scales = stubs.torch_npu.npu_moe_finalize_routing.call_args.kwargs["scales"]
     assert torch.equal(scales, torch.tensor([[0.0], [1.0]], dtype=torch.float32))
 
+
+def test_agrs_unpermute_finalize_quant_row_idx_type_1_uses_grouped_finalize(
+    prepare_module, monkeypatch
+):
+    module, stubs = prepare_module
+    original_arange = torch.arange
+
+    def _cpu_arange(*args, **kwargs):
+        kwargs.pop("device", None)
+        return original_arange(*args, **kwargs)
+
+    monkeypatch.setattr(module.torch, "arange", _cpu_arange)
+    layer = SimpleNamespace(
+        global_num_experts=4,
+        local_num_experts=2,
+        quant_config=object(),
+        dp_size=1,
+        w2_weight=torch.ones(2, 3, 2, dtype=torch.int8),
+        w2_weight_scale=torch.ones(2, 3, dtype=torch.bfloat16),
+        w2_bias=torch.zeros(2, 3, dtype=torch.bfloat16),
+    )
+    stubs.torch_npu.npu_grouped_matmul_finalize_routing.return_value = torch.ones(
+        2, 3, dtype=torch.bfloat16
+    )
+    handler = module.AGRSPrepPmtAndUnpmtFinal(layer)
+    handler.batch_size = 2
+    prepare_result = module.AGRSPreparePermuteResult(
+        hidden_states_sorted_by_experts=torch.zeros(4, 3),
+        expert_tokens=torch.tensor([1, 1], dtype=torch.int32),
+        dynamic_scale=torch.ones(4),
+        expert_range=[2, 4],
+        expanded_row_idx=torch.tensor([0, 1, 4, 5], dtype=torch.int32),
+        gathered_topk_ids=torch.tensor([[2, 3], [2, 3]], dtype=torch.int32),
+        dtype=torch.float16,
+        row_idx_type=1,
+    )
+    topk_ids = torch.tensor([[2, 3], [2, 3]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.2, 0.8], [0.3, 0.7]], dtype=torch.float32)
+    hidden_states = (
+        torch.ones(4, 3, dtype=torch.int8),
+        torch.tensor([1.0, 1.1, 1.2, 1.3], dtype=torch.float32),
+    )
+
+    y = handler.unpermute_finalize(
+        layer=layer,
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        agrs_prepare_permute_result=prepare_result,
+    )
+
+    assert y.dtype == torch.float16
+    kwargs = stubs.torch_npu.npu_grouped_matmul_finalize_routing.call_args.kwargs
+    assert torch.allclose(kwargs["logit"], torch.tensor([0.2, 0.8, 0.3, 0.3]))
+    assert torch.equal(kwargs["row_index"], torch.tensor([0, 0, 1, 1], dtype=torch.int64))
+    assert kwargs["output_bs"] == 2
+    assert kwargs["group_list_type"] == 1
+    assert kwargs["bias"] is layer.w2_bias
+    assert kwargs["shared_input"].shape == (2, 3)
 
 def test_strategy_selector_a2_tp_dp_branches(prepare_module):
     module, stubs = prepare_module
