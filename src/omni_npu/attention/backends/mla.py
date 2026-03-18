@@ -681,7 +681,12 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         else:
             query_heads = self.num_heads           
 
-        num_tokens = decode_ql_nope.size(0)
+        # In graph/dummy-run mode, decode queries may be padded while
+        # actual_seq_lengths still records real token count.
+        # Keep query T aligned with actual_seq_lengths[-1] for TND kernels.
+        num_tokens = attn_metadata.decode.query_cumlens[-1]
+        decode_ql_nope = decode_ql_nope[:num_tokens]
+        decode_q_pe = decode_q_pe[:num_tokens]
         forward_context = get_forward_context()
         if self.sink_len > 0:
             if self.sliding_window is not None:

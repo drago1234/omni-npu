@@ -355,11 +355,12 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 window_size = self.sliding_window-1
             else:
                 window_size = NPUMLAImpl.MAX_WINDOW_SIZE
+            actual_query_cumlens = attn_metadata.query_cumlens
             kwargs = {
-                "query": q_nope, 
+                "query": q_nope[:actual_query_cumlens[-1]], 
+                "query_rope": q_pe[:actual_query_cumlens[-1]],
                 "key": kv_cache[0], 
                 "value": kv_cache[0],
-                "query_rope": q_pe,
                 "key_rope": kv_cache[1],
                 "num_query_heads": query_heads,
                 "num_key_value_heads": 1,
@@ -367,7 +368,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 "softmax_scale": self.scaling,
                 "block_table": attn_metadata.block_table,
                 "block_size": 128,
-                "actual_seq_qlen": attn_metadata.query_cumlens,
+                "actual_seq_qlen": actual_query_cumlens,
                 "actual_seq_kvlen": attn_metadata.seq_lens,
                 "atten_mask": NPUMLAImpl.DECORE_ATTN_MASK,
                 "sparse_mode": 4,
@@ -384,11 +385,11 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                     softmax_lse=softmax_lse ,
                     num_tokens=num_tokens,
                     const_args=kwargs)
-                attn_output = attn_output.transpose(0, 1).contiguous()
             else:
-                attn_output = torch.ops.custom.npu_fused_infer_attention_sink(
+                attn_output[:actual_query_cumlens[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(
                     **kwargs
-                )[0].transpose(0, 1).contiguous() # TND -> NTD
+                )[0]
+            attn_output = attn_output.transpose(0, 1).contiguous() # TND -> NTD
         else:
             sparse_mode = 3
             input_layout = "TND_NTD"
@@ -661,6 +662,21 @@ def npu_mla_forward(
     sin: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
+    full_hidden_states = hidden_states
+    total_tokens = full_hidden_states.shape[0]
+
+    def _pad_output_to_input_tokens(attn_output: torch.Tensor) -> torch.Tensor:
+        output_tokens = attn_output.shape[0]
+        if output_tokens == total_tokens:
+            return attn_output
+        if output_tokens > total_tokens:
+            raise RuntimeError(
+                f"npu_mla_forward output tokens ({output_tokens}) exceed input tokens ({total_tokens})"
+            )
+        full_output = full_hidden_states.clone()
+        full_output[:output_tokens, ...] = attn_output
+        return full_output
+
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     attn_metadata = forward_context.attn_metadata
@@ -701,14 +717,40 @@ def npu_mla_forward(
         attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
         decode_output = self._forward_decode(decode_hidden_states, decode_cos, decode_sin, attn_metadata.decode, pd_mixed_flag=True)
 
-        return torch.cat([decode_output, prefill_output], dim=0)
+        mixed_output = torch.cat([decode_output, prefill_output], dim=0)
+        if mixed_output.shape[0] != num_actual_toks:
+            raise RuntimeError(
+                f"mixed attention output tokens ({mixed_output.shape[0]}) do not match num_actual_tokens ({num_actual_toks})"
+            )
+        return _pad_output_to_input_tokens(mixed_output)
 
     if attn_metadata.prefill is not None:
-        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping
-        return self._forward_prefill(hidden_states, cos, sin, attn_metadata.prefill)
+        # Keep prefill inputs aligned with slot_mapping length expected by
+        # npu_kv_rmsnorm_rope_cache (index size must equal B*S).
+        prefill_hidden_states = hidden_states[:num_actual_toks, ...]
+        prefill_cos = cos[:num_actual_toks, ...]
+        prefill_sin = sin[:num_actual_toks, ...]
+        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[:num_actual_toks]
+        prefill_output = self._forward_prefill(prefill_hidden_states, prefill_cos, prefill_sin, attn_metadata.prefill)
+        if prefill_output.shape[0] != num_actual_toks:
+            raise RuntimeError(
+                f"prefill attention output tokens ({prefill_output.shape[0]}) do not match num_actual_tokens ({num_actual_toks})"
+            )
+        return _pad_output_to_input_tokens(prefill_output)
     else:
-        attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping
-        return self._forward_decode(hidden_states, cos, sin, attn_metadata.decode)
+        # Keep decode-only inputs aligned with slot_mapping length expected by
+        # npu_kv_rmsnorm_rope_cache (index size must equal B*S).
+        decode_hidden_states = hidden_states[:num_actual_toks, ...]
+        decode_cos = cos[:num_actual_toks, ...]
+        decode_sin = sin[:num_actual_toks, ...]
+        attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_actual_toks]
+        decode_output = self._forward_decode(
+            decode_hidden_states,
+            decode_cos,
+            decode_sin,
+            attn_metadata.decode,
+        )
+        return _pad_output_to_input_tokens(decode_output)
     
     
 def npu_mla_forward_fake(   

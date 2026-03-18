@@ -98,6 +98,10 @@ class DummyAttnMeta:
     prefill: DummyPrefillMeta | None
     decode: DummyDecodeMeta | None
     slot_mapping: torch.Tensor
+    num_actual_tokens: int
+    num_prefills: int
+    num_decodes: int
+    num_decode_tokens: int
 
 
 class DummyForwardContext:
@@ -201,19 +205,50 @@ def _get_cos_sin_for_positions(
     rotary_emb: torch.nn.Module, positions: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     positions = positions.flatten()
+    seqlen = int(positions.max().item()) + 1
+
+    def _gather_by_positions(cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if cos.shape[0] == positions.numel():
+            return cos, sin
+        if cos.shape[0] >= seqlen:
+            cos = cos.index_select(0, positions)
+            sin = sin.index_select(0, positions)
+            return cos, sin
+        raise ValueError(
+            f"Cannot align rotary cache with positions: "
+            f"cache_len={cos.shape[0]}, num_positions={positions.numel()}, seqlen={seqlen}"
+        )
+
     try:
-        return rotary_emb.get_cos_sin(positions)
-    except TypeError:
-        seqlen = int(positions.max().item()) + 1
+        # Prefer deterministic full-cache path, then gather exact positions.
         cos, sin = rotary_emb.get_cos_sin(seqlen)
-        cos = cos.index_select(0, positions)
-        sin = sin.index_select(0, positions)
-        # vLLM base rotary cache is half-dim [T, D/2], while NPU MLA kernels
-        # consume interleaved full-dim [T, D].
-        if cos.dim() >= 1:
-            cos = cos.repeat_interleave(2, dim=-1)
-            sin = sin.repeat_interleave(2, dim=-1)
-        return cos, sin
+        cos, sin = _gather_by_positions(cos, sin)
+    except TypeError:
+        # Fallback for rotary implementations that only accept position tensors.
+        cos, sin = rotary_emb.get_cos_sin(positions)
+        cos, sin = _gather_by_positions(cos, sin)
+    # Keep cache dim aligned with NPU MLA rope dim.
+    # Some rotary impls return half-dim cache [T, D/2].
+    if cos.shape[-1] * 2 == QK_ROPE_HEAD_DIM:
+        cos = cos.repeat_interleave(2, dim=-1)
+        sin = sin.repeat_interleave(2, dim=-1)
+    elif cos.shape[-1] != QK_ROPE_HEAD_DIM:
+        raise ValueError(
+            f"Unexpected rope dim from rotary cache: {cos.shape[-1]} "
+            f"(expected {QK_ROPE_HEAD_DIM} or {QK_ROPE_HEAD_DIM // 2})"
+        )
+
+    # NPU kernels in npu_mla.py expect 4D cos/sin (B, 1, 1, D).
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(1).unsqueeze(1)
+        sin = sin.unsqueeze(1).unsqueeze(1)
+    elif cos.dim() == 3:
+        cos = cos.unsqueeze(2)
+        sin = sin.unsqueeze(2)
+    elif cos.dim() != 4:
+        raise ValueError(f"Unexpected rope cache rank: cos={cos.dim()}, sin={sin.dim()}")
+
+    return cos, sin
 
 
 def _build_query_cumlens(batch_size: int, seq_len: int) -> list[int]:
@@ -643,7 +678,7 @@ def test_npu_mla_prefill_matches_reference(
     slot_mapping = _build_slot_mapping(batch_size, seq_len, block_table)
     query_cumlens = _build_query_cumlens(batch_size, seq_len)
     prefill_meta = DummyPrefillMeta(
-        seq_lens=query_cumlens,
+        seq_lens=[seq_len] * batch_size,
         query_cumlens=query_cumlens,
         max_query_len=seq_len,
     )
@@ -651,6 +686,10 @@ def test_npu_mla_prefill_matches_reference(
         prefill=prefill_meta,
         decode=None,
         slot_mapping=slot_mapping,
+        num_actual_tokens=batch_size * seq_len,
+        num_prefills=batch_size,
+        num_decodes=0,
+        num_decode_tokens=0,
     )
 
     module = _build_module(device, dtype, monkeypatch, attn_metadata)
@@ -712,6 +751,10 @@ def test_npu_mla_decode_matches_reference(
         prefill=None,
         decode=decode_meta,
         slot_mapping=slot_mapping,
+        num_actual_tokens=batch_size,
+        num_prefills=0,
+        num_decodes=batch_size,
+        num_decode_tokens=batch_size,
     )
 
     module = _build_module(device, dtype, monkeypatch, attn_metadata)
