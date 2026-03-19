@@ -6,8 +6,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import set_weight_attrs
 
 from omni_models.models.pangu.openpangu import mHCModule
 import omni_training_custom_ops
@@ -26,21 +24,16 @@ class NPUmHCModule(mHCModule):
         self.hidden_size = config.hidden_size
         self.merge_layer_only_pre = merge_layer_only_pre
 
-        # modify alpha beta gamma and phi to float32 for mhc pre operator
         if not self.merge_layer_only_pre:
             phi_output_hidden_size = (self.num_stream + 2) * self.num_stream
-
-            self.branch_alpha_post = nn.Parameter(torch.empty(1, dtype=torch.float32))
-            self.branch_alpha_res = nn.Parameter(torch.empty(1, dtype=torch.float32))
-            self.branch_beta_post = nn.Parameter(torch.empty(self.num_stream, dtype=torch.float32))
-            self.branch_beta_res = nn.Parameter(
-                torch.empty(self.num_stream * self.num_stream, dtype=torch.float32)
+            self.branch_alpha = nn.Parameter(torch.empty(3, dtype=torch.float32))
+            self.branch_beta = nn.Parameter(
+                torch.empty(self.num_stream * (self.num_stream + 2), dtype=torch.float32)
             )
         else:
             phi_output_hidden_size = self.num_stream
-
-        self.branch_alpha_pre = nn.Parameter(torch.empty(1, dtype=torch.float32))
-        self.branch_beta_pre = nn.Parameter(torch.empty(self.num_stream, dtype=torch.float32))
+            self.branch_alpha_pre = nn.Parameter(torch.empty(1, dtype=torch.float32))
+            self.branch_beta_pre = nn.Parameter(torch.empty(self.num_stream, dtype=torch.float32))
 
         self.phi = ReplicatedLinear(
             self.hidden_size * self.num_stream,
@@ -56,70 +49,6 @@ class NPUmHCModule(mHCModule):
         if self.mhc_use_gamma:
             self.norm_gamma = nn.Parameter(torch.empty(self.hidden_size * self.num_stream, dtype=torch.float32))
 
-        # These buffers are materialized after weight loading.
-        # Keep None at init so we do not allocate placeholder tensors and
-        # can detect uninitialized state explicitly.
-        self.register_buffer('_branch_alpha', None)
-        self.register_buffer('_branch_beta', None)
-        self._concat_tensors_initialized = False
-        self._concat_tensors_dirty = True
-        self._register_branch_weight_loaders()
-
-    def _register_branch_weight_loaders(self) -> None:
-        branch_params = [
-            self.branch_alpha_pre,
-            self.branch_beta_pre,
-        ]
-        if not self.merge_layer_only_pre:
-            branch_params.extend(
-                [
-                    self.branch_alpha_post,
-                    self.branch_alpha_res,
-                    self.branch_beta_post,
-                    self.branch_beta_res,
-                ]
-            )
-        for param in branch_params:
-            set_weight_attrs(param, {"weight_loader": self._branch_weight_loader})
-
-    def _branch_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-        default_weight_loader(param, loaded_weight)
-        self._concat_tensors_dirty = True
-
-    def _update_concatenated_tensors(self) -> None:
-        """Update the pre-computed concatenated alpha and beta tensors.
-
-        This should be called after any of the branch parameters are loaded.
-        For merge_layer_only_pre=True mode, only alpha_pre and beta_pre are concatenated.
-        """
-        if self.merge_layer_only_pre:
-            # Pre-only mode: use single element tensors directly
-            self._branch_alpha = self.branch_alpha_pre.clone()
-            self._branch_beta = self.branch_beta_pre.clone()
-        else:
-            # Full mode: concatenate all three components
-            self._branch_alpha = torch.cat([
-                self.branch_alpha_pre,
-                self.branch_alpha_post,
-                self.branch_alpha_res
-            ])
-            self._branch_beta = torch.cat([
-                self.branch_beta_pre,
-                self.branch_beta_post,
-                self.branch_beta_res
-            ])
-        self._concat_tensors_initialized = True
-        self._concat_tensors_dirty = False
-
-    def post_weight_load(self) -> None:
-        """Process concatenated tensors after weight loading.
-
-        Provides a manual interface to trigger tensor concatenation. Can be called
-        after model weight loading. Works with lazy initialization to ensure
-        concatenated tensors are always up-to-date.
-        """
-        self._update_concatenated_tensors()
-
     def hc_pre(self, x: torch.Tensor):
         if self.merge_layer_only_pre:
             dtype = x.dtype
@@ -132,14 +61,9 @@ class NPUmHCModule(mHCModule):
             h_pre, h_post, h_res = self.hc_split_sinkhorn_torch(weight)
             y = torch.sum(h_pre.unsqueeze(-1) * x.unflatten(dim=-1, sizes=(self.num_stream, -1)), dim=1).squeeze(1).to(dtype)
         else:
-            # Lazy initialization: ensure concatenated tensors are up-to-date
-            if (not self._concat_tensors_initialized) or self._concat_tensors_dirty:
-                self._update_concatenated_tensors()
-
-            # Use pre-computed concatenated tensors
             y, h_post, h_res, _, _, _ = torch.ops.custom.npu_manifold_constrained_hyper_connection_pre(
                 x.view(-1, self.num_stream, self.hidden_size), self.phi.weight,
-                self._branch_alpha, self._branch_beta,
+                self.branch_alpha, self.branch_beta,
                 gamma=self.norm_gamma.view(self.num_stream, -1),
                 out_flag=1, norm_eps=self.hc_eps, hc_eps=self.hc_eps
             )
@@ -149,16 +73,21 @@ class NPUmHCModule(mHCModule):
     def hc_split_sinkhorn_torch(self, weight):
         if not self.merge_layer_only_pre:
             h_pre, h_post, h_res = weight.split([self.num_stream, self.num_stream, self.num_stream * self.num_stream], dim=-1)
-            h_post = 2 * torch.sigmoid(h_post * self.branch_alpha_post + self.branch_beta_post)
+            alpha_pre, alpha_post, alpha_res = self.branch_alpha.view(-1).split([1, 1, 1])
+            beta_pre, beta_post, beta_res = self.branch_beta.view(-1).split(
+                [self.num_stream, self.num_stream, self.num_stream * self.num_stream]
+            )
+            h_post = 2 * torch.sigmoid(h_post * alpha_post + beta_post)
             h_res = h_res.unflatten(-1, (self.num_stream, self.num_stream))
-            h_res = h_res * self.branch_alpha_res + \
-                    self.branch_beta_res.view(self.num_stream, self.num_stream)
+            h_res = h_res * alpha_res + beta_res.view(self.num_stream, self.num_stream)
             h_res, _, _ = torch.ops.custom.npu_sinkhorn(h_res, num_iters=self.mhc_recur_norm, eps=self.hc_eps)
         else:
             h_pre = weight
             h_post = None
             h_res = None
-        h_pre = torch.sigmoid(h_pre * self.branch_alpha_pre + self.branch_beta_pre) + self.hc_eps
+            alpha_pre = self.branch_alpha_pre
+            beta_pre = self.branch_beta_pre
+        h_pre = torch.sigmoid(h_pre * alpha_pre + beta_pre) + self.hc_eps
         return h_pre, h_post, h_res
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, h_post: torch.Tensor, h_res: torch.Tensor):
