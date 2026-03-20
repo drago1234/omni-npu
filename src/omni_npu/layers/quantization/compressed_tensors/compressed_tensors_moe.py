@@ -396,7 +396,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         return torch_npu.npu_grouped_matmul(
             [intermediate_h],
             [layer.w2_weight],
-            bias=None,
+            bias=[layer.w2_bias] if has_bias and hasattr(layer, "w2_bias") else None,
             scale=[layer.w2_weight_scale.to(torch.bfloat16)],
             per_token_scale=[pertoken_scale],
             group_list=expert_tokens,
