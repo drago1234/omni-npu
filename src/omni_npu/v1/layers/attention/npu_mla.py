@@ -284,9 +284,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_metadata: Optional['NPUMLADecodeMetadata'] = None,
-        pd_mixed_flag: bool = False,
+        pd_mixed_flag: int = 0,
     ) -> torch.Tensor:
-        force_decode = True if pd_mixed_flag else False
+        force_decode = True if pd_mixed_flag == 1 else False
+        short_prefill = True if pd_mixed_flag == 2 else False
         kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
         nz_block_size = 16
 
@@ -295,13 +296,13 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
 
         if self.compresskv_conv is not None:
             kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            kv_c = self.compresskv_conv(kv_c, force_decode=force_decode) + kv_c
+            kv_c = self.compresskv_conv(kv_c, force_decode=force_decode, short_prefill=short_prefill) + kv_c
             if not self.rope_interleaved:
                 k_pe = self.even_odd_indexing(k_pe)
             kv = torch.cat([kv_c, k_pe], dim=-1)
 
         if self.qa_conv is not None:
-            q_lora = self.qa_conv(q_lora, force_decode=force_decode) + q_lora
+            q_lora = self.qa_conv(q_lora, force_decode=force_decode, short_prefill=short_prefill) + q_lora
         q_norm = self.q_a_layernorm(q_lora)
         q = self.q_b_proj(q_norm)[0]
 
@@ -435,7 +436,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         attn_output = torch_npu.npu_transpose_batchmatmul(attn_output, self.attn.impl.W_UV, perm_y=(1, 0, 2))
         attn_output = attn_output.reshape(bsz, 1, -1).view(-1, self.num_local_heads * self.v_head_dim)
         if self.o_conv is not None:
-            attn_output = self.o_conv(attn_output, force_decode=force_decode) + attn_output
+            attn_output = self.o_conv(attn_output, force_decode=force_decode, short_prefill=short_prefill) + attn_output
         return self.o_proj.forward(attn_output)[0]
 
     def _forward_prefill(
@@ -715,7 +716,8 @@ def npu_mla_forward(
         decode_cos = cos[:num_decode_tokens]
         decode_sin = sin[:num_decode_tokens]
         attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
-        decode_output = self._forward_decode(decode_hidden_states, decode_cos, decode_sin, attn_metadata.decode, pd_mixed_flag=True)
+        pd_mixed_flag = 2 if num_decode_tokens > attn_metadata.num_decodes else 1 # short prefill in decode or pure decode 
+        decode_output = self._forward_decode(decode_hidden_states, decode_cos, decode_sin, attn_metadata.decode, pd_mixed_flag=pd_mixed_flag)
 
         mixed_output = torch.cat([decode_output, prefill_output], dim=0)
         if mixed_output.shape[0] != num_actual_toks:

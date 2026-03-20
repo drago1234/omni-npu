@@ -61,7 +61,7 @@ class MoMEPatch(VLLMPatch):
             self.cache_states = torch.zeros((self.max_num_seqs + 1, self.cache_length, hidden_size), device=current_platform.device_type)
             self.padding = padding
 
-        def forward(self, hidden_states: torch.Tensor, only_prefill=False, force_decode=False) -> torch.Tensor:
+        def forward(self, hidden_states: torch.Tensor, only_prefill=False, force_decode=False, short_prefill=False) -> torch.Tensor:
             forward_context = get_forward_context()
             attn_metadata = forward_context.attn_metadata
             if attn_metadata is None:
@@ -75,11 +75,15 @@ class MoMEPatch(VLLMPatch):
                 cache_idx_offset = attn_metadata.num_decodes
             elif force_decode:
                 cache_slot_id = forward_context.cache_slot_id[:attn_metadata.num_decodes]
+            elif short_prefill:
+                query_start_loc = attn_metadata.query_start_loc[:attn_metadata.num_decodes]
+                cache_slot_id = forward_context.cache_slot_id[:attn_metadata.num_decodes]
+                cache_idx_offset = 0
             else:
                 query_start_loc = attn_metadata.query_start_loc
                 cache_slot_id = forward_context.cache_slot_id
                 cache_idx_offset = 0
-            if (attn_metadata.num_prefills > 0 or batch_descriptor.num_tokens > attn_metadata.num_decodes) and not force_decode:
+            if (attn_metadata.num_prefills > 0 or batch_descriptor.num_tokens > attn_metadata.num_decodes or short_prefill) and not force_decode:
                 batch_size = len(query_start_loc) - 1
                 conv_output_list = []
                 for i in range(batch_size):
