@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
+import itertools
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -181,7 +182,7 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_scheduler is None:
             raise RuntimeError("self.connector_scheduler cannot be None")
         return self.connector_scheduler.request_finished(request, block_ids, spec_token_ids)
-    
+
     def get_finished_count(self) -> int | None:
         """
         Get the count of requests expected to complete send/receive operations
@@ -237,10 +238,7 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        if self.connector_scheduler is None:
-            raise RuntimeError("self.connector_scheduler cannot be None")
-        flatten_block_ids = [block for group in block_ids for block in group]
-        return self.connector_scheduler.request_finished(request, flatten_block_ids)
+        return self.request_finished(request, list(itertools.chain(*block_ids)))
 
 class PrefillConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -522,9 +520,7 @@ class DecodeConnectorScheduler:
 
         if num_computed_tokens % self.block_size != 0:
             raise RuntimeError("num_computed_tokens must be divisible by self.block_size")
-        rounded_num_prompt_tokens = self._round_up(
-            len(request.prompt_token_ids), self.block_size)
-        count = max(rounded_num_prompt_tokens - num_computed_tokens, 0)
+        count = max(len(request.prompt_token_ids) - num_computed_tokens, 0)
         return count, count > 0
 
     def _round_up(self, x: int, y: int) -> int:
@@ -559,6 +555,8 @@ class DecodeConnectorScheduler:
     ) -> KVConnectorMetadata:
         metadata = DatadistConnectorMetadata()
         for req_id, (req, block_ids) in self._reqs_need_recv.items():
+            if isinstance(block_ids, tuple):
+                block_ids = list(itertools.chain(*block_ids))
             if req.kv_transfer_params is None:
                 logger.warning(f"For reuqest {req_id}: kv_transfer_params now is None")
             else:
@@ -687,10 +685,10 @@ class DecodeConnectorWorker:
 
             with self.zmq_socket_map_lock:
                 self.zmq_socket_map = {ip_port: value
-                    for ip_port, value in self.zmq_socket_map.items() 
+                    for ip_port, value in self.zmq_socket_map.items()
                     if ip_port.replace("tcp://", "").split(":")[0] not in tmp_sub_ips}
 
-            #send heartbeat to each remote 
+            #send heartbeat to each remote
             for ip_port in self.zmq_socket_map.keys():
                 json_data = json.dumps([f"decode_hb:{self.datadist_manager.data_dist_config.cluster_id}"])
                 self.zmq_socket_map[ip_port].send_string(json_data)
@@ -767,7 +765,7 @@ class DecodeConnectorWorker:
                     if self.tp_rank == 0:
                         logger.info(f" ***** Request {req_id} has 0 local blocks, skip load kv.")
                     continue
-                # remote_block_ids in P is less than local_block_ids[0] in D, 
+                # remote_block_ids in P is less than local_block_ids[0] in D,
                 # leaded by lookahead num, which is used by eagle and multi step
                 elif len(meta.remote_block_ids[0]) < len(meta.local_block_ids[0]):
                     meta.local_block_ids[0] = meta.local_block_ids[0][:len(meta.remote_block_ids[0])]

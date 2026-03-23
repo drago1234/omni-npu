@@ -140,7 +140,7 @@ class NPUModelRunner(GPUModelRunner):
             self.router_sliding_window = 0
         if self.router_sliding_window > 0:
             self.req_cache_map = {self.max_num_reqs + 1: 0}
-            self.cache_slot_id = torch.zeros(self.max_num_reqs, 
+            self.cache_slot_id = torch.zeros(self.max_num_reqs,
                                     dtype=torch.long, device=self.device)
 
     def _build_conv_context(self, dummy:bool = False):
@@ -202,56 +202,66 @@ class NPUModelRunner(GPUModelRunner):
         kernel_block_sizes: list[int],
     ) -> dict[str, torch.Tensor]:
         kv_caches: dict[str, torch.Tensor] = {}
-        has_attn, has_mamba = False, False
+        has_tensor, has_tuple = False, False
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
-                if isinstance(kv_cache_spec, MambaSpec):
-                    # Original page_size is padded, the actual applied size is the real required one,
-                    # refer to get_kv_cache_config_from_groups in KVCacheUtilsPatch.
-                    kv_cache_spec = replace(kv_cache_spec, page_size_padded=None)
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0, \
+                    f"{kv_cache_spec=}, {raw_tensor.numel()=}, {kv_cache_spec.page_size_bytes=}"
                 num_blocks = (raw_tensor.numel() //
                               kv_cache_spec.page_size_bytes)
-                if isinstance(kv_cache_spec, AttentionSpec):
-                    has_attn = True
-                    kwargs = {}
-                    kv_cache_tensors = attn_backend.reshape_kv_cache(
-                        raw_tensor,
-                        num_blocks,
-                        kv_cache_spec,
-                        **kwargs,
-                    )
-                    kv_caches[layer_name] = kv_cache_tensors
-                elif isinstance(kv_cache_spec, MambaSpec):
-                    state_tensors = []
-                    offset = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                        dtype_size = get_dtype_size(dtype)
-                        target_shape = (num_blocks, *shape)
-
-                        # Make contiguous tensor
-                        size_bytes = np.prod(target_shape) * dtype_size
-                        final_tensor = raw_tensor[offset:offset + size_bytes].view(dtype).view(target_shape)
-                        offset += size_bytes
-                        assert final_tensor.is_contiguous()
-                        state_tensors.append(final_tensor)
-
-                    kv_caches[layer_name] = tuple(state_tensors)
+                kwargs = {}
+                kv_cache_tensors = attn_backend.reshape_kv_cache(
+                    raw_tensor,
+                    num_blocks,
+                    kv_cache_spec,
+                    **kwargs,
+                )
+                if isinstance(kv_cache_tensors, torch.Tensor) and kv_cache_tensors.is_contiguous():
+                    has_tensor = True
+                elif isinstance(kv_cache_tensors, tuple) and len(kv_cache_tensors) > 1:
+                    has_tuple = True
                 else:
-                    raise NotImplementedError
-        # NPU kernels need contiguous layout
-        if has_attn and has_mamba:
+                    raise RuntimeError(
+                        f"Invalid case! Cache shouldn't be non-contiguous Tensor or single-element tuple."
+                    )
+                kv_caches[layer_name] = kv_cache_tensors
+
+        if has_tensor and has_tuple:
             self._update_hybrid_attention_mamba_layout(kv_caches)
 
         return kv_caches
 
+    def _update_hybrid_attention_mamba_layout(
+        self, kv_caches: dict[str, Union[torch.Tensor, tuple[torch.Tensor, ...]]]
+    ) -> None:
+        for group in self._kv_cache_spec_attn_group_iterator():
+            kv_cache_spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                kv_cache = kv_caches[layer_name]
+                if (
+                    isinstance(kv_cache_spec, AttentionSpec)
+                    and isinstance(kv_cache, torch.Tensor)
+                    and kv_cache.shape[0] == 2
+                ):
+                    assert kv_cache.shape[1] != 2, (
+                        "Fail to determine whether the layout is "
+                        "(2, num_blocks, ...) or (num_blocks, 2, ...) for "
+                        f"a tensor of shape {kv_cache.shape}"
+                    )
+                    hidden_size = kv_cache.shape[2:].numel()
+                    kv_cache.as_strided_(
+                        size=kv_cache.shape,
+                        stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
+                    )
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        if self.vllm_config.model_config.use_mla and hasattr(self.vllm_config.model_config.hf_config, "index_topk"):
+        is_pangu_hybrid = 'pangu_v2_hybrid' in os.getenv("OMNI_NPU_PATCHES_DIR", "")
+        if not is_pangu_hybrid and self.vllm_config.model_config.use_mla and hasattr(self.vllm_config.model_config.hf_config, "index_topk"):
             indexer_head_size = self.vllm_config.model_config.hf_config.index_head_dim
             kv_cache_spec: dict[str, KVCacheSpec] = {}
             layer_type = cast(type[Any], AttentionLayerBase)
@@ -862,7 +872,7 @@ class NPUModelRunner(GPUModelRunner):
 
         omni_cache.update_kv_cache_spec(kv_cache_config, self.vllm_config)
         omni_cache.update_model_runner(self)
-        omni_cache.ensure_device_cache_initialized() # 
+        omni_cache.ensure_device_cache_initialized() #
         if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
             from vllm.v1.worker.utils import bind_kv_cache
             assert omni_cache.device_cache is not None
@@ -895,7 +905,7 @@ class NPUModelRunner(GPUModelRunner):
     ) -> "InputBatch":
         input_batch = super().prepare_inputs(scheduler_output, num_tokens_after_padding)
 
-        if (self.omni_cache.enable_dsa and 
+        if (self.omni_cache.enable_dsa and
             self.omni_cache.enable_omni_cache):
             from omni_cache.cache import omni_cache
             from omni_cache.cache.omni_cache_define import DecodeOmniCache
@@ -913,14 +923,14 @@ class NPUModelRunner(GPUModelRunner):
             for name, module in attn_layers.items():
                 if isinstance(module, (StaticSinkAttention, StaticSinkMLAAttention)):
                     self._kv_cache_sink_attn_after_wake_up(module)
-    
+
     def _kv_cache_sink_attn_after_wake_up(self, module) -> None:
         sink_kv_cache = getattr(module, "kv_cache")
 
         # populate_sink_kv in SinkAttention retrieves the `virtual_engine` value from `ForwardContext`
-        # but this value is unavailable here. 
+        # but this value is unavailable here.
         # Since `virtual_engine` is defaulted to 0 and will be deprecated, we directly set it to 0 here.
-        self_kv_cache = sink_kv_cache[0] 
+        self_kv_cache = sink_kv_cache[0]
         if self_kv_cache is not None and len(self_kv_cache) > 0:
             populate_sink_kv_method = getattr(module, "populate_sink_kv")
             populate_sink_kv_method(self_kv_cache[0], self_kv_cache[1])

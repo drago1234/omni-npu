@@ -32,8 +32,9 @@ from vllm.v1.attention.backends.mla.common import (
     QueryLenSupport,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches
+from omni_npu.v1.models.config_loader.loader import model_extra_config
 
-from omni_npu.attention.backends.utils import register_attention_backend
 
 ENABLE_OMNI_CACHE = int(os.getenv("ENABLE_OMNI_CACHE", "0")) == 1
 
@@ -60,11 +61,42 @@ class NPUDSABackend(MLACommonBackend):
         return NPUDSAImpl
 
     @staticmethod
+    def _reshape_kv_cache_noncontiguous(
+        raw_tensor: torch.Tensor,
+        num_blocks: int,
+        kv_cache_spec: "DSAAttentionSpec",
+    ) -> tuple[torch.Tensor, ...]:
+        if kv_cache_spec.cache_dtype_str == "fp8_ds_mla":
+            shapes = ( (656,), (132,) )
+            dtypes = (torch.fp8, torch.int8)  # TODO: replace fp8 with float8_e4m3fn or float8_e5m2
+        elif kv_cache_spec.cache_dtype_str == "int8_ds_mla":
+            shapes = ( (656,), (130,) )
+            dtypes = (torch.int8, torch.int8)
+        else:
+            shapes = ( (576,), (128,) )
+            dtypes = (torch.bfloat16, torch.bfloat16)
+
+        return _maybe_padded_raw_tensor_to_strided_caches(
+            raw_tensor,
+            num_blocks=num_blocks,
+            block_size=kv_cache_spec.block_size,
+            shapes=shapes,
+            dtypes=dtypes,
+            page_size_bytes=kv_cache_spec.page_size_bytes,
+        )
+
+    @staticmethod
     def reshape_kv_cache(
         raw_tensor: torch.Tensor,
         num_blocks: int,
         kv_cache_spec: AttentionSpec,
     ) -> Tuple[torch.Tensor, ...]:
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            return NPUDSABackend._reshape_kv_cache_noncontiguous(
+                raw_tensor,
+                num_blocks,
+                kv_cache_spec,
+            )
         is_prefill = (get_current_vllm_config().kv_transfer_config.kv_role != "kv_consumer")
         block_size = kv_cache_spec.block_size
         dtype = kv_cache_spec.dtype
@@ -182,7 +214,7 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
                 num_computed_tokens_cpu = common_attn_metadata.seq_lens_cpu - query_seq_lens_cpu
                 prefix_meta = omni_cache.get_prefill_prefix_copy_meta(
                     # block_size=self.block_size,
-                    self.vllm_config, 
+                    self.vllm_config,
                     kv_lens=num_computed_tokens_cpu[:num_reqs],
                     query_lens_list=query_lens_list,
                     block_tables=common_attn_metadata.block_table_tensor.cpu().numpy()[:num_reqs],

@@ -144,7 +144,7 @@ class ModelOperatorOptConfig:
     enable_dsa: bool=True
 
     omni_disable_npu_add_rms_norm: bool = False
-
+    use_noncontiguous_kv: bool = False
 
     def __post_init__(self):
 

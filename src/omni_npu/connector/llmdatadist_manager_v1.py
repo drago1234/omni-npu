@@ -8,6 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from functools import cached_property
+from typing import Union
 
 import llm_datadist
 import torch
@@ -104,14 +105,14 @@ class LLMDataDistConfig:
             ip_port_to_int(f"{ip}:{host_port}", self.tp_size)
             for ip in host_ip_list
         ]
-        
+
         # (timestamp_ms, ip1_int, ip2_int, ip3_int, ...)
         self.host_cluster_id = (timestamp_ms, *ip_integers)
 
     # get all node ips in a TP group
     def _get_worker_ips(self):
         """Return worker IPs. Only query Ray when Ray is actually available/running.
-        
+
         Behavior:
         - If self.is_prefill is False: return [self.local_host_ip].
         - If Ray is not installed: log and return [self.local_host_ip].
@@ -121,10 +122,10 @@ class LLMDataDistConfig:
         """
         # default fallback
         worker_ips = [self.local_host_ip]
-        
+
         if not self.is_prefill:
             return worker_ips
-            
+
         try:
             import ray
         except ImportError:
@@ -138,7 +139,7 @@ class LLMDataDistConfig:
         except Exception as e:
             logger.warning(f"Failed to connect/list Ray nodes (address='auto'): {e}. Using local_host_ip.")
             return worker_ips
-        
+
         ips = []
         head_ip = None
 
@@ -161,7 +162,7 @@ class LLMDataDistConfig:
             worker_ips = [head_ip] + ips
         else:
             worker_ips = ips
-        
+
         return worker_ips
 
     @cached_property
@@ -200,16 +201,16 @@ class LLMDataDistManager:
     def get_real_remote_cluster_ids(self, meta, tp_rank=0):
         # remote_cluster_id: (timestamp, ip1, ip2, ...)
         remote_id_key = tuple(meta.remote_cluster_id) if isinstance(meta.remote_cluster_id, list) else meta.remote_cluster_id
-        
+
         key = (remote_id_key, meta.remote_dp_rank, self.rank)
         with self.registered_link_infos_lock:
             remote_cluster_ids = self.registered_link_infos.get(key, None)
-        
+
         if remote_cluster_ids is None:
             old_key = None
             with self.registered_link_infos_lock:
                 for (reg_key, reg_dp_rank, reg_rank) in list(self.registered_link_infos.keys()):
-                    if (reg_dp_rank == meta.remote_dp_rank and reg_rank == self.rank and 
+                    if (reg_dp_rank == meta.remote_dp_rank and reg_rank == self.rank and
                         any(ip in reg_key[1:] for ip in remote_id_key[1:])):
                         old_key = (reg_key, reg_dp_rank, reg_rank) # reg_key: (time_stamp, ip1_int, .., ip2_int)
                         break
@@ -222,7 +223,7 @@ class LLMDataDistManager:
             self.register_link(remote_id_key, meta.remote_dp_rank, self.rank, tp_rank)
             with self.registered_link_infos_lock:
                 remote_cluster_ids = self.registered_link_infos.get(key, None)
-        
+
         return remote_cluster_ids
 
     def _init_llm_data_dist(self):
@@ -367,10 +368,10 @@ class LLMDataDistManager:
         with self.registered_link_infos_lock:
             prompt_p_metas = [
                 key for key, values in self.registered_link_infos.items()
-                if (isinstance(values, list) and 
-                    prompt_cluster_id in values and 
+                if (isinstance(values, list) and
+                    prompt_cluster_id in values and
                     len(key) >= 3 and
-                    key[1] == prefill_dp_rank and 
+                    key[1] == prefill_dp_rank and
                     key[2] == d_rank)
             ]
         if not prompt_p_metas:
@@ -390,7 +391,7 @@ class LLMDataDistManager:
         decode_tp_size = self.tp_size # set decode_tp_size using parallel_config instead of kv_config
         decode_id = 0
         decode_num = int(os.getenv('DECODE_POD_NUM', "1"))
-        
+
         p_rank_start = get_p_start_rank(prefill_tp_size, 1, decode_tp_size, self.dp_size,
                                         decode_num, decode_id, d_rank)
         p_rank_list = [p_rank_start + dp_idx * prefill_tp_size for dp_idx in range(self.prefill_dp_size)]
@@ -416,81 +417,120 @@ class LLMDataDistManager:
     def register_memory(self, kv_caches: dict[str, torch.Tensor], kv_cache_config: KVCacheConfig = None):
         if len(self.registered_kv_caches) > 0:
             raise ValueError("Attr `registered_kv_caches` must be empty before register kv_caches.")
-        model_id = 0
-        for group in kv_cache_config.kv_cache_groups:
-            if isinstance(kv_caches, dict):
-                kv_caches_of_group = {}
-                for layer_name in group.layer_names:
-                    kv_caches_of_group[layer_name] = kv_caches[layer_name]
-                flatten_kv_caches = unzip_kv_cache_dict(kv_caches_of_group)
+        if isinstance(kv_caches, dict):
+            flatten_kv_caches = unzip_kv_cache_dict(kv_caches)
+        else:
+            flatten_kv_caches = unzip_kv_cache_list(kv_caches)
+
+        # dense model.
+        flatten_kv_caches = maybe_merge_kv_caches(flatten_kv_caches)
+        # spec model.
+        flatten_kv_caches = maybe_split_kv_caches_for_spec_layers(flatten_kv_caches)
+
+        for model_id, sub_kv_caches in enumerate(flatten_kv_caches):
+            cache_desc = CacheDesc(num_tensors=len(sub_kv_caches), shape=tuple(sub_kv_caches[0].shape),
+                                data_type=TORCH_DTYPE_TO_NPU_DTYPE[sub_kv_caches[0].dtype])
+
+            cache_addrs = [int(item.data_ptr()) for item in sub_kv_caches]
+
+            if self.data_dist_config.is_prefill:
+                cache_key = BlocksCacheKey(self.data_dist_engine.cluster_id, model_id=model_id)
             else:
-                flatten_kv_caches = unzip_kv_cache_list(kv_caches)
+                cache_key = None
 
-            # dense model.
-            flatten_kv_caches = maybe_merge_kv_caches(flatten_kv_caches)
-            # spec model.
-            flatten_kv_caches = maybe_split_kv_caches_for_spec_layers(flatten_kv_caches)
-            for _, sub_kv_caches in enumerate(flatten_kv_caches):
-                cache_desc = CacheDesc(num_tensors=len(sub_kv_caches), shape=tuple(sub_kv_caches[0].shape),
-                                    data_type=TORCH_DTYPE_TO_NPU_DTYPE[sub_kv_caches[0].dtype])
-
-                cache_addrs = [int(item.data_ptr()) for item in sub_kv_caches]
-
-                if self.data_dist_config.is_prefill:
-                    cache_key = BlocksCacheKey(self.data_dist_engine.cluster_id, model_id=model_id)
-                else:
-                    cache_key = None
-
-                cache = self.data_dist_engine.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
-                self.registered_kv_caches.append(cache)
-                self.registered_kv_caches_tensor.append(sub_kv_caches)
-                model_id += 1
+            cache = self.data_dist_engine.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
+            self.registered_kv_caches.append(cache)
         logger.debug(f" ***** registered_kv_caches num:{len(self.registered_kv_caches)}")
 
     def cluster_id_to_ip_port(self, cluster_id):
         """Extract ip_port from int64 cluster id (inverse of ip_port_to_int)."""
         if not isinstance(cluster_id, int):
             raise TypeError("cluster_id must be int type")
-        
+
         # Extract fields (reverse order of packing)
         tp_size = cluster_id & 0xFFFF              # Lower 16 bits
         port = (cluster_id >> 16) & 0xFFFF         # Next 16 bits
         ip_int = (cluster_id >> 32) & 0xFFFFFFFF   # Upper 32 bits
-        
+
         ip = socket.inet_ntoa(struct.pack('!I', ip_int))
 
         return f"{ip}:{port}", tp_size, 0  # tp_rank always 0
 
-# reuse the existing code
-def unzip_kv_cache_dict(kv_caches: dict[str, torch.Tensor], ):
-    # Convert kv_caches dict to a list of tensors in the order of layer_index.
-    _, first_kv_cache = next(iter(kv_caches.items()))
-    if isinstance(first_kv_cache, tuple):
-        cache_num = len(first_kv_cache)
-    else:
-        cache_num = 1
 
-    flatten_kv_caches = [[] for _ in  range(cache_num)]
+def unzip_kv_cache_dict(kv_caches: dict[str, Union[torch.Tensor, tuple[torch.Tensor, ...]]]) -> list[list[torch.Tensor]]:
+    """
+    Unzips a key-value cache dictionary into a flattened structure of tensors.
 
-    index2name = defaultdict(list)
-    for layer_name in kv_caches:
-        index2name[extract_layer_index(layer_name)].append(layer_name)
+    Parameters:
+    kv_caches (dict): A dictionary where
+      - keys are layer names (str),
+      - values are either:
+        - torch.Tensor: single tensor representing the layer's cache, or
+        - tuple(torch.Tensor, ...): multiple tensors for the layer's cache.
+            - if each Tensor in the tuple is contiguous: common GQA case where Tensors represent key or value
+            - if Tensors are non-contiguous: hybrid attention case where each Tensor is a strided view
 
-    for layer_index in sorted(index2name.keys()):
-        layer_names = index2name[layer_index]
-        if len(layer_names) > 1:
-            # One typical case is encoder-decoder model, e.g., bart.
-            # The cross attention and self attention in the same decoder layer
-            # has different layer_name but the same layer_index.
-            raise NotImplementedError
-        layer_name = layer_names[0]
-        kv_cache = kv_caches[layer_name]
-        if isinstance(kv_cache, tuple):
-            for index, sub_cache in enumerate(kv_cache):
-                flatten_kv_caches[index].append(sub_cache)
+    Returns:
+    A flattened structure (list) of tensors extracted from "kv_caches".
+
+    Raises:
+    ValueError: If the dictionary contains inconsistent types or is empty.
+    """
+    if not kv_caches:
+        raise ValueError("kv_caches dictionary cannot be empty")
+
+    addrs = set()
+    shape2tensor = defaultdict(list)
+
+    def _add_distinct_tensor_by_shape(tensor: torch.Tensor) -> bool:
+        curr_addr = tensor.data_ptr()
+        if curr_addr in addrs:
+            return False
+        addrs.add(curr_addr)
+        shape2tensor[tensor.shape].append(tensor)
+        return True
+
+    for layer_name, layer_cache in kv_caches.items():
+        if isinstance(layer_cache, tuple):
+            if layer_cache[0].is_contiguous():
+                for idx, item in enumerate(layer_cache):
+                    if not isinstance(item, torch.Tensor):
+                        raise TypeError(
+                            f"Tuple element at index {idx} in layer '{layer_name}' is not a tensor: {type(item)}"
+                        )
+                    _add_distinct_tensor_by_shape(item)
+            else:
+                # Hybrid Attention Case: Tuple of non-contiguous strided views.
+                # Extract the single underlying contiguous memory pool.
+                num_blocks = layer_cache[0].shape[0]
+                reference_tensor = layer_cache[0]
+
+                # 1. Access the shared underlying raw memory
+                shared_storage = reference_tensor.untyped_storage()
+
+                # 2. Reconstruct a 1D contiguous tensor from the storage
+                raw_tensor = torch.empty(
+                    0,
+                    dtype=torch.int8,
+                    device=reference_tensor.device
+                )
+                raw_tensor.set_(shared_storage)
+
+                # 3. Reshape into the standard (num_blocks, elements_per_block) format
+                contiguous_backing_tensor = raw_tensor.view(num_blocks, -1)
+
+                # 4. Add the single backing tensor instead of the individual views
+                _add_distinct_tensor_by_shape(contiguous_backing_tensor)
         else:
-            flatten_kv_caches[0].append(kv_cache)
+            if not isinstance(layer_cache, torch.Tensor):
+                raise ValueError(
+                    f"Element in layer '{layer_name}' is not a tensor: {type(layer_cache)}"
+                )
+            _add_distinct_tensor_by_shape(layer_cache)
+
+    flatten_kv_caches = list(shape2tensor.values())
     return flatten_kv_caches
+
 
 # reuse the existing code
 def unzip_kv_cache_list(kv_caches: list[torch.Tensor], ):
@@ -531,11 +571,11 @@ def maybe_split_kv_caches_for_spec_layers(flatten_kv_caches):
             if str(cache.shape) not in shape_dict:
                 shape_dict[str(cache.shape)] = []
             shape_dict[str(cache.shape)].append(cache)
-        
+
         flatten_kv_caches_split.extend(shape_dict.values())
-        if len(shape_dict) > 1 or need_split: 
+        if len(shape_dict) > 1 or need_split:
             need_split = True
-        
+
     if not need_split:
         return flatten_kv_caches
     else:
