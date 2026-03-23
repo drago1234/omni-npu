@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import functools
 import torch
+import torch_npu
 
 
 ACL_FORMAT_ND = 2
 ACL_FORMAT_FRACTAL_NZ = 29
 _current_stream = None
+
+
+@functools.lru_cache(maxsize=1)
+def is_A5() -> bool:
+    """Check if the device is an Ascend950 (A5) device."""
+    return torch_npu.npu.get_device_name(0).startswith("Ascend950")
 
 
 def get_nth_last_sep_pos(s: str, sep: str = '.', n: int = 2) -> int:
