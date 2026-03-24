@@ -33,6 +33,7 @@ def mla_setup():
             self.reorder_batch_threshold = 0
 
     utils_mod = types.ModuleType("vllm.v1.attention.backends.utils")
+    utils_mod.PAD_SLOT_ID = -1
     utils_mod.split_decodes_and_prefills = MagicMock(return_value=(1, 0, 1, 0))
     utils_mod.dcp_local_seq_lens = MagicMock()
     utils_mod.get_dcp_local_seq_lens = MagicMock()
@@ -320,6 +321,44 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
     def setup_fixture(self, mla_setup):
         """Auto-use fixture that stores data for unittest.TestCase methods."""
         self.mla_setup = mla_setup
+
+    def test_builder_build_prefill_with_sink_len_updates_seq_lens(self):
+        import omni_npu.attention.backends.mla as mla_mod
+
+        builder = self.mla_setup["builder"].__new__(self.mla_setup["builder"])
+        builder.reorder_batch_threshold = 0
+        builder.vllm_config = MagicMock()
+        builder.vllm_config.kv_transfer_config = None
+        builder.dcp_world_size = 1
+        builder.sink_len = 128
+
+        metadata = MagicMock(
+            prefill=type(
+                "PrefillMeta",
+                (),
+                {"query_start_loc": torch.tensor([0, 3], dtype=torch.int32)},
+            )(),
+            decode=None,
+            num_prefills=1,
+            num_decodes=0,
+        )
+        common_attn_metadata = MagicMock(
+            seq_lens=torch.tensor([0], dtype=torch.int32),
+        )
+
+        with patch.object(
+            mla_mod.MLACommonMetadataBuilder, "build", return_value=metadata
+        ):
+            result = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=False,
+            )
+
+        self.assertEqual(result.prefill.sink_len, 128)
+        self.assertEqual(result.prefill.query_start_loc_list, [0, 3])
+        self.assertEqual(result.prefill.query_cumlens, [3])
+        self.assertEqual(result.prefill.seq_lens, [128])
 
     def test_npu_mla_impl(self):
         device = torch.device("cpu")
@@ -753,11 +792,18 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 sink_len, kv_lora_rank, dtype=dtype, device=device
             )
             impl.sink_len = sink_len
+            impl.W_UK_T = torch.randn(
+                num_heads, qk_nope_head_dim, kv_lora_rank, dtype=dtype, device=device
+            )
+            impl.W_UV = torch.randn(
+                num_heads, kv_lora_rank, v_head_dim, dtype=dtype, device=device
+            )
             T = 8
             q = torch.randn(T, num_heads, qk_head_dim, dtype=dtype, device=device)
             kv_c_normed = torch.randn(T, kv_lora_rank, dtype=dtype, device=device)
             k_pe = torch.randn(T, qk_rope_head_dim, dtype=dtype, device=device)
             k_scale = torch.tensor(1.0, dtype=dtype, device=device)
+            num_blocks, block_size, table_len = 10, 128, 10
             metadata = MagicMock(
                 prefill=type(
                     "PrefillMeta",
@@ -765,6 +811,11 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                     {
                         "query_start_loc": [0, T],
                         "query_start_loc_list": [0, T],
+                        "query_cumlens": [T],
+                        "seq_lens": [T + sink_len],
+                        "block_table": torch.randint(
+                            0, num_blocks, (1, table_len), dtype=torch.int32, device=device
+                        ),
                         "chunked_context": None,
                     },
                 )(),
@@ -775,25 +826,153 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 num_decode_tokens=0,
                 slot_mapping=None,
             )
-            kv_cache = (torch.empty(0), torch.empty(0))
-            sink_out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
+            kv_cache = (
+                torch.randn(num_blocks, block_size, kv_lora_rank, dtype=dtype, device=device),
+                torch.randn(
+                    num_blocks, block_size, qk_rope_head_dim, dtype=dtype, device=device
+                ),
+            )
+            sink_out = torch.randn(T, num_heads, kv_lora_rank, dtype=dtype, device=device)
             sink_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
+            projected_out = torch.randn(
+                T, num_heads * v_head_dim, dtype=dtype, device=device
+            )
 
             with patch(
                 "torch.ops.custom.npu_fused_infer_attention_sink",
                 return_value=(sink_out, sink_lse),
-            ) as mock_sink_op:
+            ) as mock_sink_op, patch.object(
+                impl, "_v_up_proj", return_value=projected_out
+            ) as mock_v_up_proj:
                 result = impl._forward_prefill(
                     q, kv_c_normed, k_pe, kv_cache, metadata, k_scale
                 )
 
             mock_sink_op.assert_called_once()
+            mock_v_up_proj.assert_called_once()
             kwargs = mock_sink_op.call_args.kwargs
             self.assertEqual(kwargs["actual_seq_qlen"], [T])
             self.assertEqual(kwargs["actual_seq_kvlen"], [T + sink_len])
             self.assertEqual(kwargs["sink_number"], sink_len)
             self.assertEqual(kwargs["pre_tokens"], sliding_window - 1)
             self.assertEqual(kwargs["sparse_mode"], 4)
+            self.assertEqual(kwargs["num_key_value_heads"], 1)
+            self.assertEqual(kwargs["block_table"].shape, (1, table_len))
+            self.assertEqual(result.shape, (T, num_heads * v_head_dim))
+
+    def test_forward_prefill_with_sink_pads_query_heads_to_power_of_two(self):
+        device = torch.device("cpu")
+        dtype = torch.bfloat16
+        num_heads = 30
+        query_heads = 32
+        qk_nope_head_dim = 128
+        qk_rope_head_dim = 64
+        v_head_dim = 128
+        kv_lora_rank = 512
+        q_lora_rank = 256
+        qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        num_kv_heads = 8
+        sink_len = 128
+        kv_b_proj = (
+            torch.nn.Linear(
+                kv_lora_rank,
+                num_kv_heads * (qk_nope_head_dim + v_head_dim),
+                bias=False,
+            )
+            .to(device)
+            .to(torch.bfloat16)
+        )
+        with (
+            patch(
+                "vllm.v1.attention.backends.mla.common.MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size",
+                return_value=64,
+            ),
+            patch(
+                "omni_npu.attention.backends.mla.get_current_vllm_config",
+                return_value=None,
+            ),
+        ):
+            impl = self.mla_setup["impl"](
+                num_heads=num_heads,
+                head_size=128,
+                scale=1.0 / (128**0.5),
+                num_kv_heads=num_kv_heads,
+                alibi_slopes=None,
+                sliding_window=None,
+                logits_soft_cap=None,
+                kv_sharing_target_layer_name=None,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                v_head_dim=v_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                q_lora_rank=q_lora_rank,
+                qk_head_dim=qk_head_dim,
+                kv_b_proj=kv_b_proj,
+                kv_cache_dtype="auto",
+                attn_type=AttentionType.DECODER,
+            )
+            impl.W_UK_T = torch.randn(
+                num_heads, qk_nope_head_dim, kv_lora_rank, dtype=dtype, device=device
+            )
+            impl.sink_len = sink_len
+            T = 8
+            q = torch.randn(T, num_heads, qk_head_dim, dtype=dtype, device=device)
+            kv_c_normed = torch.randn(T, kv_lora_rank, dtype=dtype, device=device)
+            k_pe = torch.randn(T, qk_rope_head_dim, dtype=dtype, device=device)
+            k_scale = torch.tensor(1.0, dtype=dtype, device=device)
+            num_blocks, block_size, table_len = 10, 128, 10
+            metadata = MagicMock(
+                prefill=type(
+                    "PrefillMeta",
+                    (),
+                    {
+                        "query_start_loc": [0, T],
+                        "query_start_loc_list": [0, T],
+                        "query_cumlens": [T],
+                        "seq_lens": [T + sink_len],
+                        "block_table": torch.randint(
+                            0, num_blocks, (1, table_len), dtype=torch.int32, device=device
+                        ),
+                        "chunked_context": None,
+                    },
+                )(),
+                decode=None,
+                num_actual_tokens=T,
+                num_prefills=1,
+                num_decodes=0,
+                num_decode_tokens=0,
+                slot_mapping=None,
+            )
+            kv_cache = (
+                torch.randn(num_blocks, block_size, kv_lora_rank, dtype=dtype, device=device),
+                torch.randn(
+                    num_blocks, block_size, qk_rope_head_dim, dtype=dtype, device=device
+                ),
+            )
+            sink_out = torch.randn(
+                T, query_heads, kv_lora_rank, dtype=dtype, device=device
+            )
+            sink_lse = torch.randn(T, query_heads, 1, dtype=torch.float32, device=device)
+            projected_out = torch.randn(
+                T, num_heads * v_head_dim, dtype=dtype, device=device
+            )
+
+            with patch(
+                "torch.ops.custom.npu_fused_infer_attention_sink",
+                return_value=(sink_out, sink_lse),
+            ) as mock_sink_op, patch.object(
+                impl, "_v_up_proj", return_value=projected_out
+            ) as mock_v_up_proj:
+                result = impl._forward_prefill(
+                    q, kv_c_normed, k_pe, kv_cache, metadata, k_scale
+                )
+
+            mock_sink_op.assert_called_once()
+            mock_v_up_proj.assert_called_once()
+            kwargs = mock_sink_op.call_args.kwargs
+            self.assertEqual(kwargs["query"].shape, (T, query_heads, kv_lora_rank))
+            self.assertEqual(kwargs["query_rope"].shape, (T, query_heads, qk_rope_head_dim))
+            self.assertEqual(kwargs["num_query_heads"], query_heads)
             self.assertEqual(result.shape, (T, num_heads * v_head_dim))
 
     def test_forward_decode_with_sink_and_sliding_window(self):
@@ -974,11 +1153,18 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 sink_len, kv_lora_rank, dtype=dtype, device=device
             )
             impl.sink_len = sink_len
+            impl.W_UK_T = torch.randn(
+                num_heads, qk_nope_head_dim, kv_lora_rank, dtype=dtype, device=device
+            )
+            impl.W_UV = torch.randn(
+                num_heads, kv_lora_rank, v_head_dim, dtype=dtype, device=device
+            )
             T = 8
             q = torch.randn(T, num_heads, qk_head_dim, dtype=dtype, device=device)
             kv_c_normed = torch.randn(T, kv_lora_rank, dtype=dtype, device=device)
             k_pe = torch.randn(T, qk_rope_head_dim, dtype=dtype, device=device)
             k_scale = torch.tensor(1.0, dtype=dtype, device=device)
+            num_blocks, block_size, table_len = 10, 128, 10
             metadata = MagicMock(
                 prefill=type(
                     "PrefillMeta",
@@ -986,6 +1172,11 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                     {
                         "query_start_loc": [0, T],
                         "query_start_loc_list": [0, T],
+                        "query_cumlens": [T],
+                        "seq_lens": [T + sink_len],
+                        "block_table": torch.randint(
+                            0, num_blocks, (1, table_len), dtype=torch.int32, device=device
+                        ),
                         "chunked_context": None,
                     },
                 )(),
@@ -996,18 +1187,29 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
                 num_decode_tokens=0,
                 slot_mapping=None,
             )
-            kv_cache = (torch.empty(0), torch.empty(0))
-            out = torch.randn(T, num_heads, v_head_dim, dtype=dtype, device=device)
+            kv_cache = (
+                torch.randn(num_blocks, block_size, kv_lora_rank, dtype=dtype, device=device),
+                torch.randn(
+                    num_blocks, block_size, qk_rope_head_dim, dtype=dtype, device=device
+                ),
+            )
+            out = torch.randn(T, num_heads, kv_lora_rank, dtype=dtype, device=device)
             out_lse = torch.randn(T, num_heads, 1, dtype=torch.float32, device=device)
-            # When sink_len > 0, uses npu_fused_infer_attention_sink with pre_tokens=MAX_WINDOW_SIZE
+            projected_out = torch.randn(
+                T, num_heads * v_head_dim, dtype=dtype, device=device
+            )
+            # When sink_len > 0, prefill uses paged sink attention with matrix absorption.
             with patch(
                 "torch.ops.custom.npu_fused_infer_attention_sink",
                 return_value=(out, out_lse),
-            ) as mock_sink_op:
+            ) as mock_sink_op, patch.object(
+                impl, "_v_up_proj", return_value=projected_out
+            ) as mock_v_up_proj:
                 result = impl._forward_prefill(
                     q, kv_c_normed, k_pe, kv_cache, metadata, k_scale
                 )
             mock_sink_op.assert_called_once()
+            mock_v_up_proj.assert_called_once()
             kwargs = mock_sink_op.call_args.kwargs
             self.assertEqual(kwargs["sparse_mode"], 4)
             self.assertEqual(kwargs["actual_seq_qlen"], [T])
@@ -1016,7 +1218,8 @@ class TestNPUAttentionBackendMLANpuMlaImpl(unittest.TestCase):
             self.assertEqual(
                 kwargs["pre_tokens"], self.mla_setup["impl"].MAX_WINDOW_SIZE
             )
-            self.assertEqual(kwargs["return_softmax_lse"], False)
+            self.assertEqual(kwargs["num_key_value_heads"], 1)
+            self.assertEqual(kwargs["block_table"].shape, (1, table_len))
             self.assertEqual(result.shape, (T, num_heads * v_head_dim))
 
     def test_forward_decode_with_sink_without_sliding_window(self):

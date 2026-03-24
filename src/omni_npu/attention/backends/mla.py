@@ -40,8 +40,7 @@ from omni_npu.compilation.utils import (
     capture_multi_fia_graph_size,
     capture_multi_fia_sink_graph_size,
 )
-from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.attention.backends.utils import register_attention_backend
 
 import omni_training_custom_ops
 import omni_custom_ops
@@ -70,32 +69,11 @@ class NPUMLABackend(MLACommonBackend):
         return NPUMLAImpl
 
     @staticmethod
-    def _reshape_kv_cache_noncontiguous(
-        raw_tensor: torch.Tensor,
-        num_blocks: int,
-        kv_cache_spec: AttentionSpec,
-    ) -> Tuple[torch.Tensor, ...]:
-        return _maybe_padded_raw_tensor_to_strided_caches(
-            raw_tensor,
-            num_blocks=num_blocks,
-            block_size=kv_cache_spec.block_size,
-            shapes=( (512,), (64,) ),
-            dtypes=(kv_cache_spec.dtype,) * 2,
-            page_size_bytes=kv_cache_spec.page_size_bytes,
-        )
-
-    @staticmethod
     def reshape_kv_cache(
         raw_tensor: torch.Tensor,
         num_blocks: int,
         kv_cache_spec: AttentionSpec,
     ) -> Tuple[torch.Tensor, ...]:
-        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-            return NPUMLABackend._reshape_kv_cache_noncontiguous(
-                raw_tensor,
-                num_blocks,
-                kv_cache_spec,
-            )
         block_size = kv_cache_spec.block_size
         dtype = kv_cache_spec.dtype
         raw_tensor = raw_tensor.view(dtype=dtype)
@@ -193,7 +171,18 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if metadata.prefill is not None:
             metadata.prefill.query_start_loc_list = metadata.prefill.query_start_loc.tolist()
             metadata.prefill.query_cumlens = metadata.prefill.query_start_loc[1:].cpu().tolist()
-            metadata.prefill.seq_lens = metadata.prefill.query_cumlens
+            prefill_seq_lens = common_attn_metadata.seq_lens[
+                metadata.num_decodes : metadata.num_decodes + metadata.num_prefills
+            ]
+            if isinstance(prefill_seq_lens, torch.Tensor):
+                prefill_seq_lens = prefill_seq_lens.cpu().tolist()
+            metadata.prefill.seq_lens = prefill_seq_lens
+            if hasattr(self, "sink_len") and self.sink_len > 0:
+                metadata.prefill.sink_len = self.sink_len
+                metadata.prefill.seq_lens = [
+                    self.sink_len if seq == 0 else seq
+                    for seq in metadata.prefill.seq_lens
+                ]
         if self.dcp_world_size > 1:
             self.prepare_dcp_slots(metadata)
             self.prepare_dcp_ag_reorg(metadata)
@@ -346,7 +335,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                     torch.ones((2048, 2048), dtype=torch.bool, device="npu")
                 )
             cls.DECORE_ATTN_MASK = cls.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
-
+            
     def update_sink_kv(self, sink_k_pe: torch.Tensor, sink_compressed_kv: torch.Tensor) -> None:
         self.sink_k_pe = sink_k_pe.unsqueeze(1)
         self.sink_compressed_kv = sink_compressed_kv
@@ -506,79 +495,71 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
 
-        # When sink tokens are used, we need to insert cached sink tokens at the beginning of each sequence
+        has_context = attn_metadata.prefill.chunked_context is not None
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        tnd_cumlens = attn_metadata.prefill.query_start_loc_list[1:]
+
         if self.sink_len > 0:
-            k_pe = self._insert_tensor_by_start_loc(
-                k_pe,
-                self.sink_k_pe,
-                attn_metadata.prefill.query_start_loc,
-            )
-            kv_c_normed = self._insert_tensor_by_start_loc(
-                kv_c_normed,
-                self.sink_compressed_kv,
-                attn_metadata.prefill.query_start_loc,
-            )
+            q_nope = q_nope.transpose(0, 1)
+            ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
+            query_heads = 1 << (self.num_heads - 1).bit_length()
+            pad_len = query_heads - self.num_heads
+            if pad_len > 0:
+                ql_nope_pad = ql_nope.new_empty(
+                    (ql_nope.shape[0], pad_len, ql_nope.shape[-1])
+                )
+                ql_nope = torch.cat([ql_nope, ql_nope_pad], dim=1)
+                q_pe_pad = q_pe.new_empty((q_pe.shape[0], pad_len, q_pe.shape[-1]))
+                q_pe = torch.cat([q_pe, q_pe_pad], dim=1)
+
+            if self.sliding_window is not None:
+                window_size = self.sliding_window - 1
+            else:
+                window_size = NPUMLAImpl.MAX_WINDOW_SIZE
+
+            o = torch.ops.custom.npu_fused_infer_attention_sink(
+                query=ql_nope,
+                key=kv_cache[0],
+                value=kv_cache[0],
+                query_rope=q_pe,
+                key_rope=kv_cache[1],
+                num_query_heads=query_heads,
+                num_key_value_heads=1,
+                input_layout="TND",
+                softmax_scale=self.scale,
+                block_table=attn_metadata.prefill.block_table,
+                block_size=128,
+                actual_seq_qlen=attn_metadata.prefill.query_cumlens,
+                actual_seq_kvlen=attn_metadata.prefill.seq_lens,
+                atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                sparse_mode=4,
+                sink_number=self.sink_len,
+                pre_tokens=window_size,
+                next_tokens=0,
+            )[0].transpose(0, 1).contiguous()
+            return self._v_up_proj(o[: self.num_heads])
 
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
-
-        has_context = attn_metadata.prefill.chunked_context is not None
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        tnd_cumlens = attn_metadata.prefill.query_start_loc_list[1:]
-
-        if self.sink_len > 0:
-            # When sink tokens are used, the actual sequence lengths for key and value are different.
-            num_prefills = len(tnd_cumlens)
-            sink_len_offset = [self.sink_len * (i + 1) for i in range(num_prefills)]
-            kv_cumlens = [x + y for x, y in zip(tnd_cumlens, sink_len_offset)]
-        else:
-            kv_cumlens = tnd_cumlens
-
-        if self.sink_len > 0:
-            has_context = False
-            if self.sliding_window is not None:
-                window_size = self.sliding_window-1
-            else:
-                window_size = NPUMLAImpl.MAX_WINDOW_SIZE
-            output, output_lse = torch.ops.custom.npu_fused_infer_attention_sink(
-                q_nope,
-                k_nope,
-                v,
-                query_rope=q_pe,
-                key_rope=k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1),
-                num_query_heads=self.num_heads,
-                num_key_value_heads=self.num_heads,
-                input_layout="TND",
-                sparse_mode=4,
-                atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
-                actual_seq_qlen=tnd_cumlens,
-                actual_seq_kvlen=kv_cumlens,
-                softmax_scale=self.scale,
-                sink_number=self.sink_len,
-                pre_tokens=window_size,
-                next_tokens=0,
-                return_softmax_lse=has_context,
-            )
-        else:
-            output, output_lse = torch.ops.npu.npu_fused_infer_attention_score(
-                q_nope,
-                k_nope,
-                v,
-                query_rope=q_pe,
-                key_rope=k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1),
-                num_heads=self.num_heads,
-                num_key_value_heads=self.num_heads,
-                input_layout="TND",
-                atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
-                sparse_mode=3,
-                actual_seq_lengths=tnd_cumlens,
-                actual_seq_lengths_kv=kv_cumlens,
-                scale=self.scale,
-                next_tokens=0,
-                softmax_lse_flag=has_context,
-            )
+        output, output_lse = torch.ops.npu.npu_fused_infer_attention_score(
+            q_nope,
+            k_nope,
+            v,
+            query_rope=q_pe,
+            key_rope=k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_heads, 1),
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_heads,
+            input_layout="TND",
+            atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+            sparse_mode=3,
+            actual_seq_lengths=tnd_cumlens,
+            actual_seq_lengths_kv=tnd_cumlens,
+            scale=self.scale,
+            next_tokens=0,
+            softmax_lse_flag=has_context,
+        )
 
         if has_context:
             if self.dcp_world_size > 1:
@@ -701,7 +682,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             q_pe_pad = decode_q_pe.new_empty((decode_q_pe.shape[0], pad_len, decode_q_pe.shape[-1]))
             decode_q_pe = torch.cat([decode_q_pe, q_pe_pad], dim=1)
         else:
-            query_heads = self.num_heads
+            query_heads = self.num_heads           
 
         # In graph/dummy-run mode, decode queries may be padded while
         # actual_seq_lengths still records real token count.
@@ -716,8 +697,8 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             else:
                 window_size = NPUMLAImpl.MAX_WINDOW_SIZE
             kwargs = {
-                "query": decode_ql_nope,
-                "key": kv_cache[0],
+                "query": decode_ql_nope, 
+                "key": kv_cache[0], 
                 "value": kv_cache[0],
                 "query_rope": decode_q_pe,
                 "key_rope": kv_cache[1],
