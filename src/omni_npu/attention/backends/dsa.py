@@ -97,7 +97,8 @@ class NPUDSABackend(MLACommonBackend):
                 num_blocks,
                 kv_cache_spec,
             )
-        is_prefill = (get_current_vllm_config().kv_transfer_config.kv_role != "kv_consumer")
+        kv_config = get_current_vllm_config().kv_transfer_config
+        is_prefill = kv_config is None or kv_config.kv_role != "kv_consumer"
         block_size = kv_cache_spec.block_size
         dtype = kv_cache_spec.dtype
         raw_tensor = raw_tensor.view(dtype=dtype)

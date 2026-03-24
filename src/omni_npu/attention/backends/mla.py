@@ -40,7 +40,8 @@ from omni_npu.compilation.utils import (
     capture_multi_fia_graph_size,
     capture_multi_fia_sink_graph_size,
 )
-from omni_npu.attention.backends.utils import register_attention_backend
+from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches
+from omni_npu.v1.models.config_loader.loader import model_extra_config
 
 import omni_training_custom_ops
 import omni_custom_ops
@@ -69,11 +70,32 @@ class NPUMLABackend(MLACommonBackend):
         return NPUMLAImpl
 
     @staticmethod
+    def _reshape_kv_cache_noncontiguous(
+        raw_tensor: torch.Tensor,
+        num_blocks: int,
+        kv_cache_spec: AttentionSpec,
+    ) -> Tuple[torch.Tensor, ...]:
+        return _maybe_padded_raw_tensor_to_strided_caches(
+            raw_tensor,
+            num_blocks=num_blocks,
+            block_size=kv_cache_spec.block_size,
+            shapes=( (512,), (64,) ),
+            dtypes=(kv_cache_spec.dtype,) * 2,
+            page_size_bytes=kv_cache_spec.page_size_bytes,
+        )
+
+    @staticmethod
     def reshape_kv_cache(
         raw_tensor: torch.Tensor,
         num_blocks: int,
         kv_cache_spec: AttentionSpec,
     ) -> Tuple[torch.Tensor, ...]:
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            return NPUMLABackend._reshape_kv_cache_noncontiguous(
+                raw_tensor,
+                num_blocks,
+                kv_cache_spec,
+            )
         block_size = kv_cache_spec.block_size
         dtype = kv_cache_spec.dtype
         raw_tensor = raw_tensor.view(dtype=dtype)
@@ -335,7 +357,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                     torch.ones((2048, 2048), dtype=torch.bool, device="npu")
                 )
             cls.DECORE_ATTN_MASK = cls.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
-            
+
     def update_sink_kv(self, sink_k_pe: torch.Tensor, sink_compressed_kv: torch.Tensor) -> None:
         self.sink_k_pe = sink_k_pe.unsqueeze(1)
         self.sink_compressed_kv = sink_compressed_kv
@@ -682,7 +704,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             q_pe_pad = decode_q_pe.new_empty((decode_q_pe.shape[0], pad_len, decode_q_pe.shape[-1]))
             decode_q_pe = torch.cat([decode_q_pe, q_pe_pad], dim=1)
         else:
-            query_heads = self.num_heads           
+            query_heads = self.num_heads
 
         # In graph/dummy-run mode, decode queries may be padded while
         # actual_seq_lengths still records real token count.
@@ -697,8 +719,8 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             else:
                 window_size = NPUMLAImpl.MAX_WINDOW_SIZE
             kwargs = {
-                "query": decode_ql_nope, 
-                "key": kv_cache[0], 
+                "query": decode_ql_nope,
+                "key": kv_cache[0],
                 "value": kv_cache[0],
                 "query_rope": decode_q_pe,
                 "key_rope": kv_cache[1],

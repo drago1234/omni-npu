@@ -6,7 +6,7 @@ from omni_npu.attention.backends.attention import (
     NPUAttentionBackend,
     NPUAttentionMetadataBuilder,
 )
-from omni_npu.attention.backends.pangu_hybrid import NPUPanguMomeBackend
+from omni_npu.attention.backends.mome import NPUPanguMomeBackend
 
 __all__ = [
     "NPUAttentionBackendImpl",

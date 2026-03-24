@@ -7,6 +7,7 @@ import pytest
 import os
 import sys
 import types
+from types import SimpleNamespace
 
 # Ensure torch.fp8 exists for the test environment to avoid AttributeError
 # when pangu_hybrid.py references it dynamically.
@@ -37,14 +38,17 @@ from omni_npu.vllm_patches.patches.models.pangu_v2_hybrid.patch_worker_utils imp
 from omni_npu.vllm_patches.patches.models.pangu_v2_hybrid.patch_kv_cache_utils import (
     _get_kv_cache_groups_uniform_page_size_patched
 )
-from omni_npu.attention.backends.pangu_hybrid import (
-    _maybe_padded_raw_tensor_to_strided_caches,
-    NPUPanguMLABackend,
-    NPUPanguDSABackend,
+from omni_npu.attention.backends.utils import _maybe_padded_raw_tensor_to_strided_caches
+from omni_npu.attention.backends.dsa import NPUDSABackend
+from omni_npu.attention.backends.mla import NPUMLABackend
+from omni_npu.attention.backends.mome import (
     NPUPanguMomeBackend,
     NPUMomeAttentionMetadataBuilder,
-    NPUMomeAttentionMetadata
+    NPUMomeAttentionMetadata,
 )
+
+import omni_npu.attention.backends.dsa as dsa_module
+import omni_npu.attention.backends.mla as mla_module
 
 
 @pytest.mark.unit
@@ -231,27 +235,37 @@ class TestNPUPanguBackends(unittest.TestCase):
         self.device = torch.device('cpu')
 
     def test_mla_backend(self):
-        self.assertEqual(NPUPanguMLABackend.get_name(), "NPUPanguMLA")
+        self.assertEqual(NPUMLABackend.get_name(), "NPUMLA")
         spec = MagicMock()
         spec.block_size = 16
         spec.dtype = torch.bfloat16
         spec.page_size_bytes = 16 * (512 + 64) * 2
         raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.uint8, device=self.device)
 
-        caches = NPUPanguMLABackend.reshape_kv_cache(raw, 2, spec)
+        with patch.object(
+            mla_module.model_extra_config,
+            "operator_opt_config",
+            SimpleNamespace(use_noncontiguous_kv=True),
+        ):
+            caches = NPUMLABackend.reshape_kv_cache(raw, 2, spec)
         self.assertEqual(len(caches), 2)
         self.assertEqual(caches[0].shape, (2, 16, 512))
         self.assertEqual(caches[1].shape, (2, 16, 64))
 
     def test_dsa_backend_fp8(self):
-        self.assertEqual(NPUPanguDSABackend.get_name(), "NPUPanguDSA")
+        self.assertEqual(NPUDSABackend.get_name(), "NPUDSA")
         spec = MagicMock()
         spec.block_size = 16
         spec.cache_dtype_str = "fp8_ds_mla"
         spec.page_size_bytes = 16 * (656 * 1 + 132 * 1) # Approximation of required bytes
         raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.uint8, device=self.device)
 
-        caches = NPUPanguDSABackend.reshape_kv_cache(raw, 2, spec)
+        with patch.object(
+            dsa_module.model_extra_config,
+            "operator_opt_config",
+            SimpleNamespace(use_noncontiguous_kv=True),
+        ):
+            caches = NPUDSABackend.reshape_kv_cache(raw, 2, spec)
         self.assertEqual(caches[0].shape, (2, 16, 656))
         self.assertEqual(caches[1].shape, (2, 16, 132))
 
@@ -262,7 +276,12 @@ class TestNPUPanguBackends(unittest.TestCase):
         spec.page_size_bytes = 16 * (576 * 2 + 128 * 2)
         raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.uint8, device=self.device)
 
-        caches = NPUPanguDSABackend.reshape_kv_cache(raw, 2, spec)
+        with patch.object(
+            dsa_module.model_extra_config,
+            "operator_opt_config",
+            SimpleNamespace(use_noncontiguous_kv=True),
+        ):
+            caches = NPUDSABackend.reshape_kv_cache(raw, 2, spec)
         self.assertEqual(caches[0].shape, (2, 16, 576))
         self.assertEqual(caches[1].shape, (2, 16, 128))
 
@@ -306,7 +325,7 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
         # 16 is decode_cudagraph_max_bs limit, 1024/16 = 64 blocks max
         self.assertEqual(builder.cache_indices_tensor.shape, (16, 64))
 
-    @patch('omni_npu.attention.backends.pangu_hybrid.split_decodes_and_prefills')
+    @patch('omni_npu.attention.backends.mome.split_decodes_and_prefills')
     def test_builder_build_decode_with_cudagraph(self, mock_split):
         mock_split.return_value = (4, 0, 4, 0) # num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens
 
@@ -331,7 +350,7 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
         self.assertTrue(torch.equal(builder.cache_indices_tensor[:4], common_meta.block_table_tensor[:4]))
         self.assertTrue(torch.equal(meta.cache_indices, builder.cache_indices_tensor[:4]))
 
-    @patch('omni_npu.attention.backends.pangu_hybrid.split_decodes_and_prefills')
+    @patch('omni_npu.attention.backends.mome.split_decodes_and_prefills')
     def test_update_block_table(self, mock_split):
         mock_split.return_value = (4, 0, 4, 0)
         builder = NPUMomeAttentionMetadataBuilder(self.spec, ["layer1"], self.vllm_config, self.device)
@@ -347,7 +366,7 @@ class TestNPUMomeAttentionMetadataBuilder(unittest.TestCase):
         self.assertTrue(torch.equal(builder.cache_indices_tensor[:4], new_table))
         self.assertTrue(torch.equal(updated_meta.cache_indices, new_table))
 
-    @patch('omni_npu.attention.backends.pangu_hybrid.split_decodes_and_prefills')
+    @patch('omni_npu.attention.backends.mome.split_decodes_and_prefills')
     def test_build_for_cudagraph_capture(self, mock_split):
         mock_split.return_value = (2, 0, 2, 0)
         builder = NPUMomeAttentionMetadataBuilder(self.spec, ["layer1"], self.vllm_config, self.device)
