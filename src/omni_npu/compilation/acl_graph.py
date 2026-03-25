@@ -449,10 +449,15 @@ class ACLGraphWrapper:
     def _update_mla_attn_params(self, update_stream, forward_context, runtime_shape):
         if forward_context.attn_metadata is None:
             raise RuntimeError(f"attn_metadata is None")
+        attn_metadata = {
+            key: metadata
+            for key, metadata in forward_context.attn_metadata.items()
+            if metadata.decode and isinstance(metadata.decode.seq_lens, list)
+        }
         graph_params = get_graph_params()
         with torch.npu.stream(update_stream):
             for key, param, handle, event in zip(
-                forward_context.attn_metadata,
+                attn_metadata,
                 graph_params.attn_params[runtime_shape],
                 graph_params.handles[runtime_shape],
                 graph_params.events[runtime_shape],

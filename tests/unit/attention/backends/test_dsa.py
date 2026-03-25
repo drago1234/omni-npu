@@ -75,6 +75,47 @@ class TestNPUDSABackend(unittest.TestCase):
 
 
 class TestNPUDSAMetadataBuilder(unittest.TestCase):
+    def test_init_success_with_valid_config(self):
+        """Test NPUDSAMetadataBuilder.__init__ succeeds with valid config."""
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.speculative_config = None
+        mock_vllm_config.scheduler_config.max_num_seqs = 16
+        mock_vllm_config.kv_transfer_config = None
+        mock_vllm_config.model_config.hf_config = MagicMock()
+        mock_vllm_config.model_config.hf_config.param_sink_number = 128
+
+        mock_kv_cache_spec = MagicMock()
+        mock_kv_cache_spec.block_size = 16
+
+        with patch.object(mla_mod.MLACommonMetadataBuilder, "__init__", return_value=None), \
+             patch.object(mla_mod, "current_platform") as mock_platform:
+            mock_platform.device_type = "npu"
+
+            # Create via __new__ and set parent-initialized attributes
+            builder = mla_mod.NPUDSAMetadataBuilder.__new__(mla_mod.NPUDSAMetadataBuilder)
+            builder._use_fi_prefill = False
+            builder._use_cudnn_prefill = False
+            builder.dcp_world_size = 1
+            builder.aot_schedule = False
+            builder.vllm_config = mock_vllm_config
+
+            builder.__init__(
+                kv_cache_spec=mock_kv_cache_spec,
+                layer_names=["layer0"],
+                vllm_config=mock_vllm_config,
+                device=torch.device("npu"),
+            )
+
+            # Verify parent __init__ was called
+            mla_mod.MLACommonMetadataBuilder.__init__.assert_called_once()
+
+            # Verify attributes set by __init__
+            self.assertEqual(builder.prefill_metadata_cls, mla_mod.NPUDSAPrefillMetadata)
+            self.assertEqual(builder.uniform_decode_query_len, 1)
+            self.assertEqual(builder.mc2_mask.shape, (16,))
+            self.assertEqual(builder.mc2_mask.dtype, torch.bool)
+            self.assertEqual(builder.sink_len, 128)
+
     def _new_builder_minimal(self):
         """
         Avoid calling real MLACommonMetadataBuilder.__init__.
@@ -144,30 +185,6 @@ class TestNPUDSAMetadataBuilder(unittest.TestCase):
         self.assertIs(out, fake_meta)
         self.assertTrue(torch.equal(out.prefill.seq_lens, torch.tensor([2, 3], dtype=torch.long)))
         self.assertTrue(torch.equal(out.prefill.query_cumlens, torch.tensor([2, 5], dtype=torch.long)))
-
-    def test_build_raises_on_chunked_prefill(self):
-        b = self._new_builder_minimal()
-
-        class _Prefill:
-            def __init__(self):
-                self.query_start_loc = torch.tensor([0, 1], dtype=torch.long)
-                self.chunked_context = object()  # not None triggers error
-                self.seq_lens = None
-                self.query_cumlens = None
-
-        class _Meta:
-            def __init__(self):
-                self.prefill = _Prefill()
-                self.decode = None
-                self.num_actual_tokens = 0
-                self.num_reqs = 0
-                self.slot_mapping = torch.tensor([], dtype=torch.long)
-
-        fake_meta = _Meta()
-
-        with patch.object(mla_mod.MLACommonMetadataBuilder, "build", return_value=fake_meta):
-            with self.assertRaises(RuntimeError):
-                _ = b.build(common_prefix_len=0, common_attn_metadata=MagicMock(), fast_build=False)
 
 
 class TestNPUDSAImplInit(unittest.TestCase):

@@ -428,7 +428,7 @@ class CommunicationStrategySelector:
                 strategy = "agrs"
             else:
                 # TP + DP
-                if num_tokens <= decode_threshold:
+                if decode_threshold == 0 or num_tokens <= decode_threshold:
                     strategy = "agrs"
                 else:
                     strategy = "all2all"
