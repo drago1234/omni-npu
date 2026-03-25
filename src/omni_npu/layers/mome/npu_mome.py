@@ -3,7 +3,7 @@
 
 import torch
 import torch.nn.functional as F
-from omni_npu.v1.utils import is_A5
+from omni_npu.v1.utils import on_ascend950
 
 from vllm.distributed import (
     divide,
@@ -252,7 +252,7 @@ class ColumnParallelMOME(torch.nn.Module):
         
         super().__init__()
 
-        self.is_A5 = is_A5()
+        self.on_ascend950 = on_ascend950()
 
         # Keep input parameters
         self.dim = dim
@@ -312,7 +312,7 @@ class ColumnParallelMOME(torch.nn.Module):
         has_initial_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert x.ndim == 2
-        if not self.is_A5:
+        if not self.on_ascend950:
             assert conv_states.size(1) == self.kernel_width - 1
             return torch.ops.custom.npu_ai_infra_causal_conv1d_fn_add(
                 x,
@@ -341,7 +341,7 @@ class ColumnParallelMOME(torch.nn.Module):
         num_accepted_tokens: torch.Tensor | None = None,
         pad_slot_id: int = -1,
     ) -> torch.Tensor:
-        if not self.is_A5:
+        if not self.on_ascend950:
             return torch.ops.custom.npu_ai_infra_causal_conv1d_update_add(
                 x,
                 self.weight,

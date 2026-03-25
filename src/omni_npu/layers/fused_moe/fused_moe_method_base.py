@@ -15,7 +15,7 @@ from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import (
 class NPUFusedMoEMethodBase(ABC):
 
     def __init__(self):
-        super().__init__()
+        ABC.__init__(self)
         self.communication_strategy_selector = None
 
     def make_communication_strategy_selector(

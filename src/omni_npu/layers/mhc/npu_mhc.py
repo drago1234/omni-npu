@@ -8,7 +8,7 @@ from transformers import PretrainedConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.logger import init_logger
 
-from omni_npu.v1.utils import is_A5
+from omni_npu.v1.utils import on_ascend950
 
 logger = init_logger(__name__)
 try:
@@ -33,7 +33,7 @@ class NPUmHC(torch.nn.Module):
         self.hc_eps = 1e-6
         assert config.mhc_use_gamma
         self.pre_only = pre_only
-        self.is_A5 = is_A5()
+        self.on_ascend950 = on_ascend950()
 
         self.branch_alpha_pre = torch.nn.Parameter(
             torch.empty(1, dtype=torch.float32)
@@ -114,7 +114,7 @@ class NPUmHC(torch.nn.Module):
             )
             hidden_states = hidden_states.view(-1, self.num_stream, self.hidden_size)
 
-            if not self.is_A5:
+            if not self.on_ascend950:
                 hidden_states, h_post, h_res, _, _, _ = \
                     torch.ops.custom.npu_manifold_constrained_hyper_connection_pre(
                         hidden_states,
@@ -160,7 +160,7 @@ class NPUmHC(torch.nn.Module):
         if self.pre_only:
             return h_res
 
-        if not self.is_A5:
+        if not self.on_ascend950:
             h_res, _, _ = torch.ops.custom.npu_sinkhorn(
                 h_res,
                 eps=self.hc_eps,
@@ -196,7 +196,7 @@ class NPUmHC(torch.nn.Module):
             return residual
 
         residual = residual.view(-1, self.num_stream, self.hidden_size)
-        if not self.is_A5:
+        if not self.on_ascend950:
             hidden_states = torch.ops.custom.npu_ai_infra_manifold_constrained_hyper_connection_post(
                 residual,
                 h_res,

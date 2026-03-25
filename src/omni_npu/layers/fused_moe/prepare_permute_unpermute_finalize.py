@@ -18,6 +18,11 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from omni_npu.v1.utils import on_ascend950
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 DEFAULT_ALL2ALL_THRESHOLD = 64
 GROUPED_FINALIZE_ROW_INDEX_STRIDE = 991
@@ -212,12 +217,18 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             is_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
             if self.is_a2_device and not is_prefill:
                 row_idx_type = 1
-            x_int8, x_scale = torch_npu.npu_dynamic_quant(x)
-            x_int8 = get_dp_group().all_gather(x_int8, dim=0)
+            if layer.quant_method.moe_quant_config.use_hifloat8_w8a8:
+                x_scale = torch.ones((x.shape[0], ), dtype=torch.float32, device=x.device)
+                x_fp8 = torch_npu.npu_dtype_cast(x, torch_npu.hifloat8)
+                x_quant = x_fp8.view(dtype=torch.int8)
+            elif layer.quant_method.moe_quant_config.use_int8_w8a8:
+                x_int8, x_scale = torch_npu.npu_dynamic_quant(x)
+                x_quant = x_int8
+            x_quant = get_dp_group().all_gather(x_quant, dim=0)
             x_scale = get_dp_group().all_gather(x_scale, dim=0)
             gathered_topk_ids = get_dp_group().all_gather(topk_ids, dim=0)
             expanded_x, expanded_row_idx, expert_tokens, dynamic_scale = torch_npu.npu_moe_init_routing_v2(
-                x_int8,
+                x_quant,
                 gathered_topk_ids,
                 scale=x_scale,
                 offset=None,
@@ -262,6 +273,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         gathered_topk_weights = get_dp_group().all_gather(topk_weights, dim=0)
 
         if layer.quant_config is not None:
+            # TODO wjc: 1.hif8 gmmfr adaption 2. add share_experts_output.
             if row_idx_type == 1:
                 x, pertoken_scale = hidden_states
                 hidden_size = x.shape[1]
@@ -329,10 +341,14 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
 class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
     def __init__(self, layer):
         super().__init__(layer)
-        self.moe_all_to_all_group = get_ep_group().device_group
-        self.moe_all_to_all_group_name = self.moe_all_to_all_group._get_backend(
-            torch.device(current_platform.device_type)
-        ).get_hccl_comm_name(get_ep_group().rank_in_group)
+        if on_ascend950():
+            # TODO zhaoyi: fix get_hccl_comm_name error on A5
+            logger.warning_once("DispatchCombinePrepPmtAndUnpmtFinal's initialization is skipped due to get_hccl_comm_name error on Ascend950.")  
+        else:
+            self.moe_all_to_all_group = get_ep_group().device_group
+            self.moe_all_to_all_group_name = self.moe_all_to_all_group._get_backend(
+                torch.device(current_platform.device_type)
+            ).get_hccl_comm_name(get_ep_group().rank_in_group)
 
     def _get_mc2_mask(self, num_tokens: int) -> torch.Tensor | None:
         attn_metadata = get_forward_context().attn_metadata
@@ -405,6 +421,7 @@ class CommunicationStrategySelector:
     def __init__(self, moe: torch.nn.Module):
         device_name = torch_npu.npu.get_device_name(0)
         self.is_a2_device = device_name.startswith("Ascend910B")
+        self.is_a5_device = device_name.startswith("Ascend950")
         self.tp_size = get_tensor_model_parallel_world_size()
         self.dp_size = get_dp_group().world_size
 
@@ -432,6 +449,8 @@ class CommunicationStrategySelector:
                     strategy = "agrs"
                 else:
                     strategy = "all2all"
+        elif self.is_a5_device:
+            strategy = "agrs"
         else:
             # TP or DP only
             if self.dp_size == 1 or self.tp_size == 1:

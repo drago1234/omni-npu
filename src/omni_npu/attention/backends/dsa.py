@@ -97,21 +97,30 @@ class NPUDSABackend(MLACommonBackend):
                 num_blocks,
                 kv_cache_spec,
             )
-        kv_config = get_current_vllm_config().kv_transfer_config
-        is_prefill = kv_config is None or kv_config.kv_role != "kv_consumer"
+        vllm_config = get_current_vllm_config()
+        if getattr(vllm_config, "kv_transfer_config", None) is not None:
+            is_prefill = (vllm_config.kv_transfer_config.kv_role != "kv_consumer")
+        else:
+            is_prefill = False
+        cache_dtype_str = vllm_config.cache_config.cache_dtype
         block_size = kv_cache_spec.block_size
         dtype = kv_cache_spec.dtype
         raw_tensor = raw_tensor.view(dtype=dtype)
         if ENABLE_OMNI_CACHE and not is_prefill:
             shapes = [(num_blocks, block_size, 1, 128)] # for omni cache decode, only indexer is registered on device
+            dtypes = [dtype]
+        elif cache_dtype_str == 'hif8_ds_mla':
+            shapes = [(num_blocks, block_size, 1, 656), (num_blocks, block_size, 1, 128), (num_blocks, block_size, 1, 4)]
+            dtypes = [dtype, dtype, torch.float32]
         else:
             shapes = [(num_blocks, block_size, 1, 512), (num_blocks, block_size, 1, 64), (num_blocks, block_size, 1, 128)]
+            dtypes = [dtype, dtype, dtype]
         sizes = [math.prod(shape) for shape in shapes]
         if raw_tensor.numel() != sum(sizes):
             raise RuntimeError(f"Raw tensor has {raw_tensor.numel()} elements, while"
                                f" the expected sizes for KV cache are {sizes}.")
         tensors = torch.split(raw_tensor, sizes)
-        return tuple(t.view(shape) for t, shape in zip(tensors, shapes))
+        return tuple(t.view(shape).view(dt) for t, shape, dt in zip(tensors, shapes, dtypes))
 
 
 @dataclass

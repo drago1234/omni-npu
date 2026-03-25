@@ -12,7 +12,7 @@ _current_stream = None
 
 
 @functools.lru_cache(maxsize=1)
-def is_A5() -> bool:
+def on_ascend950() -> bool:
     """Check if the device is an Ascend950 (A5) device."""
     return torch_npu.npu.get_device_name(0).startswith("Ascend950")
 

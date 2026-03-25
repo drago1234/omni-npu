@@ -51,8 +51,10 @@ def load_model_extra_config(model_config, vllm_config, scheduler_config):
         hardware_platform = "A2"
     elif device_name.startswith("Ascend910"):
         hardware_platform = "A3"
+    elif device_name.startswith("Ascend950"):
+        hardware_platform = "A5"
     else:
-        raise ValueError(f"Unsupported device: {device_name}. Only Ascend910/Ascend910B are supported.")
+        raise ValueError(f"Unsupported device: {device_name}. Only Ascend910/Ascend910B/Ascend950 are supported.")
     
     update_task_config(
         model_name = model_name,
@@ -245,7 +247,7 @@ def parse_hf_config(hf_config):
     else:
         quantization_config = None
 
-    if quantization_config is not None and quantization_config['format'].strip() == 'int-quantized':
+    if quantization_config is not None and quantization_config.get('format', '').strip() == 'int-quantized':
         weights_type = quantization_config["config_groups"]["group_0"]["weights"]["num_bits"]
         if isinstance(weights_type, dict):
             num_bits_values = weights_type.values()

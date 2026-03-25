@@ -13,6 +13,7 @@ from vllm.config.model import LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler as V1TopKTopPSampler
+from omni_npu.v1.utils import on_ascend950
 
 
 
@@ -56,10 +57,13 @@ def generate_coins(
 class NPUTopKTopPSampler(V1TopKTopPSampler):
     def __init__(self, logprobs_mode: LogprobsMode = "raw_logprobs", dsa_stream = None) -> None:
         super().__init__(logprobs_mode)
-        self.apply_top_k_top_p = apply_top_k_top_p_npu
-        self.forward = self.forward_npu
+        if on_ascend950():
+            self.forward = self.forward_native
+        else:
+            self.apply_top_k_top_p = apply_top_k_top_p_npu
+            self.forward = self.forward_npu
         self.dsa_stream = dsa_stream if dsa_stream is not None else torch_npu.npu.Stream()
-    
+
     def forward_npu(
         self,
         logits: torch.Tensor,

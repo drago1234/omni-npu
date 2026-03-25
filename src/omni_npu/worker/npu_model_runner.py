@@ -271,15 +271,32 @@ class NPUModelRunner(GPUModelRunner):
                 is_dsa = not hasattr(config, "dsa_layers") or extract_layer_index(layer_name) in config.dsa_layers
                 head_size = (attn_module.head_size if hasattr(attn_module, 'head_size') else attn_module.head_dim) + \
                     (indexer_head_size if is_dsa else 0)
-                if not getattr(attn_module, 'sink_len', 0):
+                if is_dsa and self.vllm_config.cache_config.cache_dtype in ["hif8_ds_mla"]:
+                    # In the "HiF8 with scale" format, each token's KV cache is 656 Bytes
+                    # reference vllm/vllm/v1/attention/backends/mla/flashmla_sparse.py
+                    kv_cache_spec[layer_name] = MLAAttentionSpec(
+                        block_size=self.vllm_config.cache_config.block_size,
+                        num_kv_heads=1,
+                        head_size=656 + indexer_head_size + 4, # 4 bytes for one fp32 scale
+                        dtype=kv_cache_dtype_str_to_dtype(self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config),
+                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                    )
+                elif not getattr(attn_module, 'sink_len', 0):
                     if int(os.getenv("ENABLE_OMNI_CACHE", "0")) and self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
                         head_size = indexer_head_size
+                    # hif8_ds_mla kv quantization is only applied to DSA layers
+                    if self.vllm_config.cache_config.cache_dtype in ["hif8_ds_mla"] and not is_dsa:
+                        kv_dtype = kv_cache_dtype_str_to_dtype("auto", self.vllm_config.model_config)
+                        kv_dtype_str = "auto"
+                    else:  # keep original specified dtype
+                        kv_dtype = kv_cache_dtype_str_to_dtype(self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config),
+                        kv_dtype_str = self.vllm_config.cache_config.cache_dtype
                     kv_cache_spec[layer_name] = MLAAttentionSpec(
                         block_size=self.vllm_config.cache_config.block_size,
                         num_kv_heads=1,
                         head_size=head_size,
-                        dtype=kv_cache_dtype_str_to_dtype(self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config),
-                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                        dtype=kv_dtype,
+                        cache_dtype_str=kv_dtype_str,
                     )
                 else:
                     from vllm.v1.kv_cache_interface import SinkMLAAttentionSpec

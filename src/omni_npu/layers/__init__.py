@@ -6,6 +6,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 from omni_npu.layers.quantization.compressed_tensors.compressed_tensors import NPUCompressedTensorsConfig
+from omni_npu.layers.quantization.hifloat8 import Hifloat8Config
 from omni_npu.layers.fused_moe.layer import NPUUnquantizedFusedMoEMethod, NPUFusedMoE
 from omni_npu.layers.attention.npu_mla_wrapper import NPUMultiHeadLatentAttentionWrapper
 from omni_npu.layers.npu_rms_norm import NPURMSNorm

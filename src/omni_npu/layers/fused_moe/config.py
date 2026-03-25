@@ -14,8 +14,13 @@ def use_int8_w8a8(self) -> bool:
     return self.quant_dtype == torch.int8 and self._w1.dtype == torch.int8
 
 
+def use_hifloat8_w8a8(self) -> bool:
+    return self.quant_dtype == "hifloat8"
+
+
 FusedMoEQuantConfig.use_int4_w4a8 = property(use_int4_w4a8)
 FusedMoEQuantConfig.use_int8_w8a8 = property(use_int8_w8a8)
+FusedMoEQuantConfig.use_hifloat8_w8a8 = property(use_hifloat8_w8a8)
 
 
 def int4_w4a8_moe_quant_config(
@@ -43,3 +48,24 @@ def int4_w4a8_moe_quant_config(
     )
     assert quant_config.per_act_token_quant == per_act_token_quant
     return quant_config
+
+
+def hifloat8_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    a1_scale: torch.Tensor | None,
+    a2_scale: torch.Tensor | None,
+):
+    """
+    Construct a quant config for hifloat8 weights and activations.
+    """
+    quant_dtype = "hifloat8"
+    a_shape, w_shape = _quant_flags_to_group_shape(
+        quant_dtype, False, False, None
+    )
+    return FusedMoEQuantConfig(
+        _a1=FusedMoEQuantDesc(quant_dtype, a_shape, a1_scale),
+        _a2=FusedMoEQuantDesc(quant_dtype, a_shape, a2_scale),
+        _w1=FusedMoEQuantDesc(quant_dtype, w_shape, w1_scale),
+        _w2=FusedMoEQuantDesc(quant_dtype, w_shape, w2_scale),
+    )
