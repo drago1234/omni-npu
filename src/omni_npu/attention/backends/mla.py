@@ -127,7 +127,6 @@ class NPUMLADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
     mc2_mask: torch.Tensor = None
     slot_mapping: torch.Tensor = None
-    num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
 
 @dataclass
@@ -166,13 +165,6 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         max_decode_tokens = min(256, self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold)
         self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
 
-        # Read sink_len from model config for static sink attention
-        self.sink_len = 0
-        if hasattr(vllm_config, 'model_config') and hasattr(vllm_config.model_config, 'hf_config'):
-            hf_config = vllm_config.model_config.hf_config
-            # Try to get param_sink_number from config (used for Pangu models)
-            self.sink_len = getattr(hf_config, 'param_sink_number', 0)
-
     def _build_decode(
         self,
         block_table_tensor: torch.Tensor,
@@ -195,17 +187,12 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-        num_accepted_tokens: torch.Tensor | None = None,  # Additional parameter for speculative decoding
-        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
     ) -> NPUMLAMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         metadata.decode_threshold = self.reorder_batch_threshold
         if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
             # for pd-mixed, TP is used, no need to use mc2_mask
             metadata.decode.mc2_mask = self.generate_activate_mask(metadata.decode.query_cumlens[-1])
-        # Add speculative decoding metadata
-        if metadata.decode is not None and num_accepted_tokens is not None:
-            metadata.decode.num_accepted_tokens = num_accepted_tokens
         if metadata.decode is not None and hasattr(self, "sink_len") and self.sink_len > 0:
             # for static sink attention, we need to add the sink length to the seq_lens
             metadata.decode.sink_len = self.sink_len
