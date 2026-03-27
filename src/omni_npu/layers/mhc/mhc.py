@@ -59,16 +59,19 @@ class NPUmHCModule(mHCModule):
             else:
                 weight = self.phi(x)[0] * rsqrt
             h_pre, h_post, h_res = self.hc_split_sinkhorn_torch(weight)
-            y = torch.sum(h_pre.unsqueeze(-1) * x.unflatten(dim=-1, sizes=(self.num_stream, -1)), dim=1).squeeze(1).to(dtype)
+            hidden_state = torch.sum(h_pre.unsqueeze(-1) * x.unflatten(dim=-1, sizes=(self.num_stream, -1)), dim=1).squeeze(1).to(dtype)
         else:
-            y, h_post, h_res, _, _, _ = torch.ops.custom.npu_manifold_constrained_hyper_connection_pre(
-                x.view(-1, self.num_stream, self.hidden_size), self.phi.weight,
+            weight_absorb_gamma = self.phi.weight * self.norm_gamma
+            hidden_state, h_post, h_res, _, _, _ = torch.ops.custom.npu_manifold_constrained_hyper_connection_pre(
+                x.view(-1, self.num_stream, self.hidden_size),
+                weight_absorb_gamma,
                 self.branch_alpha, self.branch_beta,
-                gamma=self.norm_gamma.view(self.num_stream, -1),
-                out_flag=1, norm_eps=self.hc_eps, hc_eps=self.hc_eps
+                gamma=None,
+                out_flag=0, # 表示算子走推理和decode分支（默认为0）；outflag=1走训练和prefill的模板，性能会比较差
+                norm_eps=self.hc_eps, hc_eps=self.hc_eps
             )
             h_res, _, _ = torch.ops.custom.npu_sinkhorn(h_res, num_iters=self.mhc_recur_norm, eps=self.hc_eps)
-        return y, h_post, h_res
+        return hidden_state, h_post, h_res
     
     def hc_split_sinkhorn_torch(self, weight):
         if not self.merge_layer_only_pre:
@@ -94,7 +97,7 @@ class NPUmHCModule(mHCModule):
         if self.merge_layer_only_pre:
             return x
         else:
-            y = torch.ops.custom.npu_ai_infra_manifold_constrained_hyper_connection_post(
+            hidden_state = torch.ops.custom.npu_ai_infra_manifold_constrained_hyper_connection_post(
                 residual.unflatten(dim=-1, sizes=(self.num_stream, -1)), h_res, x, h_post
             ).view(-1, self.num_stream * self.hidden_size)
-            return y
+            return hidden_state
