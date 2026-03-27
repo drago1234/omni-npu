@@ -1,0 +1,9 @@
+{
+    "model_parallel_config": {
+        "layer_parallel_config": {
+        }
+    },
+    "operator_optimization_config": {
+        "use_noncontiguous_kv": true
+    }
+}

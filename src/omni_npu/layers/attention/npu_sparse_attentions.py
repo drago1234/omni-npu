@@ -28,11 +28,9 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.attention.layer import MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 
-from omni_npu.attention.backends.pangu_hybrid import (
-    NPUPanguDSABackend,
-    NPUPanguMLABackend,
-    NPUPanguMomeBackend,
-)
+from omni_npu.attention.backends.mome import NPUPanguMomeBackend
+from omni_npu.attention.backends.mla import NPUMLABackend
+from omni_npu.attention.backends.dsa import NPUDSABackend
 
 logger = init_logger(__name__)
 
@@ -86,7 +84,7 @@ class MLASWAAttention(MLAAttention):
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return NPUPanguMLABackend
+        return NPUMLABackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
 
@@ -175,7 +173,7 @@ class DSAAttention(MLAAttention):
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return NPUPanguDSABackend
+        return NPUDSABackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         """

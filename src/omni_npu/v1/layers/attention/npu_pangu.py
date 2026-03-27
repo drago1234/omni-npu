@@ -23,8 +23,9 @@ from vllm.model_executor.layers.linear import (
 from vllm.v1.attention.backends.mla.common import MLACommonMetadata
 from vllm.logger import init_logger
 
-from omni_npu.attention.backends.mla import NPUMLAMetadata
 from omni_npu.v1.utils import current_stream, on_ascend950
+from omni_npu.v1.layers.utils import yarn_get_mscale
+from omni_npu.v1.models.config_loader.loader import model_extra_config
 
 from omni_npu.layers.mome.npu_mome import ColumnParallelMOME
 from omni_npu.layers.attention.npu_sparse_attentions import (
@@ -61,6 +62,9 @@ class NPUPanguIndexer(torch.nn.Module):
         self.quant_config = quant_config
         self.cache_config = cache_config
         self.layer_name = prefix
+        self.block_size = cache_config.block_size
+        self.enable_non_contiguous_kv = model_extra_config.operator_opt_config.use_noncontiguous_kv
+        self.on_ascend950 = on_ascend950()
         self._init_indexer_weights()
 
     def _init_indexer_weights(self):
@@ -75,6 +79,7 @@ class NPUPanguIndexer(torch.nn.Module):
         if self.cache_config.cache_dtype in ["hif8_ds_mla", "fp8_ds_mla"]:
             self.wq_b.weight.data = torch.ones_like(self.wq_b.weight.data)
             self.wq_b.weight_scale.data = torch.ones_like(self.wq_b.weight_scale.data)
+
         self.wk = ReplicatedLinear(
             self.hidden_size,
             self.index_head_dim,
@@ -96,20 +101,63 @@ class NPUPanguIndexer(torch.nn.Module):
             return_bias=False,
         )
 
-    def _apply_lightning_indexer(
+    def _apply_lightning_indexer(self, *args, **kwargs):
+        if quant_output := self._apply_lightning_indexer_quant(*args, **kwargs):
+            return quant_output
+        else:
+            unquant_output = self._apply_lightning_indexer_unquant(*args, **kwargs)
+            return unquant_output
+
+    def _update_indexer_cache(self, *args, **kwargs):
+        if quant_output := self._update_indexer_cache_quant(*args, **kwargs):
+            return quant_output
+        else:
+            unquant_output = self._update_indexer_cache_unquant(*args, **kwargs)
+            return unquant_output
+
+    def _apply_lightning_indexer_unquant(
         self,
-        q,
-        weights,
-        attn_metadata,
-        kv_cache,
-    ):
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
         if attn_metadata.prefill is not None:
             metadata = attn_metadata.prefill
         else:
             metadata = attn_metadata.decode
 
-        if self.cache_config.cache_dtype in ["hif8_ds_mla"]:
-            q_scale = torch.ones((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+        return torch.ops.custom.npu_lightning_indexer_enhance(
+            query=q,
+            key=kv_cache[1].unsqueeze(2),
+            weights=weights,
+            actual_seq_lengths_query=metadata.query_cumlens.to(torch.int32),
+            actual_seq_lengths_key=metadata.seq_lens.to(torch.int32),
+            block_table=metadata.block_table,
+            layout_key="PA_BSND",
+            layout_query="TND",
+            sparse_count=self.index_topk,
+            sparse_mode=3,
+            sparse_block_size=1,
+            sparse_block_mode=False,
+        )[0]
+
+    def _apply_lightning_indexer_quant(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> Union[torch.Tensor, bool]:
+        if attn_metadata.prefill is not None:
+            metadata = attn_metadata.prefill
+        else:
+            metadata = attn_metadata.decode
+
+        if self.on_ascend950 and self.cache_config.cache_dtype in ["hif8_ds_mla"]:
+            q_scale = torch.ones(
+                (q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device,
+            )
             q_hif8 = torch_npu.npu_dtype_cast(q, torch_npu.hifloat8)
 
             return torch_npu.npu_quant_lightning_indexer(
@@ -131,80 +179,38 @@ class NPUPanguIndexer(torch.nn.Module):
                 key_dtype=torch_npu.hifloat8
             )
         else:
-            return torch_npu.npu_lightning_indexer(
-                query=q,
-                key=kv_cache[2],
-                weights=weights,
-                actual_seq_lengths_query=metadata.query_cumlens.to(torch.int32),
-                actual_seq_lengths_key=metadata.seq_lens.to(torch.int32),
-                block_table=metadata.block_table,
-                layout_key="PA_BSND",
-                layout_query="TND",
-                sparse_count=self.index_topk,
-                sparse_mode=3,
-            )[0]
+            return False
 
-    def forward(
+    def _update_indexer_cache_unquant(
         self,
-        hidden_states: torch.Tensor,
-        qr: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attn_metadata: Optional[MLACommonMetadata] = None,
-        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+        k: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> bool:
 
-        q = self.wq_b(qr)
-        q = q.view(-1, self.index_n_heads, self.index_head_dim)
-        q_pe, q_nope = torch.split(
-            q,
-            [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim],
-            dim=-1,
+        slot_indices = torch.stack([
+            attn_metadata.slot_mapping // self.block_size,
+            attn_metadata.slot_mapping % self.block_size,
+            ], dim=1,
         )
-        if on_ascend950():
-            q_pe = torch_npu.npu_rotary_mul(
-                q_pe.unsqueeze(1),
-                cos.view(-1, 1, 1, self.qk_rope_head_dim),
-                sin.view(-1, 1, 1, self.qk_rope_head_dim),
-            ).squeeze(1)
-        else:
-            q_pe = torch_npu.npu_rotary_mul(
-                q_pe,
-                cos.view(-1, 1, self.qk_rope_head_dim),
-                sin.view(-1, 1, self.qk_rope_head_dim),
+        torch.ops.custom.npu_ai_infra_scatter_block_update_(
+            kv_cache[1],
+            slot_indices,
+            k.view(-1, k.shape[-1]),
+        )
+        return True
+
+    def _update_indexer_cache_quant(
+        self,
+        k: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> bool:
+
+        if self.on_ascend950 and self.cache_config.cache_dtype in ["hif8_ds_mla"]:
+            k_scale = torch.ones(
+                (k.shape[0], 1), dtype=torch.float32, device=k.device,
             )
-        q = torch.cat(
-            [q_pe, q_nope],
-            dim=-1,
-        )
-
-        k = self.wk(hidden_states)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, 
-            [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim],
-            dim=-1,
-        )
-        if on_ascend950():
-            k_pe = torch_npu.npu_rotary_mul(
-                k_pe.unsqueeze(1).unsqueeze(1),
-                cos.view(-1, 1, 1, self.qk_rope_head_dim),
-                sin.view(-1, 1, 1, self.qk_rope_head_dim),
-            ).squeeze(1).squeeze(1)
-        else:
-            k_pe = torch_npu.npu_rotary_mul(
-                k_pe.unsqueeze(1),
-                cos.view(-1, 1, self.qk_rope_head_dim),
-                sin.view(-1, 1, self.qk_rope_head_dim),
-            ).squeeze(1)
-
-        k = torch.cat(
-            [k_pe, k_nope],
-            dim=-1,
-        )
-
-        if self.cache_config.cache_dtype in ["hif8_ds_mla"]:
-            k_scale = torch.ones((k.shape[0], 1), dtype=torch.float32, device=k.device)
             k_hif8 = torch_npu.npu_dtype_cast(k, torch_npu.hifloat8)
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[1].view(-1, k_hif8.shape[-1]).view(torch.int8),
@@ -216,14 +222,74 @@ class NPUPanguIndexer(torch.nn.Module):
                 attn_metadata.slot_mapping.view(-1, 1),
                 k_scale.view(-1, k_scale.shape[-1]),
             )
+            return True
+
         else:
-            torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k.shape[-1]),
-                attn_metadata.slot_mapping.view(-1, 1),
-                k.view(-1, k.shape[-1]),
-            )
+            return False
+
+    def _indexer_prolog(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        q = self.wq_b(qr)
+        q = q.view(-1, self.index_n_heads, self.index_head_dim)
+        q_pe, q_nope = torch.split(
+            q,
+            [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_pe = torch_npu.npu_rotary_mul(
+            q_pe.view(-1, 1, self.index_n_heads, self.qk_rope_head_dim),
+            cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            sin.view(-1, 1, 1, self.qk_rope_head_dim),
+        ).squeeze(1)
+        q = torch.cat([q_pe, q_nope], dim=-1)
+
+        k = self.wk(hidden_states)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(
+            k, 
+            [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim],
+            dim=-1,
+        )
+        k_pe = torch_npu.npu_rotary_mul(
+            k_pe.view(-1, 1, 1, self.qk_rope_head_dim),
+            cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            sin.view(-1, 1, 1, self.qk_rope_head_dim),
+        ).squeeze(1).squeeze(1)
+
+        k = torch.cat([k_pe, k_nope], dim=-1)
 
         weights = self.weights_proj(hidden_states)
+
+        return q, k, weights
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_metadata: Optional[MLACommonMetadata] = None,
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+
+        q, k, weights = self._indexer_prolog(
+            hidden_states,
+            qr,
+            cos,
+            sin,
+        )
+
+        self._update_indexer_cache(
+            k,
+            attn_metadata,
+            kv_cache,
+        )
 
         return self._apply_lightning_indexer(
             q,
@@ -256,15 +322,21 @@ class NPUPanguSparseAttention(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self.sliding_window_list = sliding_window_list
         self.prefix = prefix
         self.layer_idx = extract_layer_index(self.prefix)
+        assert len(swa_layers) == len(sliding_window_list)
         self.swa_layers = swa_layers if swa_layers else []
+        self.sliding_window_list = sliding_window_list if sliding_window_list else []
+        self.aligned_window_size = max(self.sliding_window_list)
         if self.layer_idx in self.swa_layers:
             pos_in_swa = self.swa_layers.index(self.layer_idx)
             self.sliding_window = self.sliding_window_list[pos_in_swa]
             self.is_dsa_layer = False
+        elif self.layer_idx >= config.num_hidden_layers:
+            self.sliding_window = self.sliding_window_list[-1]
+            self.is_dsa_layer = False
         else:
+            self.sliding_window = None
             self.is_dsa_layer = hasattr(config, "index_topk")
             self.index_topk = getattr(config, "index_topk", None)
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -290,7 +362,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.layer_name = prefix
         self.param_sink_number = param_sink_number
         self.on_ascend950 = on_ascend950()
-        self.enable_non_contiguous_kv = False
+        self.enable_non_contiguous_kv = model_extra_config.operator_opt_config.use_noncontiguous_kv
+        self.dummy_value_cache = torch.zeros(
+            (1, cache_config.block_size, 1, self.kv_lora_rank),
+            device='npu',
+            dtype=torch.bfloat16,
+        )
 
         self._init_MLA_weights()
         self._init_rotary_emb()
@@ -298,7 +375,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self._align_pagesize()
         self._init_attention_layers()
         self._init_mome_layer()
-
 
     def _init_MLA_weights(self):
         self.q_a_proj = ReplicatedLinear(
@@ -369,6 +445,14 @@ class NPUPanguSparseAttention(torch.nn.Module):
             rope_parameters=rope_parameters,
             is_neox_style=(not self.rope_interleaved),
         )
+        if (
+            self.hf_config.rope_parameters["rope_type"] != "default"
+            and self.hf_config.rope_parameters["rope_type"] == "deepseek_yarn"
+        ):
+            mscale_all_dim = self.hf_config.rope_parameters.get("mscale_all_dim", False)
+            scaling_factor = self.hf_config.rope_parameters["factor"]
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            self.scaling = self.scaling * mscale * mscale
 
     def _init_param_sinks(self):
         self.param_sink_compressed_kv = torch.nn.Parameter(
@@ -467,7 +551,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_kwargs.update({
                 "cache_dtype_str": self.cache_dtype_str,
                 "page_size_padded": self.page_size_padded,
-                "sliding_window": self.sliding_window if self.layer_idx in self.swa_layers else None,
+                "sliding_window": self.aligned_window_size if self.sliding_window is not None else None,
             })
             self.attn = MLASWAAttention(**attn_kwargs)
 
@@ -652,42 +736,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 hidden_states = get_tp_group().reduce_scatter(hidden_states, dim=0)
         return hidden_states
 
-    def _scatter_sink_kv(
-        self,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
-    ) -> None:
-
-        param_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
-        param_sink_compressed_kv = param_sink_compressed_kv.view(self.param_sink_number, self.kv_lora_rank)
-        param_sink_k_pe = self.param_sink_k_pe.view(self.param_sink_number, self.qk_rope_head_dim)
-
-        if self.cache_config.cache_dtype == "hif8_ds_mla":
-            param_sink_compressed_kv_scale = torch.ones((param_sink_compressed_kv.shape[0], 4), dtype=torch.float32, device=param_sink_compressed_kv.device)
-            param_sink_compressed_kv_hif8 = torch_npu.npu_dtype_cast(param_sink_compressed_kv, torch_npu.hifloat8)
-
-            param_sink = torch.cat(
-                [param_sink_compressed_kv_hif8, param_sink_k_pe.view(torch.uint8), param_sink_compressed_kv_scale.view(torch.uint8)],
-                dim=-1
-            )
-
-            torch_npu.npu_scatter_nd_update_(
-                kv_cache[0].view(torch.int8),
-                self.sink_slot_indices, 
-                param_sink.view(torch.int8).unsqueeze(1),
-            )
-        else:
-            torch_npu.npu_scatter_nd_update_(
-                kv_cache[0],
-                self.sink_slot_indices, 
-                param_sink_compressed_kv,
-            )
-
-            torch_npu.npu_scatter_nd_update_(
-                kv_cache[1],
-                self.sink_slot_indices,
-                param_sink_k_pe,
-            )
-
     def _forward_decode(
         self,
         hidden_states: torch.Tensor,
@@ -729,7 +777,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         return self._mla_epilog(attn_output, attn_metadata)
 
-    def rescale_attention(
+    def _rescale_attention(
         self,
         lse: torch.Tensor,
         lse_sink: torch.Tensor,
@@ -780,9 +828,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 cache_indices[:num_reqs], 
                 attn_metadata.query_start_loc, 
             )
-            x = torch.cat(
-                [x, x_padded], dim=0
-            )
+            x = torch.cat([x, x_padded], dim=0)
             return x
 
         # decode and speculative decoding branch
@@ -797,9 +843,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_metadata.query_start_loc, 
             num_accepted_tokens=num_accepted_tokens,
         )
-        x = torch.cat(
-            [x, x_padded], dim=0
-        )
+        x = torch.cat([x, x_padded], dim=0)
         return x
 
     def _apply_MLA_attention_decode(
@@ -810,22 +854,32 @@ class NPUPanguSparseAttention(torch.nn.Module):
         attn_metadata: Optional[MLACommonMetadata] = None,
     ) -> torch.Tensor:
 
-        self._scatter_sink_kv(kv_cache)
-        block_table = torch.nn.functional.pad(
-            attn_metadata.decode.block_table,
-            pad=(1,0),
-        )
-        k_nope_cache = kv_cache[0].view(-1, self.block_size, self.kv_lora_rank)
-        k_rope_cache = kv_cache[1].view(-1, self.block_size, self.qk_rope_head_dim)
+        sink_kv_nope = self.kv_a_layernorm(self.param_sink_compressed_kv) \
+                                           .view(self.param_sink_number, self.kv_lora_rank)
+        sink_kv_rope = self.param_sink_k_pe.view(self.param_sink_number, self.qk_rope_head_dim)
 
+        torch_npu.npu_scatter_nd_update_(
+            kv_cache[0],
+            self.sink_slot_indices, 
+            sink_kv_nope,
+        )
+
+        torch_npu.npu_scatter_nd_update_(
+            kv_cache[1],
+            self.sink_slot_indices,
+            sink_kv_rope,
+        )
+
+        block_table = torch.nn.functional.pad(attn_metadata.decode.block_table, pad=(1,0))
         query_cumlens = attn_metadata.decode.query_cumlens
         seq_lens = [seq + self.param_sink_number for seq in attn_metadata.decode.seq_lens]
+
         kwargs = {
             "query": q_nope,
-            "key": k_nope_cache,
-            "value": k_nope_cache,
+            "key": kv_cache[0],
+            "value": kv_cache[0],
             "query_rope": q_pe,
-            "key_rope": k_rope_cache,
+            "key_rope": kv_cache[1],
             "num_query_heads": self.num_local_heads,
             "num_key_value_heads": 1,
             "input_layout": "TND_NTD",
@@ -861,71 +915,44 @@ class NPUPanguSparseAttention(torch.nn.Module):
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         attn_metadata: Optional[MLACommonMetadata] = None,
     ) -> torch.Tensor:
-        k_nope_cache = kv_cache[0].view(-1, self.block_size, self.kv_lora_rank)
-        k_rope_cache = kv_cache[1].view(-1, self.block_size, self.qk_rope_head_dim)
 
-        if on_ascend950():
-            param_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
-            param_sink_compressed_kv = param_sink_compressed_kv.view(self.param_sink_number, 1, self.kv_lora_rank)
-            param_sink_k_pe = self.param_sink_k_pe.view(self.param_sink_number, 1, self.qk_rope_head_dim)
+        sink_k_nope = self.kv_a_layernorm(self.param_sink_compressed_kv).unsqueeze(1)
+        sink_k_pe = self.param_sink_k_pe.unsqueeze(1)
 
-            attn_output = torch_npu._npu_attention_pioneer(
-                q_nope,
-                k_nope_cache,
-                k_nope_cache,
-                atten_mask=self.attn.impl.SHARE_MASK_TRIL_SPARSE,
-                actual_seq_lengths=attn_metadata.decode.query_cumlens,
-                actual_seq_lengths_kv=attn_metadata.decode.seq_lens,
-                block_table=attn_metadata.decode.block_table,
-                query_rope=q_pe,
-                key_rope=k_rope_cache,
-                key_sink=param_sink_compressed_kv,
-                key_rope_sink=param_sink_k_pe,
-                value_sink=param_sink_compressed_kv,
-                num_heads=self.num_local_heads,
-                num_key_value_heads=1,
-                scale=self.scaling,
-                pre_tokens=self.sliding_window-1,
-                next_tokens=0,
-                input_layout="TND_NTD",
-                sparse_mode=4,
-                block_size=self.block_size,
-                softmax_lse_flag=False,
-            )[0]
+        kwargs = {
+            "query": q_nope,
+            "key": kv_cache[0],
+            "value": kv_cache[0],
+            "query_rope": q_pe,
+            "key_rope": kv_cache[1],
+            "num_key_value_heads": 1,
+            "input_layout": "TND_NTD",
+            "atten_mask": self.attn.impl.SHARE_MASK_TRIL_SPARSE,
+            "sparse_mode": 4,
+            "pre_tokens": self.sliding_window-1,
+            "next_tokens": 0,
+            "block_table": attn_metadata.decode.block_table,
+            "block_size": self.block_size,
+            "key_sink": sink_k_nope,
+            "value_sink": sink_k_nope,
+            "key_rope_sink": sink_k_pe,
+        }
+        if self.on_ascend950:
+            kwargs.update({
+                "num_heads": self.num_local_heads,
+                "actual_seq_lengths": attn_metadata.decode.query_cumlens,
+                "actual_seq_lengths_kv": attn_metadata.decode.seq_lens,
+                "scale": self.scaling,
+            })
+            attn_output = torch_npu._npu_attention_pioneer(**kwargs)[0]
         else:
-
-            self._scatter_sink_kv(kv_cache)
-            block_table = torch.nn.functional.pad(
-                attn_metadata.decode.block_table,
-                pad=(1,0),
-            )
-
-            query_cumlens = attn_metadata.decode.query_cumlens
-            seq_lens = [seq + self.param_sink_number for seq in attn_metadata.decode.seq_lens]
-            kwargs = {
-                "query": q_nope,
-                "key": k_nope_cache,
-                "value": k_nope_cache,
-                "query_rope": q_pe,
-                "key_rope": k_rope_cache,
+            kwargs.update({
                 "num_query_heads": self.num_local_heads,
-                "num_key_value_heads": 1,
-                "input_layout": "TND_NTD",
-                "atten_mask": self.attn.impl.SHARE_MASK_TRIL_SPARSE,
-                "sparse_mode": 4,
-                "pre_tokens": self.sliding_window-1,
-                "next_tokens": 0,
+                "actual_seq_qlen": attn_metadata.decode.query_cumlens,
+                "actual_seq_kvlen": attn_metadata.decode.seq_lens,
                 "softmax_scale": self.scaling,
-                "block_table": block_table,
-                "block_size": self.block_size,
-                "sink_number": self.param_sink_number,
-                "actual_seq_qlen": query_cumlens,
-                "actual_seq_kvlen": seq_lens,
-            }
-            if self.on_ascend950:
-                attn_output = torch_npu.npu_fused_infer_attention_score_sink(**kwargs)[0]
-            else:
-                attn_output = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
+            })
+            attn_output = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
 
         attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank) 
         attn_output = (
@@ -1022,7 +1049,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             q_pe,
         )
 
-        attn_output = self.rescale_attention(
+        attn_output = self._rescale_attention(
             lse,
             lse_sink,
             attn_output,
@@ -1041,42 +1068,41 @@ class NPUPanguSparseAttention(torch.nn.Module):
         attn_metadata: Optional[MLACommonMetadata] = None,
     ) -> torch.Tensor:
 
-        if on_ascend950():
+        sink_kv = self.kv_b_proj(
+            self.kv_a_layernorm(self.param_sink_compressed_kv)
+        )
+        sink_k_nope, sink_v = torch.split(
+            sink_kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim),
+            [self.qk_nope_head_dim, self.v_head_dim],
+            dim=-1,
+        )
+        sink_k_pe = self.param_sink_k_pe.view(-1, 1, self.qk_rope_head_dim) \
+                                        .repeat(1, self.num_local_heads, 1)
+
+        if self.on_ascend950:
             query = torch.cat([q_nope, q_pe], dim=-1)
             key = torch.cat([k_nope, k_pe], dim=-1)
-
-            param_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
-            sink_kv = self.kv_b_proj(param_sink_compressed_kv)
-            sink_kv = sink_kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            sink_k_nope, sink_v = torch.split(
-                sink_kv,
-                [self.qk_nope_head_dim, self.v_head_dim],
-                dim=-1,
-            )
-            sink_k_pe = self.param_sink_k_pe.view(-1, 1, self.qk_rope_head_dim) \
-                                        .repeat(1, self.num_local_heads, 1)
             sink_key = torch.cat([sink_k_nope, sink_k_pe], dim=-1)
-
-            attn_output = torch_npu._npu_attention_pioneer(
-                query.contiguous(),
-                key.contiguous(),
-                v.contiguous(),
-                actual_seq_lengths=attn_metadata.prefill.query_cumlens,
-                actual_seq_lengths_kv=attn_metadata.prefill.seq_lens,
-                num_heads=self.num_local_heads,
-                num_key_value_heads=self.num_local_heads,
-                input_layout="TND",
-                scale=self.scaling,
-                sparse_mode=4,
-                pre_tokens=self.sliding_window-1,
-                next_tokens=0,
-                atten_mask=torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1).npu(),
-                softmax_lse_flag=False,
-                key_sink=sink_key,
-                value_sink=sink_v,
-            )[0]
+            kwargs = {
+                "query": query,
+                "key": key,
+                "value": v,
+                "actual_seq_lengths": attn_metadata.decode.query_cumlens,
+                "actual_seq_lengths_kv": attn_metadata.decode.seq_lens,
+                "num_heads": self.num_local_heads,
+                "num_key_value_heads": self.num_local_heads,
+                "input_layout": "TND",
+                "scale": self.scaling,
+                "sparse_mode": 4,
+                "pre_tokens": self.sliding_window-1,
+                "next_tokens": 0,
+                "atten_mask": self.attn.impl.SHARE_MASK_TRIL_SPARSE,
+                "softmax_lse_flag": False,
+                "key_sink": sink_key,
+                "value_sink": sink_v,
+            }
+            attn_output = torch_npu._npu_attention_pioneer(**kwargs)[0]
         else:
-
             kwargs = {
                 "query": q_nope,
                 "key": k_nope,
@@ -1091,31 +1117,21 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 "softmax_scale": self.scaling,
                 "pre_tokens": self.sliding_window-1,
                 "next_tokens": 0,
-                "return_softmax_lse": True,
                 "actual_seq_qlen": attn_metadata.prefill.query_cumlens,
                 "actual_seq_kvlen": attn_metadata.prefill.seq_lens,
-            }        
-            attn_output, lse = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)
+                "key_sink": sink_k_nope,
+                "value_sink": sink_v,
+                "key_rope_sink": sink_k_pe,
+            }
+            attn_output = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
 
-            attn_output_sink, lse_sink = self._apply_attention_prefill_sink(
-                q_nope,
-                q_pe,
-            )
-
-            attn_output = self.rescale_attention(
-                lse,
-                lse_sink,
-                attn_output,
-                attn_output_sink,
-            )
-
-        return attn_output.view(-1, self.num_local_heads * self.v_head_dim).to(torch.bfloat16)
+        return attn_output.view(-1, self.num_local_heads * self.v_head_dim)
 
     def _apply_DSA_attention(
         self,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
         topk_indices: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
     ) -> torch.Tensor:
@@ -1125,33 +1141,24 @@ class NPUPanguSparseAttention(torch.nn.Module):
         else:
             metadata = attn_metadata.decode
 
-        self._scatter_sink_kv(kv_cache)
-        block_table = torch.nn.functional.pad(
-            metadata.block_table,
-            pad=(1,0),
-        )
-        query_cumlens = metadata.query_cumlens.to(torch.int32)
-        seq_lens = metadata.seq_lens.to(torch.int32).add_(self.param_sink_number)
-        topk_indices = torch.cat([
-                self.sink_slot_mapping.view(1, self.param_sink_number).repeat(topk_indices.shape[0], 1),
-                topk_indices.view(-1, self.index_topk).add_(self.param_sink_number),
-            ],
-            dim=-1,
-        ).unsqueeze(1)
+        q = torch.cat([q_nope, q_pe], dim=-1)
 
-        if self.cache_config.cache_dtype in ["hif8_ds_mla"]:
-            query = torch.cat([q_nope, q_pe], dim=-1)
+        sink_k_nope = self.kv_a_layernorm(self.param_sink_compressed_kv).unsqueeze(1)
+        sink_k_pe = self.param_sink_k_pe.unsqueeze(1)
+        sink_kv = torch.cat([sink_k_nope, sink_k_pe], dim=-1)
+
+        if self.on_ascend950 and self.cache_config.cache_dtype in ["hif8_ds_mla"]:
             attn_output = torch_npu.npu_kv_quant_sparse_flash_attention(
-                query,
-                kv_cache[0],
-                kv_cache[1],
+                query=q,
+                key=kv_cache[0],
+                value=kv_cache[1],
                 sparse_indices=topk_indices,
                 scale_value=self.scaling,
                 key_quant_mode=2,
                 value_quant_mode=2,
-                block_table=block_table,
-                actual_seq_lengths_query=query_cumlens,
-                actual_seq_lengths_kv=seq_lens,
+                block_table=metadata.block_table,
+                actual_seq_lengths_query=metadata.query_cumlens.to(torch.int32),
+                actual_seq_lengths_kv=metadata.seq_lens.to(torch.int32),
                 sparse_block_size=1,
                 layout_query="TND",
                 layout_kv="PA_BSND",
@@ -1161,33 +1168,30 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 tile_size=128,
                 rope_head_dim=64,
                 key_dtype=torch_npu.hifloat8,
-                value_dtype=torch_npu.hifloat8
+                value_dtype=torch_npu.hifloat8,
             )
         else:
-
-            k_nope_cache = kv_cache[0].view(-1, self.block_size, 1, self.kv_lora_rank)
-            k_rope_cache = kv_cache[1].view(-1, self.block_size, 1, self.qk_rope_head_dim)
-
-            attn_output = torch_npu.npu_sparse_flash_attention(
-                query=q_nope,
-                key=k_nope_cache,
-                value=k_nope_cache,
+            attn_output = torch.ops.custom.npu_ai_infra_sparse_flash_attention_pioneer(
+                query=q,
+                key=kv_cache[0].unsqueeze(2),
+                value=self.dummy_value_cache,
                 sparse_indices=topk_indices,
                 scale_value=self.scaling,
                 sparse_block_size=1,
-                block_table=block_table,
-                actual_seq_lengths_query=query_cumlens,
-                actual_seq_lengths_kv=seq_lens,
-                query_rope=q_pe,
-                key_rope=k_rope_cache,
+                block_table=metadata.block_table,
+                actual_seq_lengths_query=metadata.query_cumlens.to(torch.int32),
+                actual_seq_lengths_kv=metadata.seq_lens.to(torch.int32),
                 pre_tokens=(1<<63)-1,
                 next_tokens=(1<<63)-1,
                 attention_mode=2,
                 layout_query="TND",
                 layout_kv="PA_BSND",
                 sparse_mode=3,
+                key_sink=sink_kv,
+                value_sink=sink_k_nope,
             )[0]
 
+        attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank)
         attn_output = (
             torch.matmul(attn_output, self.attn.impl.W_UV)
@@ -1203,11 +1207,11 @@ class NPUPanguSparseAttention(torch.nn.Module):
         q_pe: torch.Tensor,
     ) -> torch.Tensor:
 
-        param_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
-        sink_kv = self.kv_b_proj(param_sink_compressed_kv)
-        sink_kv = sink_kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        sink_kv = self.kv_b_proj(
+            self.kv_a_layernorm(self.param_sink_compressed_kv)
+        )
         sink_k_nope, sink_v = torch.split(
-            sink_kv,
+            sink_kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim),
             [self.qk_nope_head_dim, self.v_head_dim],
             dim=-1,
         )
@@ -1247,7 +1251,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # get KV cache for this layer
         kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
 
-
         if self.tp_size > 1:
             if not self.all2all_backend == "naive":
                 hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
@@ -1280,16 +1283,14 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     .reshape(-1, self.num_local_heads, self.kv_lora_rank)
             )
 
-        if not self.rope_interleaved:
-            q_pe = q_pe.view(-1, self.num_local_heads, 2, self.qk_rope_head_dim // 2) \
-                        .transpose(-1, -2) \
-                        .reshape(-1, self.num_local_heads, self.qk_rope_head_dim)
-
-        q_pe = torch_npu.npu_interleave_rope(
-            q_pe.view(-1, self.num_local_heads, 1, self.qk_rope_head_dim),
+        q_pe = torch_npu.npu_rotary_mul(
+            q_pe.view(-1, 1, self.num_local_heads, self.qk_rope_head_dim),
             cos.view(-1, 1, 1, self.qk_rope_head_dim),
             sin.view(-1, 1, 1, self.qk_rope_head_dim),
-        ).squeeze(2)
+            rotary_mode="half" if not self.rope_interleaved else "interleave",
+        ).squeeze(1)
+        q_nope = q_nope.contiguous()
+        q_pe = q_pe.contiguous()
         ### Q stream ends ###
 
 
@@ -1324,88 +1325,129 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_metadata,
             )
 
-        if self.cache_config.cache_dtype in ["hif8_ds_mla"] and self.is_dsa_layer:
-            assert not self.rope_interleaved
-            k_nope = self.kv_a_layernorm(k_nope)
-            k_nope_scale = torch.ones((k_nope.shape[0], 4), dtype=torch.float32, device=q_nope.device)
-            k_nope_hif8 = torch_npu.npu_dtype_cast(k_nope, torch_npu.hifloat8)
+        ret = self._npu_kvrmsnorm_rope_cache(
+            k_nope,
+            k_pe,
+            kv_cache,
+            cos,
+            sin,
+            attn_metadata,
+            topk_indices,
+        )
+        ### KV stream ends ###
 
+        output = (q_nope, q_pe, *ret)
+        return output
+
+    def _npu_kvrmsnorm_rope_cache(self, *args, **kwargs):
+        if quant_output := self._npu_kvrmsnorm_rope_cache_quant(*args, **kwargs):
+            return quant_output
+        else:
+            unquant_output = self._npu_kvrmsnorm_rope_cache_unquant(*args, **kwargs)
+            return unquant_output
+
+    def _npu_kvrmsnorm_rope_cache_quant(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_metadata: Optional[MLACommonMetadata],
+        topk_indices: torch.Tensor,
+    ):
+        # DSA layer c8 shape
+        if self.cache_config.cache_dtype in ["hif8_ds_mla"] and self.is_dsa_layer:
+            k_nope = self.kv_a_layernorm(k_nope)
+            k_nope_scale = torch.ones(
+                (k_nope.shape[0], k_nope.shape[1] // 128), dtype=torch.float32, device=k_nope.device,
+            )
+            k_nope_hif8 = torch_npu.npu_dtype_cast(k_nope, torch_npu.hifloat8)
             k_pe = torch_npu.npu_rotary_mul(
-                k_pe.unsqueeze(1).unsqueeze(1),
-                cos.unsqueeze(1).unsqueeze(1),
-                sin.unsqueeze(1).unsqueeze(1)
+                k_pe.view(-1, 1, 1, self.qk_rope_head_dim),
+                cos.view(-1, 1, 1, self.qk_rope_head_dim),
+                sin.view(-1, 1, 1, self.qk_rope_head_dim),
             ).squeeze(1).squeeze(1)
 
             kv = torch.cat(
                 [k_nope_hif8, k_pe.view(torch.uint8), k_nope_scale.view(torch.uint8)],
                 dim=-1,
             )
-
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[0].view(-1, kv_cache[0].shape[-1]).view(torch.int8),
                 attn_metadata.slot_mapping.view(-1, 1),
                 kv.view(-1, kv.shape[-1]).view(torch.int8)
             )
 
-            return q_nope, q_pe, kv_cache, topk_indices
+            return kv_cache, topk_indices
         else:
-            if not self.rope_interleaved:
-                k_pe = k_pe.view(-1, 2, self.qk_rope_head_dim // 2) \
-                            .transpose(-1, -2) \
-                            .reshape(-1, self.qk_rope_head_dim)
+            return False
 
-            kv = torch.cat(
-                [k_nope, k_pe],
+    def _npu_kvrmsnorm_rope_cache_unquant(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_metadata: Optional[MLACommonMetadata],
+        topk_indices: torch.Tensor,
+    ):
+        # the rest cases are unquantized
+        kv = torch.cat([k_nope, k_pe], dim=-1)
+
+        kwargs = {
+            "kv": kv.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+            "gamma": self.kv_a_layernorm.weight,
+            "cos": cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            "sin": sin.view(-1, 1, 1, self.qk_rope_head_dim),
+            "index": attn_metadata.slot_mapping,
+            "epsilon": self.kv_a_layernorm.variance_epsilon,
+            "cache_mode": "PA",
+            "rotary_mode": "half" if not self.rope_interleaved else "interleave-half",
+            "quant_mode": "none",
+            "is_output_kv": True,
+        }
+
+        if self.is_dsa_layer:
+            # DSA shape
+            kwargs.update({
+                "k_cache": None,
+                "ckv_cache": kv_cache[0].unsqueeze(2),
+            })
+            k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(**kwargs)
+
+            return kv_cache, topk_indices
+
+        elif attn_metadata.decode is not None:
+            # MLA/SWA absorb shape
+            kwargs.update({
+                "k_cache": kv_cache[1].unsqueeze(2),
+                "ckv_cache": kv_cache[0].unsqueeze(2),
+            })
+            k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(**kwargs)
+
+            return kv_cache, topk_indices
+    
+        else:
+            # MLA/SWA non-absorb shape
+            kwargs.update({
+                "k_cache": kv_cache[1].unsqueeze(2),
+                "ckv_cache": kv_cache[0].unsqueeze(2),
+            })
+            k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(**kwargs)
+
+            kv_up = self.kv_b_proj(k_nope)
+            kv_up = kv_up.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_up_nope, v_up = torch.split(
+                kv_up,
+                [self.qk_nope_head_dim, self.v_head_dim],
                 dim=-1,
             )
+            k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim) \
+                       .repeat(1, self.num_local_heads, 1)
 
-            kv_cache_unsqueeze = [c.unsqueeze(2) for c in kv_cache]
-
-            if attn_metadata.decode is not None or self.is_dsa_layer:
-                _ = torch_npu.npu_kv_rmsnorm_rope_cache(
-                    kv.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim), # bnsd
-                    self.kv_a_layernorm.weight,
-                    cos.view(-1, 1, 1, self.qk_rope_head_dim),
-                    sin.view(-1, 1, 1, self.qk_rope_head_dim),
-                    attn_metadata.slot_mapping,
-                    kv_cache_unsqueeze[1],
-                    kv_cache_unsqueeze[0],
-                    epsilon=self.kv_a_layernorm.variance_epsilon,
-                    cache_mode="PA",
-                )
-
-                return q_nope, q_pe, kv_cache, topk_indices
-            else:
-                _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
-                    kv.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim), # bnsd
-                    self.kv_a_layernorm.weight,
-                    cos.view(-1, 1, 1, self.qk_rope_head_dim),
-                    sin.view(-1, 1, 1, self.qk_rope_head_dim),
-                    attn_metadata.slot_mapping,
-                    kv_cache_unsqueeze[1],
-                    kv_cache_unsqueeze[0],
-                    k_rope_scale=None,
-                    k_rope_offset=None,
-                    epsilon=self.kv_a_layernorm.variance_epsilon,
-                    cache_mode="PA",
-                    is_output_kv=True,
-                )
-                k_pe = k_pe.squeeze(1).squeeze(1)
-                k_nope = k_nope.squeeze(1).squeeze(1)
-
-                kv_up = self.kv_b_proj(k_nope)
-                kv_up = kv_up.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-                k_up_nope, v_up = torch.split(
-                    kv_up,
-                    [self.qk_nope_head_dim, self.v_head_dim],
-                    dim=-1,
-                )
-                k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim) \
-                        .repeat(1, self.num_local_heads, 1)
-
-                return q_nope, q_pe, k_up_nope, k_pe, v_up
-        
-        ### KV stream ends ###
+            return k_up_nope.contiguous(), k_pe.contiguous(), v_up.contiguous()
 
     def _mla_epilog(
         self,
@@ -1432,36 +1474,3 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         return hidden_states
 
-    def npu_kv_rmsnorm_rope_cache(
-        self,
-        k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        kv_cache: torch.Tensor
-    ):
-        k_nope = self.kv_a_layernorm(k_nope)
-        k_pe = torch_npu.npu_interleave_rope(
-            k_pe.view(-1, 1, 1, self.qk_rope_head_dim),
-            cos.view(-1, 1, 1, self.qk_rope_head_dim),
-            sin.view(-1, 1, 1, self.qk_rope_head_dim),
-        ).squeeze(2)
-
-        slot_indices = torch.stack(
-            [slot_mapping // self.block_size, slot_mapping % self.block_size],
-            dim=1,
-        )
-
-        torch_npu.npu_scatter_nd_update_(
-            kv_cache[0],
-            slot_indices, 
-            k_nope.view(-1, k_nope.shape[-1]),
-        )
-
-        torch_npu.npu_scatter_nd_update_(
-            kv_cache[1],
-            slot_indices,
-            k_pe.view(-1, k_pe.shape[-1]),
-        )
-        return k_pe, k_nope

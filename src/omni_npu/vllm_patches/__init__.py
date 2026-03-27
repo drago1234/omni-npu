@@ -70,14 +70,18 @@ def _find_patch_dir_exact(model_type: str, models_root: Path):
     Applicable: User manually sets OMNI_NPU_PATCHES_DIR environment variable.
     """
     model_type_lower = model_type.lower()
+    patch_list = []
     for subdir in models_root.iterdir():
         if not subdir.is_dir():
             continue
 
         subdir_name_lower = subdir.name.lower()
-        if subdir_name_lower == model_type_lower:
+        if subdir_name_lower in model_type_lower:
             logger.info(f"Exact match succeeded:'{model_type}'->'{subdir.name}'")
-            return subdir
+            patch_list.append(subdir)
+
+    if len(patch_list) > 0:
+        return patch_list
 
     logger.warning(f"Exact match failed: No directory for '{model_type}' in {models_root}")
     return None
@@ -164,9 +168,16 @@ def auto_import_patches():
         # Auto-set / no env → Call fuzzy match directly
         model_dir = _find_patch_dir_fuzzy(model_type, models_root)
 
-    if model_dir and model_dir.exists():
-        import_patches_from_dir(model_dir, f"{base_pkg}.models.{model_dir.name}")
-        logger.info(f"execute---> :{base_pkg}.models.{model_dir.name}")
+    if isinstance(model_dir, Path):
+        if model_dir and model_dir.exists():
+            import_patches_from_dir(model_dir, f"{base_pkg}.models.{model_dir.name}")
+            logger.info(f"execute---> :{base_pkg}.models.{model_dir.name}")
+
+    elif isinstance(model_dir, list):
+        for dir in model_dir:
+            if dir and dir.exists():
+                import_patches_from_dir(dir, f"{base_pkg}.models.{dir.name}")
+                logger.info(f"execute---> :{base_pkg}.models.{dir.name}")
 
 
 manager = PatchManager()

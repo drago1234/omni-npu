@@ -60,5 +60,35 @@
                 "config_file": "gpt_oss/gpt_oss_w8a8c16_a2_hybrid.json"
             }
         }
+    },
+    {
+        "model": "pangu_v2_moe_505B",
+        "hardware": "A3",
+        "precision": "bf16",
+        "configs": {
+            "hybrid": {
+                "config_file": "openpangu_v2/pangu_v2_moe_bf16_a3_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "pangu_v2_moe_92B",
+        "hardware": "A3",
+        "precision": "bf16",
+        "configs": {
+            "hybrid": {
+                "config_file": "openpangu_v2/pangu_v2_moe_bf16_a3_hybrid.json"
+            }
+        }
+    },
+    {
+        "model": "pangu_v2_moe_34B",
+        "hardware": "A3",
+        "precision": "bf16",
+        "configs": {
+            "hybrid": {
+                "config_file": "openpangu_v2/pangu_v2_moe_bf16_a3_hybrid.json"
+            }
+        }
     }
 ]
