@@ -934,12 +934,16 @@ class NPUModelRunner(GPUModelRunner):
     def kv_cache_after_wake_up(self) -> None:
         attn_layers = self.compilation_config.static_forward_context
         if self.model_config.enable_sleep_mode:
-            from vllm.model_executor.layers.attention.static_sink_attention import (
-                StaticSinkAttention,
-                StaticSinkMLAAttention
-            )
+            from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkAttention
+            sink_mla_available = False
+            try:
+                from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention
+                sink_mla_available = True
+            except ImportError:
+                logger.warning("StaticSinkMLAAttention has not been defined, skipping...")
             for name, module in attn_layers.items():
-                if isinstance(module, (StaticSinkAttention, StaticSinkMLAAttention)):
+                if isinstance(module, StaticSinkAttention) or (sink_mla_available 
+                                                               and isinstance(module, StaticSinkMLAAttention)):
                     self._kv_cache_sink_attn_after_wake_up(module)
 
     def _kv_cache_sink_attn_after_wake_up(self, module) -> None:
@@ -958,3 +962,15 @@ class NPUModelRunner(GPUModelRunner):
                 for attn_builder in attn_group.metadata_builders:
                     if hasattr(attn_builder, "reinit_block_table_with_sink"):
                         attn_builder.reinit_block_table_with_sink()
+
+    def unregister_kv_caches(self):
+        if self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.kv_connector == "LLMDataDistConnector":
+            if has_kv_transfer_group():
+                logger.info(f"unregister_kv_caches")
+                get_kv_transfer_group().unregister_kv_caches()
+
+    def reregister_kv_caches(self):
+        if self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.kv_connector == "LLMDataDistConnector":
+            if has_kv_transfer_group():
+                logger.info(f"reregister_kv_caches")
+                get_kv_transfer_group().register_kv_caches(self.kv_caches)

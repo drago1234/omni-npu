@@ -114,12 +114,17 @@ class LLMDataDistConfig:
         """Return worker IPs. Only query Ray when Ray is actually available/running.
 
         Behavior:
+        - If has config "p_node_list" and self.is_prefill, return p_node_list
         - If self.is_prefill is False: return [self.local_host_ip].
         - If Ray is not installed: log and return [self.local_host_ip].
         - If Ray is installed but no cluster is reachable: log and return [self.local_host_ip].
         - If a Ray cluster is reachable: return all Alive nodes' NodeManagerAddress,
           with head node (if detected) placed first.
         """
+        worker_ips = self.kv_transfer_config.kv_connector_extra_config.get("p_node_list")
+        if self.is_prefill and worker_ips and isinstance(worker_ips, list) and len(worker_ips) > 0:
+            return worker_ips
+        
         # default fallback
         worker_ips = [self.local_host_ip]
 
@@ -188,6 +193,8 @@ class LLMDataDistManager:
         if not self.data_dist_config.is_prefill:
             self.decode_id = self.dp_rank // NUM_DIE_PER_MACH
 
+        self.data_dist_option = None
+        self.data_dist_engine_is_inited = False
         self.data_dist_engine = self._init_llm_data_dist()
 
         self.registered_kv_caches = []
@@ -227,7 +234,6 @@ class LLMDataDistManager:
         return remote_cluster_ids
 
     def _init_llm_data_dist(self):
-        data_dist = LLMDataDist(self.data_dist_config.role, self.data_dist_config.cluster_id)
         llm_config = LLMConfig()
         llm_config.device_id = self.local_rank
         llm_config.local_comm_res = ""
@@ -244,10 +250,23 @@ class LLMDataDistManager:
             llm_config.listen_ip_info = f"{host_ip_t}:{host_port_t}"
 
         options = llm_config.generate_options()
+        self.data_dist_option = options
+        data_dist = LLMDataDist(self.data_dist_config.role, self.data_dist_config.cluster_id)
         data_dist.init(options)
+        self.data_dist_engine_is_inited = True
         logger.info(f"init {self.data_dist_config.kv_role_tmp} success, {self.data_dist_config.cluster_id=}")
 
         return data_dist
+
+    def _finalize_llm_data_dist(self):
+        logger.info(f"finalize LLMDataDist, {self.data_dist_config.cluster_id=}")
+        self.data_dist_engine.finalize()
+        self.data_dist_engine_is_inited = False
+
+    def _reinit_llm_data_dist(self):
+        logger.info(f"reinit LLMDataDist, {self.data_dist_config.cluster_id=}")
+        self.data_dist_engine.init(self.data_dist_option)
+        self.data_dist_engine_is_inited = True
 
     # dynamically register link only when is needed
     def register_link(self, host_cluster_id, prefill_dp_rank, d_rank, tp_rank=0):
@@ -293,6 +312,14 @@ class LLMDataDistManager:
             with self.registered_link_infos_lock:
                 self.registered_link_infos.pop((host_cluster_id, prefill_dp_rank, d_rank), None)
         logger.info(f"rank:{self.rank} unlinked with : {remote_host_ip}, {prompt_cluster_id_list=}")
+
+    def unregister_link(self):
+        if self.data_dist_config.is_prefill:
+            self._finalize_llm_data_dist()
+        else:
+            for host_cluster_id, dp_rank, d_rank in list(self.registered_link_infos.keys()):
+                logger.info(f"{d_rank=}, unlink {host_cluster_id=}")
+                self.close_link(host_cluster_id, dp_rank, d_rank)
 
     def force_unlink(self, remote_cluster_id) -> None:
         clusters = []
@@ -415,6 +442,9 @@ class LLMDataDistManager:
 
     # reuse the existing code
     def register_memory(self, kv_caches: dict[str, torch.Tensor], kv_cache_config: KVCacheConfig = None):
+        if not self.data_dist_engine_is_inited:
+            self._reinit_llm_data_dist()
+
         if len(self.registered_kv_caches) > 0:
             raise ValueError("Attr `registered_kv_caches` must be empty before register kv_caches.")
         if isinstance(kv_caches, dict):
@@ -441,6 +471,13 @@ class LLMDataDistManager:
             cache = self.data_dist_engine.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
             self.registered_kv_caches.append(cache)
         logger.debug(f" ***** registered_kv_caches num:{len(self.registered_kv_caches)}")
+
+    def unregister_memory(self):
+        if not self.data_dist_config.is_prefill:
+            for kv_cache in self.registered_kv_caches:
+                logger.info(f"unregister {kv_cache=}")
+                self.data_dist_engine.cache_manager.unregister_cache(kv_cache.cache_id)
+        self.registered_kv_caches = []
 
     def cluster_id_to_ip_port(self, cluster_id):
         """Extract ip_port from int64 cluster id (inverse of ip_port_to_int)."""

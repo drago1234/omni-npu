@@ -2,6 +2,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import os
+import multiprocessing
 from typing import Optional, Callable, Union
 
 import torch, torch_npu
@@ -164,8 +165,11 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         super().process_weights_after_loading(layer)
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        current_method = multiprocessing.get_start_method()
+        multiprocessing.set_start_method('spawn', force=True)
         layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29)
         layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
+        multiprocessing.set_start_method(current_method, force=True)
         set_weight_attrs(layer.w13_weight, {"is_weight_transposed": True})
         set_weight_attrs(layer.w2_weight, {"is_weight_transposed": True})
 
@@ -228,12 +232,9 @@ class NPUFusedMoE(FusedMoE):
         full_load = loaded_weight.ndim == 3
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
 
-        if is_weight_transposed and "weight" in weight_name:
-            if full_load:
-                param.data = param.data.transpose(1, 2).contiguous()
-            else:
-                param.data[expert_id] = param.data[expert_id].t().contiguous()
-
+        if is_weight_transposed:
+            param.data = param.data.transpose(1, 2)
+            
         if "bias" in weight_name or "int4_scale" in weight_name:
             shard_dim = 0 if "bias" in weight_name else 1
             quant_method = getattr(param, "quant_method", None)
@@ -262,11 +263,8 @@ class NPUFusedMoE(FusedMoE):
                 return_success=return_success,
             )
 
-        if is_weight_transposed and "weight" in weight_name:
-            if full_load:
-                param.data = param.data.transpose(1, 2).contiguous()
-            else:
-                param.data[expert_id] = param.data[expert_id].t().contiguous()
+        if is_weight_transposed:
+            param.data = param.data.transpose(1, 2)
 
         return result
         

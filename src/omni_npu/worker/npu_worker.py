@@ -13,12 +13,21 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import set_random_seed
 from vllm.platforms import current_platform
 from vllm.tasks import SupportedTask
+from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+from vllm.distributed import (
+    ensure_model_parallel_initialized,
+    init_distributed_environment,
+    set_custom_all_reduce,
+    parallel_state,
+    GroupCoordinator,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -27,12 +36,10 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
-from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from .npu_model_runner import NPUModelRunner
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
 from omni_npu.v1.models.config_loader.loader import load_model_extra_config
-
 
 logger = init_logger(__name__)
 
@@ -46,6 +53,7 @@ class NPUWorker(WorkerBase):
         rank: int,
         distributed_init_method: str,
         is_driver_worker: bool = False,
+        **kwargs,
     ):
         super().__init__(
             vllm_config=vllm_config,
@@ -54,6 +62,10 @@ class NPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        # RL support: Store world_ranks if provided
+        self.world_ranks = kwargs.get("world_ranks", None)
+        logger.info(f"[NPUWorker.init] {self.rank=}, {self.local_rank=}, {self.world_ranks=}")
+
         device_config = self.device_config
         assert device_config.device_type == "npu"
         assert current_platform.device_type == "npu"
@@ -88,6 +100,7 @@ class NPUWorker(WorkerBase):
                 self.distributed_init_method,
                 self.local_rank,
                 backend,
+                world_ranks=self.world_ranks,
             )
 
             # Initialize the model best practice configs.
@@ -316,6 +329,7 @@ class NPUWorker(WorkerBase):
             return b / (1 << 30)
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
 
+        self.model_runner.unregister_kv_caches()
         allocator = NpuMemAllocator.get_instance()
         allocator.sleep(offload_tags=("weights", ) if level == 1 else tuple())
 
@@ -335,4 +349,54 @@ class NPUWorker(WorkerBase):
         if ("kv_cache" in tags and hasattr(self.model_runner, "kv_cache_after_wake_up")):
             self.model_runner.kv_cache_after_wake_up()
 
+        if tags is not None and "kv_cache" in tags:
+            logger.info(f"re-register kv caches now")
+            self.model_runner.reregister_kv_caches()
+
+def init_worker_distributed_environment(
+    vllm_config,
+    rank,
+    distributed_init_method=None,
+    local_rank=-1,
+    backend="hccl",
+    world_ranks=None,
+) -> None:
+    """Initialize the distributed environment."""
+    attention_config = vllm_config.attention_config
+    parallel_config = vllm_config.parallel_config
+    init_batch_invariance(attention_config.backend)
+    set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
+    if world_ranks is None:
+        init_method = distributed_init_method or "env://"
+        init_distributed_environment(
+            parallel_config.world_size, rank, init_method, local_rank, backend)
+    else:
+        init_world_group(world_ranks, local_rank, backend)
+    ensure_model_parallel_initialized(
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        parallel_config.prefill_context_parallel_size,
+        parallel_config.decode_context_parallel_size,
+    )
+    # Init ec connector here before KV caches caches init
+    # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
+    ensure_ec_transfer_initialized(vllm_config)
     
+def init_world_group(ranks: list[int], local_rank: int, backend: str):
+    """Initialize world group for RL scenarios where ranks are externally provided."""
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("torch.distributed must be initialized")
+    if parallel_state._WORLD is not None:
+        raise RuntimeError("_WORLD must not be initialized")
+    world_rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    logger.debug(f"worker init world group {ranks=}, {local_rank=}, {backend=}, {world_rank=}, {world_size=}")
+    if len(ranks) != world_size:
+        GroupCoordinator.use_local_synchronization = True
+    world_group = parallel_state.init_world_group(
+        ranks,
+        local_rank,
+        backend,
+    )
+    parallel_state._WORLD = world_group
+    logger.debug(f"worker init world group done {ranks=}, {local_rank=}, {backend=}, {world_rank=}")

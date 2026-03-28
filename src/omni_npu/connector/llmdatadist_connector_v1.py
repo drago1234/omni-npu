@@ -205,6 +205,11 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
             raise RuntimeError("self.connector_worker cannot be None")
         return self.connector_worker.register_kv_caches(kv_caches)
 
+    def unregister_kv_caches(self):
+        if self.connector_worker is None:
+            raise RuntimeError("self.connector_worker cannot be None")
+        return self.connector_worker.unregister_kv_caches()
+
     def get_finished(self,
                      finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
@@ -395,6 +400,10 @@ class PrefillConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.datadist_manager.register_memory(kv_caches, self.kv_cache_config)
+
+    def unregister_kv_caches(self):
+        self.datadist_manager.unregister_link()
+        self.datadist_manager.unregister_memory()
 
     def start_load_kv(self, metadata: DatadistConnectorMetadataPrefill):
         pass
@@ -704,6 +713,10 @@ class DecodeConnectorWorker:
         self.executor = ThreadPoolExecutor(max_workers=max_concurrents)
 
         logger.debug("Finish register_kv_caches.")
+
+    def unregister_kv_caches(self):
+        self.datadist_manager.unregister_link()
+        self.datadist_manager.unregister_memory()
 
     # Now go asynchronous pull_kv
     def start_load_kv(self, metadata: DatadistConnectorMetadata):

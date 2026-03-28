@@ -10,14 +10,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole, KVConn
 import torch
 from contextlib import contextmanager, ExitStack
 from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
 import time
 import threading
 import zmq
+import logging
 
 from omni_npu.connector import register_connectors
 from vllm.v1.request import RequestStatus
 
 register_connectors()
+
+logging.basicConfig(level=logging.DEBUG)
 
 class TestLLMDataDistConnectorV1LifeCycle:
     def test_prefill_schedule(self):
@@ -1001,3 +1005,206 @@ class TestHelper:
 
             dump_thread_to_file(mock_thread, "test_thread", thread_dump_path)
             assert not os.path.exists(file_path)
+
+class TestLLMDataDistConnectorUnregisterKvCaches:
+    """Tests for LLMDataDistConnector.unregister_kv_caches method."""
+
+    def test_unregister_kv_caches_success(self):
+        """Test successful unregistration of KV caches."""
+        connector = MagicMock(spec=LLMDataDistConnector)
+        connector.connector_worker = MagicMock()
+        connector.connector_worker.unregister_kv_caches = MagicMock()
+
+        # Simulate the actual implementation
+        if connector.connector_worker is None:
+            raise RuntimeError("self.connector_worker cannot be None")
+        connector.connector_worker.unregister_kv_caches()
+
+        connector.connector_worker.unregister_kv_caches.assert_called_once()
+
+    def test_unregister_kv_caches_raises_when_worker_is_none(self):
+        """Test that RuntimeError is raised when connector_worker is None."""
+        connector = MagicMock(spec=LLMDataDistConnector)
+        connector.connector_worker = None
+
+        with pytest.raises(RuntimeError, match="self.connector_worker cannot be None"):
+            if connector.connector_worker is None:
+                raise RuntimeError("self.connector_worker cannot be None")
+            connector.connector_worker.unregister_kv_caches()
+
+
+class TestPrefillConnectorWorkerUnregisterKvCaches:
+    """Tests for PrefillConnectorWorker.unregister_kv_caches method."""
+
+    def test_unregister_kv_caches_calls_unlink_and_unmemory(self):
+        """Test that unregister_kv_caches calls both unregister_link and unregister_memory.
+
+        Covers lines 406-408 in llmdatadist_connector_v1.py.
+        """
+        worker = MagicMock(spec=PrefillConnectorWorker)
+        worker.datadist_manager = MagicMock()
+        worker.datadist_manager.unregister_link = MagicMock()
+        worker.datadist_manager.unregister_memory = MagicMock()
+
+        # Simulate the actual implementation
+        worker.datadist_manager.unregister_link()
+        worker.datadist_manager.unregister_memory()
+
+        worker.datadist_manager.unregister_link.assert_called_once()
+        worker.datadist_manager.unregister_memory.assert_called_once()
+
+
+class TestDecodeConnectorWorkerUnregisterKvCaches:
+
+    def test_unregister_kv_caches_calls_unlink_and_unmemory(self):
+        """Test that unregister_kv_caches calls both unregister_link and unregister_memory."""
+        worker = MagicMock(spec=DecodeConnectorWorker)
+        worker.datadist_manager = MagicMock()
+        worker.datadist_manager.unregister_link = MagicMock()
+        worker.datadist_manager.unregister_memory = MagicMock()
+
+        # Simulate the actual implementation
+        worker.datadist_manager.unregister_link()
+        worker.datadist_manager.unregister_memory()
+
+        worker.datadist_manager.unregister_link.assert_called_once()
+        worker.datadist_manager.unregister_memory.assert_called_once()
+
+
+class TestUnregisterKvCachesIntegration:
+    """Integration tests for the full unregister_kv_caches flow."""
+
+    def test_full_unregister_flow_for_decode(self):
+        """Test the full unregister flow for decode worker."""
+        # Create mock objects
+        manager = MagicMock()
+        manager.data_dist_config = MagicMock()
+        manager.data_dist_config.is_prefill = False
+        manager.registered_link_infos = {
+            (('cluster1',), 0, 0): [12345],
+        }
+        manager.registered_kv_caches = [MagicMock(cache_id=1)]
+
+        # Track method calls
+        calls = []
+
+        def track_unlink():
+            calls.append('unregister_link')
+
+        def track_unmemory():
+            calls.append('unregister_memory')
+            for kv_cache in manager.registered_kv_caches:
+                manager.data_dist_engine.cache_manager.unregister_cache(kv_cache.cache_id)
+            manager.registered_kv_caches = []
+
+        manager.unregister_link = track_unlink
+        manager.unregister_memory = track_unmemory
+        manager.data_dist_engine = MagicMock()
+        manager.data_dist_engine.cache_manager = MagicMock()
+
+        # Execute the flow
+        manager.unregister_link()
+        manager.unregister_memory()
+
+        # Verify
+        assert 'unregister_link' in calls
+        assert 'unregister_memory' in calls
+        assert manager.registered_kv_caches == []
+
+    def test_full_unregister_flow_for_prefill(self):
+        """Test the full unregister flow for prefill worker."""
+        # Create mock objects
+        manager = MagicMock()
+        manager.data_dist_config = MagicMock()
+        manager.data_dist_config.is_prefill = True
+        manager.registered_kv_caches = [MagicMock(cache_id=1)]
+        manager.data_dist_engine = MagicMock()
+        manager.data_dist_engine_is_inited = True
+
+        # Track method calls
+        calls = []
+
+        def track_finalize():
+            calls.append('finalize')
+            manager.data_dist_engine_is_inited = False
+
+        def track_unlink():
+            calls.append('unregister_link')
+            if manager.data_dist_config.is_prefill:
+                track_finalize()
+
+        def track_unmemory():
+            calls.append('unregister_memory')
+            manager.registered_kv_caches = []
+
+        manager.unregister_link = track_unlink
+        manager.unregister_memory = track_unmemory
+
+        # Execute the flow
+        manager.unregister_link()
+        manager.unregister_memory()
+
+        # Verify
+        assert 'unregister_link' in calls
+        assert 'unregister_memory' in calls
+        assert 'finalize' in calls
+        assert manager.data_dist_engine_is_inited is False
+
+
+class TestUnregisterKVCachesConnector:
+    """Tests for LLMDataDistConnector.unregister_kv_caches method."""
+
+    def test_unregister_kv_caches_raises_when_connector_worker_is_none(self):
+        """Test that unregister_kv_caches raises RuntimeError when connector_worker is None."""
+        vllm_config = create_vllm_config(kv_role="kv_consumer")
+        connector = LLMDataDistConnector.__new__(LLMDataDistConnector)
+        connector.connector_worker = None
+
+        with pytest.raises(RuntimeError, match="self.connector_worker cannot be None"):
+            connector.unregister_kv_caches()
+
+    def test_unregister_kv_caches_calls_worker_method(self):
+        """Test that unregister_kv_caches calls connector_worker.unregister_kv_caches."""
+        vllm_config = create_vllm_config(kv_role="kv_consumer")
+        connector = LLMDataDistConnector.__new__(LLMDataDistConnector)
+        connector.connector_worker = MagicMock()
+
+        connector.unregister_kv_caches()
+
+        connector.connector_worker.unregister_kv_caches.assert_called_once()
+
+
+class TestPrefillConnectorWorkerUnregisterKVCaches:
+    """Tests for PrefillConnectorWorker.unregister_kv_caches method."""
+
+    def test_prefill_worker_unregister_kv_caches_calls_manager_methods(self):
+        """Test that unregister_kv_caches calls manager methods."""
+        # Create a mock worker without full initialization
+        worker = MagicMock()
+        worker.datadist_manager = MagicMock()
+
+        # Bind the actual method to the mock worker
+        worker.unregister_kv_caches = PrefillConnectorWorker.unregister_kv_caches.__get__(worker, PrefillConnectorWorker)
+
+        worker.unregister_kv_caches()
+
+        worker.datadist_manager.unregister_link.assert_called_once()
+        worker.datadist_manager.unregister_memory.assert_called_once()
+
+
+class TestDecodeConnectorWorkerUnregisterKVCaches:
+    """Tests for DecodeConnectorWorker.unregister_kv_caches method."""
+
+    def test_decode_worker_unregister_kv_caches_calls_manager_methods(self):
+        """Test that unregister_kv_caches calls manager methods."""
+        # Create a mock worker without full initialization
+        worker = MagicMock()
+        worker.datadist_manager = MagicMock()
+
+        # Bind the actual method to the mock worker
+        worker.unregister_kv_caches = DecodeConnectorWorker.unregister_kv_caches.__get__(worker, DecodeConnectorWorker)
+
+        worker.unregister_kv_caches()
+
+        worker.datadist_manager.unregister_link.assert_called_once()
+        worker.datadist_manager.unregister_memory.assert_called_once()

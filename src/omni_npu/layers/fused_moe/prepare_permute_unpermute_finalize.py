@@ -65,7 +65,7 @@ class FusedMoEPreparePermuteAndUnpermuteFinalize(ABC):
     def __init__(self, layer):
         self.num_experts = layer.global_num_experts
         self.ep_size = get_ep_group().world_size
-        self.ep_rank = get_ep_group().rank
+        self.ep_rank = get_ep_group().rank_in_group
 
     @abstractmethod
     def prepare_permute(
@@ -111,7 +111,7 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         )
 
         tokens_per_expert_group = tokens_per_expert.new_empty(tokens_per_expert.shape[0])
-        dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
+        dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert, group=get_ep_group().device_group)
         combine_tokens = torch.stack([tokens_per_expert_group, tokens_per_expert], dim=0)
         combine_tokens = combine_tokens.view(2, self.ep_size, -1).sum(2)
         all_tokens = combine_tokens[0].sum()
@@ -119,14 +119,14 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         input_splits = combine_tokens_cpu[1]
         output_splits = combine_tokens_cpu[0]
         gathered_tokens = expanded_x.new_empty(all_tokens.item(), expanded_x.shape[1])
-        dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits)
+        dist.all_to_all_single(gathered_tokens, expanded_x, output_splits, input_splits, group=get_ep_group().device_group)
 
         if layer.quant_config is None:
             gathered_pertoken_scale = None
         else:
             gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
             dist.all_to_all_single(
-                gathered_pertoken_scale, pertoken_scale, output_splits, input_splits
+                gathered_pertoken_scale, pertoken_scale, output_splits, input_splits, group=get_ep_group().device_group
             )
 
         hidden_states_sorted_by_experts, gathered_pertoken_scale, gathered_idxs_unsort, tokens_per_local_expert = (
@@ -165,7 +165,7 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             hidden_states, 0, gathered_idxs_unsort.to(torch.float32).argsort().to(torch.int32)
         )
         gathered_tokens = new_x.new_empty(*expanded_x.shape)
-        dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits)
+        dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=get_ep_group().device_group)
         return torch_npu.npu_moe_finalize_routing(
             gathered_tokens,
             skip1=None,

@@ -1908,3 +1908,276 @@ class TestNPUModelRunner:
 
         # Verify populate_sink_kv was still called
         assert mock_module.populate_sink_kv_called is True
+
+    def test_kv_cache_after_wake_up_with_static_sink_mla_available(self, monkeypatch):
+        """Test kv_cache_after_wake_up when StaticSinkMLAAttention is available."""
+        # Create mock classes
+        class MockStaticSinkAttention:
+            def __init__(self, name):
+                self.name = name
+                self.kv_cache = [[torch.zeros((1, 2, 4, 8), dtype=torch.float16),
+                                torch.zeros((1, 2, 4, 8), dtype=torch.float16)]]
+                self.populate_sink_kv_called = False
+            
+            def populate_sink_kv(self, k_cache, v_cache):
+                self.populate_sink_kv_called = True
+        
+        class MockStaticSinkMLAAttention:
+            def __init__(self, name):
+                self.name = name
+                self.kv_cache = [[torch.zeros((1, 2, 4, 8), dtype=torch.float16),
+                                torch.zeros((1, 2, 4, 8), dtype=torch.float16)]]
+                self.populate_sink_kv_called = False
+            
+            def populate_sink_kv(self, k_cache, v_cache):
+                self.populate_sink_kv_called = True
+        
+        # Mock the imports
+        mock_module = types.ModuleType("vllm.model_executor.layers.attention.static_sink_attention")
+        mock_module.StaticSinkAttention = MockStaticSinkAttention
+        mock_module.StaticSinkMLAAttention = MockStaticSinkMLAAttention
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm.model_executor.layers.attention.static_sink_attention",
+            mock_module
+        )
+
+        # Create mock modules
+        mock_static_sink_module = MockStaticSinkAttention("static_sink")
+        mock_mla_module = MockStaticSinkMLAAttention("mla_sink")
+
+        # Setup compilation config with mixed attention layers
+        self.runner.compilation_config = MagicMock()
+        self.runner.compilation_config.static_forward_context = {
+            "static_sink_layer": mock_static_sink_module,
+            "mla_sink_layer": mock_mla_module,
+        }
+
+        # Setup model config
+        self.runner.model_config = MagicMock()
+        self.runner.model_config.enable_sleep_mode = True
+
+        # Setup kv cache config and attention groups
+        mock_kv_cache_config = MagicMock()
+        mock_kv_cache_config.kv_cache_groups = [MagicMock()]
+        setattr(self.runner, "kv_cache_config", mock_kv_cache_config)
+
+        mock_builder = MagicMock()
+        mock_builder.reinit_block_table_with_sink = MagicMock()
+
+        mock_attn_group = MagicMock()
+        mock_attn_group.metadata_builders = [mock_builder]
+        setattr(self.runner, "attn_groups", [[mock_attn_group]])
+
+        # Call kv_cache_after_wake_up
+        self.runner.kv_cache_after_wake_up()
+
+        # Verify populate_sink_kv was called for both StaticSinkAttention and StaticSinkMLAAttention
+        assert mock_static_sink_module.populate_sink_kv_called is True
+        assert mock_mla_module.populate_sink_kv_called is True
+
+    def test_kv_cache_after_wake_up_with_import_error(self, monkeypatch):
+        """Test kv_cache_after_wake_up when StaticSinkMLAAttention import fails."""
+        # Create mock class
+        class MockStaticSinkAttention:
+            def __init__(self, name):
+                self.name = name
+                self.kv_cache = [[torch.zeros((1, 2, 4, 8), dtype=torch.float16),
+                                torch.zeros((1, 2, 4, 8), dtype=torch.float16)]]
+                self.populate_sink_kv_called = False
+            
+            def populate_sink_kv(self, k_cache, v_cache):
+                self.populate_sink_kv_called = True
+
+        # Mock the imports
+        mock_module = types.ModuleType("vllm.model_executor.layers.attention.static_sink_attention")
+        mock_module.StaticSinkAttention = MockStaticSinkAttention
+        monkeypatch.setitem(
+            sys.modules,
+            "vllm.model_executor.layers.attention.static_sink_attention",
+            mock_module
+        )
+
+        # Create mock modules
+        mock_static_sink_module = MockStaticSinkAttention("static_sink")
+        mock_mla_module = MagicMock()
+
+        # Setup compilation config with mixed attention layers
+        self.runner.compilation_config = MagicMock()
+        self.runner.compilation_config.static_forward_context = {
+            "static_sink_layer": mock_static_sink_module,
+            "mla_sink_layer": mock_mla_module,
+        }
+
+        # Setup model config
+        self.runner.model_config = MagicMock()
+        self.runner.model_config.enable_sleep_mode = True
+
+        # Setup kv cache config and attention groups
+        mock_kv_cache_config = MagicMock()
+        mock_kv_cache_config.kv_cache_groups = [MagicMock()]
+        setattr(self.runner, "kv_cache_config", mock_kv_cache_config)
+
+        mock_builder = MagicMock()
+        mock_builder.reinit_block_table_with_sink = MagicMock()
+
+        mock_attn_group = MagicMock()
+        mock_attn_group.metadata_builders = [mock_builder]
+        setattr(self.runner, "attn_groups", [[mock_attn_group]])
+
+        # Call kv_cache_after_wake_up
+        self.runner.kv_cache_after_wake_up()
+
+        # Verify StaticSinkAttention was still processed
+        assert mock_static_sink_module.populate_sink_kv_called is True
+        mock_builder.reinit_block_table_with_sink.assert_called_once()
+
+
+class TestUnregisterAndReregisterKVCaches:
+    """Tests for unregister_kv_caches and reregister_kv_caches methods."""
+
+    def test_unregister_kv_caches_with_llmdatadist_connector(self, monkeypatch):
+        """Test unregister_kv_caches with LLMDataDistConnector config."""
+        from types import SimpleNamespace
+
+        # Create a mock runner without initializing the full NPUModelRunner
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config.kv_connector = "LLMDataDistConnector"
+
+        # Import the method and bind it to the mock runner
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.unregister_kv_caches = NPUModelRunner.unregister_kv_caches.__get__(runner, type(runner))
+
+        # Mock has_kv_transfer_group and get_kv_transfer_group
+        mock_kv_group = MagicMock()
+        mock_kv_group.unregister_kv_caches = MagicMock()
+
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: True
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.get_kv_transfer_group",
+            lambda: mock_kv_group
+        )
+
+        runner.unregister_kv_caches()
+
+        mock_kv_group.unregister_kv_caches.assert_called_once()
+
+    def test_unregister_kv_caches_without_kv_transfer_config(self, monkeypatch):
+        """Test unregister_kv_caches when kv_transfer_config is None."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = None
+
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.unregister_kv_caches = NPUModelRunner.unregister_kv_caches.__get__(runner, type(runner))
+
+        # Should not raise and should return early
+        runner.unregister_kv_caches()
+
+    def test_unregister_kv_caches_with_different_connector(self, monkeypatch):
+        """Test unregister_kv_caches with different connector type."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config.kv_connector = "OtherConnector"
+
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.unregister_kv_caches = NPUModelRunner.unregister_kv_caches.__get__(runner, type(runner))
+
+        # Should not call unregister
+        runner.unregister_kv_caches()
+
+    def test_unregister_kv_caches_without_kv_transfer_group(self, monkeypatch):
+        """Test unregister_kv_caches when has_kv_transfer_group returns False."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config.kv_connector = "LLMDataDistConnector"
+
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.unregister_kv_caches = NPUModelRunner.unregister_kv_caches.__get__(runner, type(runner))
+
+        # Mock has_kv_transfer_group to return False
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: False
+        )
+
+        # Should not raise and should return early
+        runner.unregister_kv_caches()
+
+    def test_reregister_kv_caches_with_llmdatadist_connector(self, monkeypatch):
+        """Test reregister_kv_caches with LLMDataDistConnector config."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config.kv_connector = "LLMDataDistConnector"
+        runner.kv_caches = {"layer.0": torch.zeros(2, 3)}
+
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.reregister_kv_caches = NPUModelRunner.reregister_kv_caches.__get__(runner, type(runner))
+
+        # Mock has_kv_transfer_group and get_kv_transfer_group
+        mock_kv_group = MagicMock()
+        mock_kv_group.register_kv_caches = MagicMock()
+
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: True
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.get_kv_transfer_group",
+            lambda: mock_kv_group
+        )
+
+        runner.reregister_kv_caches()
+
+        mock_kv_group.register_kv_caches.assert_called_once_with(runner.kv_caches)
+
+    def test_reregister_kv_caches_without_kv_transfer_config(self, monkeypatch):
+        """Test reregister_kv_caches when kv_transfer_config is None."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = None
+
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.reregister_kv_caches = NPUModelRunner.reregister_kv_caches.__get__(runner, type(runner))
+
+        # Should not raise and should return early
+        runner.reregister_kv_caches()
+
+    def test_reregister_kv_caches_without_kv_transfer_group(self, monkeypatch):
+        """Test reregister_kv_caches when has_kv_transfer_group returns False."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config.kv_connector = "LLMDataDistConnector"
+
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.reregister_kv_caches = NPUModelRunner.reregister_kv_caches.__get__(runner, type(runner))
+
+        # Mock has_kv_transfer_group to return False
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: False
+        )
+
+        # Should not raise and should return early
+        runner.reregister_kv_caches()

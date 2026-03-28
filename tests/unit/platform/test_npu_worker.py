@@ -837,3 +837,281 @@ class TestNpuWorker:
         # Assertions
         mock_allocator.wake_up.assert_called_once_with(
             tags=['weights', 'kv_cache'])
+
+class TestInitWorkerDistributedEnvironment:
+    """Tests for init_worker_distributed_environment function."""
+
+    @pytest.fixture
+    def mock_vllm_config(self):
+        """Create a mock VllmConfig for testing."""
+        vllm_config = MagicMock()
+        vllm_config.attention_config = MagicMock()
+        vllm_config.attention_config.backend = "attention_backend"
+        vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.disable_custom_all_reduce = False
+        vllm_config.parallel_config.world_size = 4
+        vllm_config.parallel_config.tensor_parallel_size = 2
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        return vllm_config
+
+    def test_init_with_default_init_method(self, mock_vllm_config, monkeypatch):
+        """Test initialization with default init_method when world_ranks is None."""
+        from omni_npu.worker.npu_worker import init_worker_distributed_environment
+
+        # Track calls
+        calls = []
+
+        def mock_init_batch_invariance(backend):
+            calls.append(('init_batch_invariance', backend))
+
+        def mock_set_custom_all_reduce(enable):
+            calls.append(('set_custom_all_reduce', enable))
+
+        def mock_init_distributed_environment(world_size, rank, init_method, local_rank, backend):
+            calls.append(('init_distributed_environment', world_size, rank, init_method, local_rank, backend))
+
+        def mock_ensure_model_parallel_initialized(tp_size, pp_size, pcp_size, dcp_size):
+            calls.append(('ensure_model_parallel_initialized', tp_size, pp_size, pcp_size, dcp_size))
+
+        def mock_ensure_ec_transfer_initialized(config):
+            calls.append(('ensure_ec_transfer_initialized', config))
+
+        monkeypatch.setattr("omni_npu.worker.npu_worker.init_batch_invariance", mock_init_batch_invariance)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.set_custom_all_reduce", mock_set_custom_all_reduce)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.init_distributed_environment", mock_init_distributed_environment)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.ensure_model_parallel_initialized", mock_ensure_model_parallel_initialized)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.ensure_ec_transfer_initialized", mock_ensure_ec_transfer_initialized)
+
+        # Execute
+        init_worker_distributed_environment(
+            vllm_config=mock_vllm_config,
+            rank=0,
+            distributed_init_method="tcp://localhost:12345",
+            local_rank=0,
+            backend="hccl",
+            world_ranks=None,
+        )
+
+        # Verify init_distributed_environment was called (not init_world_group)
+        assert any(call[0] == 'init_distributed_environment' for call in calls)
+        assert any(call[0] == 'ensure_ec_transfer_initialized' for call in calls)
+
+    def test_init_with_env_method_when_no_init_method(self, mock_vllm_config, monkeypatch):
+        """Test initialization uses 'env://' when distributed_init_method is None."""
+        from omni_npu.worker.npu_worker import init_worker_distributed_environment
+
+        captured_init_method = []
+
+        def mock_init_distributed_environment(world_size, rank, init_method, local_rank, backend):
+            captured_init_method.append(init_method)
+
+        monkeypatch.setattr("omni_npu.worker.npu_worker.init_batch_invariance", lambda x: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.set_custom_all_reduce", lambda x: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.init_distributed_environment", mock_init_distributed_environment)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.ensure_model_parallel_initialized", lambda *args: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.ensure_ec_transfer_initialized", lambda x: None)
+
+        # Execute with None init_method
+        init_worker_distributed_environment(
+            vllm_config=mock_vllm_config,
+            rank=0,
+            distributed_init_method=None,
+            local_rank=0,
+            backend="hccl",
+            world_ranks=None,
+        )
+
+        # Verify env:// was used as default
+        assert captured_init_method[0] == "env://"
+
+    def test_init_with_world_ranks(self, mock_vllm_config, monkeypatch):
+        """Test initialization with world_ranks provided (RL scenario)."""
+        from omni_npu.worker.npu_worker import init_worker_distributed_environment
+
+        # Track calls
+        calls = []
+
+        def mock_init_world_group(ranks, local_rank, backend):
+            calls.append(('init_world_group', ranks, local_rank, backend))
+
+        monkeypatch.setattr("omni_npu.worker.npu_worker.init_batch_invariance", lambda x: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.set_custom_all_reduce", lambda x: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.init_world_group", mock_init_world_group)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.ensure_model_parallel_initialized", lambda *args: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.ensure_ec_transfer_initialized", lambda x: None)
+
+        world_ranks = [0, 1, 2, 3]
+
+        # Execute
+        init_worker_distributed_environment(
+            vllm_config=mock_vllm_config,
+            rank=0,
+            distributed_init_method="tcp://localhost:12345",
+            local_rank=0,
+            backend="hccl",
+            world_ranks=world_ranks,
+        )
+
+        # Verify init_world_group was called with correct arguments
+        assert len(calls) == 1
+        assert calls[0][0] == 'init_world_group'
+        assert calls[0][1] == world_ranks
+        assert calls[0][2] == 0
+        assert calls[0][3] == "hccl"
+
+    def test_ensure_model_parallel_initialized_called(self, mock_vllm_config, monkeypatch):
+        """Test that ensure_model_parallel_initialized is called with correct parameters."""
+        from omni_npu.worker.npu_worker import init_worker_distributed_environment
+
+        captured_args = []
+
+        def mock_ensure_model_parallel_initialized(tp_size, pp_size, pcp_size, dcp_size):
+            captured_args.append((tp_size, pp_size, pcp_size, dcp_size))
+
+        monkeypatch.setattr("omni_npu.worker.npu_worker.init_batch_invariance", lambda x: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.set_custom_all_reduce", lambda x: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.init_distributed_environment", lambda *args: None)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.ensure_model_parallel_initialized", mock_ensure_model_parallel_initialized)
+        monkeypatch.setattr("omni_npu.worker.npu_worker.ensure_ec_transfer_initialized", lambda x: None)
+
+        # Execute
+        init_worker_distributed_environment(
+            vllm_config=mock_vllm_config,
+            rank=0,
+            local_rank=0,
+            backend="hccl",
+            world_ranks=None,
+        )
+
+        # Verify
+        assert len(captured_args) == 1
+        assert captured_args[0] == (2, 1, 1, 1)  # tp_size, pp_size, pcp_size, dcp_size
+
+
+class TestInitWorldGroup:
+    """Tests for init_world_group function."""
+
+    def test_init_world_group_success(self, monkeypatch):
+        """Test successful initialization of world group."""
+        from omni_npu.worker.npu_worker import init_world_group
+
+        # Mock torch.distributed
+        mock_dist = MagicMock()
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+        mock_dist.get_world_size.return_value = 4
+        monkeypatch.setattr("torch.distributed", mock_dist)
+
+        # Mock parallel_state
+        mock_parallel_state = MagicMock()
+        mock_parallel_state._WORLD = None
+        mock_world_group = MagicMock()
+        mock_parallel_state.init_world_group.return_value = mock_world_group
+        monkeypatch.setattr("omni_npu.worker.npu_worker.parallel_state", mock_parallel_state)
+
+        # Mock GroupCoordinator
+        mock_group_coordinator = MagicMock()
+        monkeypatch.setattr("omni_npu.worker.npu_worker.GroupCoordinator", mock_group_coordinator)
+
+        ranks = [0, 1, 2, 3]
+
+        # Execute
+        init_world_group(ranks=ranks, local_rank=0, backend="hccl")
+
+        # Verify
+        mock_parallel_state.init_world_group.assert_called_once_with(ranks, 0, "hccl")
+        assert mock_parallel_state._WORLD == mock_world_group
+
+    def test_init_world_group_raises_when_dist_not_initialized(self, monkeypatch):
+        """Test that RuntimeError is raised when torch.distributed is not initialized."""
+        from omni_npu.worker.npu_worker import init_world_group
+
+        # Mock torch.distributed as not initialized
+        mock_dist = MagicMock()
+        mock_dist.is_initialized.return_value = False
+        monkeypatch.setattr("torch.distributed", mock_dist)
+
+        with pytest.raises(RuntimeError, match="torch.distributed must be initialized"):
+            init_world_group(ranks=[0, 1, 2, 3], local_rank=0, backend="hccl")
+
+    def test_init_world_group_raises_when_world_already_initialized(self, monkeypatch):
+        """Test that RuntimeError is raised when _WORLD is already initialized."""
+        from omni_npu.worker.npu_worker import init_world_group
+
+        # Mock torch.distributed as initialized
+        mock_dist = MagicMock()
+        mock_dist.is_initialized.return_value = True
+        monkeypatch.setattr("torch.distributed", mock_dist)
+
+        # Mock parallel_state with _WORLD already set
+        mock_parallel_state = MagicMock()
+        mock_parallel_state._WORLD = MagicMock()  # Already initialized
+        monkeypatch.setattr("omni_npu.worker.npu_worker.parallel_state", mock_parallel_state)
+
+        with pytest.raises(RuntimeError, match="_WORLD must not be initialized"):
+            init_world_group(ranks=[0, 1, 2, 3], local_rank=0, backend="hccl")
+
+    def test_init_world_group_sets_local_synchronization_when_ranks_mismatch(self, monkeypatch):
+        """Test that use_local_synchronization is set when ranks length != world_size."""
+        from omni_npu.worker.npu_worker import init_world_group
+
+        # Mock torch.distributed
+        mock_dist = MagicMock()
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+        mock_dist.get_world_size.return_value = 8  # world_size is 8
+        monkeypatch.setattr("torch.distributed", mock_dist)
+
+        # Mock parallel_state
+        mock_parallel_state = MagicMock()
+        mock_parallel_state._WORLD = None
+        mock_world_group = MagicMock()
+        mock_parallel_state.init_world_group.return_value = mock_world_group
+        monkeypatch.setattr("omni_npu.worker.npu_worker.parallel_state", mock_parallel_state)
+
+        # Mock GroupCoordinator
+        mock_group_coordinator = MagicMock()
+        monkeypatch.setattr("omni_npu.worker.npu_worker.GroupCoordinator", mock_group_coordinator)
+
+        # Use fewer ranks than world_size
+        ranks = [0, 1, 2, 3]  # len(ranks) = 4, world_size = 8
+
+        # Execute
+        init_world_group(ranks=ranks, local_rank=0, backend="hccl")
+
+        # Verify use_local_synchronization was set to True
+        assert mock_group_coordinator.use_local_synchronization is True
+
+    def test_init_world_group_no_local_synchronization_when_ranks_match(self, monkeypatch):
+        """Test that use_local_synchronization is not set when ranks length == world_size."""
+        from omni_npu.worker.npu_worker import init_world_group
+
+        # Mock torch.distributed
+        mock_dist = MagicMock()
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_rank.return_value = 0
+        mock_dist.get_world_size.return_value = 4  # world_size matches len(ranks)
+        monkeypatch.setattr("torch.distributed", mock_dist)
+
+        # Mock parallel_state
+        mock_parallel_state = MagicMock()
+        mock_parallel_state._WORLD = None
+        mock_world_group = MagicMock()
+        mock_parallel_state.init_world_group.return_value = mock_world_group
+        monkeypatch.setattr("omni_npu.worker.npu_worker.parallel_state", mock_parallel_state)
+
+        # Mock GroupCoordinator
+        mock_group_coordinator = MagicMock()
+        monkeypatch.setattr("omni_npu.worker.npu_worker.GroupCoordinator", mock_group_coordinator)
+
+        ranks = [0, 1, 2, 3]  # len(ranks) = 4, world_size = 4
+
+        # Execute
+        init_world_group(ranks=ranks, local_rank=0, backend="hccl")
+
+        # Verify use_local_synchronization was NOT set to True
+        # (it should remain at its default value)
+        assert not hasattr(mock_group_coordinator, 'use_local_synchronization') or \
+               mock_group_coordinator.use_local_synchronization != True

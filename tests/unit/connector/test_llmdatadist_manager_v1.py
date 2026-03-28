@@ -36,49 +36,54 @@ from omni_npu.connector.llmdatadist_manager_v1 import (
 VLLM_KV_TRANSFER_MANAGER_PATH = 'omni_npu.connector.llmdatadist_manager_v1'
 LLM_DATADIST_PATH = 'omni_npu.connector.llmdatadist_manager_v1'
 
+@pytest.fixture
+def mock_llm_datadist():
+    with patch(f'{LLM_DATADIST_PATH}.LLMDataDist') as mock_datadist:
+        mock_instance = MagicMock()
+        mock_datadist.return_value = mock_instance
+        yield mock_instance
+
+
+@pytest.fixture
+def mock_world_group():
+    with patch(f'{VLLM_KV_TRANSFER_MANAGER_PATH}.get_world_group') as mock_get_world_group:
+        mock_world_group = MagicMock()
+        mock_world_group.rank_in_group = 0
+        mock_world_group.local_rank = 0
+        mock_get_world_group.return_value = mock_world_group
+        yield mock_world_group
+
+
+@pytest.fixture
+def mock_vllm_config():
+    config = MagicMock(spec=VllmConfig)
+    config.kv_transfer_config = MagicMock()
+    config.kv_transfer_config.kv_role = 'kv_producer'
+    config.kv_transfer_config.kv_parallel_size = 2
+    config.kv_transfer_config.kv_connector_extra_config = {'kv_producer_dp_size': 1}
+    config.parallel_config = MagicMock()
+    config.parallel_config.data_parallel_rank = 0
+    config.parallel_config.tensor_parallel_size = 1
+    config.parallel_config.data_parallel_size = 1
+    yield config
+
+
+@pytest.fixture
+def mock_block_cache_key():
+    with patch(f"{VLLM_KV_TRANSFER_MANAGER_PATH}.BlocksCacheKey") as mock_obj:
+        yield mock_obj
+
+
+@pytest.fixture
+def mock_kv_cache_retry_times():
+    from omni_npu.connector import llmdatadist_manager_v1
+    ori = llmdatadist_manager_v1.KV_CACHE_RETRY_TIMES
+    llmdatadist_manager_v1.KV_CACHE_RETRY_TIMES = 3
+    yield llmdatadist_manager_v1.KV_CACHE_RETRY_TIMES
+    llmdatadist_manager_v1.KV_CACHE_RETRY_TIMES = ori
+
 
 class TestLLMDataDistManager:
-    @pytest.fixture
-    def mock_llm_datadist(self):
-        with patch(f'{LLM_DATADIST_PATH}.LLMDataDist') as mock_datadist:
-            mock_instance = MagicMock()
-            mock_datadist.return_value = mock_instance
-            yield mock_instance
-
-    @pytest.fixture
-    def mock_world_group(self):
-        with patch(f'{VLLM_KV_TRANSFER_MANAGER_PATH}.get_world_group') as mock_get_world_group:
-            mock_world_group = MagicMock()
-            mock_world_group.rank_in_group = 0
-            mock_world_group.local_rank = 0
-            mock_get_world_group.return_value = mock_world_group
-            yield mock_world_group
-
-    @pytest.fixture
-    def mock_vllm_config(self):
-        config = MagicMock(spec=VllmConfig)
-        config.kv_transfer_config = MagicMock()
-        config.kv_transfer_config.kv_role = 'kv_producer'
-        config.kv_transfer_config.kv_parallel_size = 2
-        config.kv_transfer_config.kv_connector_extra_config = {'kv_producer_dp_size': 1}
-        config.parallel_config = MagicMock()
-        config.parallel_config.data_parallel_rank = 0
-        config.parallel_config.tensor_parallel_size = 1
-        config.parallel_config.data_parallel_size = 1
-        yield config
-
-    @pytest.fixture
-    def mock_block_cache_key(self):
-        with patch(f"{VLLM_KV_TRANSFER_MANAGER_PATH}.BlocksCacheKey") as mock_obj:
-            yield mock_obj
-
-    @pytest.fixture
-    def mock_kv_cache_retry_times(self):
-        from omni_npu.connector import llmdatadist_manager_v1
-        ori = llmdatadist_manager_v1.KV_CACHE_RETRY_TIMES
-        llmdatadist_manager_v1.KV_CACHE_RETRY_TIMES = 3
-        yield llmdatadist_manager_v1.KV_CACHE_RETRY_TIMES
-        llmdatadist_manager_v1.KV_CACHE_RETRY_TIMES = ori
 
     def test_init_llm_data_dist_manager(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
         manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
@@ -663,3 +668,181 @@ class TestLLMDataDistConfig:
         config = LLMDataDistConfig(vllm_config, "127.0.0.1", 8080, ignore_load_rank=True)
 
         assert config.is_prefill == expected_prefill
+
+class TestUnregisterLink:
+    """Tests for LLMDataDistManager.unregister_link method."""
+
+    def test_unregister_link_for_prefill_calls_finalize(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that unregister_link calls _finalize_llm_data_dist for prefill."""
+        # kv_role='kv_producer' means is_prefill=True
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_producer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+
+        with patch.object(manager, '_finalize_llm_data_dist') as mock_finalize:
+            manager.unregister_link()
+            mock_finalize.assert_called_once()
+
+    def test_unregister_link_for_decode_closes_all_links(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that unregister_link closes all registered links for decode."""
+        # kv_role='kv_consumer' means is_prefill=False
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+        manager.registered_link_infos = {
+            (('cluster1',), 0, 0): [12345],
+            (('cluster2',), 1, 0): [67890],
+        }
+
+        with patch.object(manager, 'close_link') as mock_close_link:
+            manager.unregister_link()
+            assert mock_close_link.call_count == 2
+
+    def test_unregister_link_empty_link_infos(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that unregister_link handles empty link_infos gracefully."""
+        # kv_role='kv_consumer' means is_prefill=False
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+        manager.registered_link_infos = {}
+
+        with patch.object(manager, 'close_link') as mock_close_link:
+            manager.unregister_link()
+            mock_close_link.assert_not_called()
+
+
+class TestUnregisterMemory:
+    """Tests for LLMDataDistManager.unregister_memory method."""
+
+    def test_unregister_memory_for_decode_unregisters_all_caches(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that unregister_memory unregisters all KV caches for decode."""
+        # kv_role='kv_consumer' means is_prefill=False
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+
+        mock_cache1 = MagicMock()
+        mock_cache1.cache_id = 1
+        mock_cache2 = MagicMock()
+        mock_cache2.cache_id = 2
+        manager.registered_kv_caches = [mock_cache1, mock_cache2]
+
+        manager.unregister_memory()
+
+        assert manager.data_dist_engine.cache_manager.unregister_cache.call_count == 2
+        assert manager.registered_kv_caches == []
+
+    def test_unregister_memory_for_prefill_skips_unregister(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that unregister_memory skips unregister_cache for prefill."""
+        # kv_role='kv_producer' means is_prefill=True
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_producer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+
+        mock_cache = MagicMock()
+        mock_cache.cache_id = 1
+        manager.registered_kv_caches = [mock_cache]
+
+        manager.unregister_memory()
+
+        # unregister_cache should not be called for prefill
+        manager.data_dist_engine.cache_manager.unregister_cache.assert_not_called()
+        assert manager.registered_kv_caches == []
+
+    def test_unregister_memory_empty_caches(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that unregister_memory handles empty cache list gracefully."""
+        # kv_role='kv_consumer' means is_prefill=False
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+        manager.registered_kv_caches = []
+
+        manager.unregister_memory()
+
+        manager.data_dist_engine.cache_manager.unregister_cache.assert_not_called()
+        assert manager.registered_kv_caches == []
+
+
+class TestFinalizeAndReinitLLMDataDist:
+    """Tests for LLMDataDistManager._finalize_llm_data_dist and _reinit_llm_data_dist methods."""
+
+    @pytest.fixture
+    def mock_manager(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Create a LLMDataDistManager instance for testing."""
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+        return manager
+
+    def test_finalize_llm_data_dist(self, mock_manager):
+        """Test _finalize_llm_data_dist properly finalizes the engine."""
+        mock_manager.data_dist_engine_is_inited = True
+
+        mock_manager._finalize_llm_data_dist()
+
+        mock_manager.data_dist_engine.finalize.assert_called_once()
+        assert mock_manager.data_dist_engine_is_inited is False
+
+    def test_reinit_llm_data_dist(self, mock_manager):
+        """Test _reinit_llm_data_dist properly reinitializes the engine."""
+        mock_manager.data_dist_engine_is_inited = False
+
+        # Reset mock to clear previous calls from _init_llm_data_dist during manager creation
+        mock_manager.data_dist_engine.init.reset_mock()
+
+        mock_manager._reinit_llm_data_dist()
+
+        mock_manager.data_dist_engine.init.assert_called_once_with(mock_manager.data_dist_option)
+        assert mock_manager.data_dist_engine_is_inited is True
+
+    def test_register_memory_reinit_when_not_inited(self, mock_manager, mock_block_cache_key):
+        """Test register_memory calls _reinit_llm_data_dist when engine not initialized."""
+        mock_manager.data_dist_engine_is_inited = False
+
+        # Create valid kv_cache_config
+        kv_cache = {'layer.0': torch.randn(2, 4, 8, 16, dtype=torch.float16)}
+        kv_cache_config = MagicMock()
+        kv_cache_group = MagicMock()
+        kv_cache_group.layer_names = ['layer.0']
+        kv_cache_config.kv_cache_groups = [kv_cache_group]
+
+        mock_cache = MagicMock()
+        mock_manager.data_dist_engine.cache_manager.register_blocks_cache.return_value = mock_cache
+
+        # Pre-populate to avoid the duplicate call error
+        mock_manager.registered_kv_caches = []
+
+        # Use patch.object with wraps to track actual call
+        with patch.object(mock_manager, '_reinit_llm_data_dist', wraps=mock_manager._reinit_llm_data_dist) as mock_reinit, \
+             patch(f'{VLLM_KV_TRANSFER_MANAGER_PATH}.unzip_kv_cache_dict', return_value=[[kv_cache['layer.0']]]), \
+             patch(f'{VLLM_KV_TRANSFER_MANAGER_PATH}.maybe_merge_kv_caches', return_value=[[kv_cache['layer.0']]]), \
+             patch(f'{VLLM_KV_TRANSFER_MANAGER_PATH}.maybe_split_kv_caches_for_spec_layers', return_value=[[kv_cache['layer.0']]]):
+            mock_manager.register_memory(kv_cache, kv_cache_config)
+            mock_reinit.assert_called_once()
+
+
+class TestUnregisterMemoryEdgeCases:
+    """Tests for edge cases in unregister_memory."""
+
+    def test_unregister_memory_with_none_cache_id(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test unregister_memory handles caches with None cache_id."""
+        # kv_role='kv_consumer' means is_prefill=False
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+
+        # Create a cache with None cache_id
+        mock_cache = MagicMock()
+        mock_cache.cache_id = None
+        manager.registered_kv_caches = [mock_cache]
+
+        manager.unregister_memory()
+
+        # Should still attempt to unregister
+        manager.data_dist_engine.cache_manager.unregister_cache.assert_called_once_with(None)
+
+    def test_multiple_unregister_calls_idempotent(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that multiple unregister calls are idempotent."""
+        # kv_role='kv_consumer' means is_prefill=False
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+        manager.registered_kv_caches = []
+
+        # First call
+        manager.unregister_memory()
+        # Second call
+        manager.unregister_memory()
+
+        # Should not raise and no calls made
+        manager.data_dist_engine.cache_manager.unregister_cache.assert_not_called()
