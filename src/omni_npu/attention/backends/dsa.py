@@ -348,7 +348,7 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
         sparse_indices = self.indexer.topk_indices_buffer[:bs].view(
             bs, 1, self.indexer.topk_tokens)
 
-        if self.sink_len:
+        if getattr(self, 'sink_len', 0):
             sink_indices = torch.arange(self.sink_len, device=sparse_indices.device,
                                         dtype=sparse_indices.dtype).expand(bs, 1, self.sink_len)
             mask = (sparse_indices != -1).to(sparse_indices.dtype)
