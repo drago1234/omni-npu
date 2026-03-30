@@ -35,25 +35,19 @@ class NPUmHC(torch.nn.Module):
         self.pre_only = pre_only
         self.on_ascend950 = on_ascend950()
 
-        self.branch_alpha_pre = torch.nn.Parameter(
-            torch.empty(1, dtype=torch.float32)
-        )
-        self.branch_beta_pre = torch.nn.Parameter(
-            torch.empty(self.num_stream, dtype=torch.float32)
-        )
-
         if not self.pre_only:
-            self.branch_alpha_post = torch.nn.Parameter(
+            self.branch_alpha = torch.nn.Parameter(
+                torch.empty(3, dtype=torch.float32)
+            )
+            self.branch_beta = torch.nn.Parameter(
+                torch.empty(self.num_stream * (self.num_stream + 2), dtype=torch.float32)
+            ) 
+        else:
+            self.branch_alpha_pre = torch.nn.Parameter(
                 torch.empty(1, dtype=torch.float32)
             )
-            self.branch_alpha_res = torch.nn.Parameter(
-                torch.empty(1, dtype=torch.float32)
-            )
-            self.branch_beta_post = torch.nn.Parameter(
+            self.branch_beta_pre = torch.nn.Parameter(
                 torch.empty(self.num_stream, dtype=torch.float32)
-            )
-            self.branch_beta_res = torch.nn.Parameter(
-                torch.empty(self.num_stream * self.num_stream, dtype=torch.float32)
             )
 
         self.phi = ReplicatedLinear(
@@ -100,18 +94,6 @@ class NPUmHC(torch.nn.Module):
             h_post = None
             h_res = None
         else:
-            self.branch_alpha = torch.cat([
-                self.branch_alpha_pre,
-                self.branch_alpha_post,
-                self.branch_alpha_res,
-                ]
-            )
-            self.branch_beta = torch.cat([
-                self.branch_beta_pre,
-                self.branch_beta_post,
-                self.branch_beta_res,
-                ]
-            )
             hidden_states = hidden_states.view(-1, self.num_stream, self.hidden_size)
 
             if not self.on_ascend950:
@@ -138,15 +120,19 @@ class NPUmHC(torch.nn.Module):
                 h_pre, h_post, h_res = mixes.split(
                     [self.num_stream, self.num_stream, self.num_stream**2], dim=-1,
                 )
+                alpha_pre, alpha_post, alpha_res = self.branch_alpha.view(-1).split([1, 1, 1])
+                beta_pre, beta_post, beta_res = self.branch_beta.view(-1).split(
+                    [self.num_stream, self.num_stream, self.num_stream * self.num_stream]
+                )
 
                 h_pre = torch.nn.functional.sigmoid(
-                    h_pre * self.branch_alpha_pre + self.branch_beta_pre
+                    h_pre * alpha_pre + beta_pre
                 ) + self.hc_eps
                 h_post = 2 * torch.nn.functional.sigmoid(
-                    h_post * self.branch_alpha_post + self.branch_beta_post
+                    h_post * alpha_post + beta_post
                 )
-                h_res = h_res.unflatten(-1, (self.num_stream, self.num_stream)) * self.branch_alpha_res \
-                            + self.branch_beta_res.view(self.num_stream, self.num_stream)
+                h_res = h_res.unflatten(-1, (self.num_stream, self.num_stream)) * alpha_res \
+                            + beta_res.view(self.num_stream, self.num_stream)
                 hidden_states = torch.sum(
                     h_pre.unsqueeze(-1) * hidden_states.view(shape), dim=-2,
                 ).to(dtype)
