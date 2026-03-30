@@ -63,7 +63,6 @@ class NPUPanguIndexer(torch.nn.Module):
         self.cache_config = cache_config
         self.layer_name = prefix
         self.block_size = cache_config.block_size
-        self.enable_non_contiguous_kv = model_extra_config.operator_opt_config.use_noncontiguous_kv
         self.on_ascend950 = on_ascend950()
         self._init_indexer_weights()
 
@@ -329,16 +328,24 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.sliding_window_list = sliding_window_list if sliding_window_list else []
         self.aligned_window_size = max(self.sliding_window_list)
         if self.layer_idx in self.swa_layers:
+            # SWA layer
             pos_in_swa = self.swa_layers.index(self.layer_idx)
             self.sliding_window = self.sliding_window_list[pos_in_swa]
             self.is_dsa_layer = False
         elif self.layer_idx >= config.num_hidden_layers:
+            # MTP layer
             self.sliding_window = self.sliding_window_list[-1]
             self.is_dsa_layer = False
-        else:
+        elif hasattr(config, "index_topk") and config.index_topk > 0:
+            # DSA layer
             self.sliding_window = None
-            self.is_dsa_layer = hasattr(config, "index_topk")
-            self.index_topk = getattr(config, "index_topk", None)
+            self.is_dsa_layer = True
+            self.index_topk = config.index_topk
+        else:
+            # MLA layer
+            # set a very large sliding window to disable the sliding window attention and fall back to global attention
+            self.sliding_window = max(1024 * 1024, self.aligned_window_size + 1)
+            self.is_dsa_layer = False
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -362,7 +369,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.layer_name = prefix
         self.param_sink_number = param_sink_number
         self.on_ascend950 = on_ascend950()
-        self.enable_non_contiguous_kv = model_extra_config.operator_opt_config.use_noncontiguous_kv
+        assert model_extra_config.operator_opt_config.use_noncontiguous_kv
         self.dummy_value_cache = torch.zeros(
             (1, cache_config.block_size, 1, self.kv_lora_rank),
             device='npu',
@@ -533,13 +540,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             "prefix": f"{self.layer_name}.attn",
         }
 
-        if not self.enable_non_contiguous_kv:
-            attn_kwargs.update({
-                "use_sparse": self.is_dsa_layer,
-                "indexer": self.indexer,
-            })
-            self.attn = MLAAttention(**attn_kwargs)
-        elif self.is_dsa_layer:
+        if self.is_dsa_layer:
             attn_kwargs.update({
                 "indexer": self.indexer,
                 "indexer_head_dim": self.indexer.index_head_dim,
@@ -551,7 +552,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_kwargs.update({
                 "cache_dtype_str": self.cache_dtype_str,
                 "page_size_padded": self.page_size_padded,
-                "sliding_window": self.aligned_window_size if self.sliding_window is not None else None,
+                "sliding_window": self.aligned_window_size 
+                                  if self.sliding_window <= self.aligned_window_size
+                                  else None,
             })
             self.attn = MLASWAAttention(**attn_kwargs)
 
@@ -559,18 +562,17 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if not self.use_mome:
             return
 
-        if self.enable_non_contiguous_kv:
-            mome_kwargs = {
-                "kernel_size": self.mome_kernel_width,
-                "num_spec_tokens": self.num_spec_tokens,
-                "state_dtypes": self.mome_state_dtypes,
-                "state_shapes": self.mome_state_shapes,
-                "quant_config": self.quant_config,
-                "cache_config": self.cache_config,
-                "prefix": f"{self.layer_name}.mome",
-                "page_size_padded": self.page_size_padded,
-            }
-            self.mome_attn = MomeAttention(**mome_kwargs)
+        mome_kwargs = {
+            "kernel_size": self.mome_kernel_width,
+            "num_spec_tokens": self.num_spec_tokens,
+            "state_dtypes": self.mome_state_dtypes,
+            "state_shapes": self.mome_state_shapes,
+            "quant_config": self.quant_config,
+            "cache_config": self.cache_config,
+            "prefix": f"{self.layer_name}.mome",
+            "page_size_padded": self.page_size_padded,
+        }
+        self.mome_attn = MomeAttention(**mome_kwargs)
 
         self.qa_conv = ColumnParallelMOME(
             dim=self.q_lora_rank,
@@ -760,45 +762,14 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_metadata,
             )
         else:
-            if self.layer_idx in self.swa_layers:
-                attn_output = self._apply_SWA_attention_decode(
-                    q_nope,
-                    q_pe,
-                    kv_cache,
-                    attn_metadata,
-                )
-            else:
-                attn_output = self._apply_MLA_attention_decode(
-                    q_nope,
-                    q_pe,
-                    kv_cache,
-                    attn_metadata,
-                )
+            attn_output = self._apply_SWA_attention_decode(
+                q_nope,
+                q_pe,
+                kv_cache,
+                attn_metadata,
+            )
 
         return self._mla_epilog(attn_output, attn_metadata)
-
-    def _rescale_attention(
-        self,
-        lse: torch.Tensor,
-        lse_sink: torch.Tensor,
-        attn_output: torch.Tensor,
-        attn_output_sink: torch.Tensor,
-    ):
-        lse = lse.to(torch.float32)
-        lse_sink = lse_sink.to(torch.float32)
-
-        lse_max = torch.maximum(
-            lse_sink,
-            lse,
-        )
-        w_sink = torch.exp(
-            lse_sink - lse_max,
-        )
-        w = torch.exp(
-            lse - lse_max,
-        )
-        attn_output = (attn_output_sink * w_sink + attn_output * w) / (w_sink + w)
-        return attn_output
 
     def _apply_MOME(
         self,
@@ -845,68 +816,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         )
         x = torch.cat([x, x_padded], dim=0)
         return x
-
-    def _apply_MLA_attention_decode(
-        self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: Optional[MLACommonMetadata] = None,
-    ) -> torch.Tensor:
-
-        sink_kv_nope = self.kv_a_layernorm(self.param_sink_compressed_kv) \
-                                           .view(self.param_sink_number, self.kv_lora_rank)
-        sink_kv_rope = self.param_sink_k_pe.view(self.param_sink_number, self.qk_rope_head_dim)
-
-        torch_npu.npu_scatter_nd_update_(
-            kv_cache[0],
-            self.sink_slot_indices, 
-            sink_kv_nope,
-        )
-
-        torch_npu.npu_scatter_nd_update_(
-            kv_cache[1],
-            self.sink_slot_indices,
-            sink_kv_rope,
-        )
-
-        block_table = torch.nn.functional.pad(attn_metadata.decode.block_table, pad=(1,0))
-        query_cumlens = attn_metadata.decode.query_cumlens
-        seq_lens = [seq + self.param_sink_number for seq in attn_metadata.decode.seq_lens]
-
-        kwargs = {
-            "query": q_nope,
-            "key": kv_cache[0],
-            "value": kv_cache[0],
-            "query_rope": q_pe,
-            "key_rope": kv_cache[1],
-            "num_query_heads": self.num_local_heads,
-            "num_key_value_heads": 1,
-            "input_layout": "TND_NTD",
-            "atten_mask": self.attn.impl.SHARE_MASK_TRIL_SPARSE,
-            "sparse_mode": 4,
-            "pre_tokens": 2**31 - 1,
-            "next_tokens": 0,
-            "softmax_scale": self.scaling,
-            "block_table": block_table,
-            "block_size": self.block_size,
-            "sink_number": self.param_sink_number,
-            "actual_seq_qlen": query_cumlens,
-            "actual_seq_kvlen": seq_lens,
-        }
-        if self.on_ascend950:
-            attn_output = torch_npu.npu_fused_infer_attention_score_sink(**kwargs)[0]
-        else:
-            attn_output = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
-
-        attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank) 
-        attn_output = (
-            torch.matmul(attn_output, self.attn.impl.W_UV)
-                .transpose(1, 0)
-                .reshape(-1, self.num_local_heads * self.v_head_dim)
-        )
-
-        return attn_output
 
     def _apply_SWA_attention_decode(
         self,
@@ -992,71 +901,16 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 sin,
                 attn_metadata,
             )
-            if self.layer_idx in self.swa_layers:
-                attn_output = self._apply_SWA_attention_prefill(
-                    q_nope,
-                    q_pe,
-                    k_up_nope,
-                    k_pe,
-                    v_up,
-                    attn_metadata,
-                )
-            else:
-                attn_output = self._apply_MLA_attention_prefill(
-                    q_nope,
-                    q_pe,
-                    k_up_nope,
-                    k_pe,
-                    v_up,
-                    attn_metadata,
-                )
+            attn_output = self._apply_SWA_attention_prefill(
+                q_nope,
+                q_pe,
+                k_up_nope,
+                k_pe,
+                v_up,
+                attn_metadata,
+            )
 
         return self._mla_epilog(attn_output, attn_metadata)
-
-    def _apply_MLA_attention_prefill(
-        self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
-        v: torch.Tensor,
-        attn_metadata: Optional[MLACommonMetadata] = None,
-    ) -> torch.Tensor:
-
-        kwargs = {
-            "query": q_nope,
-            "key": k_nope,
-            "value": v,
-            "query_rope": q_pe,
-            "key_rope": k_pe,
-            "num_query_heads": self.num_local_heads,
-            "num_key_value_heads": self.num_local_heads,
-            "input_layout": "TND",
-            "atten_mask": self.attn.impl.SHARE_MASK_TRIL_SPARSE,
-            "sparse_mode": 3,
-            "softmax_scale": self.scaling,
-            "return_softmax_lse": True,
-            "actual_seq_qlen": attn_metadata.prefill.query_cumlens,
-            "actual_seq_kvlen": attn_metadata.prefill.seq_lens,
-        }
-        if self.on_ascend950:
-            attn_output, lse = torch_npu.npu_fused_infer_attention_score_sink(**kwargs)
-        else:
-            attn_output, lse = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)
-
-        attn_output_sink, lse_sink = self._apply_attention_prefill_sink(
-            q_nope,
-            q_pe,
-        )
-
-        attn_output = self._rescale_attention(
-            lse,
-            lse_sink,
-            attn_output,
-            attn_output_sink,
-        )
-
-        return attn_output.view(-1, self.num_local_heads * self.v_head_dim).to(torch.bfloat16)
 
     def _apply_SWA_attention_prefill(
         self,
@@ -1201,43 +1055,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         return attn_output
 
-    def _apply_attention_prefill_sink(
-        self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-    ) -> torch.Tensor:
-
-        sink_kv = self.kv_b_proj(
-            self.kv_a_layernorm(self.param_sink_compressed_kv)
-        )
-        sink_k_nope, sink_v = torch.split(
-            sink_kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim),
-            [self.qk_nope_head_dim, self.v_head_dim],
-            dim=-1,
-        )
-        sink_k_pe = self.param_sink_k_pe.view(-1, 1, self.qk_rope_head_dim) \
-                                        .repeat(1, self.num_local_heads, 1)
-
-        kwargs = {
-            "query": q_nope,
-            "key": sink_k_nope,
-            "value": sink_v,
-            "query_rope": q_pe,
-            "key_rope": sink_k_pe,
-            "num_query_heads": self.num_local_heads,
-            "num_key_value_heads": self.num_local_heads,
-            "input_layout": "TND",
-            "atten_mask": None,
-            "sparse_mode": 0,
-            "softmax_scale": self.scaling,
-            "return_softmax_lse": True,
-            "actual_seq_qlen": [q_nope.shape[0]],
-            "actual_seq_kvlen": [self.param_sink_number],
-        }        
-        if self.on_ascend950:
-            return torch_npu.npu_fused_infer_attention_score_sink(**kwargs)
-        else:
-            return torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)
 
     def _mla_prolog(
         self,
