@@ -147,6 +147,8 @@ class ModelOperatorOptConfig:
 
     omni_disable_npu_add_rms_norm: bool = False
     use_noncontiguous_kv: bool = False
+    merge_q_kv_conv: bool = False # 是否合并qa_conv和compresskv_conv
+
 
     def __post_init__(self):
 

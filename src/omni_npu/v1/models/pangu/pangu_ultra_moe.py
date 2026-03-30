@@ -718,6 +718,7 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
                 return ""
             return None
 
+        record_conv_name = []
         for name, loaded_weight in weights:
             if _skip_weight(name):
                 continue
@@ -752,6 +753,11 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
 
             if "_conv" in remapped_name:
                 remapped_name = remapped_name.replace("_conv", "_conv.merge_conv")
+                if model_extra_config.operator_opt_config.merge_q_kv_conv and "qa_conv" in remapped_name:
+                    merge_conv_name = remapped_name.replace("qa_conv", "merge_conv")
+                    if merge_conv_name not in record_conv_name:
+                        record_conv_name.append(merge_conv_name)
+                        loaded_params.add(merge_conv_name)
 
             param = params_dict[remapped_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)

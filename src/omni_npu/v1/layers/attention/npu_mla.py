@@ -168,15 +168,22 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 elif hasattr(config, "sliding_window"):
                     sliding_window = config.sliding_window
         self.sliding_window = sliding_window
+        self.merge_q_kv_conv = model_extra_config.operator_opt_config.merge_q_kv_conv
         # MOME
         if getattr(config, "use_mome", False):
             self.qa_conv = AggregateConv(self.q_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
             self.compresskv_conv = AggregateConv(self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
+            if self.merge_q_kv_conv:
+                self.merge_conv = AggregateConv(self.q_lora_rank + self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
+            else:
+                self.merge_conv = None
             self.o_conv = AggregateConv(self.num_local_heads * self.v_head_dim, config, vllm_config, output_parallel=True, attn_prefix=f"{prefix}.attn")
         else:
             self.qa_conv = None
             self.compresskv_conv = None
+            self.merge_conv = None
             self.o_conv = None
+            self.merge_q_kv_conv = False
 
         if self.param_sink_number == 0:
             self.attn = MLAAttention(
@@ -294,14 +301,22 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         q_lora = self.q_a_proj(hidden_states)[0]
         kv = self.kv_a_proj_with_mqa(hidden_states)[0]
 
-        if self.compresskv_conv is not None:
+        if self.compresskv_conv is not None or self.merge_conv is not None:
             kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            kv_c = self.compresskv_conv(kv_c, force_decode=force_decode, short_prefill=short_prefill) + kv_c
+            if self.merge_q_kv_conv:
+                merge_data = torch.cat([q_lora, kv_c], dim=-1)
+                merge_conv = self.merge_conv(merge_data, force_decode=force_decode, short_prefill=short_prefill) + merge_data
+                q_lora, kv_c = merge_conv.split(
+                    [self.q_lora_rank, self.kv_lora_rank],
+                    dim=-1,
+                )
+            else:
+                kv_c = self.compresskv_conv(kv_c, force_decode=force_decode, short_prefill=short_prefill) + kv_c
             if not self.rope_interleaved:
                 k_pe = self.even_odd_indexing(k_pe)
             kv = torch.cat([kv_c, k_pe], dim=-1)
 
-        if self.qa_conv is not None:
+        if self.qa_conv is not None and self.merge_conv is None:
             q_lora = self.qa_conv(q_lora, force_decode=force_decode, short_prefill=short_prefill) + q_lora
         q_norm = self.q_a_layernorm(q_lora)
         q = self.q_b_proj(q_norm)[0]
@@ -458,7 +473,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             latent_cache = latent_cache.view(-1, 1, latent_cache.size(-1))
             kv_a, k_pe = torch.split(latent_cache, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            if self.compresskv_conv is not None:
+            if self.compresskv_conv is not None or self.merge_conv is not None:
                 kv_a = self.compresskv_conv(kv_a) + kv_a
             kv_a = self.kv_a_layernorm(kv_a)
             k_pe = k_pe.unsqueeze(2)
@@ -484,20 +499,29 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         sub_stream = named_stream("mla_sub_stream")
         sub_stream.wait_stream(cur_stream)
 
-        if self.qa_conv is not None:
+        with torch.npu.stream(sub_stream):
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            if self.compresskv_conv is not None:
+                kv_c, k_pe = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                if self.merge_q_kv_conv:
+                    merge_data = torch.cat([q, kv_c], dim=-1)
+                    merge_conv = self.merge_conv(merge_data, only_prefill=only_prefill) + merge_data
+                    q, kv_c = merge_conv.split(
+                        [self.q_lora_rank, self.kv_lora_rank],
+                        dim=-1,
+                    )
+                else:
+                    kv_c = self.compresskv_conv(kv_c, only_prefill=only_prefill) + kv_c
+                if not self.rope_interleaved:
+                    k_pe = self.even_odd_indexing(k_pe)
+                latent_cache = torch.cat([kv_c, k_pe], dim=-1)
+
+        if self.qa_conv is not None and self.merge_conv is None:
             q = self.qa_conv(q, only_prefill=only_prefill) + q
         q = self.q_a_layernorm(q)
         if self.quant_symbol:
             q, pertoken_scale = torch_npu.npu_dynamic_quant(q)
             q = {'x_int8': q, 'pertoken_scale': pertoken_scale}
-        with torch.npu.stream(sub_stream):
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-            if self.compresskv_conv is not None:
-                kv_c, k_pe = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                kv_c = self.compresskv_conv(kv_c, only_prefill=only_prefill) + kv_c
-                if not self.rope_interleaved:
-                    k_pe = self.even_odd_indexing(k_pe)
-                latent_cache = torch.cat([kv_c, k_pe], dim=-1)
 
         cur_stream.wait_stream(sub_stream)
         sub_stream.wait_stream(cur_stream)
@@ -617,6 +641,9 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             else:
                 param_sink_compressed_kv = self.param_sink_compressed_kv
             self.attn.update_sink_kv(self.param_sink_k_pe, param_sink_compressed_kv)
+        if self.merge_q_kv_conv and self.merge_conv is not None:
+            self.merge_conv.merge_conv.weight.data = torch.cat([self.qa_conv.merge_conv.weight.data, self.compresskv_conv.merge_conv.weight.data], dim=0).contiguous()
+            self.merge_conv.conv_weight = self.merge_conv.merge_conv.weight.data.squeeze(1).transpose(0, 1).contiguous()
 
     @staticmethod
     def _insert_tensor_by_start_loc(

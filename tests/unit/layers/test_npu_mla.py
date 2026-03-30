@@ -216,6 +216,7 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         m.param_sink_with_value = True
         m.sliding_window = 512
         m.rope_interleaved = False
+        m.merge_q_kv_conv = False
 
         m.q_a_proj = _FakeLinear(m.q_lora_rank)
         m.kv_a_proj_with_mqa = _FakeLinear(m.kv_lora_rank + m.qk_rope_head_dim)
@@ -226,6 +227,7 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         m.o_proj = _FakeLinear(16)
         m.qa_conv = _FakeAggregateConv()
         m.compresskv_conv = _FakeAggregateConv()
+        m.merge_conv = None
         m.o_conv = _FakeAggregateConv()
         m.even_odd_indexing = _Fake_even_odd_indexing()
         m._insert_tensor_by_start_loc = _Fake_insert_tensor_by_start_loc()
@@ -261,6 +263,103 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             npu_mla_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True
         ):
             out = npu_mla_mod.NPUDeepseekMLAAttention._forward_prefill(m, hs, cos, sin, attn_metadata=None)
+
+        self.assertEqual(tuple(out.shape), (bs, 16))
+
+    def test_forward_prefill_merge_conv(self):
+        m = self._make_stub()
+        m.merge_q_kv_conv = True
+        m.merge_conv = _FakeAggregateConv()
+        bs = 3
+        hs = torch.randn((bs, m.hidden_size), dtype=torch.float32)
+        cos = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        meta = SimpleNamespace(
+            prefill=_make_prefill_meta(bs, max_query_len=2),
+            decode=None,
+            slot_mapping=torch.arange(bs, dtype=torch.int64),
+        )
+        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0, capturing=False)
+        fake_stream = _FakeStream()
+
+        def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
+            k_pe = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+            kv_a = torch.zeros((bs, 1, 1, m.kv_lora_rank), dtype=torch.float32)
+            return None, None, k_pe, kv_a
+
+        def _fake_fused_attention(*args, **kwargs):
+            q_arg = args[0]
+            return torch.zeros((q_arg.shape[0], q_arg.shape[1], m.v_head_dim), dtype=torch.float32), None
+
+        with patch.object(npu_mla_mod, "get_forward_context", return_value=fc), patch.object(
+            npu_mla_mod, "named_stream", return_value=fake_stream
+        ), patch.object(
+            npu_mla_mod.torch, "npu", create=True
+        ) as torch_npu_ns, patch.object(
+            npu_mla_mod.torch_npu,
+            "npu_dynamic_quant",
+            side_effect=lambda x: (x.to(torch.int8), torch.ones((x.shape[0],), dtype=torch.float32)),
+            create=True,
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.npu, "npu_fused_infer_attention_score", side_effect=_fake_fused_attention, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.custom, "npu_fused_infer_attention_sink", side_effect=_fake_fused_attention, create=True
+        ):
+            torch_npu_ns.current_stream = lambda: fake_stream
+            torch_npu_ns.stream = lambda _s: nullcontext()
+            out = npu_mla_mod.NPUDeepseekMLAAttention._forward_prefill(m, hs, cos, sin, attn_metadata=meta.prefill)
+
+        self.assertEqual(tuple(out.shape), (bs, 16))
+
+    def test_forward_decode_merge_conv(self):
+        m = self._make_stub()
+        m.merge_q_kv_conv = True
+        m.merge_conv = _FakeAggregateConv()
+        bs = 3
+        hs = torch.randn((bs, m.hidden_size), dtype=torch.float32)
+        cos = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        meta = SimpleNamespace(
+            prefill=None,
+            decode=_make_decode_meta(bs),
+            slot_mapping=torch.arange(bs, dtype=torch.int64),
+        )
+        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0, capturing=False)
+
+        def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
+            k_rope = torch.zeros((2, 1, 128, m.qk_rope_head_dim), dtype=torch.float32)
+            k_nope = torch.zeros((2, 1, 128, m.kv_lora_rank), dtype=torch.float32)
+            return k_rope, k_nope, None, None
+
+        def _fake_tbm(x, w, perm_y=None):
+            return torch.zeros((x.shape[0], x.shape[1], w.shape[2]), dtype=torch.float32)
+
+        with patch.object(npu_mla_mod, "get_forward_context", return_value=fc), patch.object(
+            npu_mla_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=_fake_tbm, create=True
+        ), patch.object(
+            npu_mla_mod.NPUMLAImpl, "ensure_decode_attn_mask", return_value=None
+        ), patch.object(
+            npu_mla_mod.NPUMLAImpl, "DECORE_ATTN_MASK", torch.ones((1,), dtype=torch.bool), create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.npu,
+            "npu_fused_infer_attention_score",
+            return_value=(torch.zeros((m.num_local_heads, bs, m.kv_lora_rank), dtype=torch.float32),),
+            create=True,
+        ), patch.object(
+            npu_mla_mod.torch.ops.custom,
+            "npu_fused_infer_attention_sink",
+            return_value=(torch.zeros((bs, m.num_local_heads, m.kv_lora_rank), dtype=torch.float32),),
+            create=True,
+         ):
+            out = npu_mla_mod.NPUDeepseekMLAAttention._forward_decode(m, hs, cos, sin, attn_metadata=meta.decode)
 
         self.assertEqual(tuple(out.shape), (bs, 16))
 
@@ -409,6 +508,190 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
 
         # Verify output shape combines both outputs
         self.assertEqual(out.shape, (num_actual_tokens, m.hidden_size))
+
+
+class TestNPUMLAMergeConvInit(unittest.TestCase):
+    """Test merge_conv initialization logic in __init__ method."""
+
+    def _fake_cfg(self, rope_type="default", apply_yarn=True, torch_dtype=torch.bfloat16, use_mome=True):
+        return SimpleNamespace(
+            rms_norm_eps=1e-6,
+            rope_parameters={
+                "rope_type": rope_type,
+                "apply_yarn_scaling": apply_yarn,
+                "factor": 2.0,
+                "mscale_all_dim": False,
+            },
+            torch_dtype=torch_dtype,
+            use_mome=use_mome,
+        )
+
+    @pytest.mark.usefixtures("default_vllm_config")
+    @patch("omni_npu.v1.models.config_loader.loader.model_extra_config")
+    @patch("omni_npu.v1.layers.attention.npu_mla.RMSNorm")
+    @patch("omni_npu.v1.layers.attention.npu_mla.ReplicatedLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.ColumnParallelFlashCommLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.RowParallelFlashCommLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.get_rope")
+    @patch("omni_npu.v1.layers.attention.npu_mla.MLAAttention")
+    @patch.object(npu_mla_mod, "get_tensor_model_parallel_world_size", return_value=1)
+    def test_init_merge_conv_created_when_merge_q_kv_conv_true(
+        self,
+        mock_tp,
+        mock_attn,
+        mock_rope,
+        mock_row,
+        mock_col,
+        mock_rep,
+        mock_rms,
+        mock_model_extra_config,
+    ):
+        """Test that merge_conv is created when merge_q_kv_conv is True."""
+        # Setup mock for AggregateConv since it's imported via try/except
+        mock_aggregate_conv = MagicMock()
+        npu_mla_mod.AggregateConv = mock_aggregate_conv
+
+        mock_model_extra_config.operator_opt_config = SimpleNamespace(merge_q_kv_conv=True)
+        mock_aggregate_conv.return_value = MagicMock()
+        mock_rms.return_value = MagicMock()
+        mock_rep.return_value = MagicMock()
+        mock_col.return_value = MagicMock()
+        mock_row.return_value = MagicMock()
+        mock_rope.return_value = MagicMock()
+        mock_attn.return_value = MagicMock()
+
+        m = npu_mla_mod.NPUDeepseekMLAAttention(
+            vllm_config=SimpleNamespace(),
+            config=self._fake_cfg(),
+            hidden_size=16,
+            num_heads=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            q_lora_rank=12,
+            kv_lora_rank=8,
+            cache_config=None,
+            quant_config=None,
+            prefix="layers.0",
+        )
+
+        # Verify merge_conv was created with correct arguments
+        self.assertTrue(hasattr(m, "merge_conv"))
+        self.assertTrue(mock_aggregate_conv.called)
+
+    @pytest.mark.usefixtures("default_vllm_config")
+    @patch("omni_npu.v1.models.config_loader.loader.model_extra_config")
+    @patch("omni_npu.v1.layers.attention.npu_mla.RMSNorm")
+    @patch("omni_npu.v1.layers.attention.npu_mla.ReplicatedLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.ColumnParallelFlashCommLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.RowParallelFlashCommLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.get_rope")
+    @patch("omni_npu.v1.layers.attention.npu_mla.MLAAttention")
+    @patch.object(npu_mla_mod, "get_tensor_model_parallel_world_size", return_value=1)
+    def test_init_merge_conv_is_none_when_merge_q_kv_conv_false(
+        self,
+        mock_tp,
+        mock_attn,
+        mock_rope,
+        mock_row,
+        mock_col,
+        mock_rep,
+        mock_rms,
+        mock_model_extra_config,
+    ):
+        """Test that merge_conv is None when merge_q_kv_conv is False."""
+        # Setup mock for AggregateConv since it's imported via try/except
+        mock_aggregate_conv = MagicMock()
+        npu_mla_mod.AggregateConv = mock_aggregate_conv
+
+        mock_model_extra_config.operator_opt_config = SimpleNamespace(merge_q_kv_conv=False)
+        mock_aggregate_conv.return_value = MagicMock()
+        mock_rms.return_value = MagicMock()
+        mock_rep.return_value = MagicMock()
+        mock_col.return_value = MagicMock()
+        mock_row.return_value = MagicMock()
+        mock_rope.return_value = MagicMock()
+        mock_attn.return_value = MagicMock()
+
+        m = npu_mla_mod.NPUDeepseekMLAAttention(
+            vllm_config=SimpleNamespace(),
+            config=self._fake_cfg(),
+            hidden_size=16,
+            num_heads=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            q_lora_rank=12,
+            kv_lora_rank=8,
+            cache_config=None,
+            quant_config=None,
+            prefix="layers.0",
+        )
+
+        # Verify merge_conv is None
+        self.assertTrue(hasattr(m, "merge_conv"))
+        self.assertIsNone(m.merge_conv)
+        self.assertEqual(m.merge_q_kv_conv, False)
+
+        # Cleanup
+        delattr(npu_mla_mod, "AggregateConv")
+
+    @pytest.mark.usefixtures("default_vllm_config")
+    @patch("omni_npu.v1.models.config_loader.loader.model_extra_config")
+    @patch("omni_npu.v1.layers.attention.npu_mla.RMSNorm")
+    @patch("omni_npu.v1.layers.attention.npu_mla.ReplicatedLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.ColumnParallelFlashCommLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.RowParallelFlashCommLinear")
+    @patch("omni_npu.v1.layers.attention.npu_mla.get_rope")
+    @patch("omni_npu.v1.layers.attention.npu_mla.MLAAttention")
+    @patch.object(npu_mla_mod, "get_tensor_model_parallel_world_size", return_value=1)
+    def test_init_merge_conv_is_none_when_use_mome_false(
+        self,
+        mock_tp,
+        mock_attn,
+        mock_rope,
+        mock_row,
+        mock_col,
+        mock_rep,
+        mock_rms,
+        mock_model_extra_config,
+    ):
+        """Test that merge_conv is None when use_mome is False, regardless of merge_q_kv_conv."""
+        # Setup mock for AggregateConv since it's imported via try/except
+        mock_aggregate_conv = MagicMock()
+        npu_mla_mod.AggregateConv = mock_aggregate_conv
+
+        mock_model_extra_config.operator_opt_config = SimpleNamespace(merge_q_kv_conv=True)
+        mock_rms.return_value = MagicMock()
+        mock_rep.return_value = MagicMock()
+        mock_col.return_value = MagicMock()
+        mock_row.return_value = MagicMock()
+        mock_rope.return_value = MagicMock()
+        mock_attn.return_value = MagicMock()
+
+        cfg = self._fake_cfg(use_mome=False)
+
+        m = npu_mla_mod.NPUDeepseekMLAAttention(
+            vllm_config=SimpleNamespace(),
+            config=cfg,
+            hidden_size=16,
+            num_heads=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            q_lora_rank=12,
+            kv_lora_rank=8,
+            cache_config=None,
+            quant_config=None,
+            prefix="layers.0",
+        )
+
+        # Verify merge_conv is None and merge_q_kv_conv is False when use_mome is False
+        self.assertIsNone(m.merge_conv)
+        self.assertEqual(m.merge_q_kv_conv, False)
+
+        # Cleanup
+        delattr(npu_mla_mod, "AggregateConv")
 
 
 class TestNPUMLAInit(unittest.TestCase):
