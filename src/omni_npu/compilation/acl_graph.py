@@ -144,7 +144,10 @@ class ACLGraphWrapper:
         aslkv = None
         if attn_metadata is not None:
             for _, metadata in attn_metadata.items():
-                if not hasattr(metadata, "decode"):
+                if hasattr(metadata, "num_accepted_tokens"):
+                    # NPUMomeAttentionMetadata
+                    continue
+                elif not hasattr(metadata, "decode"):
                     # GQA
                     if hasattr(metadata, "query_start_loc"):
                         asl = metadata.query_start_loc[1:]
@@ -452,7 +455,7 @@ class ACLGraphWrapper:
         attn_metadata = {
             key: metadata
             for key, metadata in forward_context.attn_metadata.items()
-            if metadata.decode and isinstance(metadata.decode.seq_lens, list)
+            if hasattr(metadata, "decode") and metadata.decode and isinstance(metadata.decode.seq_lens, list)
         }
         graph_params = get_graph_params()
         with torch.npu.stream(update_stream):

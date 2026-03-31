@@ -21,6 +21,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.v1.attention.backends.mla.common import MLACommonMetadata
+from omni_npu.attention.backends.mome import NPUMomeAttentionMetadata
 from vllm.logger import init_logger
 
 from omni_npu.v1.utils import current_stream, on_ascend950
@@ -595,10 +596,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.use_mome = getattr(self.hf_config, "use_mome", False)
         self.mome_kernel_width = getattr(self.hf_config, "router_sliding_window", 0)
         if self.use_mome:
+            assert self.num_heads % self.tp_size == 0, \
+                "For MoME attention, num_heads should be divisible by tp_size."
             self.mome_state_shapes = (
                 (self.q_lora_rank,),
                 (self.kv_lora_rank,),
-                (self.num_heads * self.v_head_dim,),
+                (self.num_heads * self.v_head_dim // self.tp_size,),
             )
             self.mome_state_dtypes = (
                 torch.bfloat16,
@@ -698,32 +701,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
         )
 
-        # prepare the fake cache, the fake cache indices
-        # this should be removed in a functional version
-        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-        self.q_mome_cache = torch.zeros(
-            (max_num_seqs,
-            self.mome_kernel_width - 1 + self.num_spec_tokens,
-            self.q_lora_rank),
-            device='npu',
-        )
-        self.kv_mome_cache = torch.zeros(
-            (max_num_seqs,
-            self.mome_kernel_width - 1 + self.num_spec_tokens,
-            self.kv_lora_rank),
-            device='npu',
-        )
-        self.o_mome_cache = torch.zeros(
-            (max_num_seqs,
-            self.mome_kernel_width - 1 + self.num_spec_tokens,
-            self.o_conv.output_size_per_partition),
-            device='npu',
-        )
-        self.cache_indices = torch.arange(
-            0, max_num_seqs, dtype=torch.int32,
-            device='npu',
-        )
-
     def _calculate_page_size_padded(
         self,
         cache_config: CacheConfig,
@@ -798,7 +775,10 @@ class NPUPanguSparseAttention(torch.nn.Module):
     ) -> torch.Tensor:
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
-            attn_metadata = attn_metadata[f"{self.prefix}.attn"]
+            mome_metadata = attn_metadata.get(f"{self.prefix}.mome")
+            attn_metadata = attn_metadata.get(f"{self.prefix}.attn")
+        else:
+            mome_metadata = None
 
         if attn_metadata is None:
             return self._forward_dummy(
@@ -873,6 +853,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
+        mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
 
         q_nope, q_pe, kv_cache, topk_indices = self._mla_prolog(
@@ -880,6 +861,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             cos,
             sin,
             attn_metadata,
+            mome_metadata, 
         )
 
         if self.is_dsa_layer:
@@ -898,51 +880,47 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_metadata,
             )
 
-        return self._mla_epilog(attn_output, attn_metadata)
+        return self._mla_epilog(attn_output, attn_metadata, mome_metadata)
 
     def _apply_MOME(
         self,
         x: torch.Tensor, 
         layer: ColumnParallelMOME, 
-        cache: torch.Tensor,           # should be obtained in attn_metadata when MoME cache is handled by vLLM
-        cache_indices: torch.Tensor,   # should be obtained in attn_metadata when MoME cache is handled by vLLM
-        attn_metadata: Optional[MLACommonMetadata],
+        kv_index: int = 0, 
+        attn_metadata: Optional[MLACommonMetadata] = None,
+        mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ):
-        if attn_metadata is None:
+        if attn_metadata is None or mome_metadata is None:
             # warm up run
             return x
 
         x, x_padded = torch.split(
             x, [attn_metadata.num_actual_tokens, x.shape[0] - attn_metadata.num_actual_tokens], dim=0
         )
-
         
         width = self.mome_kernel_width
-        num_reqs = attn_metadata.num_reqs
+        kv_cache = self.mome_attn.kv_cache[get_forward_context().virtual_engine]
+
+        # todo: support continuous batching
         
-        if attn_metadata.prefill is not None:
+        if attn_metadata.num_prefills > 0:
             assert attn_metadata.num_decodes == 0
             x = layer.forward_prefill(
                 x, 
-                cache[:, :width-1], 
-                cache_indices[:num_reqs], 
-                attn_metadata.query_start_loc, 
+                kv_cache[kv_index][:, :width-1], 
+                mome_metadata.cache_indices, 
+                mome_metadata.query_start_loc, 
             )
-            x = torch.cat([x, x_padded], dim=0)
-            return x
+        else:
+            x = layer.forward_decode(
+                x, 
+                kv_cache[kv_index], 
+                mome_metadata.cache_indices, 
+                mome_metadata.query_start_loc, 
+                num_accepted_tokens=mome_metadata.num_accepted_tokens, 
+                pad_slot_id=mome_metadata.pad_slot_id, 
+            )
 
-        # decode and speculative decoding branch
-        assert attn_metadata.decode is not None
-        assert attn_metadata.num_prefills == 0
-
-        num_accepted_tokens = getattr(attn_metadata.decode, "num_accepted_tokens", None)
-        x = layer.forward_decode(
-            x, 
-            cache, 
-            cache_indices[:num_reqs], 
-            attn_metadata.query_start_loc, 
-            num_accepted_tokens=num_accepted_tokens,
-        )
         x = torch.cat([x, x_padded], dim=0)
         return x
 
@@ -1307,6 +1285,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
+        mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
 
         if self.is_dsa_layer:
@@ -1315,6 +1294,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 cos,
                 sin,
                 attn_metadata,
+                mome_metadata, 
             )
             attn_output = self._apply_DSA_attention(
                 q_nope,
@@ -1329,6 +1309,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 cos,
                 sin,
                 attn_metadata,
+                mome_metadata,
             )
             attn_output = self._apply_SWA_attention_prefill(
                 q_nope,
@@ -1339,7 +1320,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_metadata,
             )
 
-        return self._mla_epilog(attn_output, attn_metadata)
+        return self._mla_epilog(attn_output, attn_metadata, mome_metadata)
 
     def _apply_SWA_attention_prefill(
         self,
@@ -1491,6 +1472,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
+        mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor], # DSA/MLA/SWA absorb
                Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]: # MLA/SWA non-absorb
 
@@ -1503,9 +1485,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
             q_lora = self._apply_MOME(
                 q_lora,
                 self.qa_conv,
-                self.q_mome_cache,
-                self.cache_indices,
+                0,
                 attn_metadata,
+                mome_metadata, 
             )
         q_lora = self.q_a_layernorm(q_lora)
         q = self.q_b_proj(q_lora)
@@ -1562,9 +1544,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
             k_nope = self._apply_MOME(
                 k_nope,
                 self.compresskv_conv,
-                self.kv_mome_cache,
-                self.cache_indices,
+                1, 
                 attn_metadata,
+                mome_metadata,
             )
 
         ret = self._npu_kvrmsnorm_rope_cache(
@@ -1695,15 +1677,16 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self,
         attn_output: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
+        mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
 
         if self.use_mome:
             attn_output = self._apply_MOME(
                 attn_output,
                 self.o_conv,
-                self.o_mome_cache,
-                self.cache_indices,
+                2, 
                 attn_metadata,
+                mome_metadata,
             )
 
         hidden_states = self.o_proj(attn_output)
