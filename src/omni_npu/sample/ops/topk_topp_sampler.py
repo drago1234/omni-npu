@@ -81,7 +81,7 @@ class NPUTopKTopPSampler(V1TopKTopPSampler):
         else:
             k = torch.ones((logits.shape[0],), dtype=torch.int32, device=logits.device) * logits.shape[1]
         q = generate_coins(logits, generators, self.dsa_stream)
-        token_ids, logits = torch_npu.npu_top_k_top_p_sample(logits, k, p, q, is_need_logits=True)
+        token_ids, logits = torch_npu.npu_top_k_top_p_sample(logits, k, p, q=q, is_need_logits=True)
 
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":

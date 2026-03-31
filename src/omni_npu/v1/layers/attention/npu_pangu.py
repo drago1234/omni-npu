@@ -193,6 +193,7 @@ class NPUPanguIndexer(torch.nn.Module):
             slot_mapping % self.block_size,
             ], dim=1,
         )
+        # TODO: need fix
         torch.ops.custom.npu_ai_infra_scatter_block_update_(
             kv_cache[1],
             slot_indices,
@@ -785,11 +786,45 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 hidden_states,
             )
         else:
-            enable_cp = model_extra_config.parall_config.ena_context_parallel and self.is_dsa_layer
+            num_actual_tokens = attn_metadata.num_actual_tokens
+            has_decode = attn_metadata.num_decodes > 0
+            has_prefill = attn_metadata.num_prefills > 0
+
+            enable_cp = model_extra_config.parall_config.ena_context_parallel and self.is_dsa_layer \
+                        and not has_decode and num_actual_tokens > attn_metadata.num_prefills * self.tp_size * 2
             if self.tp_size > 1:
                 if not self.all2all_backend == "naive" and not enable_cp:
                     hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
-            if attn_metadata.prefill is not None:
+
+            if has_decode and has_prefill:
+                prefill_hidden_states, prefill_cos, prefill_sin = self._prepare_phase_inputs(
+                    hidden_states, cos, sin, attn_metadata,
+                    phase="prefill",
+                )
+                prefill_output = self._forward_prefill(
+                    prefill_hidden_states,
+                    prefill_cos,
+                    prefill_sin,
+                    attn_metadata,
+                    mome_metadata,
+                )
+
+                decode_hidden_states, decode_cos, decode_sin = self._prepare_phase_inputs(
+                    hidden_states, cos, sin, attn_metadata,
+                    phase="decode",
+                )
+                decode_output = self._forward_decode(
+                    decode_hidden_states,
+                    decode_cos,
+                    decode_sin,
+                    attn_metadata,
+                    mome_metadata,
+                )
+                
+                self._restore_phase_metadata(attn_metadata)
+
+                hidden_states = torch.cat([decode_output, prefill_output], dim=0)
+            elif attn_metadata.prefill is not None:
                 if enable_cp:
                     assert self.all2all_backend != "naive", "Context parallel is not supported with naive all2all backend"
                     return self._forward_prefill_cp(
@@ -805,17 +840,17 @@ class NPUPanguSparseAttention(torch.nn.Module):
                         cos,
                         sin,
                         attn_metadata,
+                        mome_metadata, 
                     )
                     hidden_states[:attn_metadata.num_actual_tokens] = attn_output
             else:
-                x = hidden_states[:attn_metadata.num_actual_tokens]
-                attn_output = self._forward_decode(
-                    x,
+                hidden_states = self._forward_decode(
+                    hidden_states,
                     cos,
                     sin,
                     attn_metadata,
+                    mome_metadata, 
                 )
-                hidden_states[:attn_metadata.num_actual_tokens] = attn_output
             if self.tp_size > 1:
                 if self.all2all_backend == "naive":
                     hidden_states = get_tp_group().all_reduce(hidden_states)
@@ -823,11 +858,64 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     hidden_states = get_tp_group().reduce_scatter(hidden_states, dim=0)
             return hidden_states
 
+    def _prepare_phase_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        phase: str,
+    ):
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_decodes = attn_metadata.num_decodes
+
+        if phase == "prefill":
+            # first phase: backup originals
+            attn_metadata.origin_slot_mapping = attn_metadata.slot_mapping.clone()
+            attn_metadata.orig_query_start_loc = attn_metadata.query_start_loc.clone()
+            attn_metadata.orig_num_actual_tokens = attn_metadata.num_actual_tokens
+            num_actual_tokens = attn_metadata.num_actual_tokens
+
+            sliced_hidden = hidden_states[num_decode_tokens:num_actual_tokens, ...]
+            sliced_cos = cos[num_decode_tokens:num_actual_tokens, ...]
+            sliced_sin = sin[num_decode_tokens:num_actual_tokens, ...]
+            attn_metadata.prefill.slot_mapping = attn_metadata.origin_slot_mapping[num_decode_tokens:num_actual_tokens]
+            attn_metadata.slot_mapping = attn_metadata.prefill.slot_mapping
+            attn_metadata.saved_decode = attn_metadata.decode
+            attn_metadata.decode = None
+            attn_metadata.num_actual_tokens = num_actual_tokens - num_decode_tokens
+            attn_metadata.query_start_loc = attn_metadata.orig_query_start_loc[num_decodes:] - attn_metadata.orig_query_start_loc[num_decodes]
+        else:
+            saved_decode = getattr(attn_metadata, 'saved_decode', None)
+            if saved_decode is not None:
+                attn_metadata.decode = attn_metadata.saved_decode
+            origin_slot_mapping = attn_metadata.origin_slot_mapping
+            orig_query_start_loc = attn_metadata.orig_query_start_loc
+
+            sliced_hidden = hidden_states[:num_decode_tokens, ...]
+            sliced_cos = cos[:num_decode_tokens, ...]
+            sliced_sin = sin[:num_decode_tokens, ...]
+            attn_metadata.decode.slot_mapping = origin_slot_mapping[:num_decode_tokens]
+            attn_metadata.slot_mapping = attn_metadata.decode.slot_mapping
+            attn_metadata.saved_prefill = attn_metadata.prefill
+            attn_metadata.prefill = None
+            attn_metadata.num_actual_tokens = num_decode_tokens
+            attn_metadata.query_start_loc = orig_query_start_loc[:num_decodes + 1]
+        return sliced_hidden, sliced_cos, sliced_sin
+
+    def _restore_phase_metadata(self, attn_metadata: MLACommonMetadata):
+        saved_prefill = getattr(attn_metadata, 'saved_prefill', None)
+        if saved_prefill is not None:
+            attn_metadata.prefill = saved_prefill
+        attn_metadata.slot_mapping = attn_metadata.origin_slot_mapping
+        attn_metadata.num_actual_tokens = attn_metadata.orig_num_actual_tokens
+        attn_metadata.query_start_loc = attn_metadata.orig_query_start_loc
+
     def _forward_dummy(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-
+        
         if self.tp_size > 1:
             if not self.all2all_backend == "naive":
                 hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
@@ -904,7 +992,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # todo: support continuous batching
         
         if attn_metadata.num_prefills > 0:
-            assert attn_metadata.num_decodes == 0
+            # assert attn_metadata.num_decodes == 0
             x = layer.forward_prefill(
                 x, 
                 kv_cache[kv_index][:, :width-1], 
@@ -935,11 +1023,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
         sink_k_nope = self.kv_a_layernorm(self.param_sink_compressed_kv).unsqueeze(1)
         sink_k_pe = self.param_sink_k_pe.unsqueeze(1)
 
+        query_cumlens = attn_metadata.decode.query_cumlens
         kwargs = {
-            "query": q_nope,
+            "query": q_nope[:query_cumlens[-1]],
             "key": kv_cache[0],
             "value": kv_cache[0],
-            "query_rope": q_pe,
+            "query_rope": q_pe[:query_cumlens[-1]],
             "key_rope": kv_cache[1],
             "num_key_value_heads": 1,
             "input_layout": "TND_NTD",
@@ -953,6 +1042,10 @@ class NPUPanguSparseAttention(torch.nn.Module):
             "value_sink": sink_k_nope,
             "key_rope_sink": sink_k_pe,
         }
+
+        num_tokens = q_nope.size(0)
+        attn_output_shape = [self.num_local_heads, num_tokens, self.kv_lora_rank]
+        attn_output = torch.empty(attn_output_shape, device=q_nope.device, dtype=q_nope.dtype)
         if self.on_ascend950:
             kwargs.update({
                 "num_heads": self.num_local_heads,
@@ -960,7 +1053,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 "actual_seq_lengths_kv": attn_metadata.decode.seq_lens,
                 "scale": self.scaling,
             })
-            attn_output = torch_npu._npu_attention_pioneer(**kwargs)[0]
+            attn_output[:, :query_cumlens[-1], :] = torch_npu._npu_attention_pioneer(**kwargs)[0]
         else:
             kwargs.update({
                 "num_query_heads": self.num_local_heads,
@@ -968,7 +1061,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 "actual_seq_kvlen": attn_metadata.decode.seq_lens,
                 "softmax_scale": self.scaling,
             })
-            attn_output = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
+            attn_output[:, :query_cumlens[-1], :] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
 
         attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank) 
         attn_output = (
@@ -1322,6 +1415,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         return self._mla_epilog(attn_output, attn_metadata, mome_metadata)
 
+
     def _apply_SWA_attention_prefill(
         self,
         q_nope: torch.Tensor,
@@ -1351,8 +1445,8 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 "query": query,
                 "key": key,
                 "value": v,
-                "actual_seq_lengths": attn_metadata.decode.query_cumlens,
-                "actual_seq_lengths_kv": attn_metadata.decode.seq_lens,
+                "actual_seq_lengths": attn_metadata.prefill.query_cumlens,
+                "actual_seq_lengths_kv": attn_metadata.prefill.seq_lens,
                 "num_heads": self.num_local_heads,
                 "num_key_value_heads": self.num_local_heads,
                 "input_layout": "TND",
@@ -1567,8 +1661,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if quant_output := self._npu_kvrmsnorm_rope_cache_quant(*args, **kwargs):
             return quant_output
         else:
-            unquant_output = self._npu_kvrmsnorm_rope_cache_unquant(*args, **kwargs)
-            return unquant_output
+            return self._npu_kvrmsnorm_rope_cache_unquant(*args, **kwargs)
 
     def _npu_kvrmsnorm_rope_cache_quant(
         self,
@@ -1582,6 +1675,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
     ):
         # DSA layer c8 shape
         if self.cache_config.cache_dtype in ["hif8_ds_mla"] and self.is_dsa_layer:
+            actual_seq_kvlen = attn_metadata.slot_mapping.shape[0]
+            k_nope = k_nope[:actual_seq_kvlen, ...]
+            k_pe = k_pe[:actual_seq_kvlen, ...]
+            cos = cos[:actual_seq_kvlen, ...]
+            sin = sin[:actual_seq_kvlen, ...]
+
             k_nope = self.kv_a_layernorm(k_nope)
             k_nope_scale = torch.ones(
                 (k_nope.shape[0], k_nope.shape[1] // 128), dtype=torch.float32, device=k_nope.device,
@@ -1618,6 +1717,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         # the rest cases are unquantized
+        actual_seq_kvlen = attn_metadata.slot_mapping.shape[0]
+        k_nope = k_nope[:actual_seq_kvlen, ...]
+        k_pe = k_pe[:actual_seq_kvlen, ...]
+        cos = cos[:actual_seq_kvlen, ...]
+        sin = sin[:actual_seq_kvlen, ...]
+
         kv = torch.cat([k_nope, k_pe], dim=-1)
 
         kwargs = {
@@ -1690,4 +1795,5 @@ class NPUPanguSparseAttention(torch.nn.Module):
             )
 
         hidden_states = self.o_proj(attn_output)
+
         return hidden_states
