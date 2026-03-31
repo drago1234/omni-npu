@@ -15,13 +15,10 @@ import math
 import torch
 import torch_npu
 
-from vllm.v1.attention.backend import (AttentionLayer, AttentionType,
-                                       AttentionCGSupport,
-                                       CommonAttentionMetadata)
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.distributed import get_tp_group
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBackend,
     MLACommonDecodeMetadata,
@@ -31,8 +28,13 @@ from vllm.v1.attention.backends.mla.common import (
     MLACommonBaseImpl,
     QueryLenSupport,
 )
+from vllm.v1.attention.backend import (AttentionLayer, AttentionType,
+                                       AttentionCGSupport,
+                                       CommonAttentionMetadata)
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import AttentionSpec
-from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches
+
+from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches, SPManager
 from omni_npu.v1.models.config_loader.loader import model_extra_config
 
 
@@ -205,6 +207,15 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         if metadata.prefill is not None:
             metadata.prefill.query_cumlens = torch.cumsum(metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1], dim=0)
             metadata.prefill.seq_lens = common_attn_metadata.seq_lens[-metadata.prefill.query_cumlens.shape[0]:]
+            if model_extra_config.parall_config.ena_context_parallel:
+                slot_mapping = metadata.slot_mapping[:metadata.num_actual_tokens]
+                metadata.prefill.sp_manager = SPManager(
+                    get_tp_group(),
+                    slot_mapping_ref=slot_mapping,
+                    blk_table_ref=metadata.prefill.block_table,
+                    cumlens=metadata.prefill.query_start_loc,
+                    init_zigzag=True,
+                )
 
         if ENABLE_OMNI_CACHE:
             from omni_cache.cache import omni_cache

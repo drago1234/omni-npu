@@ -103,6 +103,7 @@ class ModelParallelConfig:
     eh_proj_tp_size: int = 1
     layer_parallel_config: dict[str, Any] = field(default_factory=dict)
     input_split: bool = False
+    ena_context_parallel: bool = False
 
  
 @dataclass

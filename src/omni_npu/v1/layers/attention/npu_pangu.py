@@ -26,7 +26,7 @@ from vllm.logger import init_logger
 from omni_npu.v1.utils import current_stream, on_ascend950
 from omni_npu.v1.layers.utils import yarn_get_mscale
 from omni_npu.v1.models.config_loader.loader import model_extra_config
-
+from omni_npu.attention.backends.utils import SPManager, DummySPManager, lazy_init_cos_sin
 from omni_npu.layers.mome.npu_mome import ColumnParallelMOME
 from omni_npu.layers.attention.npu_sparse_attentions import (
     MLASWAAttention,
@@ -183,13 +183,13 @@ class NPUPanguIndexer(torch.nn.Module):
     def _update_indexer_cache_unquant(
         self,
         k: torch.Tensor,
-        attn_metadata: MLACommonMetadata,
+        slot_mapping: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
     ) -> bool:
 
         slot_indices = torch.stack([
-            attn_metadata.slot_mapping // self.block_size,
-            attn_metadata.slot_mapping % self.block_size,
+            slot_mapping // self.block_size,
+            slot_mapping % self.block_size,
             ], dim=1,
         )
         torch.ops.custom.npu_ai_infra_scatter_block_update_(
@@ -202,7 +202,7 @@ class NPUPanguIndexer(torch.nn.Module):
     def _update_indexer_cache_quant(
         self,
         k: torch.Tensor,
-        attn_metadata: MLACommonMetadata,
+        slot_mapping: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
     ) -> bool:
 
@@ -213,12 +213,12 @@ class NPUPanguIndexer(torch.nn.Module):
             k_hif8 = torch_npu.npu_dtype_cast(k, torch_npu.hifloat8)
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[1].view(-1, k_hif8.shape[-1]).view(torch.int8),
-                attn_metadata.slot_mapping.view(-1, 1),
+                slot_mapping.view(-1, 1),
                 k_hif8.view(-1, k_hif8.shape[-1]).view(torch.int8),
             )
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[2].view(-1, k_scale.shape[-1]),
-                attn_metadata.slot_mapping.view(-1, 1),
+                slot_mapping.view(-1, 1),
                 k_scale.view(-1, k_scale.shape[-1]),
             )
             return True
@@ -286,7 +286,7 @@ class NPUPanguIndexer(torch.nn.Module):
 
         self._update_indexer_cache(
             k,
-            attn_metadata,
+            attn_metadata.slot_mapping,
             kv_cache,
         )
 
@@ -296,6 +296,106 @@ class NPUPanguIndexer(torch.nn.Module):
             attn_metadata,
             kv_cache,
         )
+
+    def _apply_lightning_indexer_cp(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        sp_manager: Optional[MLACommonMetadata] = None,
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        is_second_frag: bool = False,
+    ) -> torch.Tensor:
+        actual_seq_lengths_query = sp_manager.cp_attn_meta_2()[1] if is_second_frag else sp_manager.cp_attn_meta_2()[0]
+        actual_seq_lengths_kv = sp_manager.cp_attn_meta_2()[3] if is_second_frag else sp_manager.cp_attn_meta_2()[1]
+        block_table = sp_manager.blk_table_ori
+
+        return torch.ops.custom.npu_lightning_indexer_enhance(
+            query=q,
+            key=kv_cache[1].unsqueeze(2),
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_kv,
+            block_table=block_table,
+            layout_key="PA_BSND",
+            layout_query="TND",
+            sparse_count=self.index_topk,
+            sparse_mode=3,
+            sparse_block_size=1,
+            sparse_block_mode=False,
+        )[0]
+
+    def forward_cp(
+        self,
+        cp_x: torch.Tensor,
+        sp_x: torch.Tensor,
+        q_lora: torch.Tensor,
+        sp_cos: torch.Tensor,
+        sp_sin: torch.Tensor,
+        cp_cos: torch.Tensor,
+        cp_sin: torch.Tensor,
+        sp_manager: Optional[SPManager] = None,
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        q = self.wq_b(q_lora)
+        q = q.view(-1, self.index_n_heads, self.index_head_dim)
+        q_pe, q_nope = torch.split(
+            q,
+            [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_pe = torch_npu.npu_rotary_mul(
+            q_pe.view(-1, 1, self.index_n_heads, self.qk_rope_head_dim),
+            cp_cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            cp_sin.view(-1, 1, 1, self.qk_rope_head_dim),
+        ).squeeze(1)
+
+        k = self.wk(sp_x)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(
+            k,
+            [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim],
+            dim=-1,
+        )
+        k_pe = torch_npu.npu_rotary_mul(
+            k_pe.view(-1, 1, 1, self.qk_rope_head_dim),
+            sp_cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            sp_sin.view(-1, 1, 1, self.qk_rope_head_dim),
+        ).squeeze(1).squeeze(1)
+
+        k = torch.cat([k_pe, k_nope], dim=-1)
+        k = sp_manager.ag_tokens(k)
+
+        weights = self.weights_proj(cp_x)
+        self._update_indexer_cache(
+            k,
+            sp_manager.slot_mapping_ori,
+            kv_cache,
+        )
+
+        # split q
+        q_nope_1, q_nope_2 = torch.split(q_nope, q_nope.size(0) // 2, dim=0)
+        q_pe_1, q_pe_2 = torch.split(q_pe, q_pe.size(0) // 2, dim=0)
+        q_1 = torch.cat([q_pe_1, q_nope_1], dim=-1)
+        q_2 = torch.cat([q_pe_2, q_nope_2], dim=-1)
+
+        # split weights
+        weights_1, weights_2 = torch.split(weights, weights.size(0) // 2, dim=0)
+
+        topk_indices_1 = self._apply_lightning_indexer_cp(
+            q_1,
+            weights_1,
+            sp_manager,
+            kv_cache,
+        )
+        topk_indices_2 = self._apply_lightning_indexer_cp(
+            q_2,
+            weights_2,
+            sp_manager,
+            kv_cache,
+            is_second_frag=True,
+        )
+
+        return topk_indices_1, topk_indices_2
 
 
 class NPUPanguSparseAttention(torch.nn.Module):
@@ -356,7 +456,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.num_heads = num_heads
         self.tp_size = get_tp_group().world_size
         assert num_heads % self.tp_size == 0
-        self.num_local_heads = num_heads // self.tp_size
+        self.num_local_heads = (
+            num_heads if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else num_heads // self.tp_size
+        )
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         self.quant_symbol = quant_config is not None
@@ -411,6 +513,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             quant_config=self.quant_config,
             prefix=f"{self.layer_name}.q_b_proj",
             return_bias=False,
+            disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
         )
         self.kv_a_layernorm = RMSNorm(
             self.kv_lora_rank,
@@ -423,6 +526,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             quant_config=self.quant_config,
             prefix=f"{self.layer_name}.kv_b_proj",
             return_bias=False,
+            disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -432,6 +536,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             reduce_results=False,
             prefix=f"{self.layer_name}.o_proj",
             return_bias=False,
+            disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
         )
 
     def _init_rotary_emb(self):
@@ -590,7 +695,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             dim=self.num_heads * self.v_head_dim,
             kernel_width=self.mome_kernel_width,
             prefix=f"{self.layer_name}.o_conv",
-            disable_tp=False,
+            disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
         )
 
         # prepare the fake cache, the fake cache indices
@@ -699,20 +804,44 @@ class NPUPanguSparseAttention(torch.nn.Module):
             return self._forward_dummy(
                 hidden_states,
             )
-        elif attn_metadata.prefill is not None:
-            return self._forward_prefill(
-                hidden_states,
-                cos,
-                sin,
-                attn_metadata,
-            )
         else:
-            return self._forward_decode(
-                hidden_states,
-                cos,
-                sin,
-                attn_metadata,
-            )
+            enable_cp = model_extra_config.parall_config.ena_context_parallel and self.is_dsa_layer
+            if self.tp_size > 1:
+                if not self.all2all_backend == "naive" and not enable_cp:
+                    hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
+            if attn_metadata.prefill is not None:
+                if enable_cp:
+                    assert self.all2all_backend != "naive", "Context parallel is not supported with naive all2all backend"
+                    return self._forward_prefill_cp(
+                        hidden_states,
+                        cos,
+                        sin,
+                        attn_metadata
+                    )
+                else:
+                    x = hidden_states[:attn_metadata.num_actual_tokens]
+                    attn_output = self._forward_prefill(
+                        x,
+                        cos,
+                        sin,
+                        attn_metadata,
+                    )
+                    hidden_states[:attn_metadata.num_actual_tokens] = attn_output
+            else:
+                x = hidden_states[:attn_metadata.num_actual_tokens]
+                attn_output = self._forward_decode(
+                    x,
+                    cos,
+                    sin,
+                    attn_metadata,
+                )
+                hidden_states[:attn_metadata.num_actual_tokens] = attn_output
+            if self.tp_size > 1:
+                if self.all2all_backend == "naive":
+                    hidden_states = get_tp_group().all_reduce(hidden_states)
+                elif not enable_cp:
+                    hidden_states = get_tp_group().reduce_scatter(hidden_states, dim=0)
+            return hidden_states
 
     def _forward_dummy(
         self,
@@ -871,6 +1000,306 @@ class NPUPanguSparseAttention(torch.nn.Module):
         )
 
         return attn_output
+
+    def _apply_DSA_attention_cp(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        topk_indices: torch.Tensor,
+        sp_manager: Optional[SPManager] = None,
+        is_second_frag: bool = False,
+    ) -> torch.Tensor:
+        actual_seq_lengths_query = sp_manager.cp_attn_meta_2()[1] if is_second_frag else sp_manager.cp_attn_meta_2()[0]
+        actual_seq_lengths_kv = sp_manager.cp_attn_meta_2()[3] if is_second_frag else sp_manager.cp_attn_meta_2()[1]
+        block_table = sp_manager.blk_table_ori
+
+        q = torch.cat([q_nope, q_pe], dim=-1)
+
+        sink_k_nope = self.kv_a_layernorm(self.param_sink_compressed_kv).unsqueeze(1)
+        sink_k_pe = self.param_sink_k_pe.unsqueeze(1)
+        sink_kv = torch.cat([sink_k_nope, sink_k_pe], dim=-1)
+
+        attn_output = torch.ops.custom.npu_ai_infra_sparse_flash_attention_pioneer(
+            query=q,
+            key=kv_cache[0].unsqueeze(2),
+            value=self.dummy_value_cache,
+            sparse_indices=topk_indices,
+            scale_value=self.scaling,
+            sparse_block_size=1,
+            block_table=block_table,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            pre_tokens=(1<<63)-1,
+            next_tokens=(1<<63)-1,
+            attention_mode=2,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            key_sink=sink_kv,
+            value_sink=sink_k_nope,
+        )[0]
+
+        attn_output = attn_output.transpose(0, 1)
+        attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank)
+        attn_output = (
+            torch.matmul(attn_output, self.attn.impl.W_UV)
+                .transpose(1, 0)
+                .reshape(-1, self.num_local_heads * self.v_head_dim)
+        )
+
+        return attn_output
+
+    def _mome_prefix_exchange(
+        self,
+        x: torch.Tensor,
+        prefix_size: int = 2,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        tp_group = get_tp_group()
+        tp_size = tp_group.world_size
+        tp_rank = tp_group.rank_in_group
+        device = x.device
+    
+        if x.shape[0] % 2 != 0:
+            raise ValueError("Expected two equal-sized local blocks.")
+    
+        block_len = x.shape[0] // 2
+        if block_len < prefix_size:
+            raise ValueError(f"block_len ({block_len}) must be >= prefix_size ({prefix_size}).")
+    
+        # TODO 按请求数量做all_gather拼接
+        phase0_x = x[:block_len]
+        phase1_x = x[block_len:]
+    
+        boundary_local = torch.cat(
+            [phase0_x[-prefix_size:], phase1_x[-prefix_size:]],
+            dim=0,
+        )
+        all_boundaries = tp_group.all_gather(boundary_local, dim=0)
+        chunk = 2 * prefix_size
+    
+        if tp_rank > 0:
+            phase0_prefix = all_boundaries.narrow(0, (tp_rank - 1) * chunk, prefix_size)
+    
+        if tp_rank == tp_size - 1:
+            phase1_prefix = phase0_x[-prefix_size:]
+        else:
+            phase1_prefix = all_boundaries.narrow(0, (tp_rank + 1) * chunk + prefix_size, prefix_size)
+    
+        if tp_rank == 0:
+            merged_x = torch.cat(
+                [phase0_x, phase1_prefix, phase1_x],
+                dim=0,
+            ) 
+        else:
+            merged_x = torch.cat(
+                [phase0_prefix, phase0_x, phase1_prefix, phase1_x],
+                dim=0,
+            )
+    
+        return merged_x, block_len
+
+    def _broadcast_mome_cache_from_rank0(
+        self,
+        cache: torch.Tensor,
+        cache_indices: torch.Tensor,
+        prefix_size: int,
+    ) -> None:
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return
+
+        cache_idx = cache_indices[:1].to(dtype=torch.int64, device=cache.device)
+        cache_slice = cache.index_select(0, cache_idx)[:, :prefix_size].contiguous()
+        torch.distributed.broadcast(
+            cache_slice,
+            src=0,
+            group=tp_group.device_group,
+        )
+        cache[cache_idx, :prefix_size] = cache_slice
+
+    def _mome_split_and_cat(
+        self,
+        merged_output: torch.Tensor,
+        block_length: int,
+        prefix_size: int = 2,
+    ) -> torch.Tensor:
+        rank = get_tp_group().rank_in_group
+        if rank == 0:
+            phase0 = merged_output[:block_length]
+            phase1 = merged_output[block_length + prefix_size:]
+        else:
+            phase0 = merged_output[prefix_size:prefix_size + block_length]
+            phase1 = merged_output[prefix_size + block_length + prefix_size:]
+    
+        hidden_states = torch.cat([phase0, phase1], dim=0)
+        return hidden_states
+
+    def _apply_MOME_prefill_cp(
+        self,
+        x: torch.Tensor,
+        layer: ColumnParallelMOME,
+        cache: torch.Tensor,           # will be obtained in attn_metadata when MoME cache is handled by vLLM
+        cache_indices: torch.Tensor,   # will be obtained in attn_metadata when MoME cache is handled by vLLM
+        sp_manager: Optional[SPManager] = None,
+    ) -> torch.Tensor:
+        prefix_size = self.mome_kernel_width - 1
+        merged_x, block_len = (
+            self._mome_prefix_exchange(x, prefix_size)
+        )
+        merged_x = layer.forward_prefill(
+            merged_x,
+            cache[:, :prefix_size],
+            cache_indices[:1],
+            sp_manager.cp_mome_metadata[0],
+        )
+        # Zigzag SP 中最后一个 block 落在 rank0 的 phase1，需要把对应的
+        # MoME prefix cache 广播给所有 rank，供下一层继续复用。  
+        self._broadcast_mome_cache_from_rank0(cache, cache_indices, prefix_size)
+        return self._mome_split_and_cat(merged_x, block_len, prefix_size)
+
+    def _forward_prefill_cp(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_metadata: Optional[MLACommonMetadata] = None,
+    ) -> torch.Tensor:
+        sp_manager: SPManager = (
+            attn_metadata.prefill.sp_manager
+            if attn_metadata is not None
+            else DummySPManager(get_tp_group()))
+        cos = cos[:attn_metadata.num_actual_tokens]
+        sin = sin[:attn_metadata.num_actual_tokens]
+        lazy_init_cos_sin(sp_manager, cos, sin, init_zigzag=True)
+        sp_cos, sp_sin = sp_manager.sp_cos, sp_manager.sp_sin
+        cp_cos, cp_sin = sp_manager.cp_cos, sp_manager.cp_sin
+        sp_x, cp_x = hidden_states, sp_manager.sp_to_cp(hidden_states)
+
+        ### Q stream begins ###
+        q_lora = self.q_a_proj(cp_x)
+        if self.use_mome:
+            q_lora = self._apply_MOME_prefill_cp(
+                q_lora,
+                self.qa_conv,
+                self.q_mome_cache,
+                self.cache_indices,
+                sp_manager,
+            )
+        q_lora = self.q_a_layernorm(q_lora)
+        q = self.q_b_proj(q_lora)
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(
+            q,
+            [self.qk_nope_head_dim, self.qk_rope_head_dim],
+            dim=-1,
+        )
+
+        q_nope = q_nope.transpose(0, 1) \
+                    .reshape(self.num_local_heads, -1, self.qk_nope_head_dim)
+        q_nope = (
+            torch.matmul(q_nope, self.attn.impl.W_UK_T)
+                .transpose(1, 0)
+                .reshape(-1, self.num_local_heads, self.kv_lora_rank)
+        )
+
+        q_pe = torch_npu.npu_rotary_mul(
+            q_pe.view(-1, 1, self.num_local_heads, self.qk_rope_head_dim),
+            cp_cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            cp_sin.view(-1, 1, 1, self.qk_rope_head_dim),
+            rotary_mode="half" if not self.rope_interleaved else "interleave",
+        ).squeeze(1)
+        q_nope = q_nope.contiguous()
+        q_pe = q_pe.contiguous()
+        ### Q stream ends ###
+
+        # get KV cache for this layer
+        kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
+        ### Indexer stream begins ###
+        topk_indices_1, topk_indices_2 = self.indexer.forward_cp(
+            cp_x,
+            sp_x,
+            q_lora,
+            sp_cos,
+            sp_sin,
+            cp_cos,
+            cp_sin,
+            sp_manager,
+            kv_cache,
+        )
+        ### Indexer stream ends ###
+
+        ### KV stream begins ###
+        kv = self.kv_a_proj_with_mqa(sp_x)
+        kv = sp_manager.ag_tokens(kv)
+        k_nope, k_pe = torch.split(
+            kv,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        if self.use_mome:
+            k_nope = self._apply_MOME(
+                k_nope,
+                self.compresskv_conv,
+                self.kv_mome_cache,
+                self.cache_indices,
+                attn_metadata,
+            )
+
+        kv = torch.cat([k_nope, k_pe], dim=-1)
+
+        kwargs = {
+            "kv": kv.view(-1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+            "k_cache": None,
+            "ckv_cache": kv_cache[0].unsqueeze(2),
+            "gamma": self.kv_a_layernorm.weight,
+            "cos": cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            "sin": sin.view(-1, 1, 1, self.qk_rope_head_dim),
+            "index": sp_manager.slot_mapping_ori,
+            "epsilon": self.kv_a_layernorm.variance_epsilon,
+            "cache_mode": "PA",
+            "rotary_mode": "half" if not self.rope_interleaved else "interleave-half",
+            "quant_mode": "none",
+            "is_output_kv": True,
+        }
+
+        k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(**kwargs)
+        ### KV stream ends ###
+
+        # split q
+        q_nope_1, q_nope_2 = torch.split(q_nope, q_nope.size(0) // 2, dim=0)
+        q_pe_1, q_pe_2 = torch.split(q_pe, q_pe.size(0) // 2, dim=0)
+
+        attn_output_1 = self._apply_DSA_attention_cp(
+            q_nope_1,
+            q_pe_1,
+            kv_cache,
+            topk_indices_1,
+            sp_manager,
+        )
+        attn_output_2 = self._apply_DSA_attention_cp(
+            q_nope_2,
+            q_pe_2,
+            kv_cache,
+            topk_indices_2,
+            sp_manager,
+            is_second_frag=True,
+        )
+        attn_output = torch.cat([attn_output_1, attn_output_2], dim=0)
+
+        if self.use_mome:
+            attn_output = self._apply_MOME_prefill_cp(
+                attn_output,
+                self.o_conv,
+                self.o_mome_cache,
+                self.cache_indices,
+                sp_manager,
+            )
+
+        hidden_states = self.o_proj(attn_output)
+
+        hidden_states = sp_manager.cp_to_sp(hidden_states)
+        return hidden_states
 
     def _forward_prefill(
         self,
@@ -1068,10 +1497,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # get KV cache for this layer
         kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
 
-        if self.tp_size > 1:
-            if not self.all2all_backend == "naive":
-                hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
-
         ### Q stream begins ###
         q_lora = self.q_a_proj(hidden_states)
         if self.use_mome:
@@ -1171,7 +1596,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata],
-        topk_indices: torch.Tensor,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # DSA layer c8 shape
         if self.cache_config.cache_dtype in ["hif8_ds_mla"] and self.is_dsa_layer:
@@ -1208,7 +1633,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata],
-        topk_indices: torch.Tensor,
+        topk_indices: Optional[torch.Tensor] = None,
     ):
         # the rest cases are unquantized
         kv = torch.cat([k_nope, k_pe], dim=-1)
@@ -1282,12 +1707,4 @@ class NPUPanguSparseAttention(torch.nn.Module):
             )
 
         hidden_states = self.o_proj(attn_output)
-
-        if self.tp_size > 1:
-            if self.all2all_backend == "naive":
-                hidden_states = get_tp_group().all_reduce(hidden_states)
-            else:
-                hidden_states = get_tp_group().reduce_scatter(hidden_states, dim=0)
-
         return hidden_states
-

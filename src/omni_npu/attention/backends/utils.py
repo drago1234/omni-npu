@@ -2,7 +2,13 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import torch
+import numpy as np
+
+from vllm.utils.math_utils import cdiv
+from vllm.distributed import GroupCoordinator
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
+
 
 logger = init_logger(__name__)
 NPU_ATTENTION_BACKEND = {}
@@ -117,3 +123,301 @@ def register_attention_backend(backend: str):
         return cls
 
     return decorator
+
+
+class SPManager:
+    """
+    This module handles sequence parallelism (SP).
+
+    SP here refers to standard SP splitting, i.e., splitting tokens with ceil division
+    based on sp_size.
+
+    CP refers to zigzag-form SP splitting, aimed at adjusting query distribution to
+    balance attention computation across ranks.
+
+    Module initialization defaults to standard SP operations; CP-related operations
+    require explicit init_zigzag flag.
+    """
+
+    def __init__(
+        self,
+        sp_group: GroupCoordinator,
+        blk_table_ref: torch.Tensor,   # ref only
+        slot_mapping_ref: torch.Tensor,
+        cumlens: torch.Tensor,         # [B + 1]
+        cumlens_np: np.ndarray = None, # [B + 1]
+        init_zigzag: bool = False,
+        pg: int = 128,                 # page size
+        mome_kernel_width: int = 3,
+    ):
+        self.sp_group = sp_group
+        self.sp_size = sp_group.world_size
+        self.sp_rank = sp_group.rank_in_group
+        self.sp_comm = sp_group.device_group
+        self.mome_kernel_width = mome_kernel_width
+        assert self.sp_size > 0
+
+        if cumlens_np is None:
+            cumlens_np = np.array(cumlens.tolist(), dtype=np.int32)
+        assert cumlens.dim() == 1 and cumlens_np.ndim == 1
+        assert cumlens_np.size == cumlens.size(0)
+        assert cumlens.size(0) > 1 # at least 2 elements in a valid batch, [B + 1]
+
+        assert blk_table_ref.dim() == 2
+        self.table_size = blk_table_ref.size(1)
+        self.pg = pg
+        self.init_zigzag = init_zigzag
+        self.blk_table_ori = blk_table_ref.clone()
+        self.slot_mapping_ori = slot_mapping_ref.clone()
+
+        self._scheme_sp_ctrl(cumlens_np)
+        if init_zigzag:
+            self._scheme_cp_attn(cumlens)
+            self._scheme_cp_slice(cumlens_np)
+            self._scheme_cp_reorg(cumlens_np)
+            self._scheme_cp_mome(cumlens_np)
+
+
+    def _scheme_sp_ctrl(self, cumlens: np.ndarray):
+        self.tok = int(cumlens[-1])
+        self.sp_len = cdiv(self.tok, self.sp_size)
+        self.sp_align = self.sp_len * self.sp_size
+        a = min(self.tok, self.sp_rank * self.sp_len)
+        b = min(self.tok, a + self.sp_len)
+        self.slice_domain = (a, b)
+
+    def align_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.size(0) == self.tok
+        if self.tok == self.sp_align:
+            return x
+        y = x.new_zeros(self.sp_align, *x.shape[1:])
+        y[:self.tok] = x
+        return y
+
+    def slice_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.size(0) >= self.tok
+        a, b = self.slice_domain
+        if b == a + self.sp_len:
+            return x[a:b]
+        y = x.new_zeros(self.sp_len, *x.shape[1:])
+        if b > a:
+            y[:b - a] = x[a:b]
+        return y
+
+    def ag_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.size(0) == self.sp_len
+        return self.sp_group.all_gather(x, dim=0)[:self.tok]
+
+
+    def _scheme_cp_reorg(self, cumlens: np.ndarray): # [B + 1]
+        frag_num = self.sp_size * 2
+        frag_lens = cdiv(np.diff(cumlens), frag_num)
+
+        ends = cumlens[1:].repeat(2)
+        frags = frag_lens.repeat(2)
+        frags_base = frags.cumsum() - frags
+        sp_len, cp_len = self.sp_len, int(frags.sum())
+
+        class slicer:
+            def __init__(self, src, dst, cp, raw):
+                self.src, self.dst = int(src), int(dst)
+                self.cp, self.raw = int(cp), int(raw)
+                self.len = 0
+            def slice_src(self, x: torch.Tensor):
+                return x[self.src : self.src + self.raw]
+            def slice_dst(self, x: torch.Tensor):
+                return x[self.dst : self.dst + self.raw]
+
+        def _recv(cp: int, sends: list):
+            prev = slicer(0, 0, cp, 0)
+            sends[0].append(prev)
+            left = np.stack([
+                cumlens[:-1] + cp * frag_lens,
+                cumlens[:-1] + (frag_num - 1 - cp) * frag_lens,
+            ]).transpose().flatten()
+            right = np.clip(left + frags, a_max=ends, a_min=None)
+            for p, a, b in zip(frags_base, left, right):
+                while(a < b):
+                    inc = sp_len - a % sp_len
+                    sect = slicer(a % sp_len, p, cp, raw=min(inc, b - a))
+                    sends[a // sp_len].append(sect)
+                    prev.len = sect.dst - prev.dst
+                    prev = sect; a += inc; p += inc
+            prev.len = cp_len - prev.dst
+
+        parallel = range(self.sp_size)
+        sends = [[] for sp in parallel] # [sp, *]
+        for cp in parallel: _recv(cp, sends)
+        sends[0] = [it for it in sends[0] if it.len > 0]
+
+        a2a_map = [] # [sp, cp]
+        for sp_sects in sends:
+            send_split = [0 for cp in parallel]
+            dst = 0
+            for sect in sp_sects:
+                sect.dst = dst # post-a2a -> pre-a2a
+                dst += sect.len
+                send_split[sect.cp] += sect.len
+            a2a_map.append(send_split)
+
+        sends = sends[self.sp_rank]
+        sp_split = a2a_map[self.sp_rank]
+        cp_split = [it[self.sp_rank] for it in a2a_map]
+
+        self.cp_reorg_metadata = (sends, sp_split, cp_split, sp_len, cp_len)
+
+    def sp_to_cp(self, sp: torch.Tensor) -> torch.Tensor:
+        assert self.init_zigzag
+        sends, sp_split, cp_split, sp_len, cp_len = self.cp_reorg_metadata
+        assert sp.size(0) == sp_len
+        tmp = sp.new_zeros(sum(sp_split), *sp.shape[1:])
+        for it in sends:
+            it.slice_dst(tmp).copy_(it.slice_src(sp))
+        cp = sp.new_empty(cp_len, *sp.shape[1:])
+        # split could be all 0, for send-only or recv-only case
+        torch.distributed.all_to_all_single(
+            cp, tmp, cp_split, sp_split,
+            group=self.sp_comm)
+        return cp # output zigzag
+
+    def cp_to_sp(self, cp: torch.Tensor) -> torch.Tensor:
+        assert self.init_zigzag
+        sends, sp_split, cp_split, sp_len, cp_len = self.cp_reorg_metadata
+        assert cp.size(0) == cp_len
+        tmp = cp.new_empty(sum(sp_split), *cp.shape[1:])
+        # split could be all 0, for send-only or recv-only case
+        torch.distributed.all_to_all_single(
+            tmp, cp, sp_split, cp_split,
+            group=self.sp_comm)
+        sp = cp.new_zeros(sp_len, *cp.shape[1:])
+        for it in sends:
+            it.slice_src(sp).copy_(it.slice_dst(tmp))
+        return sp
+
+
+    def _scheme_cp_slice(self, cumlens: np.ndarray):
+        frag_num = self.sp_size * 2
+        frag_lens = cdiv(np.diff(cumlens), frag_num)
+
+        ends = cumlens[1:].repeat(2)
+        frags = frag_lens.repeat(2)
+        frags_base = frags.cumsum() - frags
+
+        left = np.stack([
+            cumlens[:-1] + self.sp_rank * frag_lens,
+            cumlens[:-1] + (frag_num - 1 - self.sp_rank) * frag_lens,
+        ]).transpose().flatten()
+        right = np.clip(left + frags, a_max=ends, a_min=None)
+
+        sects = [(dst, src, end - src) for dst, src, end
+            in zip(frags_base, left, right) if src < end]
+        cp_len = int(frags.sum())
+        self.cp_slice_metadata = (sects, cp_len)
+
+    def cp_slice(self, x: torch.Tensor) -> torch.Tensor:
+        assert self.init_zigzag
+        assert x.size(0) >= self.tok
+        sects, cp_len = self.cp_slice_metadata
+        y = x.new_zeros(cp_len, *x.shape[1:])
+        for dst, src, n in sects:
+            y[dst : dst + n] = x[src : src + n]
+        return y
+
+
+    def _scheme_cp_attn(self, cumlens: torch.Tensor):
+        frag_num = self.sp_size * 2
+        cumlens = cumlens.to(torch.int32)    # [B + 1]
+        seq_lens = cumlens.diff()            # [B]
+        frag_lens = cdiv(seq_lens, frag_num) # [B]
+        seq_blks = cdiv(seq_lens, self.pg)   # [B]
+
+        kv_lens_1 = frag_lens * (self.sp_rank + 1)                # [B]
+        kv_lens_2 = frag_lens * (frag_num - self.sp_rank)         # [B]
+        frag_cumlens = frag_lens.cumsum(dim=0, dtype=torch.int32) # [B]
+        self.cp_attn_metadata_half = (frag_cumlens, frag_cumlens, kv_lens_1, kv_lens_2)
+
+        q_lens = frag_lens.repeat_interleave(2, dim=0)      # [2B]
+        q_cumlens = q_lens.cumsum(dim=0, dtype=torch.int32) # [2B]
+        kv_lens = torch.stack([kv_lens_1, kv_lens_2])       # [2, B]
+        kv_lens = kv_lens.transpose(0, 1).flatten()         # [2B]
+
+        blk_base = seq_blks.cumsum(dim=0, dtype=torch.int32) - seq_blks
+        table0 = torch.arange(self.table_size, dtype=torch.int32, device=cumlens.device)
+        blk_table = (table0.view(1, -1) + blk_base.repeat_interleave(2, dim=0).view(-1, 1))
+        self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table)
+
+        seq_lens = seq_lens.tolist()
+        align_lens = (seq_blks * self.pg).tolist()
+        self.blk_align_metadata = (seq_lens, align_lens)
+
+    def cp_attn_meta(self) -> tuple:
+        # FA once:
+        #
+        assert self.init_zigzag
+        return self.cp_attn_metadata # q_cumlens, kv_lens, blk_table
+
+    def cp_attn_meta_2(self) -> tuple:
+        assert self.init_zigzag
+        # return q_cumlens_1, q_cumlens_2, kv_lens_1, kv_lens_2
+        return self.cp_attn_metadata_half
+
+    def page_align(self, x: torch.Tensor) -> torch.Tensor:
+        assert self.init_zigzag
+        seq_lens, align_lens = self.blk_align_metadata
+        assert x.size(0) == self.tok
+        y = x.new_empty(sum(align_lens), *x.shape[1:])
+        torch.split_with_sizes_copy(x, seq_lens,
+            out=[it[:n] for it, n in
+                zip(y.split(align_lens), seq_lens)])
+        return y.view(-1, self.pg, 1, x.size(-1))
+
+    def _scheme_cp_mome(self, cumlens: np.ndarray):
+        cp_query_start_loc = cdiv(cumlens, self.sp_size)
+        if self.sp_rank == 0:
+            offset = self.mome_kernel_width - 1
+        else:
+            offset = (self.mome_kernel_width - 1) * 2
+        mome_query_start_loc = cp_query_start_loc + offset
+        mome_query_start_loc[0] = cp_query_start_loc[0]
+        mome_query_start_loc_tensor = torch.tensor(mome_query_start_loc, dtype=torch.int32, device=current_platform.device_type)
+        self.cp_mome_metadata = (mome_query_start_loc_tensor, )
+
+
+class DummySPManager:
+
+    def __init__(self, sp_group: GroupCoordinator):
+        self.sp_size = sp_group.world_size
+        # in dummy_run, we assert token_num divisible by sp_size
+
+    def sp_to_cp(self, x: torch.Tensor):
+        return x
+    def cp_to_sp(self, x: torch.Tensor):
+        return x
+    def align_tokens(self, x: torch.Tensor):
+        return x
+    def page_align(self, x: torch.Tensor):
+        return x
+
+    def slice_tokens(self, x: torch.Tensor):
+        return x[: x.size(0) // self.sp_size].clone()
+    def cp_slice(self, x: torch.Tensor):
+        return x[: x.size(0) // self.sp_size].clone()
+    def ag_tokens(self, x: torch.Tensor):
+        return torch.cat([x] * self.sp_size)
+    def cp_attn_meta(self) -> tuple:
+        return None, None, None
+
+
+def lazy_init_cos_sin(
+    sp_manager: SPManager | DummySPManager,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    init_zigzag: bool = False,
+):
+    if hasattr(sp_manager, "sp_cos"):
+        return
+    if init_zigzag:
+        sp_manager.cp_cos = sp_manager.cp_slice(cos)
+        sp_manager.cp_sin = sp_manager.cp_slice(sin)
+    sp_manager.sp_cos = sp_manager.slice_tokens(cos)
+    sp_manager.sp_sin = sp_manager.slice_tokens(sin)
