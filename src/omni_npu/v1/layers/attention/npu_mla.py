@@ -486,7 +486,6 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             output = self.o_proj.forward(attn_output)[0]
             return output
 
-        actual_seq_kvlen = attn_metadata.seq_lens
         actual_seq_qlen = attn_metadata.query_cumlens
         if attn_metadata.max_query_len > 1:
             attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE
@@ -554,8 +553,8 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
         q_pe = q_pe.squeeze(2) # BSH
         with torch.npu.stream(sub_stream):
-            prefill_kv_a = kv_a[:actual_seq_kvlen[-1]]
-            prefill_k_pe = k_pe[:actual_seq_kvlen[-1]]
+            prefill_kv_a = kv_a[:actual_seq_qlen[-1]]
+            prefill_k_pe = k_pe[:actual_seq_qlen[-1]]
             # When sink tokens are used, we need to insert cached sink tokens at the beginning of each sequence
             if self.param_sink_number > 0:
                 prefill_k_pe = prefill_k_pe.squeeze(2).squeeze(1)
@@ -623,7 +622,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 atten_mask=attn_mask,
                 sparse_mode=sparse_mode,
                 actual_seq_lengths=actual_seq_qlen,
-                actual_seq_lengths_kv=actual_seq_kvlen,
+                actual_seq_lengths_kv=kv_cumlens,
                 scale=self.scaling,
                 next_tokens=0
             )[0]
