@@ -304,6 +304,19 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         return attn_metadata
 
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+        num_accepted_tokens: torch.Tensor | None = None,
+    ) -> NPUMomeAttentionMetadata:
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            num_accepted_tokens=num_accepted_tokens,
+            fast_build=True,
+        )
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ):

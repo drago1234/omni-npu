@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from copy import copy
+from dataclasses import dataclass, field
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,11 +16,11 @@ from vllm.forward_context import set_forward_context, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.v1.attention.backend import (
+    AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -26,12 +29,23 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.attention.backends.tree_attn import TreeAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer, PADDING_SLOT_ID
 
+from omni_npu.attention.backends.mome import NPUMomeAttentionMetadataBuilder
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
 logger = init_logger(__name__)
 
 EagleProposer_original_init_ = EagleProposer.__init__
+
+@dataclass
+class DraftAttnGroup:
+    """A group of draft layers sharing the same KV cache group and attention
+    backend. All layers in a DraftAttnGroup share one block table and one metadata
+    builder."""
+    kv_cache_group_id: int
+    layer_names: list[str] = field(default_factory=list)
+    builder: AttentionMetadataBuilder | None = None
+    is_base: bool = False  # True for group containing attn_layer_names[0]
 
 @register_patch("TorchEagleProposer", EagleProposer)
 class EagleProposerPatch(VLLMPatch):
@@ -46,6 +60,10 @@ class EagleProposerPatch(VLLMPatch):
         'load_model',
         'propose',
         'propose_multi_mtp',
+        'validate_same_kv_cache_group',
+        '_build_common_attn_metadata_for_group',
+        '_build_per_group_metadata',
+        '_rebuild_per_group_metadata_for_step',
     ]
 
     def __init__(self, *args, **kwargs):
@@ -254,13 +272,6 @@ class EagleProposerPatch(VLLMPatch):
         target_attn_layer_names = set(
             get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
         )
-        # FIXME: support hybrid kv for draft model
-        target_indexer_layer_names = set(
-            get_layers_from_vllm_config(
-                self.vllm_config, DeepseekV32IndexerCache
-            ).keys()
-        )
-
         from vllm.compilation.backends import set_model_tag
 
         with set_model_tag("eagle_head"):
@@ -268,31 +279,21 @@ class EagleProposerPatch(VLLMPatch):
                 vllm_config=self.vllm_config, model_config=draft_model_config
             )
 
-        draft_attn_layer_names = (
-            get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
-            - target_attn_layer_names
-        )
-        indexer_layers = get_layers_from_vllm_config(
-            self.vllm_config, DeepseekV32IndexerCache
-        )
-        draft_indexer_layer_names = indexer_layers.keys() - target_indexer_layer_names
-        self.attn_layer_names = list(draft_attn_layer_names - draft_indexer_layer_names)
-        self.indexer_layer_names = list(draft_indexer_layer_names)
-
-        if self.indexer_layer_names:
-            first_layer = self.indexer_layer_names[0]
-            self.draft_indexer_metadata_builder = (
-                indexer_layers[first_layer]
-                .get_attn_backend()
-                .get_builder_cls()(
-                    indexer_layers[first_layer].get_kv_cache_spec(self.vllm_config),
-                    self.indexer_layer_names,
-                    self.vllm_config,
-                    self.device,
-                )
+        # All draft AttentionLayerBase layers — no type-specific separation.
+        # The per-group DraftAttnGroup structure handles heterogeneous attention types.
+        self.attn_layer_names = sorted(
+            list(
+                get_layers_from_vllm_config(
+                    self.vllm_config, AttentionLayerBase
+                ).keys()
+                - target_attn_layer_names
             )
-        else:
-            self.draft_indexer_metadata_builder = None
+        )
+
+        # Per-group structures — populated in validate_same_kv_cache_group()
+        # when the kv_cache_config and runner.attn_groups are available.
+        self.draft_attn_groups: list[DraftAttnGroup] = []
+        self.base_kv_cache_group_id: int | None = None
 
         if self.supports_mm_inputs:
             # Even if the target model is multimodal, we can also use
@@ -433,6 +434,167 @@ class EagleProposerPatch(VLLMPatch):
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
 
+    def validate_same_kv_cache_group(self, kv_cache_config) -> None:
+        """Build per-group draft layer structure from runner's attn_groups.
+
+        Instead of requiring all draft layers to be in one KV cache group,
+        this discovers each draft layer's (kv_cache_gid, attn_group) and
+        groups them accordingly.  Each DraftAttnGroup shares one block table
+        and one metadata builder.
+        """
+        base_layer = (
+            self.attn_layer_names[0] if self.attn_layer_names else None
+        )
+
+        self.draft_attn_groups = []
+        for kv_cache_group_id, kv_attn_groups in enumerate(self.runner.attn_groups):
+            for attn_group in kv_attn_groups:
+                draft_in_group = set(attn_group.layer_names) & set(self.attn_layer_names)
+                if draft_in_group:
+                    is_base = (
+                        base_layer is not None
+                        and base_layer in draft_in_group
+                    )
+                    self.draft_attn_groups.append(
+                        DraftAttnGroup(
+                            kv_cache_group_id=kv_cache_group_id,
+                            layer_names=sorted(list(draft_in_group)),
+                            builder=attn_group.get_metadata_builder(),
+                            is_base=is_base,
+                        )
+                    )
+
+        # Sort so the base group comes first.  This ensures the base CM is
+        # updated in-place before other groups shallow-copy from it.
+        self.draft_attn_groups.sort(
+            key=lambda g: (not g.is_base, g.kv_cache_group_id)
+        )
+        self.base_kv_cache_group_id = next(
+            (g.kv_cache_group_id for g in self.draft_attn_groups if g.is_base), None
+        )
+
+    def _build_common_attn_metadata_for_group(
+        self,
+        kv_cache_group_id: int,
+        base_cm: CommonAttentionMetadata,
+    ) -> CommonAttentionMetadata:
+        """Return a CommonAttentionMetadata with the group's block table.
+
+        For the base group the original *base_cm* is returned as-is (no
+        copy).  For other groups a shallow copy is made and the block table
+        / slot_mapping are swapped.
+        """
+        if kv_cache_group_id == self.base_kv_cache_group_id:
+            return base_cm
+        cm = copy(base_cm)
+        blk_table = self.runner.input_batch.block_table[kv_cache_group_id]
+        cm.block_table_tensor = blk_table.get_device_tensor(
+            base_cm.num_reqs
+        )
+        cm.slot_mapping = blk_table.slot_mapping.gpu[
+            : base_cm.num_actual_tokens
+        ]
+        return cm
+
+    def _build_per_group_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int = 0,
+    ) -> dict:
+        """Build per-layer attention metadata for all draft groups."""
+
+        per_layer_attn_metadata: dict = {}
+        for group in self.draft_attn_groups:
+            extra_attn_metadata_args = {}
+            if isinstance(group.builder, NPUMomeAttentionMetadataBuilder):
+                extra_attn_metadata_args['num_accepted_tokens'] = \
+                    self.runner.num_accepted_tokens.gpu[
+                        :common_attn_metadata.num_reqs
+                    ]
+
+            cm = self._build_common_attn_metadata_for_group(
+                group.kv_cache_group_id,
+                common_attn_metadata,
+            )
+            attn_metadata = group.builder.build_for_drafting(
+                common_attn_metadata=cm,
+                draft_index=draft_index,
+                **extra_attn_metadata_args,
+            )
+            for name in group.layer_names:
+                per_layer_attn_metadata[name] = attn_metadata
+        return per_layer_attn_metadata
+
+    def _rebuild_per_group_metadata_for_step(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        clamped_positions: torch.Tensor,
+        exceeds_max_model_len: torch.Tensor,
+        token_index: int,
+        per_layer_attn_metadata: dict,
+    ) -> None:
+        """Rebuild metadata for all draft groups after a seq_lens increment.
+
+        Computes per-group slot_mapping using each group's own block table
+        and block size, then rebuilds backend-specific metadata.
+
+        ``self.draft_attn_groups`` is sorted base-first so that
+        ``common_attn_metadata`` is updated in-place before other groups
+        shallow-copy from it.
+        """
+        for group in self.draft_attn_groups:
+            builder = group.builder
+            block_size = builder.kv_cache_spec.block_size
+            blk_table = self.runner.input_batch.block_table[group.kv_cache_group_id]
+            blk_table_tensor = blk_table.get_device_tensor(
+                common_attn_metadata.num_reqs
+            )
+
+            # Compute slot_mapping for this group
+            if self.uses_mrope:
+                block_numbers = clamped_positions[0] // block_size
+            else:
+                block_numbers = clamped_positions // block_size
+            block_ids = blk_table_tensor.gather(
+                dim=1, index=block_numbers.view(-1, 1)
+            ).view(-1)
+            if self.uses_mrope:
+                slot_mapping = (
+                    block_ids * block_size
+                    + clamped_positions[0] % block_size
+                )
+            else:
+                slot_mapping = (
+                    block_ids * block_size
+                    + clamped_positions % block_size
+                )
+            slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+
+            if group.kv_cache_group_id == self.base_kv_cache_group_id:
+                # Update base CM in-place (preserves current behaviour)
+                common_attn_metadata.block_table_tensor = blk_table_tensor
+                common_attn_metadata.slot_mapping = slot_mapping
+                group_cm = common_attn_metadata
+            else:
+                group_cm = copy(common_attn_metadata)
+                group_cm.block_table_tensor = blk_table_tensor
+                group_cm.slot_mapping = slot_mapping
+
+            extra_attn_metadata_args = {}
+            if isinstance(builder, NPUMomeAttentionMetadataBuilder):
+                extra_attn_metadata_args['num_accepted_tokens'] = \
+                    self.runner.num_accepted_tokens.gpu[
+                        :common_attn_metadata.num_reqs
+                    ]
+
+            attn_metadata = builder.build_for_drafting(
+                common_attn_metadata=group_cm,
+                draft_index=token_index + 1,
+                **extra_attn_metadata_args,
+            )
+            for name in group.layer_names:
+                per_layer_attn_metadata[name] = attn_metadata
+
     def propose(
         self,
         # [num_tokens]
@@ -488,33 +650,10 @@ class EagleProposerPatch(VLLMPatch):
 
         assert self.runner is not None
 
-        if self.attn_metadata_builder is None:
-            attn_metadata_builder = self._get_attention_metadata_builder()
-        else:
-            attn_metadata_builder = self.attn_metadata_builder
-
-        attn_metadata = attn_metadata_builder.build_for_drafting(
-            common_attn_metadata=common_attn_metadata, draft_index=0
+        per_layer_attn_metadata = self._build_per_group_metadata(
+            common_attn_metadata,
+            draft_index=0,
         )
-        # FIXME: support hybrid kv for draft model (remove separate indexer)
-        if self.draft_indexer_metadata_builder:
-            draft_indexer_metadata = (
-                self.draft_indexer_metadata_builder.build_for_drafting(
-                    common_attn_metadata=common_attn_metadata,
-                    draft_index=0,
-                )
-            )
-        else:
-            draft_indexer_metadata = None
-        # At this moment, we assume all eagle layers belong to the same KV
-        # cache group, thus using the same attention metadata.
-        per_layer_attn_metadata = {}
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
-
-        for layer_name in self.indexer_layer_names:
-            assert draft_indexer_metadata is not None
-            per_layer_attn_metadata[layer_name] = draft_indexer_metadata
 
         num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
             num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
@@ -599,7 +738,8 @@ class EagleProposerPatch(VLLMPatch):
         else:
             hidden_states = hidden_states[last_token_indices]
 
-        if isinstance(attn_metadata, TreeAttentionMetadata):
+        if any(isinstance(metadata, TreeAttentionMetadata)
+               for metadata in per_layer_attn_metadata.values()):
             # Draft using tree attention.
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
@@ -613,15 +753,15 @@ class EagleProposerPatch(VLLMPatch):
 
         draft_token_ids = logits.argmax(dim=-1)
 
-        if self.allowed_attn_types is not None and not isinstance(
-            attn_metadata, self.allowed_attn_types
-        ):
-            raise ValueError(
-                f"Unsupported attention metadata type for speculative "
-                "decoding with num_speculative_tokens > 1: "
-                f"{type(attn_metadata)}. Supported types are: "
-                f"{self.allowed_attn_types}"
-            )
+        if self.allowed_attn_types is not None:
+            for layer_name, metadata in per_layer_attn_metadata.items():
+                if not isinstance(metadata, self.allowed_attn_types):
+                    raise ValueError(
+                        f"Unsupported attention metadata type for speculative "
+                        f"decoding with num_speculative_tokens > 1: "
+                        f"{type(metadata)} (layer {layer_name}). Supported types "
+                        f"are: {self.allowed_attn_types}"
+                    )
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
@@ -703,38 +843,15 @@ class EagleProposerPatch(VLLMPatch):
             if common_attn_metadata._num_computed_tokens_cpu is not None:
                 common_attn_metadata._num_computed_tokens_cpu += 1
 
-            # Compute the slot mapping.
-            block_size = attn_metadata_builder.kv_cache_spec.block_size
-            if self.uses_mrope:
-                # all dimensions of positions are the same
-                block_numbers = clamped_positions[0] // block_size
-            else:
-                block_numbers = clamped_positions // block_size
-            block_ids = common_attn_metadata.block_table_tensor.gather(
-                dim=1, index=block_numbers.view(-1, 1)
+            # Compute slot mapping and rebuild attention metadata for all
+            # draft groups (each with its own block table and block size).
+            self._rebuild_per_group_metadata_for_step(
+                common_attn_metadata=common_attn_metadata,
+                clamped_positions=clamped_positions,
+                exceeds_max_model_len=exceeds_max_model_len,
+                token_index=token_index,
+                per_layer_attn_metadata=per_layer_attn_metadata,
             )
-            block_ids = block_ids.view(-1)
-            if self.uses_mrope:
-                common_attn_metadata.slot_mapping = (
-                    block_ids * block_size + clamped_positions[0] % block_size
-                )
-            else:
-                common_attn_metadata.slot_mapping = (
-                    block_ids * block_size + clamped_positions % block_size
-                )
-            # Mask out the slot mappings that exceed the max model length.
-            # Otherwise, the KV cache will be inadvertently updated with the
-            # padding tokens.
-            common_attn_metadata.slot_mapping.masked_fill_(
-                exceeds_max_model_len, PADDING_SLOT_ID
-            )
-
-            # Rebuild attention metadata
-            attn_metadata = attn_metadata_builder.build_for_drafting(  # type: ignore
-                common_attn_metadata=common_attn_metadata, draft_index=token_index + 1
-            )
-            for layer_name in self.attn_layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -802,33 +919,10 @@ class EagleProposerPatch(VLLMPatch):
 
         assert self.runner is not None
 
-        if self.attn_metadata_builder is None:
-            attn_metadata_builder = self._get_attention_metadata_builder()
-        else:
-            attn_metadata_builder = self.attn_metadata_builder
-
-        attn_metadata = attn_metadata_builder.build_for_drafting(
-            common_attn_metadata=common_attn_metadata, draft_index=0
+        per_layer_attn_metadata = self._build_per_group_metadata(
+            common_attn_metadata,
+            draft_index=0,
         )
-        # FIXME: support hybrid kv for draft model (remove separate indexer)
-        if self.draft_indexer_metadata_builder:
-            draft_indexer_metadata = (
-                self.draft_indexer_metadata_builder.build_for_drafting(
-                    common_attn_metadata=common_attn_metadata,
-                    draft_index=0,
-                )
-            )
-        else:
-            draft_indexer_metadata = None
-        # At this moment, we assume all eagle layers belong to the same KV
-        # cache group, thus using the same attention metadata.
-        per_layer_attn_metadata = {}
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
-
-        for layer_name in self.indexer_layer_names:
-            assert draft_indexer_metadata is not None
-            per_layer_attn_metadata[layer_name] = draft_indexer_metadata
 
         num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
             num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
