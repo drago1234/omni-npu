@@ -35,6 +35,12 @@ _original_preprocess_chat = OpenAIServingChat._preprocess_chat
 _original_preprocess_chat_engine = OpenAIServing._preprocess_chat
 _original_update_waiting_for_remote_kv = Scheduler._update_waiting_for_remote_kv
 _original_generate = AsyncLLM.generate
+_ROUTED_EXPERT_KEYS = (
+    "routed_experts_shape",
+    "routed_experts_dtype",
+    "routed_experts_str_len",
+    "routed_experts_str",
+)
 
 async def to_async_iterator(input: RequestOutput) -> AsyncIterator[RequestOutput]:
     yield input
@@ -95,9 +101,70 @@ class OpenAIServingChatPatch(VLLMPatch):
                     output.stop_reason for output in final_res.outputs
                 ]
 
+        request_kv_payload = None
+        if request.kv_transfer_params and all(
+            key in request.kv_transfer_params for key in _ROUTED_EXPERT_KEYS
+        ):
+            request_kv_payload = {
+                key: request.kv_transfer_params[key] for key in _ROUTED_EXPERT_KEYS
+            }
+
+        engine_client = getattr(self, "engine_client", None)
+        vllm_config = getattr(engine_client, "vllm_config", None)
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        is_prefill_node = False
+        if kv_transfer_config is not None and getattr(
+            kv_transfer_config, "is_kv_transfer_instance", False
+        ):
+            kv_role = getattr(kv_transfer_config, "kv_role", None)
+            if kv_role == "kv_producer" or getattr(
+                kv_transfer_config, "is_kv_producer", False
+            ):
+                is_prefill_node = True
+        elif os.getenv("ROLE") == "prefill":
+            is_prefill_node = True
+
+        if is_prefill_node:
+            for output in final_res.outputs:
+                routed_experts = getattr(output, "routed_experts", None)
+                if routed_experts is None or getattr(routed_experts, "shape", None) is None:
+                    continue
+                if routed_experts.shape[0] == 0:
+                    continue
+                if final_res.kv_transfer_params is None:
+                    final_res.kv_transfer_params = {}
+                self.add_ndarray_info_to_dict(
+                    routed_experts,
+                    final_res.kv_transfer_params,
+                )
+                break
+
         response = await _original_chat_completion_full_generator(self, request, to_async_iterator(final_res), request_id, model_name, conversation, tokenizer, request_metadata)
         if isinstance(response, ErrorResponse):
             return response
+
+        payloads = []
+        for output in final_res.outputs:
+            routed_experts = getattr(output, "routed_experts", None)
+            if routed_experts is not None and getattr(routed_experts, "shape", None) is not None:
+                if routed_experts.shape[0] == 0:
+                    routed_experts = None
+
+            if routed_experts is not None:
+                if request_kv_payload is not None:
+                    routed_experts = self.concatenate_dict_and_ndarray(
+                        request_kv_payload,
+                        routed_experts,
+                    )
+                payload = {}
+                self.add_ndarray_info_to_dict(routed_experts, payload)
+                payloads.append(payload)
+            else:
+                payloads.append(request_kv_payload)
+
+        for choice, payload in zip(response.choices, payloads):
+            if payload is not None:
+                choice.routed_experts = payload
         if reuse_prefilled_tokens:
             if request.kv_transfer_params and "prefilled_token" in request.kv_transfer_params:
                 response.usage.total_tokens += 1

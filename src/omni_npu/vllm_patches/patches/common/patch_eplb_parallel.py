@@ -1,64 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-# This patch is used for enable_eplb fix in ParallelConfig and FusedMoE
-# Please use this patch by adding VLLM_PLUGINS="omni-npu,omni_npu_patches" OMNI_NPU_VLLM_PATCHES="EPLBEngineConfig,EPLBSharedFusedMoE" before vllm serve
+# This patch only contains EPLB-specific SharedFusedMoE behavior.
+# Engine-config wrapping is handled by patch_args_utils.py.
 
-import os
 import torch
-from typing import Callable, TYPE_CHECKING, Any, Literal, Optional, Union
-from typing_extensions import Self
 
-import vllm.envs as envs
-from vllm.logger import init_logger
-from vllm.config import VllmConfig
-from vllm import EngineArgs
-from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
-if TYPE_CHECKING:
-    from vllm.usage.usage_lib import UsageContext
-else:
-    UsageContext = Any
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-
-logger = init_logger(__name__)
-_orig_create_engine_config = EngineArgs.create_engine_config
-
-ExpertPlacementStrategy = Literal["linear", "round_robin"]
-DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
-
-@register_patch("EPLBEngineConfig", EngineArgs)
-class EngineConfigPatch(VLLMPatch):
-    """
-    EngineConfig for EPLB on NPU devices (when eplb enabled).
-    """
-    _attr_names_to_apply = ['create_engine_config']
-
-    def create_engine_config(
-        self,
-        usage_context: UsageContext | None = None,
-        headless: bool = False,
-    ) -> VllmConfig:
-
-        from vllm.platforms import current_platform
-
-        _orig_is_cuda_alike = current_platform.is_cuda_alike
-
-        def _npu_temp_cuda_alike_true():
-            if getattr(current_platform, "device_type", None) == "npu":
-                return True
-            return _orig_is_cuda_alike()
-
-        current_platform.is_cuda_alike = _npu_temp_cuda_alike_true
-        try:
-            vllm_config: VllmConfig = _orig_create_engine_config(self, usage_context, headless)
-            # adapter reasoning_config
-            self_reasoning_config = getattr(self, "reasoning_config", None)
-            if self_reasoning_config is not None and vllm_config.model_config is not None:
-                self_reasoning_config.initialize_token_ids(vllm_config.model_config)
-                vllm_config.reasoning_config = self_reasoning_config
-            return vllm_config
-        finally:
-            current_platform.is_cuda_alike = _orig_is_cuda_alike
+from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
 @register_patch("EPLBSharedFusedMoE", SharedFusedMoE)
 class SharedFusedMoEPatch(VLLMPatch):

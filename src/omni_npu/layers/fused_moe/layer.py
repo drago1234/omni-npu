@@ -20,6 +20,9 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
@@ -116,6 +119,16 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
         )
+
+        if (
+            getattr(layer, "vllm_config", None) is not None
+            and layer.vllm_config.model_config is not None
+            and layer.vllm_config.model_config.enable_return_routed_experts
+        ):
+            # In dummy/profile runs the capturer may not be initialized yet.
+            capturer = RoutedExpertsCapturer.get_instance()
+            if capturer is not None:
+                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
 
         prepare_permute_result = self.apply_prepare_permute(
             strategy_impl, layer, x_slice, topk_ids

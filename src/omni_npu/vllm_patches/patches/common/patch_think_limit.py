@@ -1,95 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import argparse
-import dataclasses
-import json
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    pass
-else:
-    UsageContext = Any
-# Backward compatibility for OpenAI client versions
-try:  # For older openai versions (< 1.100.0)
-    from openai.types.responses import ResponseTextConfig
-except ImportError:  # For newer openai versions (>= 1.100.0)
-    from openai.types.responses import ResponseFormatTextConfig as ResponseTextConfig
-from omni_npu.v1.config import ReasoningConfig
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
-from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm import EngineArgs
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest
-from vllm.logger import logger
-from vllm.config import VllmConfig
 from vllm import SamplingParams
-
-"""
-Passing args reasoning_config  
-"""
-
-
-@register_patch("VllmConfigPatch", VllmConfig)
-class VllmConfigPatch(VLLMPatch):
-    """
-    Patch to VllmConfig to support reasoning model configurations.
-    """
-    _attr_names_to_apply = ['reasoning_config']
-
-    reasoning_config: ReasoningConfig | None = None
-
-
-_original_add_cli_args = EngineArgs.add_cli_args
-
-
-@register_patch("EngineArgsPatch", EngineArgs)
-class EngineArgsPatch(VLLMPatch):
-    """
-    Patch to EngineArgs to support reasoning-related CLI arguments.
-    """
-
-    _attr_names_to_apply = ['reasoning_config', 'add_cli_args', 'from_cli_args']
-
-    reasoning_config: ReasoningConfig | None = None
-
-    @staticmethod
-    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
-        """Shared CLI arguments for vLLM engine."""
-        parser: FlexibleArgumentParser = _original_add_cli_args(parser)
-        # adapter reasoning_config
-        vllm_group = parser.add_argument_group(
-            title="VllmConfig",
-            description=VllmConfig.__doc__,
-        )
-        vllm_group.add_argument("--reasoning-config", **ReasoningConfig.as_argparse_dict())
-        return parser
-
-    @classmethod
-    def from_cli_args(cls, args: argparse.Namespace):
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-
-        engine_args_dict = {
-            attr: getattr(args, attr)
-            for attr in attrs if hasattr(args, attr)
-        }
-
-        instance = cls(**engine_args_dict)
-
-        # adapter reasoning_config
-        reasoning_config_var = "reasoning_config"
-        raw_reasoning = getattr(args, reasoning_config_var, None)
-        if raw_reasoning:
-            try:
-                if isinstance(raw_reasoning, str):
-                    config_dict = json.loads(raw_reasoning)
-                    instance.reasoning_config = ReasoningConfig(**config_dict)
-                else:
-                    instance.reasoning_config = raw_reasoning
-            except Exception as exception:
-                logger.error(f"Error parsing {reasoning_config_var}: {exception}")
-                instance.reasoning_config = None
-        return instance
 
 
 """
