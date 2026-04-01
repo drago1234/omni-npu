@@ -230,9 +230,11 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         block_idx_last_scheduled_token = None
 
         # Get cache indices
-        if self.vllm_config.cache_config.enable_prefix_caching:
+        apc_enabled = self.vllm_config.cache_config.enable_prefix_caching
+        if apc_enabled:
             cache_indices = common_attn_metadata.block_table_tensor
             num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
+            # TODO: need num_computed_tokens even if apc disabled (Zhixuan)
 
             (
                 block_idx_last_computed_token,
@@ -308,6 +310,48 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             block_idx_last_scheduled_token=block_idx_last_scheduled_token,
             num_reqs=num_reqs,
         )
+
+        if num_prefills == 0:
+            attn_metadata.prefill = None
+        else:
+            attn_metadata.prefill = NPUMomeAttentionMetadata(
+                num_prefills=num_prefills, 
+                num_prefill_tokens=num_prefill_tokens, 
+                num_decodes=0, 
+                num_decode_tokens=0, 
+                num_reqs=num_reqs, 
+                query_start_loc=common_attn_metadata.query_start_loc[num_decodes:], 
+                cache_indices=cache_indices[num_decodes:], 
+                max_query_len=max_query_len, 
+                pad_slot_id=PAD_SLOT_ID, 
+                B_size=self.mome_block_size, 
+                num_accepted_tokens=None, 
+                num_computed_tokens=num_computed_tokens[num_decodes:] if apc_enabled else None, 
+                block_idx_last_computed_token=block_idx_last_computed_token[num_decodes:] if apc_enabled else None, 
+                block_idx_first_scheduled_token=block_idx_first_scheduled_token[num_decodes:] if apc_enabled else None, 
+                block_idx_last_scheduled_token=block_idx_last_scheduled_token[num_decodes:] if apc_enabled else None, 
+            )
+        if num_decodes == 0:
+            attn_metadata.decode = None
+        else:
+            attn_metadata.decode = NPUMomeAttentionMetadata(
+                num_prefills=0, 
+                num_prefill_tokens=0, 
+                num_decodes=num_decodes, 
+                num_decode_tokens=num_decode_tokens, 
+                num_reqs=num_reqs, 
+                query_start_loc=common_attn_metadata.query_start_loc[:num_decodes+1], 
+                cache_indices=cache_indices[:num_decodes], 
+                max_query_len=max_query_len, 
+                pad_slot_id=PAD_SLOT_ID, 
+                B_size=self.mome_block_size, 
+                num_accepted_tokens=num_accepted_tokens, 
+                num_computed_tokens=num_computed_tokens[:num_decodes] if apc_enabled else None, 
+                block_idx_last_computed_token=block_idx_last_computed_token[:num_decodes] if apc_enabled else None, 
+                block_idx_first_scheduled_token=block_idx_first_scheduled_token[:num_decodes] if apc_enabled else None, 
+                block_idx_last_scheduled_token=block_idx_last_scheduled_token[:num_decodes] if apc_enabled else None, 
+            )
+
         return attn_metadata
 
     def build_for_drafting(

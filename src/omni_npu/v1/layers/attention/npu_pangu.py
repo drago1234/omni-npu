@@ -2,6 +2,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 from typing import Optional, Union, Tuple
+from itertools import accumulate
 
 import torch
 import torch_npu
@@ -798,7 +799,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
             if has_decode and has_prefill:
                 prefill_hidden_states, prefill_cos, prefill_sin = self._prepare_phase_inputs(
-                    hidden_states, cos, sin, attn_metadata,
+                    hidden_states, cos, sin, attn_metadata, 
                     phase="prefill",
                 )
                 prefill_output = self._forward_prefill(
@@ -806,11 +807,11 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     prefill_cos,
                     prefill_sin,
                     attn_metadata,
-                    mome_metadata,
+                    mome_metadata.prefill,
                 )
 
                 decode_hidden_states, decode_cos, decode_sin = self._prepare_phase_inputs(
-                    hidden_states, cos, sin, attn_metadata,
+                    hidden_states, cos, sin, attn_metadata, 
                     phase="decode",
                 )
                 decode_output = self._forward_decode(
@@ -818,7 +819,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                     decode_cos,
                     decode_sin,
                     attn_metadata,
-                    mome_metadata,
+                    mome_metadata.decode,
                 )
                 
                 self._restore_phase_metadata(attn_metadata)
@@ -867,12 +868,10 @@ class NPUPanguSparseAttention(torch.nn.Module):
         phase: str,
     ):
         num_decode_tokens = attn_metadata.num_decode_tokens
-        num_decodes = attn_metadata.num_decodes
 
         if phase == "prefill":
             # first phase: backup originals
             attn_metadata.origin_slot_mapping = attn_metadata.slot_mapping.clone()
-            attn_metadata.orig_query_start_loc = attn_metadata.query_start_loc.clone()
             attn_metadata.orig_num_actual_tokens = attn_metadata.num_actual_tokens
             num_actual_tokens = attn_metadata.num_actual_tokens
 
@@ -884,13 +883,11 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_metadata.saved_decode = attn_metadata.decode
             attn_metadata.decode = None
             attn_metadata.num_actual_tokens = num_actual_tokens - num_decode_tokens
-            attn_metadata.query_start_loc = attn_metadata.orig_query_start_loc[num_decodes:] - attn_metadata.orig_query_start_loc[num_decodes]
         else:
             saved_decode = getattr(attn_metadata, 'saved_decode', None)
             if saved_decode is not None:
                 attn_metadata.decode = attn_metadata.saved_decode
             origin_slot_mapping = attn_metadata.origin_slot_mapping
-            orig_query_start_loc = attn_metadata.orig_query_start_loc
 
             sliced_hidden = hidden_states[:num_decode_tokens, ...]
             sliced_cos = cos[:num_decode_tokens, ...]
@@ -900,7 +897,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_metadata.saved_prefill = attn_metadata.prefill
             attn_metadata.prefill = None
             attn_metadata.num_actual_tokens = num_decode_tokens
-            attn_metadata.query_start_loc = orig_query_start_loc[:num_decodes + 1]
         return sliced_hidden, sliced_cos, sliced_sin
 
     def _restore_phase_metadata(self, attn_metadata: MLACommonMetadata):
@@ -909,7 +905,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_metadata.prefill = saved_prefill
         attn_metadata.slot_mapping = attn_metadata.origin_slot_mapping
         attn_metadata.num_actual_tokens = attn_metadata.orig_num_actual_tokens
-        attn_metadata.query_start_loc = attn_metadata.orig_query_start_loc
 
     def _forward_dummy(
         self,
@@ -991,8 +986,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         # todo: support continuous batching
         
-        if attn_metadata.num_prefills > 0:
-            # assert attn_metadata.num_decodes == 0
+        if mome_metadata.num_prefills > 0:
             x = layer.forward_prefill(
                 x, 
                 kv_cache[kv_index][:, :width-1], 
@@ -1436,6 +1430,11 @@ class NPUPanguSparseAttention(torch.nn.Module):
         )
         sink_k_pe = self.param_sink_k_pe.view(-1, 1, self.qk_rope_head_dim) \
                                         .repeat(1, self.num_local_heads, 1)
+        
+        # Note: 
+        # Currently, attn_metadata.prefill.seq_lens is constructed as the "true" sequence lengths.
+        # We pass actual_seq_lengths_kv=query_cumlens instead, as the ops need cumulative sum. 
+        # Need to fix this when chunked prefill or prefix caching is enabled. 
 
         if self.on_ascend950:
             query = torch.cat([q_nope, q_pe], dim=-1)
@@ -1446,7 +1445,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 "key": key,
                 "value": v,
                 "actual_seq_lengths": attn_metadata.prefill.query_cumlens,
-                "actual_seq_lengths_kv": attn_metadata.prefill.seq_lens,
+                "actual_seq_lengths_kv": attn_metadata.prefill.query_cumlens,
                 "num_heads": self.num_local_heads,
                 "num_key_value_heads": self.num_local_heads,
                 "input_layout": "TND",
@@ -1476,7 +1475,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 "pre_tokens": self.sliding_window-1,
                 "next_tokens": 0,
                 "actual_seq_qlen": attn_metadata.prefill.query_cumlens,
-                "actual_seq_kvlen": attn_metadata.prefill.seq_lens,
+                "actual_seq_kvlen": attn_metadata.prefill.query_cumlens,
                 "key_sink": sink_k_nope,
                 "value_sink": sink_v,
                 "key_rope_sink": sink_k_pe,
