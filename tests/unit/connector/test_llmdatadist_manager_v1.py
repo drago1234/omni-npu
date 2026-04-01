@@ -669,6 +669,52 @@ class TestLLMDataDistConfig:
 
         assert config.is_prefill == expected_prefill
 
+    @pytest.mark.parametrize(
+        "p_node_list, kv_role, expected_ips",
+        [
+            # is_prefill=True (kv_producer) scenarios
+            (["192.168.1.10", "192.168.1.20"], "kv_producer", ["192.168.1.10", "192.168.1.20"]),
+            (["192.168.1.10"], "kv_producer", ["192.168.1.10"]),
+            ([], "kv_producer", ["127.0.0.1"]),  # Empty list falls back to Ray, then local
+            (None, "kv_producer", ["127.0.0.1"]),  # None falls back to Ray, then local
+            ("not_a_list", "kv_producer", ["127.0.0.1"]),  # Non-list falls back to local
+
+            # is_prefill=False (kv_consumer) scenarios - always returns local IP
+            (["192.168.1.10", "192.168.1.20"], "kv_consumer", ["127.0.0.1"]),
+            (["192.168.1.10"], "kv_consumer", ["127.0.0.1"]),
+            ([], "kv_consumer", ["127.0.0.1"]),
+            (None, "kv_consumer", ["127.0.0.1"]),
+            ("not_a_list", "kv_consumer", ["127.0.0.1"]),  # Non-list falls back to local
+        ]
+    )
+    def test_get_worker_ips_p_node_list(
+            self, p_node_list, kv_role, expected_ips,
+            vllm_config, mock_ip_port_to_int, mock_get_world_group, block_ray_import
+    ):
+        """Test _get_worker_ips method with p_node_list configurations.
+
+        Covers the logic at lines 123-131 in llmdatadist_manager_v1.py:
+        - if self.is_prefill and worker_ips and isinstance(worker_ips, list) and len(worker_ips) > 0:
+            return worker_ips
+        - worker_ips = [self.local_host_ip]
+        - if not self.is_prefill:
+            return worker_ips
+        """
+        vllm_config.kv_transfer_config.kv_role = kv_role
+        vllm_config.kv_transfer_config.kv_connector_extra_config["p_node_list"] = p_node_list
+        mock_ip_port_to_int.return_value = -1
+
+        config = LLMDataDistConfig(vllm_config, "127.0.0.1", 8080, ignore_load_rank=True)
+
+        # Directly call the method being tested
+        result = config._get_worker_ips()
+
+        assert result == expected_ips
+
+        # Note: The current implementation does not log warnings for invalid p_node_list types
+        # Based on the code at lines 123-131 in llmdatadist_manager_v1.py, there is no warning log.
+        # If warnings are added in the future, tests should be updated accordingly.
+
 class TestUnregisterLink:
     """Tests for LLMDataDistManager.unregister_link method."""
 
