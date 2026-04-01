@@ -181,7 +181,6 @@ class NPUAttentionBackend(AttentionBackend):
 
 class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
     SHARE_MASK_TRIL_SPARSE = None
-    DECORE_ATTN_MASK = None
 
     def __init__(
         self,
@@ -226,8 +225,6 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
                 torch.ones((2048, 2048), dtype=torch.bool, device="npu")
             )
-            NPUAttentionBackendImpl.DECORE_ATTN_MASK = NPUAttentionBackendImpl.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
-
         self.sparse_mode = 4 if sliding_window else 3
         self.sink_len = sink_len
 

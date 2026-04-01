@@ -35,7 +35,7 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 logger = init_logger(__name__)
 
-EagleProposer_original_init_ = EagleProposer.__init__
+EagleProposer_original_init = EagleProposer.__init__
 
 @dataclass
 class DraftAttnGroup:
@@ -67,7 +67,8 @@ class EagleProposerPatch(VLLMPatch):
     ]
 
     def __init__(self, *args, **kwargs):
-        EagleProposer_original_init_(self, *args, **kwargs)
+        EagleProposer_original_init(self, *args, **kwargs)
+        self.use_cuda_graph = True
         self.n_predict = getattr(
             self.draft_model_config.hf_config, "n_predict", 1
         )
@@ -207,46 +208,41 @@ class EagleProposerPatch(VLLMPatch):
         num_tokens: int,
         use_cudagraphs=True,
         is_graph_capturing=False,
-        batch_descriptor=None,
-        cudagraph_runtime_mode=None,
     ) -> None:
-        # Adapt: new param attn_metadata and batch_descriptor
-        # Determine if CUDA graphs should be used for this run.
-        cudagraphs_enabled = use_cudagraphs and self.use_cuda_graph
 
+        assert self.runner.batch_execution_and_padding_state is not None, \
+            "dummy_run of drafter should be executed after runner._determine_batch_execution_and_padding"
+        cudagraph_mode, batch_descriptor, num_tokens_across_dp = self.runner.batch_execution_and_padding_state
+        self.runner.batch_execution_and_padding_state = None
+        num_input_tokens = batch_descriptor.num_tokens
+        if attn_metadata is not None:
+            per_layer_attn_metadata = {}
+            for layer_name in self.attn_layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata[layer_name]
+        else:
+            per_layer_attn_metadata = None
         # FIXME: when using tree-based specdec, adjust number of forward-passes
         # according to the depth of the tree.
         for fwd_idx in range(
             self.num_speculative_tokens
             if not is_graph_capturing else min(self.num_speculative_tokens, self.n_predict)
         ):
-            if fwd_idx <= 1:
+            if fwd_idx == 1 and cudagraph_mode == CUDAGraphMode.NONE:
                 num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
                     num_tokens_padded=num_tokens,
                 )
-                if (
-                    cudagraphs_enabled
-                    and num_tokens_dp_padded
-                    <= self.compilation_config.max_cudagraph_capture_size
-                ):
-                    num_input_tokens = self.vllm_config.pad_for_cudagraph(
-                        num_tokens_dp_padded
-                    )
-                else:
-                    num_input_tokens = num_tokens_dp_padded
+                num_input_tokens = num_tokens_dp_padded
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
             # Adapt: pass attn_metadata and batch_descriptor to set_forward_context, change cudagraph_runtime_mode
             with set_forward_context(
-                attn_metadata,
+                per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode
-                if cudagraphs_enabled
-                else CUDAGraphMode.NONE,
+                cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_descriptor
             ):
                 forward_context = get_forward_context()
@@ -655,16 +651,13 @@ class EagleProposerPatch(VLLMPatch):
             draft_index=0,
         )
 
-        num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
-            num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
-        )
-
         # Adapt start: get token info from target model batch descriptor
-        num_input_tokens = self.batch_desc.num_tokens
+        assert self.runner.batch_execution_and_padding_state is not None, \
+            "propose of drafter should be executed after runner._determine_batch_execution_and_padding"
+        cudagraph_runtime_mode, batch_descriptor, num_tokens_across_dp = self.runner.batch_execution_and_padding_state
+        self.runner.batch_execution_and_padding_state = None
+        num_input_tokens = batch_descriptor.num_tokens
         # Adapt end
-
-        if num_tokens_across_dp is not None:
-            num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
         # copy inputs to buffer for cudagraph
         self._set_positions(num_tokens, target_positions)
@@ -691,8 +684,8 @@ class EagleProposerPatch(VLLMPatch):
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=self.target_model_cuda_graph_mode, # Adapt : get cudagraph mode from model runner
-            batch_descriptor=self.batch_desc, # Adapt : get batch_descriptor from model runner
+            cudagraph_runtime_mode=cudagraph_runtime_mode, # Adapt : get cudagraph mode from model runner
+            batch_descriptor=batch_descriptor, # Adapt : get batch_descriptor from model runner
         ):
             forward_context = get_forward_context()
             forward_context.capturing = False
@@ -715,14 +708,6 @@ class EagleProposerPatch(VLLMPatch):
         if self.num_speculative_tokens == 1:
             draft_token_ids = logits.argmax(dim=-1)
             return draft_token_ids.view(-1, 1)
-
-        # FIXME (zxp): Adapt: currently, when num_speculative_tokens > 1, only supports cudagraph_mode "FULL" and "NONE"
-        cudagraph_mode = self.compilation_config.cudagraph_mode
-        if cudagraph_mode != CUDAGraphMode.FULL and cudagraph_mode != CUDAGraphMode.NONE:
-            raise ValueError(
-                f"Speculative decoding with num_speculative_tokens > 1 only "
-                f"supports cudagraph_mode FULL and NONE, but got {cudagraph_mode}."
-            )
 
         if self.uses_mrope:
             positions = target_positions[:, last_token_indices]
@@ -766,29 +751,26 @@ class EagleProposerPatch(VLLMPatch):
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
-        batch_size_dp_padded, batch_size_across_dp = self._pad_batch_across_dp(
-            num_tokens_unpadded=batch_size, num_tokens_padded=batch_size
-        )
-
-        if (
-            self.use_cuda_graph
-            and batch_size_dp_padded
-            <= self.compilation_config.max_cudagraph_capture_size
-        ):
-            input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size_dp_padded)
-            cudagraph_runtime_mode = self.target_model_cuda_graph_mode  # Adapt : get cudagraph mode from model runner
-        else:
+        if cudagraph_runtime_mode == CUDAGraphMode.NONE:
+            batch_descriptor = None
+            batch_size_dp_padded, batch_size_across_dp = self._pad_batch_across_dp(
+                num_tokens_unpadded=batch_size, num_tokens_padded=batch_size
+            )
             input_batch_size = batch_size_dp_padded
-            cudagraph_runtime_mode = CUDAGraphMode.NONE
-        if batch_size_across_dp is not None:
-            batch_size_across_dp[self.dp_rank] = input_batch_size
+            if batch_size_across_dp is not None:
+                batch_size_across_dp[self.dp_rank] = input_batch_size
+        else:
+            input_batch_size = num_input_tokens
+            batch_size_across_dp = num_tokens_across_dp
 
-        common_attn_metadata.num_actual_tokens = batch_size
+        common_attn_metadata.num_actual_tokens = input_batch_size
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
-        common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+        common_attn_metadata.query_start_loc[: batch_size + 1] = self.arange[: batch_size + 1]
+        common_attn_metadata.query_start_loc[batch_size :] = self.arange[batch_size]
+        common_attn_metadata.query_start_loc_cpu[: batch_size + 1] = torch.from_numpy(
             self.token_arange_np[: batch_size + 1]
         ).clone()
+        common_attn_metadata.query_start_loc_cpu[batch_size :] = common_attn_metadata.query_start_loc_cpu[batch_size]
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -831,7 +813,7 @@ class EagleProposerPatch(VLLMPatch):
             # operations in case they are modified in next step's `prepare_input`
             # of main model.
             # Increment the sequence lengths.
-            common_attn_metadata.seq_lens += 1
+            common_attn_metadata.seq_lens[:batch_size] += 1
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
             common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_max_model_len, 1)
@@ -839,9 +821,9 @@ class EagleProposerPatch(VLLMPatch):
             # Also update the CPU-side shadow; NOTE: this is hacky and should be
             # removed in when common_attn_metadata.seq_lens_cpu is deprecated.
             if common_attn_metadata._seq_lens_cpu is not None:
-                common_attn_metadata._seq_lens_cpu += 1
+                common_attn_metadata._seq_lens_cpu[:batch_size] += 1
             if common_attn_metadata._num_computed_tokens_cpu is not None:
-                common_attn_metadata._num_computed_tokens_cpu += 1
+                common_attn_metadata._num_computed_tokens_cpu[:batch_size] += 1
 
             # Compute slot mapping and rebuild attention metadata for all
             # draft groups (each with its own block table and block size).
@@ -873,6 +855,7 @@ class EagleProposerPatch(VLLMPatch):
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor, # Adapt : get batch_descriptor from model runner
             ):
                 forward_context = get_forward_context()
                 forward_context.capturing = False
@@ -929,11 +912,12 @@ class EagleProposerPatch(VLLMPatch):
         )
 
         # Adapt start: get token info from target model batch descriptor
-        num_input_tokens = self.batch_desc.num_tokens
+        assert self.runner.batch_execution_and_padding_state is not None, \
+            "propose of drafter should be executed after runner._determine_batch_execution_and_padding"
+        cudagraph_runtime_mode, batch_descriptor, num_tokens_across_dp = self.runner.batch_execution_and_padding_state
+        self.runner.batch_execution_and_padding_state = None
+        num_input_tokens = batch_descriptor.num_tokens
         # Adapt end
-
-        if num_tokens_across_dp is not None:
-            num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
         # copy inputs to buffer for cudagraph
         self._set_positions(num_tokens, target_positions)
@@ -947,8 +931,8 @@ class EagleProposerPatch(VLLMPatch):
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=self.target_model_cuda_graph_mode, # Adapt : get cudagraph mode from model runner
-            batch_descriptor=self.batch_desc, # Adapt : get batch_descriptor from model runner
+            cudagraph_runtime_mode=cudagraph_runtime_mode, # Adapt : get cudagraph mode from model runner
+            batch_descriptor=batch_descriptor, # Adapt : get batch_descriptor from model runner
         ):
             forward_context = get_forward_context()
             forward_context.capturing = False

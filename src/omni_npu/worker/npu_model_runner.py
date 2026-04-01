@@ -143,6 +143,13 @@ class NPUModelRunner(GPUModelRunner):
             self.cache_slot_id = torch.zeros(self.max_num_reqs,
                                     dtype=torch.long, device=self.device)
 
+        self.batch_execution_and_padding_state: tuple[
+            CUDAGraphMode,
+            BatchDescriptor,
+            torch.Tensor | None,
+        ] | None = None
+
+
     def _build_conv_context(self, dummy:bool = False):
         forward_context = get_forward_context()
         if not dummy:
@@ -443,10 +450,11 @@ class NPUModelRunner(GPUModelRunner):
         # Adapt start: MTP extra property.
         # Add `batch_descriptor` and `cudagraph_mode` for latter use in mtp.
         if self.speculative_config and isinstance(self.drafter, EagleProposer):
-            self.drafter.batch_desc = batch_descriptor
-            self.drafter.target_model_cuda_graph_mode = cudagraph_mode
-        # Adapt end: MTP extra property.
-
+            self.batch_execution_and_padding_state = (
+                cudagraph_mode,
+                batch_descriptor,
+                num_tokens_across_dp,
+            )
         return (
             cudagraph_mode,
             batch_descriptor,
@@ -810,16 +818,14 @@ class NPUModelRunner(GPUModelRunner):
                 if self.compilation_config.cudagraph_specialize_lora and activate_lora:
                     use_cudagraphs = False
 
-                # Adapt start: to pass attn_metadata and batch_desc
+                # Adapt start: to pass attn_metadata
                 self.drafter.dummy_run(
                     attn_metadata,
-                    num_tokens_padded,
+                    num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
-                    batch_descriptor=batch_desc,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
                 )
-                # Adapt end: to pass attn_metadata and batch_desc
+                # Adapt end: to pass attn_metadata
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by

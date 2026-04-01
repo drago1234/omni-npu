@@ -386,7 +386,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 "block_size": 128,
                 "actual_seq_qlen": actual_query_cumlens,
                 "actual_seq_kvlen": attn_metadata.seq_lens,
-                "atten_mask": NPUMLAImpl.DECORE_ATTN_MASK,
+                "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
                 "sparse_mode": 4,
                 "sink_number": self.param_sink_number,
                 "pre_tokens": window_size,
@@ -410,7 +410,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             sparse_mode = 3
             input_layout = "TND_NTD"
             attn_output_shape = (self.num_local_heads, num_tokens, self.kv_lora_rank)
-            attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
+            attn_mask = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE
             num_key_value_heads = 1
             block_size = 128
             kwargs = {

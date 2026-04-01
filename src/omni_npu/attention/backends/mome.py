@@ -111,7 +111,13 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.use_spec_decode = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
-        self.decode_cudagraph_max_bs = self.vllm_config.scheduler_config.max_num_seqs
+        self.use_full_cuda_graph = (
+            self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        )
+
+        self.decode_cudagraph_max_bs = (
+            self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
+        )
         if self.compilation_config.max_cudagraph_capture_size is not None:
             self.decode_cudagraph_max_bs = min(
                 self.decode_cudagraph_max_bs,

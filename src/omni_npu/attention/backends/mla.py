@@ -296,7 +296,6 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
 class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
     can_return_lse_for_decode: bool = True
     SHARE_MASK_TRIL_SPARSE = None
-    DECORE_ATTN_MASK = None
     MAX_WINDOW_SIZE = 2**31 - 1
 
     def __init__(
@@ -358,13 +357,11 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
 
     @classmethod
     def ensure_decode_attn_mask(cls) -> None:
-        if cls.DECORE_ATTN_MASK is None:
-            if cls.SHARE_MASK_TRIL_SPARSE is None:
-                cls.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
-                    torch.ones((2048, 2048), dtype=torch.bool, device="npu")
-                )
-            cls.DECORE_ATTN_MASK = cls.SHARE_MASK_TRIL_SPARSE.to(torch.uint8)
-
+        if cls.SHARE_MASK_TRIL_SPARSE is None:
+            cls.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
+                torch.ones((2048, 2048), dtype=torch.bool, device="npu")
+            )
+            
     def update_sink_kv(self, sink_k_pe: torch.Tensor, sink_compressed_kv: torch.Tensor) -> None:
         self.sink_k_pe = sink_k_pe.unsqueeze(1)
         self.sink_compressed_kv = sink_compressed_kv
@@ -661,7 +658,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             input_layout="TND_NTD",
             scale=self.scale,
             sparse_mode=3,
-            atten_mask=NPUMLAImpl.DECORE_ATTN_MASK,
+            atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
             block_size=128,
             block_table=blk_table,
             actual_seq_lengths=cu_q_lens,
@@ -739,7 +736,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 "block_size": 128,
                 "actual_seq_qlen": attn_metadata.decode.query_cumlens,
                 "actual_seq_kvlen": attn_metadata.decode.seq_lens,
-                "atten_mask": NPUMLAImpl.DECORE_ATTN_MASK,
+                "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
                 "sparse_mode": 4,
                 "sink_number": self.sink_len,
                 "pre_tokens": window_size,
@@ -762,7 +759,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
         else:
             num_kv_heads = 1
             input_layout = "TND_NTD"
-            attn_mask = NPUMLAImpl.DECORE_ATTN_MASK
+            attn_mask = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE
             sparse_mode = 3
             block_size = 128
             attn_output_shape = (query_heads, num_tokens, self.kv_lora_rank)

@@ -58,10 +58,8 @@ BLOCK_SIZE = 128
 @pytest.fixture(autouse=True)
 def _clear_mla_static_masks() -> None:
     NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = None
-    NPUMLAImpl.DECORE_ATTN_MASK = None
     yield
     NPUMLAImpl.SHARE_MASK_TRIL_SPARSE = None
-    NPUMLAImpl.DECORE_ATTN_MASK = None
 
 
 @contextmanager

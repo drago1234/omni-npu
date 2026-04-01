@@ -440,8 +440,6 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         ), patch.object(
             npu_mla_mod.NPUMLAImpl, "ensure_decode_attn_mask", return_value=None
         ), patch.object(
-            npu_mla_mod.NPUMLAImpl, "DECORE_ATTN_MASK", torch.ones((1,), dtype=torch.bool), create=True
-        ), patch.object(
             npu_mla_mod.torch.ops.npu,
             "npu_fused_infer_attention_score",
             return_value=(torch.zeros((m.num_local_heads, bs, m.kv_lora_rank), dtype=torch.float32),),
