@@ -247,21 +247,23 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         else:
             cache_indices = common_attn_metadata.block_table_tensor[:, 0]
 
-        if num_accepted_tokens is not None:
-            self.num_accepted_tokens[:num_decodes].copy_(
-                num_accepted_tokens, non_blocking=True
-            )
-            num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
-
         # For cudagraph: copy to persistent buffer if applicable
         if (
             num_prefills == 0
             and num_decodes <= self.decode_cudagraph_max_bs
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
-            self.cache_indices_tensor[:num_decodes].copy_(cache_indices, non_blocking=True)
+            self.cache_indices_tensor[:num_decodes].copy_(
+                cache_indices, non_blocking=True
+            )
             cache_indices = self.cache_indices_tensor[:num_decodes]  # NOTE: slice to num_decodes instead of num_decode_tokens
             self.cache_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
+
+            if num_accepted_tokens is not None:
+                self.num_accepted_tokens[:num_decodes].copy_(
+                    num_accepted_tokens, non_blocking=True
+                )
+                num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
 
             if self.vllm_config.cache_config.enable_prefix_caching:
                 self.block_idx_last_computed_token[:num_decodes].copy_(
@@ -320,13 +322,13 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 num_prefill_tokens=num_prefill_tokens, 
                 num_decodes=0, 
                 num_decode_tokens=0, 
-                num_reqs=num_reqs, 
+                num_reqs=num_prefills, 
                 query_start_loc=common_attn_metadata.query_start_loc[num_decodes:], 
                 cache_indices=cache_indices[num_decodes:], 
                 max_query_len=max_query_len, 
                 pad_slot_id=PAD_SLOT_ID, 
                 B_size=self.mome_block_size, 
-                num_accepted_tokens=None, 
+                num_accepted_tokens=num_accepted_tokens[num_decodes:] if num_accepted_tokens else None, 
                 num_computed_tokens=num_computed_tokens[num_decodes:] if apc_enabled else None, 
                 block_idx_last_computed_token=block_idx_last_computed_token[num_decodes:] if apc_enabled else None, 
                 block_idx_first_scheduled_token=block_idx_first_scheduled_token[num_decodes:] if apc_enabled else None, 
@@ -340,13 +342,13 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 num_prefill_tokens=0, 
                 num_decodes=num_decodes, 
                 num_decode_tokens=num_decode_tokens, 
-                num_reqs=num_reqs, 
+                num_reqs=num_decodes, 
                 query_start_loc=common_attn_metadata.query_start_loc[:num_decodes+1], 
                 cache_indices=cache_indices[:num_decodes], 
                 max_query_len=max_query_len, 
                 pad_slot_id=PAD_SLOT_ID, 
                 B_size=self.mome_block_size, 
-                num_accepted_tokens=num_accepted_tokens, 
+                num_accepted_tokens=num_accepted_tokens[:num_decodes] if num_accepted_tokens else None, 
                 num_computed_tokens=num_computed_tokens[:num_decodes] if apc_enabled else None, 
                 block_idx_last_computed_token=block_idx_last_computed_token[:num_decodes] if apc_enabled else None, 
                 block_idx_first_scheduled_token=block_idx_first_scheduled_token[:num_decodes] if apc_enabled else None, 

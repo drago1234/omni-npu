@@ -13,4 +13,6 @@ class CommonAttentionMetadataPatch(VLLMPatch):
     def unpadded(
         self, num_actual_tokens: int, num_actual_reqs: int
     ) -> "CommonAttentionMetadata":
+        self.num_tokens_unpadded = num_actual_tokens
+        self.num_reqs_unpadded = num_actual_reqs
         return self
