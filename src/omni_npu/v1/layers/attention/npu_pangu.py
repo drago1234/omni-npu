@@ -310,11 +310,9 @@ class NPUPanguIndexer(torch.nn.Module):
         weights: torch.Tensor,
         sp_manager: Optional[MLACommonMetadata] = None,
         kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        is_second_frag: bool = False,
     ) -> torch.Tensor:
-        actual_seq_lengths_query = sp_manager.cp_attn_meta_2()[1] if is_second_frag else sp_manager.cp_attn_meta_2()[0]
-        actual_seq_lengths_kv = sp_manager.cp_attn_meta_2()[3] if is_second_frag else sp_manager.cp_attn_meta_2()[1]
-        block_table = sp_manager.blk_table_ori
+        actual_seq_lengths_query, actual_seq_lengths_kv, _ = sp_manager.cp_attn_meta()
+        block_table = sp_manager.cp_block_table
 
         return torch.ops.custom.npu_lightning_indexer_enhance(
             query=q,
@@ -375,34 +373,19 @@ class NPUPanguIndexer(torch.nn.Module):
         weights = self.weights_proj(cp_x)
         self._update_indexer_cache(
             k,
-            sp_manager.slot_mapping_ori,
+            sp_manager.cp_slot_mapping,
             kv_cache,
         )
 
-        # split q
-        q_nope_1, q_nope_2 = torch.split(q_nope, q_nope.size(0) // 2, dim=0)
-        q_pe_1, q_pe_2 = torch.split(q_pe, q_pe.size(0) // 2, dim=0)
-        q_1 = torch.cat([q_pe_1, q_nope_1], dim=-1)
-        q_2 = torch.cat([q_pe_2, q_nope_2], dim=-1)
-
-        # split weights
-        weights_1, weights_2 = torch.split(weights, weights.size(0) // 2, dim=0)
-
-        topk_indices_1 = self._apply_lightning_indexer_cp(
-            q_1,
-            weights_1,
+        q = torch.cat([q_pe, q_nope], dim=-1)
+        topk_indices = self._apply_lightning_indexer_cp(
+            q,
+            weights,
             sp_manager,
             kv_cache,
         )
-        topk_indices_2 = self._apply_lightning_indexer_cp(
-            q_2,
-            weights_2,
-            sp_manager,
-            kv_cache,
-            is_second_frag=True,
-        )
 
-        return topk_indices_1, topk_indices_2
+        return topk_indices
 
 
 class NPUPanguSparseAttention(torch.nn.Module):
@@ -609,10 +592,14 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if self.use_mome:
             assert self.num_heads % self.tp_size == 0, \
                 "For MoME attention, num_heads should be divisible by tp_size."
+            if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel:
+                o_mome_cache_shape = (self.num_heads * self.v_head_dim,)
+            else:
+                o_mome_cache_shape = (self.num_heads * self.v_head_dim // self.tp_size,)
             self.mome_state_shapes = (
                 (self.q_lora_rank,),
                 (self.kv_lora_rank,),
-                (self.num_heads * self.v_head_dim // self.tp_size,),
+                o_mome_cache_shape,
             )
             self.mome_state_dtypes = (
                 torch.bfloat16,
@@ -1017,11 +1004,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         topk_indices: torch.Tensor,
         sp_manager: Optional[SPManager] = None,
-        is_second_frag: bool = False,
     ) -> torch.Tensor:
-        actual_seq_lengths_query = sp_manager.cp_attn_meta_2()[1] if is_second_frag else sp_manager.cp_attn_meta_2()[0]
-        actual_seq_lengths_kv = sp_manager.cp_attn_meta_2()[3] if is_second_frag else sp_manager.cp_attn_meta_2()[1]
-        block_table = sp_manager.blk_table_ori
+        actual_seq_lengths_query, actual_seq_lengths_kv, _ = sp_manager.cp_attn_meta()
+        block_table = sp_manager.cp_block_table
 
         q = torch.cat([q_nope, q_pe], dim=-1)
 
@@ -1059,113 +1044,26 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         return attn_output
 
-    def _mome_prefix_exchange(
-        self,
-        x: torch.Tensor,
-        prefix_size: int = 2,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        tp_group = get_tp_group()
-        tp_size = tp_group.world_size
-        tp_rank = tp_group.rank_in_group
-        device = x.device
-    
-        if x.shape[0] % 2 != 0:
-            raise ValueError("Expected two equal-sized local blocks.")
-    
-        block_len = x.shape[0] // 2
-        if block_len < prefix_size:
-            raise ValueError(f"block_len ({block_len}) must be >= prefix_size ({prefix_size}).")
-    
-        # TODO 按请求数量做all_gather拼接
-        phase0_x = x[:block_len]
-        phase1_x = x[block_len:]
-    
-        boundary_local = torch.cat(
-            [phase0_x[-prefix_size:], phase1_x[-prefix_size:]],
-            dim=0,
-        )
-        all_boundaries = tp_group.all_gather(boundary_local, dim=0)
-        chunk = 2 * prefix_size
-    
-        if tp_rank > 0:
-            phase0_prefix = all_boundaries.narrow(0, (tp_rank - 1) * chunk, prefix_size)
-    
-        if tp_rank == tp_size - 1:
-            phase1_prefix = phase0_x[-prefix_size:]
-        else:
-            phase1_prefix = all_boundaries.narrow(0, (tp_rank + 1) * chunk + prefix_size, prefix_size)
-    
-        if tp_rank == 0:
-            merged_x = torch.cat(
-                [phase0_x, phase1_prefix, phase1_x],
-                dim=0,
-            ) 
-        else:
-            merged_x = torch.cat(
-                [phase0_prefix, phase0_x, phase1_prefix, phase1_x],
-                dim=0,
-            )
-    
-        return merged_x, block_len
-
-    def _broadcast_mome_cache_from_rank0(
-        self,
-        cache: torch.Tensor,
-        cache_indices: torch.Tensor,
-        prefix_size: int,
-    ) -> None:
-        tp_group = get_tp_group()
-        if tp_group.world_size <= 1:
-            return
-
-        cache_idx = cache_indices[:1].to(dtype=torch.int64, device=cache.device)
-        cache_slice = cache.index_select(0, cache_idx)[:, :prefix_size].contiguous()
-        torch.distributed.broadcast(
-            cache_slice,
-            src=0,
-            group=tp_group.device_group,
-        )
-        cache[cache_idx, :prefix_size] = cache_slice
-
-    def _mome_split_and_cat(
-        self,
-        merged_output: torch.Tensor,
-        block_length: int,
-        prefix_size: int = 2,
-    ) -> torch.Tensor:
-        rank = get_tp_group().rank_in_group
-        if rank == 0:
-            phase0 = merged_output[:block_length]
-            phase1 = merged_output[block_length + prefix_size:]
-        else:
-            phase0 = merged_output[prefix_size:prefix_size + block_length]
-            phase1 = merged_output[prefix_size + block_length + prefix_size:]
-    
-        hidden_states = torch.cat([phase0, phase1], dim=0)
-        return hidden_states
-
     def _apply_MOME_prefill_cp(
         self,
         x: torch.Tensor,
         layer: ColumnParallelMOME,
-        cache: torch.Tensor,           # will be obtained in attn_metadata when MoME cache is handled by vLLM
-        cache_indices: torch.Tensor,   # will be obtained in attn_metadata when MoME cache is handled by vLLM
+        kv_index: int,
+        mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
         sp_manager: Optional[SPManager] = None,
     ) -> torch.Tensor:
-        prefix_size = self.mome_kernel_width - 1
-        merged_x, block_len = (
-            self._mome_prefix_exchange(x, prefix_size)
-        )
+        merged_x = sp_manager.mome_suffix_exchange(x)
+        merged_x = sp_manager.broadcast_mome_req_tails_from_rank0(merged_x)
+        kv_cache = self.mome_attn.kv_cache[get_forward_context().virtual_engine]
+        cache = kv_cache[kv_index][:, :self.mome_kernel_width - 1]
+        cache_indices = mome_metadata.cache_indices
         merged_x = layer.forward_prefill(
             merged_x,
-            cache[:, :prefix_size],
-            cache_indices[:1],
-            sp_manager.cp_mome_metadata[0],
+            cache,
+            cache_indices,
+            sp_manager.cp_mome_query_start_loc,
         )
-        # Zigzag SP 中最后一个 block 落在 rank0 的 phase1，需要把对应的
-        # MoME prefix cache 广播给所有 rank，供下一层继续复用。  
-        self._broadcast_mome_cache_from_rank0(cache, cache_indices, prefix_size)
-        return self._mome_split_and_cat(merged_x, block_len, prefix_size)
+        return sp_manager.mome_split_and_cat(merged_x)
 
     def _forward_prefill_cp(
         self,
@@ -1173,6 +1071,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
+        mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
         sp_manager: SPManager = (
             attn_metadata.prefill.sp_manager
@@ -1191,8 +1090,8 @@ class NPUPanguSparseAttention(torch.nn.Module):
             q_lora = self._apply_MOME_prefill_cp(
                 q_lora,
                 self.qa_conv,
-                self.q_mome_cache,
-                self.cache_indices,
+                0,
+                mome_metadata,
                 sp_manager,
             )
         q_lora = self.q_a_layernorm(q_lora)
@@ -1225,7 +1124,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # get KV cache for this layer
         kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
         ### Indexer stream begins ###
-        topk_indices_1, topk_indices_2 = self.indexer.forward_cp(
+        topk_indices = self.indexer.forward_cp(
             cp_x,
             sp_x,
             q_lora,
@@ -1250,9 +1149,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
             k_nope = self._apply_MOME(
                 k_nope,
                 self.compresskv_conv,
-                self.kv_mome_cache,
-                self.cache_indices,
+                1,
                 attn_metadata,
+                mome_metadata,
             )
 
         kv = torch.cat([k_nope, k_pe], dim=-1)
@@ -1264,7 +1163,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             "gamma": self.kv_a_layernorm.weight,
             "cos": cos.view(-1, 1, 1, self.qk_rope_head_dim),
             "sin": sin.view(-1, 1, 1, self.qk_rope_head_dim),
-            "index": sp_manager.slot_mapping_ori,
+            "index": sp_manager.cp_slot_mapping,
             "epsilon": self.kv_a_layernorm.variance_epsilon,
             "cache_mode": "PA",
             "rotary_mode": "half" if not self.rope_interleaved else "interleave-half",
@@ -1275,40 +1174,25 @@ class NPUPanguSparseAttention(torch.nn.Module):
         k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(**kwargs)
         ### KV stream ends ###
 
-        # split q
-        q_nope_1, q_nope_2 = torch.split(q_nope, q_nope.size(0) // 2, dim=0)
-        q_pe_1, q_pe_2 = torch.split(q_pe, q_pe.size(0) // 2, dim=0)
-
-        attn_output_1 = self._apply_DSA_attention_cp(
-            q_nope_1,
-            q_pe_1,
+        attn_output = self._apply_DSA_attention_cp(
+            q_nope,
+            q_pe,
             kv_cache,
-            topk_indices_1,
+            topk_indices,
             sp_manager,
         )
-        attn_output_2 = self._apply_DSA_attention_cp(
-            q_nope_2,
-            q_pe_2,
-            kv_cache,
-            topk_indices_2,
-            sp_manager,
-            is_second_frag=True,
-        )
-        attn_output = torch.cat([attn_output_1, attn_output_2], dim=0)
 
         if self.use_mome:
             attn_output = self._apply_MOME_prefill_cp(
                 attn_output,
                 self.o_conv,
-                self.o_mome_cache,
-                self.cache_indices,
+                2,
+                mome_metadata,
                 sp_manager,
             )
 
         hidden_states = self.o_proj(attn_output)
-
-        hidden_states = sp_manager.cp_to_sp(hidden_states)
-        return hidden_states
+        return sp_manager.cp_to_sp(hidden_states)
 
     def _forward_prefill(
         self,
@@ -1763,6 +1647,7 @@ def npu_pangu_forward(
         )
     else:
         num_actual_tokens = attn_metadata.num_actual_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
 
@@ -1807,25 +1692,24 @@ def npu_pangu_forward(
                     hidden_states,
                     cos,
                     sin,
-                    attn_metadata
+                    attn_metadata,
+                    mome_metadata,
                 )
             else:
-                x = hidden_states[:attn_metadata.num_actual_tokens]
-                attn_output = self._forward_prefill(
-                    x,
-                    cos,
-                    sin,
+                hidden_states[num_decode_tokens:num_actual_tokens] = self._forward_prefill(
+                    hidden_states[num_decode_tokens:num_actual_tokens],
+                    cos[num_decode_tokens:num_actual_tokens],
+                    sin[num_decode_tokens:num_actual_tokens],
                     attn_metadata,
-                    mome_metadata, 
+                    mome_metadata,
                 )
-                hidden_states[:attn_metadata.num_actual_tokens] = attn_output
         else:
-            hidden_states = self._forward_decode(
-                hidden_states,
-                cos,
-                sin,
+            hidden_states[:num_decode_tokens] = self._forward_decode(
+                hidden_states[:num_decode_tokens],
+                cos[:num_decode_tokens],
+                sin[:num_decode_tokens],
                 attn_metadata,
-                mome_metadata, 
+                mome_metadata,
             )
         if self.tp_size > 1:
             if self.all2all_backend == "naive":

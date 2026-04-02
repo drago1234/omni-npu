@@ -154,7 +154,6 @@ class SPManager:
         self.sp_size = sp_group.world_size
         self.sp_rank = sp_group.rank_in_group
         self.sp_comm = sp_group.device_group
-        self.mome_kernel_width = mome_kernel_width
         assert self.sp_size > 0
 
         if cumlens_np is None:
@@ -167,16 +166,15 @@ class SPManager:
         self.table_size = blk_table_ref.size(1)
         self.pg = pg
         self.init_zigzag = init_zigzag
-        self.blk_table_ori = blk_table_ref.clone()
-        self.slot_mapping_ori = slot_mapping_ref.clone()
+        self.mome_prefix_size = mome_kernel_width - 1
 
         self._scheme_sp_ctrl(cumlens_np)
         if init_zigzag:
-            self._scheme_cp_attn(cumlens)
+            self._scheme_cp_attn(cumlens, blk_table_ref, slot_mapping_ref)
             self._scheme_cp_slice(cumlens_np)
             self._scheme_cp_reorg(cumlens_np)
-            self._scheme_cp_mome(cumlens_np)
-
+            if self.mome_prefix_size > 0:
+                self._scheme_cp_mome(cumlens_np)
 
     def _scheme_sp_ctrl(self, cumlens: np.ndarray):
         self.tok = int(cumlens[-1])
@@ -323,8 +321,7 @@ class SPManager:
             y[dst : dst + n] = x[src : src + n]
         return y
 
-
-    def _scheme_cp_attn(self, cumlens: torch.Tensor):
+    def _scheme_cp_attn(self, cumlens: torch.Tensor, blk_table_ref: torch.Tensor, slot_mapping_ref: torch.Tensor):
         frag_num = self.sp_size * 2
         cumlens = cumlens.to(torch.int32)    # [B + 1]
         seq_lens = cumlens.diff()            # [B]
@@ -345,6 +342,8 @@ class SPManager:
         table0 = torch.arange(self.table_size, dtype=torch.int32, device=cumlens.device)
         blk_table = (table0.view(1, -1) + blk_base.repeat_interleave(2, dim=0).view(-1, 1))
         self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table)
+        self.cp_block_table = blk_table_ref.repeat_interleave(2, dim=0)
+        self.cp_slot_mapping = slot_mapping_ref.clone()
 
         seq_lens = seq_lens.tolist()
         align_lens = (seq_blks * self.pg).tolist()
@@ -382,6 +381,157 @@ class SPManager:
         mome_query_start_loc_tensor = torch.tensor(mome_query_start_loc, dtype=torch.int32, device=current_platform.device_type)
         self.cp_mome_metadata = (mome_query_start_loc_tensor, )
 
+    def _scheme_cp_mome(self, cumlens: np.ndarray):
+        """
+        TP4, req_num = 2 for example, 8 chunks per request in total
+        r0 means req0, c0 means chunk0
+        before mome hidden_states layout:
+        rank0: | r0 c0 | r0 c7 | r1 c0 | r1 c7 |
+        rank1: | r0 c1 | r0 c6 | r1 c1 | r1 c6 |
+        before mome suffix exchange suffix layout:
+        rank0: | r0 c0 suffix(2) | r0 c7 suffix(2) | r1 c0 suffix(2) | r1 c7 suffix(2) |
+        rank1: | r0 c1 suffix(2) | r0 c6 suffix(2) | r1 c1 suffix(2) | r1 c6 suffix(2) |
+        after mome suffix exchange suffix layout:
+        rank0: | r0 c6 suffix(2) | r1 c6 suffix(2) |
+        rank1: | r0 c0 suffix(2) | r0 c5 suffix(2) | r1 c0 suffix(2) | r1 c5 suffix(2) |
+        after rank0 mome suffix broadcast hidden_states layout:
+        rank0: | r0 c0 | r0 c6 suffix(2) | r0 c7 | r1 c0 | r1 c6 suffix(2) | r1 c7 |
+        rank1: | r0 c0 suffix(2) | r0 c1 | r0 c5 suffix(2) | r0 c6 | r0 c7 suffix(4) | r1 c0 suffix(2) | r1 c1 | r1 c5 suffix(2) | r1 c6 | r1 c7 suffix(4) |
+        after mome suffix exchange hidden_states layout:
+        rank0: | r0 c0 | r0 c6 suffix(2) | r0 c7 | r1 c0 | r1 c6 suffix(2) | r1 c7 |
+        rank1: | r0 c0 suffix(2) | r0 c1 | r0 c5 suffix(2) | r0 c6 | r0 c7 suffix(4) | r1 c0 suffix(2) | r1 c1 | r1 c5 suffix(2) | r1 c6 | r1 c7 suffix(4) |
+        rank 0 start_query_loc = [0, (2 *r0_chunk_len + 2), (2 * r0_chunk_len + 2) + (2 * r1_chunk_len + 2)]
+        rank 1 start_query_loc = [0, (2 * (r0_chunk_len + 2) + 4), (2 * (r0_chunk_len + 2) + 4) + (2 * (r1_chunk_len + 2) + 4)]
+        after mome restore layout:
+        rank0: | r0 c0 | r0 c7 | r1 c0 | r1 c7 |
+        rank1: | r0 c1 | r0 c6 | r1 c1 | r1 c6 | 
+        """
+
+        cp_query_split_lens = cdiv(np.diff(cumlens), self.sp_size * 2)
+        self.cp_mome_phase_split_sizes = tuple(int(req_len) for req_len in cp_query_split_lens.tolist())
+        num_reqs = len(self.cp_mome_phase_split_sizes)
+
+        factor = 1 if self.sp_rank == 0 else 2
+        core_merged_query_lens = 2 * cp_query_split_lens + factor * self.mome_prefix_size
+        # Non-rank0 appends rank0's per-request 4 tail tokens after suffix exchange.
+        tail_append_len = 0 if self.sp_rank == 0 else 2 * self.mome_prefix_size
+        merged_query_lens = core_merged_query_lens + tail_append_len
+        mome_query_start_loc = np.zeros(num_reqs + 1, dtype=cp_query_split_lens.dtype)
+        mome_query_start_loc[1:] = np.cumsum(merged_query_lens)
+        self.cp_mome_query_start_loc = torch.tensor(
+            mome_query_start_loc,
+            dtype=torch.int32,
+            device=current_platform.device_type,
+        )
+
+        self.cp_mome_req_split_sizes = tuple(
+            2 * req_len for req_len in self.cp_mome_phase_split_sizes
+        )
+        self.cp_mome_merged_core_split_sizes = tuple(
+            int(merged_len) for merged_len in core_merged_query_lens.tolist()
+        )
+        self.cp_mome_merged_split_sizes = tuple(int(merged_len) for merged_len in merged_query_lens.tolist())
+        self.cp_mome_suffix_block_len = num_reqs * self.mome_prefix_size
+        self.cp_mome_local_suffix_len = self.cp_mome_suffix_block_len * 2
+
+    def mome_suffix_exchange(self, x: torch.Tensor) -> torch.Tensor:
+        # x layout is req-prior: [req0 chunk0][req0 chunk7][req1 chunk0][req1 chunk7]...
+        suffix_size = self.mome_prefix_size
+        req_chunks = x.split(self.cp_mome_req_split_sizes, dim=0)
+        phase0_chunks = [
+            req_chunk[:req_len]
+            for req_chunk, req_len in zip(req_chunks, self.cp_mome_phase_split_sizes)
+        ]
+        phase1_chunks = [
+            req_chunk[req_len:]
+            for req_chunk, req_len in zip(req_chunks, self.cp_mome_phase_split_sizes)
+        ]
+        local_suffixes = torch.cat(
+            [req_chunk[-suffix_size:] for req_chunk in phase0_chunks]
+            + [req_chunk[-suffix_size:] for req_chunk in phase1_chunks],
+            dim=0,
+        )
+        phase0_local_suffix = local_suffixes.narrow(0, 0, self.cp_mome_suffix_block_len)
+        all_suffixes = self.sp_group.all_gather(local_suffixes, dim=0)
+
+        local_suffix_len = self.cp_mome_local_suffix_len
+        suffix_block_len = self.cp_mome_suffix_block_len
+
+        if self.sp_rank == 0:
+            phase0_suffix_chunks = ()
+            phase1_suffix = all_suffixes.narrow(0, local_suffix_len + suffix_block_len, suffix_block_len)
+        else:
+            prev_rank_off = (self.sp_rank - 1) * local_suffix_len
+            phase0_suffix = all_suffixes.narrow(0, prev_rank_off, suffix_block_len)
+            phase0_suffix_chunks = phase0_suffix.split(suffix_size, dim=0)
+            if self.sp_rank == self.sp_size - 1:
+                phase1_suffix = phase0_local_suffix
+            else:
+                next_rank_off = (self.sp_rank + 1) * local_suffix_len + suffix_block_len
+                phase1_suffix = all_suffixes.narrow(0, next_rank_off, suffix_block_len)
+
+        phase1_suffix_chunks = phase1_suffix.split(suffix_size, dim=0)
+        merged_pieces = []
+        for idx, (phase0_chunk, phase1_suffix_chunk, phase1_chunk) in enumerate(zip(phase0_chunks, phase1_suffix_chunks, phase1_chunks)):
+            if self.sp_rank != 0:
+                merged_pieces.append(phase0_suffix_chunks[idx])
+            merged_pieces.extend([phase0_chunk, phase1_suffix_chunk, phase1_chunk])
+        return torch.cat(merged_pieces, dim=0)
+
+    def broadcast_mome_req_tails_from_rank0(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        tail_len = self.mome_prefix_size + self.mome_prefix_size
+        req_core_sizes = self.cp_mome_merged_core_split_sizes
+        num_reqs = len(req_core_sizes)
+        tail_shape = (num_reqs, tail_len, *x.shape[1:])
+        tail_scratch = torch.empty(
+            tail_shape,
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        if self.sp_rank == 0:
+            for req_idx, (req_chunk, req_len) in enumerate(zip(x.split(req_core_sizes, dim=0), req_core_sizes)):
+                assert req_len >= tail_len, f"Expected req_len >= tail_len, got req_len={req_len}, tail_len={tail_len}"
+                tail_scratch[req_idx].copy_(req_chunk[-tail_len:])
+
+        torch.distributed.broadcast(
+            tail_scratch,
+            src=0,
+            group=self.sp_comm,
+        )
+        if self.sp_rank == 0:
+            return x
+
+        req_chunks = x.split(req_core_sizes, dim=0)
+        merged_pieces = []
+        for idx, req_chunk in enumerate(req_chunks):
+            merged_pieces.extend([req_chunk, tail_scratch[idx]])
+        return torch.cat(merged_pieces, dim=0)
+
+    def mome_split_and_cat(self, merged_output: torch.Tensor) -> torch.Tensor:
+        merged_chunks = merged_output.split(self.cp_mome_merged_split_sizes, dim=0)
+        restored_chunks = []
+        phase0_start = 0 if self.sp_rank == 0 else self.mome_prefix_size
+        phase1_base = self.mome_prefix_size if self.sp_rank == 0 else 2 * self.mome_prefix_size
+        for req_len, merged_chunk in zip(self.cp_mome_phase_split_sizes, merged_chunks):
+            phase0_end = phase0_start + req_len
+            phase0_chunk = merged_chunk[phase0_start:phase0_end]
+            phase1_start = phase1_base + req_len
+            phase1_chunk = merged_chunk[phase1_start:phase1_start + req_len]
+            restored_chunks.extend([phase0_chunk, phase1_chunk])
+        return torch.cat(restored_chunks, dim=0)
+
+    def __repr__(self):
+        return f"""SPManager(
+            sp_size={self.sp_size}, 
+            sp_rank={self.sp_rank}, 
+            init_zigzag={self.init_zigzag},
+            cp_mome_query_start_loc={self.cp_mome_query_start_loc},
+        )"""
+
 
 class DummySPManager:
 
@@ -391,19 +541,25 @@ class DummySPManager:
 
     def sp_to_cp(self, x: torch.Tensor):
         return x
+
     def cp_to_sp(self, x: torch.Tensor):
         return x
+
     def align_tokens(self, x: torch.Tensor):
         return x
+
     def page_align(self, x: torch.Tensor):
         return x
 
     def slice_tokens(self, x: torch.Tensor):
         return x[: x.size(0) // self.sp_size].clone()
+
     def cp_slice(self, x: torch.Tensor):
         return x[: x.size(0) // self.sp_size].clone()
+
     def ag_tokens(self, x: torch.Tensor):
         return torch.cat([x] * self.sp_size)
+
     def cp_attn_meta(self) -> tuple:
         return None, None, None
 
