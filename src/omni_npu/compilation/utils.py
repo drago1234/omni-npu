@@ -19,6 +19,9 @@ def adjust_fia_graph_params_ref(const_args):
         "key_rope",
         "block_table",
         "atten_mask",
+        "key_sink", 
+        "value_sink", 
+        "key_rope_sink",
     )
 
     for adjust_item in adjust_list:

@@ -180,6 +180,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         """
         num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
         # Block index of the last computed token
+        # TODO: fix block_idx_last_computed_token when APC enabled
         block_idx_last_computed_token = cdiv(num_computed_tokens, mome_block_size) - 1
         # which is <= block index for the first scheduled token
         block_idx_first_scheduled_token = (
@@ -234,7 +235,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if apc_enabled:
             cache_indices = common_attn_metadata.block_table_tensor
             num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
-            # TODO: need num_computed_tokens even if apc disabled (Zhixuan)
+            # TODO: need num_computed_tokens even if apc disabled
 
             (
                 block_idx_last_computed_token,
@@ -373,7 +374,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         """
         Reuse the logic of GDN builder for aclgraph capture.
         """
-        super().build_for_cudagraph_capture(common_attn_metadata)
+        return super().build_for_cudagraph_capture(common_attn_metadata)
 
     def update_block_table(
         self,

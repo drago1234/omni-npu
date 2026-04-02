@@ -453,7 +453,8 @@ class ACLGraphWrapper:
         attn_metadata = {
             key: metadata
             for key, metadata in forward_context.attn_metadata.items()
-            if hasattr(metadata, "decode") and metadata.decode and isinstance(metadata.decode.seq_lens, list)
+            if hasattr(metadata, "decode") and metadata.decode \
+                and hasattr(metadata.decode, "seq_lens") and isinstance(metadata.decode.seq_lens, list)
         }
         graph_params = get_graph_params()
         with torch.npu.stream(update_stream):
@@ -524,7 +525,6 @@ class ACLGraphWrapper:
                     num_kv_heads = param["num_key_value_heads"]
                     input_layout = param["input_layout"]
                     softmax_scale = param["softmax_scale"]
-                    sink_number = param["sink_number"]
                     pre_tokens = param["pre_tokens"]
                     next_tokens = param["next_tokens"]
                     attn_output = param["attn_output"]
@@ -533,6 +533,15 @@ class ACLGraphWrapper:
                     attn_mask = param["atten_mask"]
                     block_tables = param["block_table"]
                     block_size = param["block_size"]
+
+                    sink_kwargs = {}
+                    if "sink_number" in param:
+                        sink_kwargs["sink_number"] = param["sink_number"]
+                    if "key_sink" in param:
+                        sink_kwargs["key_sink"] = param["key_sink"]
+                        sink_kwargs["value_sink"] = param["value_sink"]
+                        sink_kwargs["key_rope_sink"] = param["key_rope_sink"]
+
                     actual_seq_len, actual_seq_len_kv = self._update_fia_params(forward_context, key)
                     if actual_seq_len_kv is None:
                         raise RuntimeError(f"kv length is None. {(forward_context.attn_metadata[key] is None)=}")
@@ -544,7 +553,6 @@ class ACLGraphWrapper:
                         value,
                         query_rope=query_rope,
                         key_rope=key_rope,
-                        sink_number=sink_number,
                         input_layout=input_layout,
                         actual_seq_qlen=actual_seq_len,
                         actual_seq_kvlen=actual_seq_len_kv,
@@ -559,6 +567,7 @@ class ACLGraphWrapper:
                         block_size=block_size,
                         workspace=graph_params.workspaces.get(runtime_shape),
                         out=[attn_output, softmax_lse],
+                        **sink_kwargs, 
                     )
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
