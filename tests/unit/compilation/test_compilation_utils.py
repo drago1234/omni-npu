@@ -114,10 +114,10 @@ class TestCaptureMultiFiaGraphSize:
         with patch("omni_npu.compilation.acl_graph.set_graph_params"):
             with patch("omni_npu.compilation.utils.get_graph_params") as mock_get:
                 mock_graph_params = MagicMock()
-                mock_graph_params.events = {16: []}
+                mock_graph_params.events = {16: {}}
                 mock_graph_params.workspaces = {}
-                mock_graph_params.handles = {16: []}
-                mock_graph_params.attn_params = {16: []}
+                mock_graph_params.handles = {16: {}}
+                mock_graph_params.attn_params = {16: {}}
                 mock_get.return_value = mock_graph_params
                 yield mock_graph_params
 
@@ -131,6 +131,7 @@ class TestCaptureMultiFiaGraphSize:
             "key": torch.randn(2, 4, 8),
         }
         workspace = torch.tensor([100.0, 200.0])
+        layer_name = "test_layer_name"
 
         with patch("torch_npu.npu.current_stream") as mock_stream:
             mock_stream_instance = MagicMock()
@@ -155,7 +156,7 @@ class TestCaptureMultiFiaGraphSize:
                                         mock_end.return_value = mock_handle
 
                                         capture_multi_fia_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args
+                                            attn_output, softmax_lse, num_tokens, const_args, layer_name,
                                         )
 
                                         mock_get_ws.assert_called_once_with(**const_args)
@@ -180,6 +181,7 @@ class TestCaptureMultiFiaGraphSize:
         softmax_lse = torch.randn(2, 4)
         num_tokens = 16
         const_args = {"query": torch.randn(2, 4, 8)}
+        layer_name = "test_layer_name"
 
         with patch("torch_npu.npu.current_stream") as mock_stream:
             mock_stream_instance = MagicMock()
@@ -200,7 +202,7 @@ class TestCaptureMultiFiaGraphSize:
                                         mock_end.return_value = MagicMock()
 
                                         capture_multi_fia_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args
+                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
                                         )
 
                                         mock_get_ws.assert_not_called()
@@ -212,6 +214,7 @@ class TestCaptureMultiFiaGraphSize:
         softmax_lse = torch.randn(2, 4)
         num_tokens = 16
         const_args = {"query": torch.randn(2, 4, 8)}
+        layer_name = "test_layer_name"
 
         with patch("torch_npu.npu.current_stream"):
             with patch("torch.npu.ExternalEvent"):
@@ -226,10 +229,10 @@ class TestCaptureMultiFiaGraphSize:
                                 with patch("torch_npu.npu_fused_infer_attention_score.out", create=True):
                                     with patch("torch.npu.graph_task_group_end"):
                                         capture_multi_fia_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args
+                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
                                         )
 
-                                        captured_params = setup_graph_params.attn_params[num_tokens][0]
+                                        captured_params = setup_graph_params.attn_params[num_tokens][layer_name]
                                         assert captured_params["op_name"] == "npu_fused_infer_attention_score"
 
 
@@ -242,10 +245,10 @@ class TestCaptureMultiFiaV2GraphSize:
         with patch("omni_npu.compilation.acl_graph.set_graph_params"):
             with patch("omni_npu.compilation.utils.get_graph_params") as mock_get:
                 mock_graph_params = MagicMock()
-                mock_graph_params.events = {32: []}
+                mock_graph_params.events = {32: {}}
                 mock_graph_params.workspaces = {}
-                mock_graph_params.handles = {32: []}
-                mock_graph_params.attn_params = {32: []}
+                mock_graph_params.handles = {32: {}}
+                mock_graph_params.attn_params = {32: {}}
                 mock_get.return_value = mock_graph_params
                 yield mock_graph_params
 
@@ -259,6 +262,7 @@ class TestCaptureMultiFiaV2GraphSize:
             "key": torch.randn(2, 4, 8),
         }
         workspace = torch.tensor([300.0, 400.0])
+        layer_name = "test_layer_name"
 
         with patch("torch_npu.npu.current_stream") as mock_stream:
             mock_stream_instance = MagicMock()
@@ -281,7 +285,7 @@ class TestCaptureMultiFiaV2GraphSize:
                                         mock_end.return_value = MagicMock()
 
                                         capture_multi_fia_v2_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args
+                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
                                         )
 
                                         mock_get_ws.assert_called_once_with(**const_args)
@@ -296,6 +300,7 @@ class TestCaptureMultiFiaV2GraphSize:
         softmax_lse = torch.randn(2, 4)
         num_tokens = 32
         const_args = {"query": torch.randn(2, 4, 8)}
+        layer_name = "test_layer_name"
 
         with patch("torch_npu.npu.current_stream"):
             with patch("torch.npu.ExternalEvent"):
@@ -310,10 +315,10 @@ class TestCaptureMultiFiaV2GraphSize:
                                 with patch("torch_npu.npu_fused_infer_attention_score_v2.out", create=True):
                                     with patch("torch.npu.graph_task_group_end"):
                                         capture_multi_fia_v2_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args
+                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
                                         )
 
-                                        captured_params = setup_graph_params.attn_params[num_tokens][0]
+                                        captured_params = setup_graph_params.attn_params[num_tokens][layer_name]
                                         assert captured_params["op_name"] == "npu_fused_infer_attention_score_v2"
 
 
@@ -326,10 +331,10 @@ class TestCaptureMultiFiaSinkGraphSize:
         with patch("omni_npu.compilation.acl_graph.set_graph_params"):
             with patch("omni_npu.compilation.utils.get_graph_params") as mock_get:
                 mock_graph_params = MagicMock()
-                mock_graph_params.events = {64: []}
+                mock_graph_params.events = {64: {}}
                 mock_graph_params.workspaces = {}
-                mock_graph_params.handles = {64: []}
-                mock_graph_params.attn_params = {64: []}
+                mock_graph_params.handles = {64: {}}
+                mock_graph_params.attn_params = {64: {}}
                 mock_get.return_value = mock_graph_params
                 yield mock_graph_params
 
@@ -343,6 +348,7 @@ class TestCaptureMultiFiaSinkGraphSize:
             "key": torch.randn(2, 4, 8),
         }
         workspace = torch.tensor([500.0, 600.0])
+        layer_name = "test_layer_name"
 
         with patch("torch_npu.npu.current_stream") as mock_stream:
             mock_stream_instance = MagicMock()
@@ -365,7 +371,7 @@ class TestCaptureMultiFiaSinkGraphSize:
                                         mock_end.return_value = MagicMock()
 
                                         capture_multi_fia_sink_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args
+                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
                                         )
 
                                         mock_get_ws.assert_called_once_with(**const_args)
@@ -390,6 +396,7 @@ class TestCaptureMultiFiaSinkGraphSize:
         softmax_lse = torch.randn(2, 4)
         num_tokens = 64
         const_args = {"query": torch.randn(2, 4, 8)}
+        layer_name = "test_layer_name"
 
         with patch("torch_npu.npu.current_stream") as mock_stream:
             mock_stream_instance = MagicMock()
@@ -410,7 +417,7 @@ class TestCaptureMultiFiaSinkGraphSize:
                                         mock_end.return_value = MagicMock()
 
                                         capture_multi_fia_sink_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args
+                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
                                         )
 
                                         mock_get_ws.assert_not_called()
@@ -422,6 +429,7 @@ class TestCaptureMultiFiaSinkGraphSize:
         softmax_lse = torch.randn(2, 4)
         num_tokens = 64
         const_args = {"query": torch.randn(2, 4, 8)}
+        layer_name = "test_layer_name"
 
         with patch("torch_npu.npu.current_stream"):
             with patch("torch.npu.ExternalEvent"):
@@ -436,8 +444,8 @@ class TestCaptureMultiFiaSinkGraphSize:
                                 with patch("torch.ops.custom.npu_fused_infer_attention_sink.out", create=True):
                                     with patch("torch.npu.graph_task_group_end"):
                                         capture_multi_fia_sink_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args
+                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
                                         )
 
-                                        captured_params = setup_graph_params.attn_params[num_tokens][0]
+                                        captured_params = setup_graph_params.attn_params[num_tokens][layer_name]
                                         assert captured_params["op_name"] == "npu_fused_infer_attention_sink"

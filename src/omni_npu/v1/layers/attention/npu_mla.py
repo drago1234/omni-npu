@@ -292,6 +292,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         sin: torch.Tensor,
         attn_metadata: Optional['NPUMLADecodeMetadata'] = None,
         pd_mixed_flag: int = 0,
+        layer_name: str = "",
     ) -> torch.Tensor:
         force_decode = True if pd_mixed_flag == 1 else False
         short_prefill = True if pd_mixed_flag == 2 else False
@@ -400,7 +401,9 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                     attn_output=attn_output,
                     softmax_lse=softmax_lse ,
                     num_tokens=num_tokens,
-                    const_args=kwargs)
+                    const_args=kwargs,
+                    layer_name=layer_name,
+                )
             else:
                 attn_output[:actual_query_cumlens[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(
                     **kwargs
@@ -439,7 +442,9 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                     attn_output=attn_output,
                     softmax_lse=softmax_lse ,
                     num_tokens=num_tokens,
-                    const_args=kwargs)
+                    const_args=kwargs,
+                    layer_name=layer_name,
+                )
             else:
                 attn_output = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
 
@@ -743,7 +748,14 @@ def npu_mla_forward(
         decode_sin = sin[:num_decode_tokens]
         attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
         pd_mixed_flag = 2 if num_decode_tokens > attn_metadata.num_decodes else 1 # short prefill in decode or pure decode 
-        decode_output = self._forward_decode(decode_hidden_states, decode_cos, decode_sin, attn_metadata.decode, pd_mixed_flag=pd_mixed_flag)
+        decode_output = self._forward_decode(
+            decode_hidden_states,
+            decode_cos,
+            decode_sin,
+            attn_metadata.decode,
+            pd_mixed_flag=pd_mixed_flag,
+            layer_name=f"{layer_name}.attn",
+        )
 
         mixed_output = torch.cat([decode_output, prefill_output], dim=0)
         if mixed_output.shape[0] != num_actual_toks:
@@ -777,6 +789,7 @@ def npu_mla_forward(
             decode_cos,
             decode_sin,
             attn_metadata.decode,
+            layer_name=f"{layer_name}.attn",
         )
         return _pad_output_to_input_tokens(decode_output)
     

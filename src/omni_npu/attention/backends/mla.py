@@ -750,7 +750,9 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                     attn_output=attn_output,
                     softmax_lse=softmax_lse ,
                     num_tokens=num_tokens,
-                    const_args=kwargs)
+                    const_args=kwargs,
+                    layer_name=layer.layer_name,
+                )
                 o = attn_output.transpose(0, 1).contiguous()
             else:
                 o = torch.ops.custom.npu_fused_infer_attention_sink(
@@ -789,7 +791,9 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                     attn_output=attn_output,
                     softmax_lse=softmax_lse ,
                     num_tokens=num_tokens,
-                    const_args=kwargs)
+                    const_args=kwargs,
+                    layer_name=layer.layer_name,
+                )
                 o = attn_output
             else:
                 # output shape: (N, T, D)

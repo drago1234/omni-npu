@@ -313,12 +313,10 @@ class ACLGraphWrapper:
         if num_layers == 0:
             return
         with torch.npu.stream(update_stream):
-            for key, param, handle, event in zip(
-                attn_keys,
-                graph_params.attn_params[runtime_shape],
-                graph_params.handles[runtime_shape],
-                graph_params.events[runtime_shape],
-            ):
+            for key in attn_keys:
+                param = graph_params.attn_params[runtime_shape][key]
+                handle = graph_params.handles[runtime_shape][key]
+                event = graph_params.events[runtime_shape][key]
                 op_name = param["op_name"]
                 if op_name == "npu_fused_infer_attention_score":
                     query = param["query"]
@@ -459,12 +457,10 @@ class ACLGraphWrapper:
         }
         graph_params = get_graph_params()
         with torch.npu.stream(update_stream):
-            for key, param, handle, event in zip(
-                attn_metadata,
-                graph_params.attn_params[runtime_shape],
-                graph_params.handles[runtime_shape],
-                graph_params.events[runtime_shape],
-            ):
+            for key in attn_metadata:
+                param = graph_params.attn_params[runtime_shape][key]
+                handle = graph_params.handles[runtime_shape][key]
+                event = graph_params.events[runtime_shape][key]
                 op_name = param["op_name"]
                 if op_name == "npu_fused_infer_attention_score":
                     query = param["query"]
@@ -580,10 +576,10 @@ def weak_ref_workspaces(params):
 
 @dataclass
 class GraphParams:
-    events: dict[int, list[torch.npu.ExternalEvent]]
+    events: dict[int, dict[str, torch.npu.ExternalEvent]]
     workspaces: dict[int, torch.Tensor]
-    handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
-    attn_params: dict[int, list[dict]]
+    handles: dict[int, dict[str, torch_npu._C._NPUTaskGroupHandle]]
+    attn_params: dict[int, dict[str, dict]]
 
 _graph_params: Optional[GraphParams] = None
 
@@ -593,13 +589,13 @@ def set_graph_params(aclgraph_capture_sizes: set[int]):
     if _graph_params is not None:
         raise ValueError("Graph parameters have already been set!")
     _graph_params = GraphParams(
-        {size: []
+        {size: dict()
          for size in aclgraph_capture_sizes},
         {size: None
          for size in aclgraph_capture_sizes},
-        {size: []
+        {size: dict()
          for size in aclgraph_capture_sizes},
-        {size: []
+        {size: dict()
          for size in aclgraph_capture_sizes},
     )
 

@@ -295,7 +295,9 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                     attn_output=attn_output,
                     softmax_lse=softmax_lse ,
                     num_tokens=num_tokens,
-                    const_args=kwargs)
+                    const_args=kwargs,
+                    layer_name=layer.layer_name,
+                )
             else:
                 attn_output = torch.ops.custom.npu_fused_infer_attention_sink(
                     **kwargs
@@ -350,6 +352,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                     softmax_lse=softmax_lse,
                     num_tokens=num_tokens,
                     const_args=kwargs,
+                    layer_name=layer.layer_name,
                 )
             else:
                 attn_output = torch_npu.npu_fused_infer_attention_score(**kwargs)[0]
@@ -398,6 +401,7 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
                 softmax_lse=softmax_lse,
                 num_tokens=num_tokens,
                 const_args=kwargs,
+                layer_name=layer.layer_name,
             )
         else:
             attn_output = torch_npu.npu_fused_infer_attention_score_v2(

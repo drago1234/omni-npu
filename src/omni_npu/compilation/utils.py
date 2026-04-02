@@ -30,13 +30,14 @@ def capture_multi_fia_graph_size(
     softmax_lse,
     num_tokens,
     const_args,
+    layer_name,
 ):
     graph_params = get_graph_params()
     stream = torch_npu.npu.current_stream()
     event = torch.npu.ExternalEvent()
     event.wait(stream)
     event.reset(stream)
-    graph_params.events[num_tokens].append(event)
+    graph_params.events[num_tokens][layer_name] = event
 
     workspace = graph_params.workspaces.get(num_tokens)
     if workspace is None:
@@ -52,29 +53,28 @@ def capture_multi_fia_graph_size(
         "softmax_lse": weak_ref_tensors(softmax_lse),
     })
     adjust_fia_graph_params_ref(local_const_args)
-    graph_params.attn_params[num_tokens].append(
-        local_const_args
-    )
+    graph_params.attn_params[num_tokens][layer_name] = local_const_args
 
     torch.npu.graph_task_group_begin(stream)
     torch_npu.npu_fused_infer_attention_score.out(
         **const_args, workspace=workspace, out=[attn_output, softmax_lse]
     )
     handle = torch.npu.graph_task_group_end(stream)
-    graph_params.handles[num_tokens].append(handle)
+    graph_params.handles[num_tokens][layer_name] = handle
 
 def capture_multi_fia_v2_graph_size(
     attn_output,
     softmax_lse,
     num_tokens,
     const_args,
+    layer_name,
 ):
     graph_params = get_graph_params()
     stream = torch_npu.npu.current_stream()
     event = torch.npu.ExternalEvent()
     event.wait(stream)
     event.reset(stream)
-    graph_params.events[num_tokens].append(event)
+    graph_params.events[num_tokens][layer_name] = event
 
     workspace = graph_params.workspaces.get(num_tokens)
     if workspace is None:
@@ -91,29 +91,28 @@ def capture_multi_fia_v2_graph_size(
     })
     
     adjust_fia_graph_params_ref(local_const_args)
-    graph_params.attn_params[num_tokens].append(
-        local_const_args
-    )
+    graph_params.attn_params[num_tokens][layer_name] = local_const_args
 
     torch.npu.graph_task_group_begin(stream)
     torch_npu.npu_fused_infer_attention_score_v2.out(
         **const_args, workspace=workspace, out=[attn_output, softmax_lse]
     )
     handle = torch.npu.graph_task_group_end(stream)
-    graph_params.handles[num_tokens].append(handle)
+    graph_params.handles[num_tokens][layer_name] = handle
 
 def capture_multi_fia_sink_graph_size(
     attn_output,
     softmax_lse,
     num_tokens,
     const_args,
+    layer_name,
 ):
     graph_params = get_graph_params()
     stream = torch_npu.npu.current_stream()
     event = torch.npu.ExternalEvent()
     event.wait(stream)
     event.reset(stream)
-    graph_params.events[num_tokens].append(event)
+    graph_params.events[num_tokens][layer_name] = event
 
     workspace = graph_params.workspaces.get(num_tokens)
     if workspace is None:
@@ -130,13 +129,11 @@ def capture_multi_fia_sink_graph_size(
     })
     
     adjust_fia_graph_params_ref(local_const_args)
-    graph_params.attn_params[num_tokens].append(
-        local_const_args
-    )
+    graph_params.attn_params[num_tokens][layer_name] = local_const_args
 
     torch.npu.graph_task_group_begin(stream)
     torch.ops.custom.npu_fused_infer_attention_sink.out(
         **const_args, workspace=workspace, out=[attn_output, softmax_lse]
     )
     handle = torch.npu.graph_task_group_end(stream)
-    graph_params.handles[num_tokens].append(handle)
+    graph_params.handles[num_tokens][layer_name] = handle
