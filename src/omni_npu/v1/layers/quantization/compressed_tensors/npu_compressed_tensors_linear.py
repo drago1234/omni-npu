@@ -18,7 +18,7 @@ from omni_npu.v1.layers.linear import (
 )
 from omni_npu.v1.layers.utils import get_npu_execution_type
 from omni_npu.v1.utils import ACL_FORMAT_FRACTAL_NZ
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
 logger = init_logger(__name__)

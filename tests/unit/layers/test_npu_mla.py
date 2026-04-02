@@ -525,7 +525,7 @@ class TestNPUMLAMergeConvInit(unittest.TestCase):
         )
 
     @pytest.mark.usefixtures("default_vllm_config")
-    @patch("omni_npu.v1.models.config_loader.loader.model_extra_config")
+    @patch("omni_npu.model_config.config_loader.loader.model_extra_config")
     @patch("omni_npu.v1.layers.attention.npu_mla.RMSNorm")
     @patch("omni_npu.v1.layers.attention.npu_mla.ReplicatedLinear")
     @patch("omni_npu.v1.layers.attention.npu_mla.ColumnParallelFlashCommLinear")
@@ -578,7 +578,7 @@ class TestNPUMLAMergeConvInit(unittest.TestCase):
         self.assertTrue(mock_aggregate_conv.called)
 
     @pytest.mark.usefixtures("default_vllm_config")
-    @patch("omni_npu.v1.models.config_loader.loader.model_extra_config")
+    @patch("omni_npu.model_config.config_loader.loader.model_extra_config")
     @patch("omni_npu.v1.layers.attention.npu_mla.RMSNorm")
     @patch("omni_npu.v1.layers.attention.npu_mla.ReplicatedLinear")
     @patch("omni_npu.v1.layers.attention.npu_mla.ColumnParallelFlashCommLinear")
@@ -635,7 +635,7 @@ class TestNPUMLAMergeConvInit(unittest.TestCase):
         delattr(npu_mla_mod, "AggregateConv")
 
     @pytest.mark.usefixtures("default_vllm_config")
-    @patch("omni_npu.v1.models.config_loader.loader.model_extra_config")
+    @patch("omni_npu.model_config.config_loader.loader.model_extra_config")
     @patch("omni_npu.v1.layers.attention.npu_mla.RMSNorm")
     @patch("omni_npu.v1.layers.attention.npu_mla.ReplicatedLinear")
     @patch("omni_npu.v1.layers.attention.npu_mla.ColumnParallelFlashCommLinear")

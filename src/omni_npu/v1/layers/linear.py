@@ -31,7 +31,7 @@ from omni_npu.v1.distributed.parallel_state_ext import (
     get_layer_parallel_world_size,
     get_layer_parallel_rank
 )
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.v1.utils import (get_last_two_parts, ACL_FORMAT_FRACTAL_NZ)
 
 logger = init_logger(__name__)

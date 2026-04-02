@@ -227,7 +227,7 @@ class TestNpuWorker:
             mock_load_config,
         )
         monkeypatch.setattr(
-            "omni_npu.v1.models.config_loader.loader.load_model_extra_config",
+            "omni_npu.model_config.config_loader.loader.load_model_extra_config",
             mock_load_config,
         )
 

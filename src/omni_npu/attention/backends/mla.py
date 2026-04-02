@@ -41,7 +41,7 @@ from omni_npu.compilation.utils import (
     capture_multi_fia_sink_graph_size,
 )
 from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 logger = init_logger(__name__)
 

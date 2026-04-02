@@ -94,13 +94,7 @@ class TaskConfig:
 
 @dataclass
 class ModelParallelConfig:
-    dense_mlp_tp_size: int = 1
-    o_proj_tp_size: int = 1
-    attn_sp_size: int = 1
-    redundancy_shared_expert_num: int = 0
-    attn_dies: int = 0
     enable_share_expert_tp: bool = False
-    eh_proj_tp_size: int = 1
     layer_parallel_config: dict[str, Any] = field(default_factory=dict)
     input_split: bool = False
     ena_context_parallel: bool = False
@@ -110,23 +104,11 @@ class ModelParallelConfig:
 class ModelOperatorOptConfig:
     enable_kv_rmsnorm_rope_cache: bool = False
     kv_nz: bool = True
-    prefill_moe_all_to_all: bool = True
     moe_multi_stream_tune: bool = False
-    best_ep: bool = False
-    merge_qkv: bool = False
-    two_stage_comm: bool = False
-    gmm_nz: bool = False
     unquant_bmm_nz: bool = False
-    decode_moe_dispatch_combine: bool = True
-    decode_flash_comm_1: bool = True # decode节点开启FlashComm1优化
+    decode_moe_dispatch_combine: bool = False
     enable_super_kernel: bool = False
-    enable_prefill_micro_batch: bool = False
     enable_mlaprolog: bool = False
-    cast_w2_scale_f32: bool = False
-    control_accept_rate: float = -1 # <0 or >1 不控制, >=0 and <=1 控制MTP开启时接受率为该值，几乎必然导致输出结果异常，仅保证只投机1个token时满足这一数值
-    mla_multistream_limit_core: str = '' # 空字符串代表不开启多流分核，形如'20|36'代表主流分配的AIC和AIV核数分别为20和36
-    shared_experts_to_gmm: bool = False # 当redundancy_shared_expert_num > 0时，共享专家使用GMM代替BMM进行计算（限定收益场景：EP288 + 单die bs >= 48，仅针对Decode阶段）
-    enable_gmm_swiglu_quant: bool = False # 当redundancy_shared_expert_num > 0时，使用npu_grouped_matmul_swiglu_quant_v2融合算子
     mtp_remove_redundant_kv: bool = False # MTP场景下，去除FIA算子对同一请求的冗余KV cache搬运，当前不支持与Omni Attention同时使用
     enable_prefetch: bool = True # 是否开启预取
     expert_gate_up_prefetch: int = 50 # 默认预取大小为 50Mb；如果是权重是BF16型，设置为 30Mb
@@ -139,10 +121,6 @@ class ModelOperatorOptConfig:
 
     enable_round_pipeline_comm: bool = False
     enable_pipeline_comm: bool = False
-    prefill_enable_long_seq: bool = False
-    prefill_enable_mla_alltoall: bool = False
-    prefill_enable_mla_alltoall_local: bool = False
-    fa_quant: bool = False
     use_omni_cache: bool = False
     enable_dsa: bool=True
 

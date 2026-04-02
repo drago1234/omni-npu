@@ -1,8 +1,0 @@
-{
-    "model_parallel_config": {
-        "dense_mlp_tp_size": 4
-    },
-    "operator_optimization_config": {
-        "decode_moe_dispatch_combine": false
-    }
-}

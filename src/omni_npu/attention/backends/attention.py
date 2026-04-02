@@ -38,7 +38,7 @@ from omni_npu.compilation.utils import (
 )
 
 from omni_npu.attention.backends.utils import register_attention_backend
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 NZ_DIM = 16
 VLLM_NPU_ATTN = "VLLM_NPU_ATTN"

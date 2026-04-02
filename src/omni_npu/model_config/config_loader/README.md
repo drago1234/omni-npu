@@ -1,6 +1,6 @@
 # 模型配置项自动加载使用说明
 ## 模型配置项定义
-模型配置项统一定义在v1\models\config_loader\loader.py的配置类中，如需添加，按照配置项功能放在对应的配置类中，注意初始值的设定，当模型对应的配置项json文件不包含该配置项时，设为默认值。
+模型配置项统一定义在 `omni_npu/model_config/config_loader/loader.py` 的配置类中，如需添加，按照配置项功能放在对应的配置类中，注意初始值的设定，当模型对应的配置项json文件不包含该配置项时，设为默认值。
 
 模型配置类分为三个：
 1. `TaskConfig`: 任务相关的一些配置项，如当前模型的类型、当前执行的硬件环境、节点属性。
@@ -24,7 +24,7 @@ model_extra_config.operator_opt_config.xxxx
 ## 关于新增模型的配置项json
 假如需要新增模型配置项json文件，需要以下几个步骤：
 1. 检查当前模型在`match_hf_configs.json`中是否登记，若未登记，先登记；
-对于新增模型，若新增模型需要新增配置项json文件，必须在v1\models\config文件夹下的`match_hf_configs.json`进行登记。
+对于新增模型，若新增模型需要新增配置项json文件，必须在 `omni_npu/model_config/configs` 文件夹下的 `match_hf_configs.json` 进行登记。
 登记方法为：添加模型权重文件中的config.json文件上的架构相关的属性，用于匹配对应的模型类型。其中一级json对象的key一一对应`best_practice_configs.json`中的model字段，如`"qwen-235B"`、`"kimi-k2"`。
 `match_hf_configs.json`格式如下：
     ```json
@@ -74,7 +74,7 @@ model_extra_config.operator_opt_config.xxxx
     ADDITIONAL_CONFIG='{"enable_low_latency":true}'
     ```
 - 用户自定义配置文件是为了实现模型配置项的灵活使用设置的，可用于开发调测、性能无关问题的规避等场景，这些文件需要环境变量`CUSTOM_MODEL_CONFIG_PATH`控制，若打开，则优先使用自定义模型配置。
-注意，`CUSTOM_MODEL_CONFIG_PATH`给定的是相对路径，必须在v1\models\config路径下面。
+注意，`CUSTOM_MODEL_CONFIG_PATH`给定的是相对路径，必须在 `omni_npu/model_config/configs` 路径下面。
 
 3. 检查对应文件下的`best_practice_configs.json`是否有和新增配置**相同的运行平台和量化类型**，若有，在对应的json对象中的configs内新增对应部署形态的配置文件路径，若无，参考其他json对象，新增对应`model_type`、`hardware_platform`、`quant_type`字段的json对象。
 `best_practice_configs.json`格式如下：

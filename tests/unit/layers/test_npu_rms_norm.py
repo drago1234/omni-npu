@@ -26,7 +26,7 @@ class TestNPURMSNorm(unittest.TestCase):
         self.mock_config = MagicMock()
         self.mock_config.operator_opt_config = MagicMock()
         self.mock_config.operator_opt_config.omni_disable_npu_add_rms_norm = False
-        self.config_patch = patch("omni_npu.v1.models.config_loader.loader.model_extra_config", self.mock_config)
+        self.config_patch = patch("omni_npu.model_config.config_loader.loader.model_extra_config", self.mock_config)
         self.config_patch_loader = patch("omni_npu.layers.npu_rms_norm.model_extra_config", self.mock_config)
         self.config_patch.start()
         self.config_patch_loader.start()

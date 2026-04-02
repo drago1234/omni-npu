@@ -50,7 +50,7 @@ from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
 from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
 from omni_npu.v1.layers.vocab_parallel_embedding import NPUVocabParallelEmbedding
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_models.models.pangu.openpangu import OpenPanguMLAAttention, mHCModule
 
 

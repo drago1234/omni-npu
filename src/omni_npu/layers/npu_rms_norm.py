@@ -8,7 +8,7 @@ import torch_npu
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
 
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
 @RMSNorm.register_oot

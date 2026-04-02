@@ -27,7 +27,7 @@ from vllm.logger import init_logger
 
 from omni_npu.v1.utils import current_stream, on_ascend950
 from omni_npu.v1.layers.utils import yarn_get_mscale
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.attention.backends.utils import SPManager, DummySPManager, lazy_init_cos_sin
 from omni_npu.layers.mome.npu_mome import ColumnParallelMOME
 from omni_npu.layers.attention.npu_sparse_attentions import (

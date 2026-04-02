@@ -26,7 +26,7 @@ from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
     ReplicatedFlashCommLinear
 )
-from omni_npu.v1.models.config_loader.loader import  model_extra_config
+from omni_npu.model_config.config_loader.loader import  model_extra_config
 from omni_npu.v1.utils import current_stream
 
 

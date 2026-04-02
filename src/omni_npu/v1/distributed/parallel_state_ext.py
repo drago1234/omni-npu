@@ -368,7 +368,7 @@ def is_layer_parallel_input_split_enabled() -> bool:
 def _get_model_parallel_config() -> Any | None:
     """Return model parallel config from model_extra_config, if available."""
     try:
-        from omni_npu.v1.models.config_loader.loader import model_extra_config
+        from omni_npu.model_config.config_loader.loader import model_extra_config
     except Exception as e:
         logger.debug(f"Failed to import model_extra_config: {e}")
         return None

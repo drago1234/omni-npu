@@ -39,7 +39,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 from .npu_model_runner import NPUModelRunner
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
-from omni_npu.v1.models.config_loader.loader import load_model_extra_config
+from omni_npu.model_config.config_loader.loader import load_model_extra_config
 
 logger = init_logger(__name__)
 

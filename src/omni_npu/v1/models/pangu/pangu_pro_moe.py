@@ -49,7 +49,7 @@ from vllm.v1 import kv_cache_interface
 from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import get_forward_context
 
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 logger = init_logger(__name__)
 AttentionSpec = kv_cache_interface.AttentionSpec

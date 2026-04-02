@@ -35,7 +35,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches, SPManager
-from omni_npu.v1.models.config_loader.loader import model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
 ENABLE_OMNI_CACHE = int(os.getenv("ENABLE_OMNI_CACHE", "0")) == 1
