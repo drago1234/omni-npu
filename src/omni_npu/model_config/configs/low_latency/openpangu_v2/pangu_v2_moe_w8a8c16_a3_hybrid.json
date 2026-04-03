@@ -1,0 +1,10 @@
+{
+    "model_parallel_config": {
+        "ena_context_parallel": false,
+        "layer_parallel_config": {
+        }
+    },
+    "operator_optimization_config": {
+        "use_noncontiguous_kv": true
+    }
+}

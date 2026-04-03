@@ -82,6 +82,16 @@
         }
     },
     {
+        "model": "pangu_v2_moe_92B",
+        "hardware": "A3",
+        "precision": "w8a8c16",
+        "configs": {
+            "hybrid": {
+                "config_file": "openpangu_v2/pangu_v2_moe_w8a8c16_a3_hybrid.json"
+            }
+        }
+    },
+    {
         "model": "pangu_v2_moe_34B",
         "hardware": "A3",
         "precision": "bf16",
