@@ -97,7 +97,9 @@ class ACLGraphWrapper:
                  runtime_mode: CUDAGraphMode,
                  graph_pool: Any = None,
                  cudagraph_options: Optional[CUDAGraphOptions] = None,
-                 update_stream: torch.npu.Stream = None):
+                 update_stream: torch.npu.Stream = None,
+                 attn_layer_names: list[str] = [],
+    ):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.graph_pool = graph_pool
@@ -121,6 +123,7 @@ class ACLGraphWrapper:
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry]\
                                                                         = {}
+        self.attn_layer_names = attn_layer_names
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -314,6 +317,8 @@ class ACLGraphWrapper:
             return
         with torch.npu.stream(update_stream):
             for key in attn_keys:
+                if key not in self.attn_layer_names:
+                    continue
                 param = graph_params.attn_params[runtime_shape][key]
                 handle = graph_params.handles[runtime_shape][key]
                 event = graph_params.events[runtime_shape][key]
@@ -459,6 +464,8 @@ class ACLGraphWrapper:
         graph_params = get_graph_params()
         with torch.npu.stream(update_stream):
             for key in attn_metadata:
+                if key not in self.attn_layer_names:
+                    continue
                 param = graph_params.attn_params[runtime_shape][key]
                 handle = graph_params.handles[runtime_shape][key]
                 event = graph_params.events[runtime_shape][key]

@@ -227,7 +227,7 @@ class EagleProposerPatch(VLLMPatch):
             self.num_speculative_tokens
             if not is_graph_capturing else min(self.num_speculative_tokens, self.n_predict)
         ):
-            if fwd_idx == 1 and cudagraph_mode == CUDAGraphMode.NONE:
+            if self.n_predict == 1 and fwd_idx == 1 and cudagraph_mode == CUDAGraphMode.NONE:
                 num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
                     num_tokens_padded=num_tokens,

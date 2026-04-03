@@ -489,17 +489,26 @@ class NPUModelRunner(GPUModelRunner):
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.draft_update_stream: torch.npu.Stream = torch.npu.Stream()
             set_graph_params(self.compilation_config.cudagraph_capture_sizes)
+            
+            attn_layer_names = set(get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys())
+            if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
+                attn_layer_names = attn_layer_names - set(self.drafter.attn_layer_names)
+            attn_layer_names = list(attn_layer_names)
+
             self.model = ACLGraphWrapper(self.model.runnable,
                                          self.vllm_config,
                                          runtime_mode=CUDAGraphMode.FULL,
-                                         update_stream=self.update_stream)
+                                         update_stream=self.update_stream,
+                                         attn_layer_names=attn_layer_names,
+                                        )
             logger.debug("<<< Wrapped original model with ACLGraphWrapper")
             if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
                 self.drafter.model = ACLGraphWrapper(
                     self.drafter.model,
                     self.vllm_config,
                     runtime_mode=CUDAGraphMode.FULL,
-                    update_stream=self.draft_update_stream
+                    update_stream=self.draft_update_stream,
+                    attn_layer_names=self.drafter.attn_layer_names,
                 )
                 logger.debug("<<< Wrapped drafter model with ACLGraphWrapper")
 
