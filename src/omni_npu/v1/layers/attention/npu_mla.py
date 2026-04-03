@@ -596,9 +596,9 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             else:
                 window_size = NPUMLAImpl.MAX_WINDOW_SIZE
             output = torch.ops.custom.npu_fused_infer_attention_sink(
-                q_nope[:actual_seq_qlen[-1]],
-                k_nope,
-                v,
+                q_nope[:actual_seq_qlen[-1]].contiguous(),
+                k_nope.contiguous(),
+                v.contiguous(),
                 query_rope=q_pe[:actual_seq_qlen[-1]],
                 key_rope=prefill_k_rope,
                 num_query_heads=self.num_local_heads,
