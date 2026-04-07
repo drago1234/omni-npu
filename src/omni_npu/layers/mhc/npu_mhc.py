@@ -2,6 +2,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import torch
+import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -63,6 +64,65 @@ class NPUmHC(torch.nn.Module):
             torch.empty(self.hidden_size * self.num_stream, dtype=torch.float32)
         )
 
+    def _mhc_pre_naive(self, hidden_states: torch.Tensor):
+        shape, dtype = hidden_states.size(), hidden_states.dtype
+        hidden_states = hidden_states.flatten(-2).float()
+        rsqrt = torch.rsqrt(
+            hidden_states.square().mean(-1, keepdim=True) + self.norm_eps,
+        )
+        mixes = torch.nn.functional.linear(
+            hidden_states * rsqrt * self.norm_gamma,
+            self.phi.weight,
+        )
+        h_pre, h_post, h_res = mixes.split(
+            [self.num_stream, self.num_stream, self.num_stream**2], dim=-1,
+        )
+
+        h_pre = torch.nn.functional.sigmoid(
+            h_pre * self.branch_alpha_pre + self.branch_beta_pre
+        ) + self.hc_eps
+        h_post = 2 * torch.nn.functional.sigmoid(
+            h_post * self.branch_alpha_post + self.branch_beta_post
+        )
+        h_res = h_res.unflatten(-1, (self.num_stream, self.num_stream)) * self.branch_alpha_res \
+                    + self.branch_beta_res.view(self.num_stream, self.num_stream)
+        hidden_states = torch.sum(
+            h_pre.unsqueeze(-1) * hidden_states.view(shape), dim=-2,
+        ).to(dtype)
+        return hidden_states, h_post, h_res
+
+    def _mhc_sinkhorn_naive(self, h_res: torch.Tensor):
+        h_res = h_res.softmax(-1) + self.hc_eps
+
+        # === Step 1: Initial Col Norm ===
+        col_sum = h_res.sum(-2, keepdim=True) + self.hc_eps
+        h_res = h_res / col_sum
+
+        # === Step 2: Loop ===
+        for _ in range(self.mhc_recur_norm - 1):
+            # Row Norm
+            row_sum = h_res.sum(-1, keepdim=True) + self.hc_eps
+            h_res = h_res / row_sum
+
+            # Col Norm
+            col_sum = h_res.sum(-2, keepdim=True) + self.hc_eps
+            h_res = h_res / col_sum
+
+        return h_res
+
+    def _mhc_post_naive(
+            self,
+            hidden_states: torch.Tensor,
+            h_post: torch.Tensor,
+            residual: torch.Tensor,
+            h_res: torch.Tensor,
+    ):
+        hidden_states = (
+            h_post.unsqueeze(-1) * hidden_states.unsqueeze(-2) \
+            + torch.sum(h_res.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3)
+        ).to(hidden_states.dtype)
+        return hidden_states
+
     def mhc_pre(
         self,
         hidden_states: torch.Tensor,
@@ -108,34 +168,14 @@ class NPUmHC(torch.nn.Module):
                         hc_eps=self.hc_eps,
                 )
             else:
-                shape, dtype = hidden_states.size(), hidden_states.dtype
-                hidden_states = hidden_states.flatten(-2).float()
-                rsqrt = torch.rsqrt(
-                    hidden_states.square().mean(-1, keepdim=True) + self.norm_eps,
-                )
-                mixes = torch.nn.functional.linear(
-                    hidden_states * rsqrt * self.norm_gamma,
+                hidden_states, h_post, h_res, _, _, _ = torch_npu.npu_mhc_pre(
+                    hidden_states,
                     self.phi.weight,
+                    self.branch_alpha,
+                    self.branch_beta,
+                    gamma=self.norm_gamma.view(self.num_stream, -1),
+                    out_flag=0,
                 )
-                h_pre, h_post, h_res = mixes.split(
-                    [self.num_stream, self.num_stream, self.num_stream**2], dim=-1,
-                )
-                alpha_pre, alpha_post, alpha_res = self.branch_alpha.view(-1).split([1, 1, 1])
-                beta_pre, beta_post, beta_res = self.branch_beta.view(-1).split(
-                    [self.num_stream, self.num_stream, self.num_stream * self.num_stream]
-                )
-
-                h_pre = torch.nn.functional.sigmoid(
-                    h_pre * alpha_pre + beta_pre
-                ) + self.hc_eps
-                h_post = 2 * torch.nn.functional.sigmoid(
-                    h_post * alpha_post + beta_post
-                )
-                h_res = h_res.unflatten(-1, (self.num_stream, self.num_stream)) * alpha_res \
-                            + beta_res.view(self.num_stream, self.num_stream)
-                hidden_states = torch.sum(
-                    h_pre.unsqueeze(-1) * hidden_states.view(shape), dim=-2,
-                ).to(dtype)
             
         return hidden_states, h_post, h_res
 
@@ -153,21 +193,12 @@ class NPUmHC(torch.nn.Module):
                 num_iters=self.mhc_recur_norm,
             )
         else:
-            h_res = h_res.softmax(-1) + self.hc_eps
-
-            # === Step 1: Initial Col Norm ===
-            col_sum = h_res.sum(-2, keepdim=True) + self.hc_eps
-            h_res = h_res / col_sum
-
-            # === Step 2: Loop ===
-            for _ in range(self.mhc_recur_norm - 1):
-                # Row Norm
-                row_sum = h_res.sum(-1, keepdim=True) + self.hc_eps
-                h_res = h_res / row_sum
-                
-                # Col Norm
-                col_sum = h_res.sum(-2, keepdim=True) + self.hc_eps
-                h_res = h_res / col_sum
+            h_res, _, _ = torch_npu.npu_mhc_sinkhorn(
+                h_res,
+                eps=self.hc_eps,
+                num_iters=self.mhc_recur_norm,
+                out_flag=0,
+            )
 
         return h_res
 
@@ -190,10 +221,12 @@ class NPUmHC(torch.nn.Module):
                 h_post,
             )
         else:
-            hidden_states = (
-                h_post.unsqueeze(-1) * hidden_states.unsqueeze(-2) \
-                + torch.sum(h_res.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3)
-            ).to(hidden_states.dtype)
+            hidden_states = torch_npu.npu_mhc_post(
+                residual,
+                h_res,
+                hidden_states,
+                h_post,
+            )
         
         hidden_states = hidden_states.view(-1, self.num_stream * self.hidden_size)
 

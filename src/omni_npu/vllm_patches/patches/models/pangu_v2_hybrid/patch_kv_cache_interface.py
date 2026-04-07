@@ -50,6 +50,9 @@ class DSAAttentionSpec(FullAttentionSpec):
         elif self.cache_dtype_str == "int8_ds_mla":
             # Quant case: 512 int8 + 64 bf16 + 4 fp32 + 128 int8 + 1 bf16
             return self.block_size * (656 + 128 + 2)
+        elif self.cache_dtype_str == "hif8_ds_mla":
+            # HiF8 with scale: 656 bytes KV data + 128 bytes indexer + 4 bytes fp32 scale
+            return self.block_size * (656 + 128 + 4)
         # Non-quant case: standard attention format
         return (
             self.block_size
@@ -79,9 +82,6 @@ class DSAAttentionSpec(FullAttentionSpec):
         return merged_spec
 
     def __post_init__(self):
-        assert self.page_size_padded is None, (
-            f"For DSAAttentionSpec, page size should not be padded, but got {self.page_size_padded}."
-        )
         assert self.sliding_window is None, (
             f"For DSAAttentionSpec, sliding window should not be enabled, but got {self.sliding_window}."
         )

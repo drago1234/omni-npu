@@ -100,5 +100,15 @@
                 "config_file": "openpangu_v2/pangu_v2_moe_bf16_a3_hybrid.json"
             }
         }
+    },
+    {
+        "model": "pangu_v2_moe_92B",
+        "hardware": "A5",
+        "precision": "hif8",
+        "configs": {
+            "hybrid": {
+                "config_file": "openpangu_v2/pangu_v2_moe_hif8_a5_hybrid.json"
+            }
+        }
     }
 ]

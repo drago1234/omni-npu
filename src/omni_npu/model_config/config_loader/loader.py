@@ -238,7 +238,7 @@ def parse_hf_config(hf_config):
         if isinstance(input_activations_type, dict):
             num_bits_values = input_activations_type.values()
             input_activations_type = f"{min(num_bits_values)}"
-        
+
         kv_cache_scheme_type = quantization_config["kv_cache_scheme"]
         quant_type = f"w{weights_type}a{input_activations_type}"
         if kv_cache_scheme_type == "Opti-C8":
@@ -248,6 +248,8 @@ def parse_hf_config(hf_config):
             quant_type = f"{quant_type}c{num_bits_values}"
         else:
             quant_type = f"{quant_type}c16"
+    elif quantization_config is not None and quantization_config.get('quant_method', '').strip() == 'hifloat8':
+        quant_type = "hif8"
     else:
         quant_type = "bf16"
 

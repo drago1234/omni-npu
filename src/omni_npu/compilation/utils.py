@@ -140,3 +140,41 @@ def capture_multi_fia_sink_graph_size(
     )
     handle = torch.npu.graph_task_group_end(stream)
     graph_params.handles[num_tokens][layer_name] = handle
+
+def capture_multi_pioneer_graph_size(
+    attn_output,
+    softmax_lse,
+    num_tokens,
+    const_args,
+    layer_name,
+):
+    graph_params = get_graph_params()
+    stream = torch_npu.npu.current_stream()
+    event = torch.npu.ExternalEvent()
+    event.wait(stream)
+    event.reset(stream)
+    graph_params.events[num_tokens][layer_name] = event
+
+    workspace = graph_params.workspaces.get(num_tokens)
+    if workspace is None:
+        workspace = torch_npu._npu_attention_pioneer_get_max_workspace(
+            **const_args
+        )
+        update_graph_params_workspaces(num_tokens, workspace)
+
+    local_const_args = const_args.copy()
+    local_const_args.update({
+        "op_name": "_npu_attention_pioneer",
+        "attn_output": weak_ref_tensors(attn_output),
+        "softmax_lse": weak_ref_tensors(softmax_lse),
+    })
+
+    adjust_fia_graph_params_ref(local_const_args)
+    graph_params.attn_params[num_tokens][layer_name] = local_const_args
+
+    torch.npu.graph_task_group_begin(stream)
+    torch_npu._npu_attention_pioneer.out(
+        **const_args, workspace=workspace, out=[attn_output, softmax_lse]
+    )
+    handle = torch.npu.graph_task_group_end(stream)
+    graph_params.handles[num_tokens][layer_name] = handle

@@ -92,7 +92,8 @@ class Hifloat8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
-        custom_model_enabled = "omni_custom_models" in os.environ.get("VLLM_PLUGINS", "")
+        vllm_plugins = os.environ.get("VLLM_PLUGINS", "")
+        custom_model_enabled = "omni_custom_models" in vllm_plugins
         if custom_model_enabled:
             return self.get_quant_method_custom(layer, prefix)
         
@@ -239,7 +240,7 @@ class Hifloat8MlpMethod:
         return output
 
 
-class Hifloat8MoEMethod(NPUFusedMoEMethodBase, FusedMoEMethodBase):
+class Hifloat8MoEMethod(FusedMoEMethodBase, NPUFusedMoEMethodBase):
 
     def __init__(self, quant_config: Hifloat8Config, layer):
         FusedMoEMethodBase.__init__(self, layer.moe_config)

@@ -21,6 +21,8 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from omni_npu.sample.ops.topk_topp_sampler import apply_top_k_top_p_npu
+from omni_npu.v1.utils import on_ascend950
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 logger = init_logger(__name__)
 
@@ -320,7 +322,10 @@ def compute_probs(
 
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
-    logits = apply_top_k_top_p_npu(logits, top_k, top_p)
+    if on_ascend950():
+        logits = apply_top_k_top_p(logits, top_k, top_p)
+    else:
+        logits = apply_top_k_top_p_npu(logits, top_k, top_p)
     return logits
 
 def expand_batch_to_tokens(
@@ -612,6 +617,11 @@ def compute_probs_and_sample(
             logits, sampling_metadata, metadata,
         ).type(torch.float32)
     torch.npu.default_stream().wait_stream(stream)
+    if on_ascend950():
+        logits = apply_top_k_top_p(logits, top_k, top_p)
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        token_ids = probs.div_(q).argmax(dim=-1).view(-1)
+        return token_ids.to(torch.int32), logits
     res = torch_npu.npu_top_k_top_p_sample(logits, top_k, top_p, q, is_need_logits=True)
     return res[0].to(torch.int32), res[1]
 

@@ -2,6 +2,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import torch
+import torch_npu
 import torch.nn.functional as F
 from omni_npu.v1.utils import on_ascend950
 
@@ -29,6 +30,7 @@ except ImportError as e:
     logger.warning(f"Failed to import omni_custom_ops: {e}")
 except Exception as e:
     logger.warning(f"Error occurred while importing omni_custom_ops: {e}")
+
 
 # ============================================================
 # reference implementation of causal_conv1d begins
@@ -323,14 +325,19 @@ class ColumnParallelMOME(torch.nn.Module):
                 initial_state_mode=has_initial_state,
             )
         else:
-            return causal_conv1d_fn(
-                x,
-                self.weight,
-                conv_states,
-                query_start_loc,
-                cache_indices,
-                has_initial_state,
+            fused_out = torch_npu.npu_fused_causal_conv1d(
+                x, self.weight, conv_states,
+                query_start_loc=query_start_loc.to(torch.int32),
+                cache_indices=cache_indices,
+                initial_state_mode=torch.Tensor([2]).npu().to(torch.int32),
+                bias=None,
+                num_accepted_tokens=None,
+                activation_mode="None",
+                run_mode=0,
+                residual_connection=1,
             )
+
+            return fused_out
 
     def forward_decode(
         self,
@@ -352,16 +359,18 @@ class ColumnParallelMOME(torch.nn.Module):
                 pad_slot_id=pad_slot_id,
             )
         else:
-            return causal_conv1d_update(
-                x,
-                self.weight,
-                conv_states,
-                cache_indices,
-                query_start_loc,
-                True,
-                num_accepted_tokens,
-                pad_slot_id,
+            fused_out = torch_npu.npu_fused_causal_conv1d(
+                x, self.weight, conv_states,
+                query_start_loc=query_start_loc.to(torch.int32),
+                cache_indices=cache_indices,
+                num_accepted_tokens=num_accepted_tokens.to(dtype=torch.int32) \
+                                    if num_accepted_tokens is not None else None,
+                activation_mode="None",
+                pad_slot_id=pad_slot_id,
+                run_mode=1,
+                residual_connection=1,
             )
+            return fused_out
     
     def update_param_tp_status(self):
         for param in self.parameters():

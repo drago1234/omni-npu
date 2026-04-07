@@ -574,12 +574,73 @@ class ACLGraphWrapper:
                         block_size=block_size,
                         workspace=graph_params.workspaces.get(runtime_shape),
                         out=[attn_output, softmax_lse],
-                        **sink_kwargs, 
+                        **sink_kwargs,
                     )
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
+                elif op_name == "_npu_attention_pioneer":
+                    self._update_attention_pioneer(
+                        update_stream, forward_context, key, param, handle, event,
+                        graph_params, runtime_shape,
+                    )
                 else:
                     raise RuntimeError(f"Unsupported op name for mla: {(op_name)=}")
+
+    def _update_attention_pioneer(self, update_stream, forward_context, key, param, handle, event,
+                                  graph_params, runtime_shape):
+        query = param["query"]
+        key_cache = param["key"]
+        value = param["value"]
+        query_rope = param["query_rope"]
+        key_rope = param["key_rope"]
+        num_heads = param["num_heads"]
+        num_kv_heads = param["num_key_value_heads"]
+        input_layout = param["input_layout"]
+        scale = param["scale"]
+        pre_tokens = param["pre_tokens"]
+        next_tokens = param["next_tokens"]
+        attn_output = param["attn_output"]
+        softmax_lse = param["softmax_lse"]
+        sparse_mode = param["sparse_mode"]
+        attn_mask = param["atten_mask"]
+        block_tables = param["block_table"]
+        block_size = param["block_size"]
+
+        sink_kwargs = {}
+        if "key_sink" in param:
+            sink_kwargs["key_sink"] = param["key_sink"]
+            sink_kwargs["value_sink"] = param["value_sink"]
+            sink_kwargs["key_rope_sink"] = param["key_rope_sink"]
+
+        actual_seq_len, actual_seq_len_kv = self._update_fia_params(forward_context, key)
+        if actual_seq_len_kv is None:
+            raise RuntimeError(f"kv length is None. {(forward_context.attn_metadata[key] is None)=}")
+
+        torch.npu.graph_task_update_begin(update_stream, handle)
+        torch_npu._npu_attention_pioneer.out(
+            query,
+            key_cache,
+            value,
+            query_rope=query_rope,
+            key_rope=key_rope,
+            input_layout=input_layout,
+            actual_seq_lengths=actual_seq_len,
+            actual_seq_lengths_kv=actual_seq_len_kv,
+            num_key_value_heads=num_kv_heads,
+            num_heads=num_heads,
+            scale=scale,
+            pre_tokens=pre_tokens,
+            next_tokens=next_tokens,
+            sparse_mode=sparse_mode,
+            atten_mask=attn_mask,
+            block_table=block_tables,
+            block_size=block_size,
+            workspace=graph_params.workspaces.get(runtime_shape),
+            out=[attn_output, softmax_lse],
+            **sink_kwargs,
+        )
+        torch.npu.graph_task_update_end(update_stream)
+        event.record(update_stream)
 
 
 def weak_ref_workspaces(params):

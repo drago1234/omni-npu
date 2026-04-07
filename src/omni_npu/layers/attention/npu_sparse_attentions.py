@@ -99,8 +99,13 @@ class MLASWAAttention(MLAAttention):
             ShareKVSlidingWindowSpec,
         )
 
+        # hif8_ds_mla/fp8_ds_mla/int8_ds_mla are DSA-only quantization formats;
+        # SWA layers always use unquantized (auto) cache dtype.
+        cache_dtype = self.kv_cache_dtype
+        if cache_dtype in ("hif8_ds_mla", "fp8_ds_mla", "int8_ds_mla"):
+            cache_dtype = "auto"
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
-            self.kv_cache_dtype, vllm_config.model_config
+            cache_dtype, vllm_config.model_config
         )
 
         if self.sliding_window is None:
@@ -193,6 +198,7 @@ class DSAAttention(MLAAttention):
             head_size=self.head_size + self.indexer_head_dim,
             dtype=kv_cache_dtype,
             cache_dtype_str=self.cache_dtype_str,
+            page_size_padded=self.page_size_padded,
         )
 
 
