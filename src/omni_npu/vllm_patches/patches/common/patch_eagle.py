@@ -908,10 +908,6 @@ class EagleProposerPatch(VLLMPatch):
             draft_index=0,
         )
 
-        num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
-            num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
-        )
-
         # Adapt start: get token info from target model batch descriptor
         assert self.runner.batch_execution_and_padding_state is not None, \
             "propose of drafter should be executed after runner._determine_batch_execution_and_padding"
@@ -985,7 +981,7 @@ class EagleProposerPatch(VLLMPatch):
                 
                 # update previous
                 previous_input_ids = self.input_ids[: num_tokens]
-                previous_hidden_states = last_hidden_states
+                previous_hidden_states = last_hidden_states[: num_tokens]
                 previous_next_token_ids = new_next_token_ids
 
         return torch.stack(draft_token_ids_list, dim=1)

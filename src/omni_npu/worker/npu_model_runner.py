@@ -484,9 +484,8 @@ class NPUModelRunner(GPUModelRunner):
         # wrap the model with full graph wrapper if needed.
         logger.debug(f"<<< {self.compilation_config.cudagraph_mode.has_full_cudagraphs()=}")
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-            self.update_stream: torch.npu.Stream = torch.npu.Stream()
-            self.draft_update_stream: torch.npu.Stream = torch.npu.Stream()
             set_graph_params(self.compilation_config.cudagraph_capture_sizes)
+            self.update_stream: torch.npu.Stream = torch.npu.Stream()
             
             attn_layer_names = set(get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys())
             if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
@@ -501,14 +500,39 @@ class NPUModelRunner(GPUModelRunner):
                                         )
             logger.debug("<<< Wrapped original model with ACLGraphWrapper")
             if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
-                self.drafter.model = ACLGraphWrapper(
-                    self.drafter.model,
-                    self.vllm_config,
-                    runtime_mode=CUDAGraphMode.FULL,
-                    update_stream=self.draft_update_stream,
-                    attn_layer_names=self.drafter.attn_layer_names,
-                )
-                logger.debug("<<< Wrapped drafter model with ACLGraphWrapper")
+                n_predict = getattr(self.drafter, "n_predict", 1)
+                if n_predict == 1:
+                    self.draft_update_stream: torch.npu.Stream = torch.npu.Stream()
+                    self.drafter.model = ACLGraphWrapper(
+                        self.drafter.model,
+                        self.vllm_config,
+                        runtime_mode=CUDAGraphMode.FULL,
+                        update_stream=self.draft_update_stream,
+                        attn_layer_names=self.drafter.attn_layer_names,
+                    )
+                    logger.debug("<<< Wrapped drafter model with ACLGraphWrapper")
+                else:
+                    mtp_start_layer_idx = self.drafter.model.config.num_hidden_layers
+                    self.draft_update_stream_list: list[torch.npu.Stream] = [
+                        torch.npu.Stream for _ in range(n_predict)]
+                    
+                    wrapped_layers = dict()
+                    for i in range(n_predict):
+                        now_layer = mtp_start_layer_idx + i
+                        one_attn_layer_names = [
+                            item for item in self.drafter.attn_layer_names
+                            if self.drafter.model.get_spec_layer(item) == now_layer
+                        ]
+                        wrapped_layers[str(now_layer)] = ACLGraphWrapper(
+                            self.drafter.model.model.layers[str(now_layer)],
+                            self.vllm_config,
+                            runtime_mode=CUDAGraphMode.FULL,
+                            update_stream=self.draft_update_stream_list[i],
+                            attn_layer_names=one_attn_layer_names,
+                        )
+                    self.drafter.model.model.runnable = self.drafter.model.layers
+                    self.drafter.model.model.layers = wrapped_layers
+                    logger.debug("<<< Wrapped multi mtp layers of drafter model with ACLGraphWrapper")
 
     def capture_model(self) -> int:
         logger.debug("<<< Capturing model in npu_model_runner")
