@@ -317,18 +317,20 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if num_prefills == 0:
             attn_metadata.prefill = None
         else:
+            prefill_query_start_loc = common_attn_metadata.query_start_loc[num_decodes:] \
+                - common_attn_metadata.query_start_loc[num_decodes]
             attn_metadata.prefill = NPUMomeAttentionMetadata(
                 num_prefills=num_prefills, 
                 num_prefill_tokens=num_prefill_tokens, 
                 num_decodes=0, 
                 num_decode_tokens=0, 
                 num_reqs=num_prefills, 
-                query_start_loc=common_attn_metadata.query_start_loc[num_decodes:], 
+                query_start_loc=prefill_query_start_loc, 
                 cache_indices=cache_indices[num_decodes:], 
                 max_query_len=max_query_len, 
                 pad_slot_id=PAD_SLOT_ID, 
                 B_size=self.mome_block_size, 
-                num_accepted_tokens=num_accepted_tokens[num_decodes:] if num_accepted_tokens else None, 
+                num_accepted_tokens=num_accepted_tokens[num_decodes:] if num_accepted_tokens is not None else None, 
                 num_computed_tokens=num_computed_tokens[num_decodes:] if apc_enabled else None, 
                 block_idx_last_computed_token=block_idx_last_computed_token[num_decodes:] if apc_enabled else None, 
                 block_idx_first_scheduled_token=block_idx_first_scheduled_token[num_decodes:] if apc_enabled else None, 
@@ -348,7 +350,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 max_query_len=max_query_len, 
                 pad_slot_id=PAD_SLOT_ID, 
                 B_size=self.mome_block_size, 
-                num_accepted_tokens=num_accepted_tokens[:num_decodes] if num_accepted_tokens else None, 
+                num_accepted_tokens=num_accepted_tokens[:num_decodes] if num_accepted_tokens is not None else None, 
                 num_computed_tokens=num_computed_tokens[:num_decodes] if apc_enabled else None, 
                 block_idx_last_computed_token=block_idx_last_computed_token[:num_decodes] if apc_enabled else None, 
                 block_idx_first_scheduled_token=block_idx_first_scheduled_token[:num_decodes] if apc_enabled else None, 

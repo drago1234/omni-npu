@@ -205,7 +205,7 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             metadata.slot_mapping = self._align_slot_mapping(metadata.slot_mapping, metadata.num_reqs)
 
         if metadata.prefill is not None:
-            metadata.prefill.query_cumlens = torch.cumsum(metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1], dim=0)
+            metadata.prefill.query_cumlens = torch.cumsum(metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1], dim=0, dtype=torch.int32)
             metadata.prefill.seq_lens = common_attn_metadata.seq_lens[-metadata.prefill.query_cumlens.shape[0]:]
             if model_extra_config.parall_config.ena_context_parallel:
                 slot_mapping = metadata.slot_mapping[:metadata.num_actual_tokens]

@@ -88,12 +88,10 @@ class NPUModelRunner(GPUModelRunner):
                 self.drafter.batch_desc = None
                 self.drafter.target_model_cuda_graph_mode = None
 
-        # NOTE:(runze) query_lens and seq_lens arguments need to be int64 in FIA op,
-        # otherwise an implicit conversion would happen which might hurt performance.
-        self.query_start_loc = self._make_buffer(self.max_num_reqs + 1,
-                                                 dtype=torch.int64)
-        self.seq_lens = self._make_buffer(self.max_num_reqs,
-                                          dtype=torch.int64)
+        # Overwrite num_accepted_tokens from GPUModelRunner to make it int32
+        self.num_accepted_tokens = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
 
         # sampled_token_ids is int32 in npu, sampled_token_ids_pinned_cpu should
         # be same dtype to synchronize.

@@ -318,7 +318,7 @@ class ColumnParallelMOME(torch.nn.Module):
                 x,
                 self.weight,
                 conv_states,
-                query_start_loc=query_start_loc.to(dtype=torch.int32),
+                query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
                 initial_state_mode=has_initial_state,
             )
@@ -346,10 +346,9 @@ class ColumnParallelMOME(torch.nn.Module):
                 x,
                 self.weight,
                 conv_states,
-                query_start_loc=query_start_loc.to(dtype=torch.int32),
+                query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
-                num_accepted_tokens=num_accepted_tokens.to(dtype=torch.int32) \
-                                    if num_accepted_tokens is not None else None,
+                num_accepted_tokens=num_accepted_tokens,
                 pad_slot_id=pad_slot_id,
             )
         else:
