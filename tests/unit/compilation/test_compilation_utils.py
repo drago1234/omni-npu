@@ -2,450 +2,381 @@
 """Unit tests for omni_npu.compilation.utils module."""
 
 import pytest
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
+
 import torch
 
+from omni_npu.compilation.acl_graph import (
+    GraphTaskEntry,
+    OpDescriptor,
+)
 from omni_npu.compilation.utils import (
-    adjust_fia_graph_params_ref,
-    capture_multi_fia_graph_size,
-    capture_multi_fia_v2_graph_size,
-    capture_multi_fia_sink_graph_size,
+    _pad_list,
+    _extract_fia_params,
+    _compute_fia_dynamic_kwargs,
+    _get_or_create_workspace,
+    _capture_kwargs,
+    capture_graph_task,
 )
 
 
-class TestAdjustFiaGraphParamsRef:
-    """Tests for adjust_fia_graph_params_ref function."""
+# ---------------------------------------------------------------------------
+# _pad_list
+# ---------------------------------------------------------------------------
 
-    def test_adjust_fia_graph_params_ref_with_valid_args(self):
-        """Test that adjust_fia_graph_params_ref weak references valid tensor args."""
-        query = torch.tensor([1.0, 2.0, 3.0])
-        key = torch.tensor([4.0, 5.0, 6.0])
-        value = torch.tensor([7.0, 8.0, 9.0])
-        query_rope = torch.tensor([1.0, 0.0])
-        key_rope = torch.tensor([0.0, 1.0])
-        block_table = torch.tensor([0, 1, 2], dtype=torch.int32)
-        atten_mask = torch.tensor([1.0, 0.0])
+class TestPadList:
 
-        const_args = {
-            "query": query,
-            "key": key,
-            "value": value,
-            "query_rope": query_rope,
-            "key_rope": key_rope,
-            "block_table": block_table,
-            "atten_mask": atten_mask,
-            "other_arg": "not_adjusted",
-        }
+    def test_empty_returns_empty(self):
+        assert _pad_list([], 3) == []
 
-        # 假设 adjust_list 内部定义了这些键
-        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-            mock_weak_ref.side_effect = lambda x: f"weak_ref_{x}"
+    def test_exact_length_unchanged(self):
+        assert _pad_list([1, 2, 3], 3) == [1, 2, 3]
 
-            adjust_fia_graph_params_ref(const_args)
+    def test_pads_with_last_element(self):
+        assert _pad_list([1, 2], 4) == [1, 2, 2, 2]
 
-            # Verify that weak_ref_tensors was called for all adjust_list items
-            # 注意：这里假设 adjust_list 包含这 7 个键。如果实现中 adjust_list 是硬编码的，这个断言是安全的。
-            adjust_calls = 7 
-            assert mock_weak_ref.call_count == adjust_calls
+    def test_pads_with_explicit_fill(self):
+        assert _pad_list([1, 2], 4, fill=0) == [1, 2, 0, 0]
 
-            # Verify that the const_args were updated with weak references
-            for adjust_item in [
-                "query", "key", "value", "query_rope", "key_rope", "block_table", "atten_mask"
-            ]:
-                assert const_args[adjust_item].startswith("weak_ref_")
-
-            # Verify that non-adjust items are unchanged
-            assert const_args["other_arg"] == "not_adjusted"
-
-    def test_adjust_fia_graph_params_ref_with_none_values(self):
-        """Test that adjust_fia_graph_params_ref handles None values correctly."""
-        const_args = {
-            "query": None,
-            "key": torch.tensor([1.0, 2.0]),
-            "value": None,
-        }
-
-        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-            mock_weak_ref.return_value = "weak_ref"
-
-            adjust_fia_graph_params_ref(const_args)
-
-            # weak_ref_tensors should only be called for non-None values
-            assert mock_weak_ref.call_count == 1
-            assert const_args["query"] is None
-            assert const_args["key"] == "weak_ref"
-            assert const_args["value"] is None
-
-    def test_adjust_fia_graph_params_ref_with_partial_args(self):
-        """Test that adjust_fia_graph_params_ref works with only some adjust_list items present."""
-        const_args = {
-            "query": torch.tensor([1.0]),
-            "value": torch.tensor([2.0]),
-            "other": torch.tensor([3.0]),
-        }
-
-        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-            mock_weak_ref.return_value = "weak_ref"
-
-            adjust_fia_graph_params_ref(const_args)
-
-            # Only 'query' and 'value' are in the default adjust_list
-            assert mock_weak_ref.call_count == 2 
-            assert const_args["query"] == "weak_ref"
-            assert const_args["value"] == "weak_ref"
-            # 'other' is not in adjust_list, so it remains untouched
-            assert torch.equal(const_args["other"], torch.tensor([3.0]))
-
-    def test_adjust_fia_graph_params_ref_empty_args(self):
-        """Test that adjust_fia_graph_params_ref handles empty dict."""
-        const_args = {}
-
-        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-            adjust_fia_graph_params_ref(const_args)
-            mock_weak_ref.assert_not_called()
+    def test_truncates(self):
+        assert _pad_list([1, 2, 3, 4], 2) == [1, 2]
 
 
-class TestCaptureMultiFiaGraphSize:
-    """Tests for capture_multi_fia_graph_size function."""
+# ---------------------------------------------------------------------------
+# _extract_fia_params
+# ---------------------------------------------------------------------------
 
-    @pytest.fixture(autouse=True)
-    def setup_graph_params(self):
-        """Setup graph params before each test."""
-        with patch("omni_npu.compilation.acl_graph.set_graph_params"):
-            with patch("omni_npu.compilation.utils.get_graph_params") as mock_get:
-                mock_graph_params = MagicMock()
-                mock_graph_params.events = {16: {}}
-                mock_graph_params.workspaces = {}
-                mock_graph_params.handles = {16: {}}
-                mock_graph_params.attn_params = {16: {}}
-                mock_get.return_value = mock_graph_params
-                yield mock_graph_params
+class TestExtractFiaParams:
 
-    def test_capture_multi_fia_graph_size_new_workspace(self, setup_graph_params):
-        """Test capture_multi_fia_graph_size with new workspace calculation."""
-        attn_output = torch.randn(2, 4, 8)
-        softmax_lse = torch.randn(2, 4)
-        num_tokens = 16
-        const_args = {
-            "query": torch.randn(2, 4, 8),
-            "key": torch.randn(2, 4, 8),
-        }
-        workspace = torch.tensor([100.0, 200.0])
-        layer_name = "test_layer_name"
+    @pytest.fixture
+    def batch_descriptor(self):
+        bd = MagicMock()
+        bd.num_reqs = 3
+        bd.num_tokens = 4
+        return bd
 
-        with patch("torch_npu.npu.current_stream") as mock_stream:
-            mock_stream_instance = MagicMock()
-            mock_stream.return_value = mock_stream_instance
+    @pytest.fixture
+    def vllm_config(self):
+        cfg = MagicMock()
+        cfg.scheduler_config.max_num_seqs = 10
+        return cfg
 
-            with patch("torch.npu.ExternalEvent") as mock_event:
-                mock_event_instance = MagicMock()
-                mock_event.return_value = mock_event_instance
+    def test_gqa_with_list_seqlens(self, vllm_config, batch_descriptor):
+        """GQA metadata (no decode attr): list seq_lens are padded."""
+        metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
+        metadata.query_start_loc = [0, 1, 2]
+        metadata.seq_lens = [5, 6]
 
-                # 统一使用 torch_npu 前缀
-                with patch("torch_npu._npu_fused_infer_attention_score_get_max_workspace", create=True) as mock_get_ws:
-                    mock_get_ws.return_value = workspace
+        q, kv = _extract_fia_params(metadata, vllm_config, batch_descriptor)
 
-                    with patch("omni_npu.compilation.utils.update_graph_params_workspaces") as mock_update_ws:
-                        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-                            mock_weak_ref.side_effect = lambda x: x
+        assert len(q) == 3  # padded to num_reqs=3
+        assert len(kv) == 3
 
-                            with patch("torch.npu.graph_task_group_begin") as mock_begin:
-                                with patch("torch_npu.npu_fused_infer_attention_score.out", create=True) as mock_fia_out:
-                                    with patch("torch.npu.graph_task_group_end") as mock_end:
-                                        mock_handle = MagicMock()
-                                        mock_end.return_value = mock_handle
+    def test_gqa_with_tensor_seqlens(self, vllm_config, batch_descriptor):
+        """GQA metadata with tensor seq_lens: returned directly (early return)."""
+        metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
+        metadata.query_start_loc = [0, 1]
+        metadata.seq_lens = torch.tensor([5, 6])
 
-                                        capture_multi_fia_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args, layer_name,
-                                        )
+        q, kv = _extract_fia_params(metadata, vllm_config, batch_descriptor)
 
-                                        mock_get_ws.assert_called_once_with(**const_args)
-                                        mock_update_ws.assert_called_once_with(num_tokens, workspace)
+        assert isinstance(kv, torch.Tensor)
+        assert torch.equal(kv, torch.tensor([5, 6]))
 
-                                        mock_event.assert_called_once()
-                                        mock_event_instance.wait.assert_called_once_with(mock_stream_instance)
-                                        mock_event_instance.reset.assert_called_once_with(mock_stream_instance)
+    def test_mla_with_list_seqlens(self, vllm_config, batch_descriptor):
+        """MLA metadata (has decode): list seq_lens are padded."""
+        metadata = MagicMock()
+        metadata.decode = MagicMock()
+        metadata.decode.query_cumlens = [1, 2]
+        metadata.decode.seq_lens = [5, 6]
 
-                                        assert mock_weak_ref.call_count > 0
+        q, kv = _extract_fia_params(metadata, vllm_config, batch_descriptor)
 
-                                        mock_begin.assert_called_once_with(mock_stream_instance)
-                                        mock_fia_out.assert_called_once()
-                                        mock_end.assert_called_once_with(mock_stream_instance)
+        assert len(q) == 3  # padded to num_reqs=3
+        assert len(kv) == 3
 
-    def test_capture_multi_fia_graph_size_existing_workspace(self, setup_graph_params):
-        """Test capture_multi_fia_graph_size with existing workspace."""
-        # 更新 fixture 中的状态以模拟已有 workspace
-        setup_graph_params.workspaces = {16: torch.tensor([50.0, 100.0])}
-        
-        attn_output = torch.randn(2, 4, 8)
-        softmax_lse = torch.randn(2, 4)
-        num_tokens = 16
-        const_args = {"query": torch.randn(2, 4, 8)}
-        layer_name = "test_layer_name"
+    def test_mla_with_tensor_seqlens(self, vllm_config, batch_descriptor):
+        """MLA metadata with tensor seq_lens: returned directly."""
+        metadata = MagicMock()
+        metadata.decode = MagicMock()
+        metadata.decode.query_cumlens = torch.tensor([1, 2])
+        metadata.decode.seq_lens = torch.tensor([5, 6])
 
-        with patch("torch_npu.npu.current_stream") as mock_stream:
-            mock_stream_instance = MagicMock()
-            mock_stream.return_value = mock_stream_instance
+        q, kv = _extract_fia_params(metadata, vllm_config, batch_descriptor)
 
-            with patch("torch.npu.ExternalEvent") as mock_event:
-                mock_event_instance = MagicMock()
-                mock_event.return_value = mock_event_instance
+        assert isinstance(kv, torch.Tensor)
 
-                with patch("torch_npu._npu_fused_infer_attention_score_get_max_workspace", create=True) as mock_get_ws:
-                    with patch("omni_npu.compilation.utils.update_graph_params_workspaces") as mock_update_ws:
-                        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-                            mock_weak_ref.side_effect = lambda x: x
+    def test_pads_to_num_reqs(self, vllm_config, batch_descriptor):
+        """When num_reqs is set, pad to that length."""
+        batch_descriptor.num_reqs = 5
+        metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
+        metadata.query_start_loc = [0, 1]
+        metadata.seq_lens = [3]
 
-                            with patch("torch.npu.graph_task_group_begin"):
-                                with patch("torch_npu.npu_fused_infer_attention_score.out", create=True):
-                                    with patch("torch.npu.graph_task_group_end") as mock_end:
-                                        mock_end.return_value = MagicMock()
+        q, kv = _extract_fia_params(metadata, vllm_config, batch_descriptor)
 
-                                        capture_multi_fia_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
-                                        )
+        assert len(q) == 5
+        assert len(kv) == 5
 
-                                        mock_get_ws.assert_not_called()
-                                        mock_update_ws.assert_not_called()
+    def test_pads_to_min_when_no_num_reqs(self, vllm_config, batch_descriptor):
+        """When num_reqs is None, pad to min(max_num_seqs, num_tokens)."""
+        batch_descriptor.num_reqs = None
+        batch_descriptor.num_tokens = 4
+        vllm_config.scheduler_config.max_num_seqs = 10
 
-    def test_capture_multi_fia_graph_size_op_name(self, setup_graph_params):
-        """Test that op_name is set correctly."""
-        attn_output = torch.randn(2, 4, 8)
-        softmax_lse = torch.randn(2, 4)
-        num_tokens = 16
-        const_args = {"query": torch.randn(2, 4, 8)}
-        layer_name = "test_layer_name"
+        metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
+        metadata.query_start_loc = [0, 1]
+        metadata.seq_lens = [3]
 
-        with patch("torch_npu.npu.current_stream"):
-            with patch("torch.npu.ExternalEvent"):
-                with patch("torch_npu._npu_fused_infer_attention_score_get_max_workspace", create=True) as mock_get_ws:
-                    mock_get_ws.return_value = torch.tensor([100.0])
+        q, kv = _extract_fia_params(metadata, vllm_config, batch_descriptor)
 
-                    with patch("omni_npu.compilation.utils.update_graph_params_workspaces"):
-                        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-                            mock_weak_ref.side_effect = lambda x: x
-
-                            with patch("torch.npu.graph_task_group_begin"):
-                                with patch("torch_npu.npu_fused_infer_attention_score.out", create=True):
-                                    with patch("torch.npu.graph_task_group_end"):
-                                        capture_multi_fia_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
-                                        )
-
-                                        captured_params = setup_graph_params.attn_params[num_tokens][layer_name]
-                                        assert captured_params["op_name"] == "npu_fused_infer_attention_score"
+        assert len(q) == 4  # min(10, 4) = 4
+        assert len(kv) == 4
 
 
-class TestCaptureMultiFiaV2GraphSize:
-    """Tests for capture_multi_fia_v2_graph_size function."""
+# ---------------------------------------------------------------------------
+# _compute_fia_dynamic_kwargs
+# ---------------------------------------------------------------------------
+
+class TestComputeFiaDynamicKwargs:
+
+    def test_layer_not_in_metadata_returns_none(self):
+        ctx = MagicMock()
+        ctx.attn_metadata = {}
+
+        result = _compute_fia_dynamic_kwargs(
+            ctx, "layer0", MagicMock(),
+            seq_len_q_key="ql", seq_len_kv_key="kvl")
+
+        assert result is None
+
+    def test_returns_mapped_keys(self):
+        metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
+        metadata.query_start_loc = [0, 1]
+        metadata.seq_lens = [3]
+
+        ctx = MagicMock()
+        ctx.attn_metadata = {"layer0": metadata}
+        ctx.batch_descriptor.num_reqs = 2
+        ctx.batch_descriptor.num_tokens = 2
+
+        cfg = MagicMock()
+        cfg.scheduler_config.max_num_seqs = 10
+
+        result = _compute_fia_dynamic_kwargs(
+            ctx, "layer0", cfg,
+            seq_len_q_key="actual_seq_lengths",
+            seq_len_kv_key="actual_seq_lengths_kv")
+
+        assert "actual_seq_lengths" in result
+        assert "actual_seq_lengths_kv" in result
+
+
+# ---------------------------------------------------------------------------
+# _get_or_create_workspace
+# ---------------------------------------------------------------------------
+
+class TestGetOrCreateWorkspace:
 
     @pytest.fixture(autouse=True)
     def setup_graph_params(self):
-        """Setup graph params before each test."""
-        with patch("omni_npu.compilation.acl_graph.set_graph_params"):
-            with patch("omni_npu.compilation.utils.get_graph_params") as mock_get:
-                mock_graph_params = MagicMock()
-                mock_graph_params.events = {32: {}}
-                mock_graph_params.workspaces = {}
-                mock_graph_params.handles = {32: {}}
-                mock_graph_params.attn_params = {32: {}}
-                mock_get.return_value = mock_graph_params
-                yield mock_graph_params
+        with patch("omni_npu.compilation.utils.get_graph_params") as mock_get:
+            mock_gp = MagicMock()
+            mock_gp.workspaces = {}
+            mock_get.return_value = mock_gp
+            yield mock_gp
 
-    def test_capture_multi_fia_v2_graph_size_new_workspace(self, setup_graph_params):
-        """Test capture_multi_fia_v2_graph_size with new workspace calculation."""
-        attn_output = torch.randn(2, 4, 8)
-        softmax_lse = torch.randn(2, 4)
-        num_tokens = 32
-        const_args = {
-            "query": torch.randn(2, 4, 8),
-            "key": torch.randn(2, 4, 8),
-        }
-        workspace = torch.tensor([300.0, 400.0])
-        layer_name = "test_layer_name"
+    def test_new_workspace_created_and_cached(self, setup_graph_params):
+        workspace = torch.tensor([100.0])
+        op_desc = OpDescriptor(
+            op_out_fn=MagicMock(),
+            workspace_fn=MagicMock(return_value=workspace),
+        )
+        op_kwargs = {"query": torch.randn(2, 4)}
 
-        with patch("torch_npu.npu.current_stream") as mock_stream:
-            mock_stream_instance = MagicMock()
-            mock_stream.return_value = mock_stream_instance
+        with patch("omni_npu.compilation.utils.weak_ref_tensors",
+                    side_effect=lambda x: x):
+            result = _get_or_create_workspace(op_desc, op_kwargs, 16)
 
-            with patch("torch.npu.ExternalEvent") as mock_event:
-                mock_event_instance = MagicMock()
-                mock_event.return_value = mock_event_instance
+        op_desc.workspace_fn.assert_called_once_with(**op_kwargs)
+        assert torch.equal(result, workspace)
+        assert setup_graph_params.workspaces[16][op_desc.workspace_fn] \
+            is workspace
 
-                with patch("torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace", create=True) as mock_get_ws:
-                    mock_get_ws.return_value = workspace
+    def test_existing_workspace_reused(self, setup_graph_params):
+        existing = torch.tensor([50.0])
+        op_desc = OpDescriptor(
+            op_out_fn=MagicMock(),
+            workspace_fn=MagicMock(),
+        )
+        setup_graph_params.workspaces = {
+            16: {op_desc.workspace_fn: existing}}
 
-                    with patch("omni_npu.compilation.utils.update_graph_params_workspaces") as mock_update_ws:
-                        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-                            mock_weak_ref.side_effect = lambda x: x
+        result = _get_or_create_workspace(op_desc, {}, 16)
 
-                            with patch("torch.npu.graph_task_group_begin") as mock_begin:
-                                with patch("torch_npu.npu_fused_infer_attention_score_v2.out", create=True) as mock_fia_out:
-                                    with patch("torch.npu.graph_task_group_end") as mock_end:
-                                        mock_end.return_value = MagicMock()
-
-                                        capture_multi_fia_v2_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
-                                        )
-
-                                        mock_get_ws.assert_called_once_with(**const_args)
-                                        mock_update_ws.assert_called_once_with(num_tokens, workspace)
-                                        mock_begin.assert_called_once_with(mock_stream_instance)
-                                        mock_fia_out.assert_called_once()
-                                        mock_end.assert_called_once_with(mock_stream_instance)
-
-    def test_capture_multi_fia_v2_graph_size_op_name(self, setup_graph_params):
-        """Test that op_name is set to 'npu_fused_infer_attention_score_v2'."""
-        attn_output = torch.randn(2, 4, 8)
-        softmax_lse = torch.randn(2, 4)
-        num_tokens = 32
-        const_args = {"query": torch.randn(2, 4, 8)}
-        layer_name = "test_layer_name"
-
-        with patch("torch_npu.npu.current_stream"):
-            with patch("torch.npu.ExternalEvent"):
-                with patch("torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace", create=True) as mock_get_ws:
-                    mock_get_ws.return_value = torch.tensor([100.0])
-
-                    with patch("omni_npu.compilation.utils.update_graph_params_workspaces"):
-                        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-                            mock_weak_ref.side_effect = lambda x: x
-
-                            with patch("torch.npu.graph_task_group_begin"):
-                                with patch("torch_npu.npu_fused_infer_attention_score_v2.out", create=True):
-                                    with patch("torch.npu.graph_task_group_end"):
-                                        capture_multi_fia_v2_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
-                                        )
-
-                                        captured_params = setup_graph_params.attn_params[num_tokens][layer_name]
-                                        assert captured_params["op_name"] == "npu_fused_infer_attention_score_v2"
+        op_desc.workspace_fn.assert_not_called()
+        assert torch.equal(result, existing)
 
 
-class TestCaptureMultiFiaSinkGraphSize:
-    """Tests for capture_multi_fia_sink_graph_size function."""
+# ---------------------------------------------------------------------------
+# _capture_kwargs
+# ---------------------------------------------------------------------------
+
+class TestCaptureKwargs:
+
+    def test_weak_refs_listed_keys(self):
+        query = torch.randn(2)
+        other = torch.randn(2)
+        op_desc = OpDescriptor(
+            op_out_fn=MagicMock(),
+            workspace_fn=MagicMock(),
+            weak_ref_keys=("query",),
+        )
+        op_kwargs = {"query": query, "other": other}
+
+        def fake_weak_ref(x):
+            return f"weak_{id(x)}"
+
+        with patch("omni_npu.compilation.utils.weak_ref_tensors",
+                    side_effect=fake_weak_ref):
+            result = _capture_kwargs(op_desc, op_kwargs)
+
+        assert result["query"] == f"weak_{id(query)}"
+        assert torch.equal(result["other"], other)
+
+    def test_skips_none_values(self):
+        op_desc = OpDescriptor(
+            op_out_fn=MagicMock(),
+            workspace_fn=MagicMock(),
+            weak_ref_keys=("query",),
+        )
+        op_kwargs = {"query": None, "other": torch.randn(2)}
+
+        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_wr:
+            result = _capture_kwargs(op_desc, op_kwargs)
+
+        assert result["query"] is None
+        mock_wr.assert_not_called()
+
+    def test_original_unchanged(self):
+        tensor = torch.randn(2)
+        op_desc = OpDescriptor(
+            op_out_fn=MagicMock(),
+            workspace_fn=MagicMock(),
+            weak_ref_keys=("query",),
+        )
+        op_kwargs = {"query": tensor}
+
+        with patch("omni_npu.compilation.utils.weak_ref_tensors",
+                    return_value="weak"):
+            _capture_kwargs(op_desc, op_kwargs)
+
+        assert op_kwargs["query"] is tensor
+
+
+# ---------------------------------------------------------------------------
+# capture_graph_task
+# ---------------------------------------------------------------------------
+
+class TestCaptureGraphTask:
 
     @pytest.fixture(autouse=True)
     def setup_graph_params(self):
-        """Setup graph params before each test."""
-        with patch("omni_npu.compilation.acl_graph.set_graph_params"):
-            with patch("omni_npu.compilation.utils.get_graph_params") as mock_get:
-                mock_graph_params = MagicMock()
-                mock_graph_params.events = {64: {}}
-                mock_graph_params.workspaces = {}
-                mock_graph_params.handles = {64: {}}
-                mock_graph_params.attn_params = {64: {}}
-                mock_get.return_value = mock_graph_params
-                yield mock_graph_params
+        with patch("omni_npu.compilation.utils.get_graph_params") as mock_get:
+            mock_gp = MagicMock()
+            mock_gp.task_entries = {16: {}}
+            mock_get.return_value = mock_gp
+            yield mock_gp
 
-    def test_capture_multi_fia_sink_graph_size_new_workspace(self, setup_graph_params):
-        """Test capture_multi_fia_sink_graph_size with new workspace calculation."""
-        attn_output = torch.randn(2, 4, 8)
-        softmax_lse = torch.randn(2, 4)
-        num_tokens = 64
-        const_args = {
-            "query": torch.randn(2, 4, 8),
-            "key": torch.randn(2, 4, 8),
-        }
-        workspace = torch.tensor([500.0, 600.0])
-        layer_name = "test_layer_name"
+    def test_event_wait_and_reset(self, setup_graph_params):
+        op_desc = OpDescriptor(
+            op_out_fn=MagicMock(),
+            workspace_fn=MagicMock(return_value=torch.tensor([1.0])),
+            weak_ref_keys=("query",),
+        )
 
-        with patch("torch_npu.npu.current_stream") as mock_stream:
-            mock_stream_instance = MagicMock()
-            mock_stream.return_value = mock_stream_instance
+        with patch("torch_npu.npu.current_stream") as mock_stream, \
+             patch("torch.npu.ExternalEvent") as mock_event, \
+             patch("omni_npu.compilation.utils._get_or_create_workspace",
+                    return_value=MagicMock()), \
+             patch("omni_npu.compilation.utils._capture_kwargs",
+                    return_value={}), \
+             patch("omni_npu.compilation.utils.weak_ref_tensors",
+                    side_effect=lambda x: x), \
+             patch("torch.npu.graph_task_group_begin"), \
+             patch("torch.npu.graph_task_group_end",
+                    return_value=MagicMock()):
 
-            with patch("torch.npu.ExternalEvent") as mock_event:
-                mock_event_instance = MagicMock()
-                mock_event.return_value = mock_event_instance
+            stream_inst = MagicMock()
+            mock_stream.return_value = stream_inst
+            event_inst = MagicMock()
+            mock_event.return_value = event_inst
 
-                with patch("torch.ops.custom._npu_fused_infer_attention_sink_get_max_workspace", create=True) as mock_get_ws:
-                    mock_get_ws.return_value = workspace
+            capture_graph_task(
+                op_desc, {}, [torch.randn(2)], 16, "layer0")
 
-                    with patch("omni_npu.compilation.utils.update_graph_params_workspaces") as mock_update_ws:
-                        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-                            mock_weak_ref.side_effect = lambda x: x
+            event_inst.wait.assert_called_once_with(stream_inst)
+            event_inst.reset.assert_called_once_with(stream_inst)
 
-                            with patch("torch.npu.graph_task_group_begin") as mock_begin:
-                                with patch("torch.ops.custom.npu_fused_infer_attention_sink.out", create=True) as mock_fia_out:
-                                    with patch("torch.npu.graph_task_group_end") as mock_end:
-                                        mock_end.return_value = MagicMock()
+    def test_task_group_brackets_op(self, setup_graph_params):
+        mock_op = MagicMock()
+        op_desc = OpDescriptor(
+            op_out_fn=mock_op,
+            workspace_fn=MagicMock(return_value=torch.tensor([1.0])),
+            weak_ref_keys=("query",),
+        )
 
-                                        capture_multi_fia_sink_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
-                                        )
+        with patch("torch_npu.npu.current_stream", return_value=MagicMock()), \
+             patch("torch.npu.ExternalEvent", return_value=MagicMock()), \
+             patch("omni_npu.compilation.utils._get_or_create_workspace",
+                    return_value=MagicMock()), \
+             patch("omni_npu.compilation.utils._capture_kwargs",
+                    return_value={}), \
+             patch("omni_npu.compilation.utils.weak_ref_tensors",
+                    side_effect=lambda x: x), \
+             patch("torch.npu.graph_task_group_begin") as begin, \
+             patch("torch.npu.graph_task_group_end",
+                    return_value=MagicMock()) as end:
 
-                                        mock_get_ws.assert_called_once_with(**const_args)
-                                        mock_update_ws.assert_called_once_with(num_tokens, workspace)
+            capture_graph_task(
+                op_desc, {}, [torch.randn(2)], 16, "layer0")
 
-                                        mock_event.assert_called_once()
-                                        mock_event_instance.wait.assert_called_once_with(mock_stream_instance)
-                                        mock_event_instance.reset.assert_called_once_with(mock_stream_instance)
+            begin.assert_called_once()
+            mock_op.assert_called_once()
+            end.assert_called_once()
 
-                                        assert mock_weak_ref.call_count > 0
+    def test_stores_entry(self, setup_graph_params):
+        mock_op = MagicMock()
+        op_desc = OpDescriptor(
+            op_out_fn=mock_op,
+            workspace_fn=MagicMock(return_value=torch.tensor([1.0])),
+            weak_ref_keys=("query",),
+        )
+        mock_handle = MagicMock()
+        mock_snapshot = {"query": MagicMock()}
 
-                                        mock_begin.assert_called_once_with(mock_stream_instance)
-                                        mock_fia_out.assert_called_once()
-                                        mock_end.assert_called_once_with(mock_stream_instance)
+        with patch("torch_npu.npu.current_stream", return_value=MagicMock()), \
+             patch("torch.npu.ExternalEvent", return_value=MagicMock()), \
+             patch("omni_npu.compilation.utils._get_or_create_workspace",
+                    return_value=MagicMock()), \
+             patch("omni_npu.compilation.utils._capture_kwargs",
+                    return_value=mock_snapshot), \
+             patch("omni_npu.compilation.utils.weak_ref_tensors",
+                    side_effect=lambda x: x), \
+             patch("torch.npu.graph_task_group_begin"), \
+             patch("torch.npu.graph_task_group_end",
+                    return_value=mock_handle):
 
-    def test_capture_multi_fia_sink_graph_size_existing_workspace(self, setup_graph_params):
-        """Test capture_multi_fia_sink_graph_size with existing workspace."""
-        # 更新 fixture 状态
-        setup_graph_params.workspaces = {64: torch.tensor([250.0, 300.0])}
-        
-        attn_output = torch.randn(2, 4, 8)
-        softmax_lse = torch.randn(2, 4)
-        num_tokens = 64
-        const_args = {"query": torch.randn(2, 4, 8)}
-        layer_name = "test_layer_name"
+            capture_graph_task(
+                op_desc, {"query": torch.randn(2)},
+                [torch.randn(2)], 16, "layer0")
 
-        with patch("torch_npu.npu.current_stream") as mock_stream:
-            mock_stream_instance = MagicMock()
-            mock_stream.return_value = mock_stream_instance
+        entry = setup_graph_params.task_entries[16]["layer0"]
+        assert isinstance(entry, GraphTaskEntry)
+        assert entry.op_desc is op_desc
+        assert entry.handle is mock_handle
+        assert entry.captured_kwargs is mock_snapshot
 
-            with patch("torch.npu.ExternalEvent") as mock_event:
-                mock_event_instance = MagicMock()
-                mock_event.return_value = mock_event_instance
 
-                with patch("torch.ops.custom._npu_fused_infer_attention_sink_get_max_workspace", create=True) as mock_get_ws:
-                    with patch("omni_npu.compilation.utils.update_graph_params_workspaces") as mock_update_ws:
-                        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-                            mock_weak_ref.side_effect = lambda x: x
-
-                            with patch("torch.npu.graph_task_group_begin"):
-                                with patch("torch.ops.custom.npu_fused_infer_attention_sink.out", create=True):
-                                    with patch("torch.npu.graph_task_group_end") as mock_end:
-                                        mock_end.return_value = MagicMock()
-
-                                        capture_multi_fia_sink_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
-                                        )
-
-                                        mock_get_ws.assert_not_called()
-                                        mock_update_ws.assert_not_called()
-
-    def test_capture_multi_fia_sink_graph_size_op_name(self, setup_graph_params):
-        """Test that op_name is set to 'npu_fused_infer_attention_sink'."""
-        attn_output = torch.randn(2, 4, 8)
-        softmax_lse = torch.randn(2, 4)
-        num_tokens = 64
-        const_args = {"query": torch.randn(2, 4, 8)}
-        layer_name = "test_layer_name"
-
-        with patch("torch_npu.npu.current_stream"):
-            with patch("torch.npu.ExternalEvent"):
-                with patch("torch.ops.custom._npu_fused_infer_attention_sink_get_max_workspace", create=True) as mock_get_ws:
-                    mock_get_ws.return_value = torch.tensor([100.0])
-
-                    with patch("omni_npu.compilation.utils.update_graph_params_workspaces"):
-                        with patch("omni_npu.compilation.utils.weak_ref_tensors") as mock_weak_ref:
-                            mock_weak_ref.side_effect = lambda x: x
-
-                            with patch("torch.npu.graph_task_group_begin"):
-                                with patch("torch.ops.custom.npu_fused_infer_attention_sink.out", create=True):
-                                    with patch("torch.npu.graph_task_group_end"):
-                                        capture_multi_fia_sink_graph_size(
-                                            attn_output, softmax_lse, num_tokens, const_args, layer_name
-                                        )
-
-                                        captured_params = setup_graph_params.attn_params[num_tokens][layer_name]
-                                        assert captured_params["op_name"] == "npu_fused_infer_attention_sink"
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

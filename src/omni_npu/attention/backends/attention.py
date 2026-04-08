@@ -32,9 +32,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 from omni_npu.compilation.utils import (
-    capture_multi_fia_graph_size,
-    capture_multi_fia_v2_graph_size,
-    capture_multi_fia_sink_graph_size,
+    capture_graph_task,
+    OP_FIA_V1,
+    OP_FIA_V2,
+    OP_FIA_SINK,
 )
 
 from omni_npu.attention.backends.utils import register_attention_backend
@@ -291,11 +292,11 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
             attn_output = torch.empty(attn_output_shape, dtype=query[:actual_seq_qlen[-1]].dtype, device=query[:actual_seq_qlen[-1]].device)
             softmax_lse = torch.empty(num_tokens, dtype=query[:actual_seq_qlen[-1]].dtype, device=query[:actual_seq_qlen[-1]].device)
             if forward_context.capturing:
-                capture_multi_fia_sink_graph_size(
-                    attn_output=attn_output,
-                    softmax_lse=softmax_lse ,
+                capture_graph_task(
+                    op_desc=OP_FIA_SINK,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
                     num_tokens=num_tokens,
-                    const_args=kwargs,
                     layer_name=layer.layer_name,
                 )
             else:
@@ -347,11 +348,11 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
 
             if forward_context.capturing and attn_metadata.num_prefills == 0:
                 num_tokens = query.shape[0]
-                capture_multi_fia_graph_size(
-                    attn_output=attn_output,
-                    softmax_lse=softmax_lse,
+                capture_graph_task(
+                    op_desc=OP_FIA_V1,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
                     num_tokens=num_tokens,
-                    const_args=kwargs,
                     layer_name=layer.layer_name,
                 )
             else:
@@ -396,11 +397,11 @@ class NPUAttentionBackendImpl(AttentionImpl[NPUMetadata]):
 
         forward_context = get_forward_context()
         if forward_context.capturing:
-            capture_multi_fia_v2_graph_size(
-                attn_output=attn_output,
-                softmax_lse=softmax_lse,
+            capture_graph_task(
+                op_desc=OP_FIA_V2,
+                op_kwargs=kwargs,
+                out_tensors=[attn_output, softmax_lse],
                 num_tokens=num_tokens,
-                const_args=kwargs,
                 layer_name=layer.layer_name,
             )
         else:

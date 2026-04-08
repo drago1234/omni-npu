@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for omni_npu.compilation.acl_graph module."""
+
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -5,808 +8,525 @@ import torch
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.config import CUDAGraphMode, VllmConfig
 
-from omni_npu.compilation.acl_graph import(
+import omni_npu.compilation.acl_graph as acl_graph_module
+from omni_npu.compilation.acl_graph import (
     weak_ref_tensor,
     weak_ref_tensors,
+    OpDescriptor,
+    GraphTaskEntry,
     GraphParams,
-    set_graph_params,
-    update_graph_params_workspaces,
-    get_graph_params,
-    ACLGraphWrapper,
     ACLGraphEntry,
-    weak_ref_workspaces
+    set_graph_params,
+    get_graph_params,
+    ensure_weak_ref_graph_params,
+    ACLGraphWrapper,
 )
 
 
-def test_weak_ref_tensor():
-    """Test whether the weak reference shares data with the original tensor"""
-    tensor = torch.tensor([1.0, 2.0, 3.0])
-    result = weak_ref_tensor(tensor)
-    assert torch.equal(result, tensor)
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def reset_graph_params():
+    """Reset the module-level _graph_params before each test."""
+    acl_graph_module._graph_params = None
+    yield
+    acl_graph_module._graph_params = None
 
 
-def test_weak_ref_tensors():
-    """Test the handling of tuple and list tensor by weak_ref_tensors"""
-    tensor_list = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
-    tensor_tuple = (torch.tensor([5.0, 6.0]), torch.tensor([7.0, 8.0]))
-    tensor_dict = {"key": torch.tensor([1.0, 2.0])}
+# ---------------------------------------------------------------------------
+# weak_ref_tensor / weak_ref_tensors
+# ---------------------------------------------------------------------------
 
-    weak_ref_tensor_list = weak_ref_tensors(tensor_list)
-    assert all(torch.equal(wt, t) for wt, t in zip(weak_ref_tensor_list, tensor_list))
+class TestWeakRef:
 
-    weak_ref_tensor_tuple = weak_ref_tensors(tensor_tuple)
-    assert all(torch.equal(wt, t) for wt, t in zip(weak_ref_tensor_tuple, tensor_tuple))
-
-    with pytest.raises(ValueError, match="Invalid type for tensors"):
-        weak_ref_tensors(tensor_dict)
-
-
-def test_weak_ref_tensor_with_ascend_support():
-    """Test torch.ops._C_ascend module contains a property named 'weak_ref_tensor'"""
-    tensor = torch.tensor([1.0, 2.0, 3.0])
-
-    # Simulate the torch.ops._C_ascend module and add the weak_ref_tensor attribute
-    mock_weak_ref_tensor = MagicMock(return_value=tensor)
-    mock_ascend = MagicMock()
-    mock_ascend.weak_ref_tensor = mock_weak_ref_tensor
-
-    with patch("torch.ops._C_ascend", new=mock_ascend):
+    def test_weak_ref_tensor_passthrough(self):
+        """Without _C_ascend.weak_ref_tensor, returns the same tensor."""
+        tensor = torch.tensor([1.0, 2.0, 3.0])
         result = weak_ref_tensor(tensor)
-
-        mock_weak_ref_tensor.assert_called_once_with(tensor)
         assert torch.equal(result, tensor)
 
+    def test_weak_ref_tensor_with_ascend_op(self):
+        """When _C_ascend has weak_ref_tensor, delegates to it."""
+        tensor = torch.tensor([1.0, 2.0])
+        mock_op = MagicMock(return_value=tensor)
+        mock_ascend = MagicMock()
+        mock_ascend.weak_ref_tensor = mock_op
 
-def test_set_get_graph_params():
-    """Test set_graph_params and get_graph_params function"""
-    aclgraph_capture_sizes = {1, 2, 3}
-    set_graph_params(aclgraph_capture_sizes)
+        with patch("torch.ops._C_ascend", new=mock_ascend):
+            result = weak_ref_tensor(tensor)
 
-    with pytest.raises(ValueError, match="Graph parameters have already been set!"):
-        set_graph_params(aclgraph_capture_sizes)
+        mock_op.assert_called_once_with(tensor)
+        assert torch.equal(result, tensor)
 
-    graph_params = get_graph_params()
+    def test_weak_ref_tensors_single(self):
+        tensor = torch.tensor([1.0])
+        result = weak_ref_tensors(tensor)
+        assert torch.equal(result, tensor)
 
-    assert isinstance(graph_params, GraphParams)
-    assert set(graph_params.events.keys()) == aclgraph_capture_sizes
-    assert set(graph_params.workspaces.keys()) == aclgraph_capture_sizes
-    assert set(graph_params.handles.keys()) == aclgraph_capture_sizes
-    assert set(graph_params.attn_params.keys()) == aclgraph_capture_sizes
+    def test_weak_ref_tensors_list(self):
+        tensors = [torch.tensor([1.0]), torch.tensor([2.0])]
+        result = weak_ref_tensors(tensors)
+        assert isinstance(result, list)
+        assert all(torch.equal(r, t) for r, t in zip(result, tensors))
 
+    def test_weak_ref_tensors_tuple(self):
+        tensors = (torch.tensor([1.0]), torch.tensor([2.0]))
+        result = weak_ref_tensors(tensors)
+        assert isinstance(result, tuple)
+        assert all(torch.equal(r, t) for r, t in zip(result, tensors))
 
-def test_update_graph_params_workspaces():
-    """Test update_graph_params_workspaces function"""
-    if get_graph_params() is None:
-        aclgraph_capture_sizes = {1, 2, 3}
-        set_graph_params(aclgraph_capture_sizes)
-    
-    workspace = torch.tensor([1.0, 2.0, 3.0])
-    update_graph_params_workspaces(1, workspace)
-
-    graph_params = get_graph_params()
-    assert torch.equal(graph_params.workspaces[1], workspace)
+    def test_weak_ref_tensors_invalid_type(self):
+        with pytest.raises(ValueError, match="Invalid type"):
+            weak_ref_tensors({"key": torch.tensor([1.0])})
 
 
-class TestACLGraphWrapper:
-    """Test class for ACLGraphWrapper"""
+# ---------------------------------------------------------------------------
+# GraphParams / set_graph_params / get_graph_params
+# ---------------------------------------------------------------------------
+
+class TestGraphParams:
+
+    def test_set_and_get(self):
+        sizes = {1, 4, 8}
+        set_graph_params(sizes)
+
+        params = get_graph_params()
+        assert isinstance(params, GraphParams)
+        assert set(params.task_entries.keys()) == sizes
+        assert set(params.workspaces.keys()) == sizes
+        # each size starts with an empty dict
+        for size in sizes:
+            assert params.task_entries[size] == {}
+            assert params.workspaces[size] == {}
+
+    def test_set_twice_raises(self):
+        set_graph_params({1})
+        with pytest.raises(ValueError, match="already been set"):
+            set_graph_params({2})
+
+
+# ---------------------------------------------------------------------------
+# ensure_weak_ref_graph_params
+# ---------------------------------------------------------------------------
+
+class TestEnsureWeakRefGraphParams:
+
+    def test_weak_refs_kwargs_and_out_tensors(self):
+        """Verifies weak_ref_keys are weak-reffed, others untouched."""
+        mock_workspace_fn = MagicMock()
+        op_desc = OpDescriptor(
+            op_out_fn=MagicMock(),
+            workspace_fn=mock_workspace_fn,
+            weak_ref_keys=("query",),
+        )
+        query_tensor = torch.randn(2)
+        entry = GraphTaskEntry(
+            op_desc=op_desc,
+            captured_kwargs={"query": query_tensor, "scale": 1.0},
+            out_tensors=[torch.randn(2)],
+            handle=MagicMock(),
+            event=MagicMock(),
+        )
+        params = GraphParams(
+            task_entries={4: {"layer0": entry}},
+            workspaces={4: {mock_workspace_fn: torch.tensor([1.0])}},
+        )
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=params):
+            ensure_weak_ref_graph_params()
+
+        # scale (not in weak_ref_keys) should be unchanged
+        assert entry.captured_kwargs["scale"] == 1.0
+
+    def test_weak_refs_workspaces(self):
+        """Workspace tensors are processed by weak_ref_tensors."""
+        mock_fn = MagicMock()
+        workspace = torch.tensor([1.0, 2.0])
+        params = GraphParams(
+            task_entries={4: {}},
+            workspaces={4: {mock_fn: workspace}},
+        )
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=params):
+            ensure_weak_ref_graph_params()
+
+        # workspace value should still be a tensor (weak_ref_tensor is
+        # a pass-through without _C_ascend)
+        assert isinstance(params.workspaces[4][mock_fn], torch.Tensor)
+
+
+# ---------------------------------------------------------------------------
+# ACLGraphWrapper
+# ---------------------------------------------------------------------------
+
+class TestACLGraphWrapperInit:
+
+    def test_stores_attributes(self):
+        runnable = MagicMock()
+        vllm_config = MagicMock(spec=VllmConfig)
+        pool = MagicMock()
+        opts = MagicMock()
+
+        wrapper = ACLGraphWrapper(
+            runnable, vllm_config, CUDAGraphMode.PIECEWISE, pool, opts)
+
+        assert wrapper.runnable is runnable
+        assert wrapper.vllm_config is vllm_config
+        assert wrapper.graph_pool is pool
+        assert wrapper.runtime_mode == CUDAGraphMode.PIECEWISE
+        assert wrapper.aclgraph_options is opts
+        assert wrapper.concrete_aclgraph_entries == {}
+
+    def test_none_pool_uses_global(self):
+        mock_pool = MagicMock()
+        with patch("omni_npu.compilation.acl_graph.current_platform"
+                    ".get_global_graph_pool", return_value=mock_pool):
+            wrapper = ACLGraphWrapper(
+                MagicMock(), MagicMock(spec=VllmConfig),
+                CUDAGraphMode.PIECEWISE, graph_pool=None)
+
+        assert wrapper.graph_pool is mock_pool
+
+    def test_none_options_uses_default(self):
+        with patch("omni_npu.compilation.acl_graph.CUDAGraphOptions",
+                    return_value=MagicMock(spec=CUDAGraphOptions)) as mock_cls:
+            wrapper = ACLGraphWrapper(
+                MagicMock(), MagicMock(spec=VllmConfig),
+                CUDAGraphMode.PIECEWISE, MagicMock(), cudagraph_options=None)
+
+        mock_cls.assert_called_once()
+        assert isinstance(wrapper.aclgraph_options, CUDAGraphOptions)
+
+
+class TestACLGraphWrapperAttr:
+
+    def test_getattr_delegates(self):
+        runnable = MagicMock(spec_set=["some_attr"])
+        runnable.some_attr = "value"
+        wrapper = ACLGraphWrapper(
+            runnable, MagicMock(), CUDAGraphMode.PIECEWISE)
+        assert wrapper.some_attr == "value"
+
+    def test_getattr_missing_raises(self):
+        runnable = MagicMock(spec_set=["some_attr"])
+        wrapper = ACLGraphWrapper(
+            runnable, MagicMock(), CUDAGraphMode.PIECEWISE)
+        with pytest.raises(AttributeError):
+            _ = wrapper.nonexistent
+
+    def test_unwrap(self):
+        runnable = MagicMock()
+        wrapper = ACLGraphWrapper(
+            runnable, MagicMock(), CUDAGraphMode.PIECEWISE)
+        assert wrapper.unwrap() is runnable
+
+
+class TestACLGraphWrapperCall:
 
     @pytest.fixture
-    def default_npu_graph(self):
-        with patch("torch.npu.NPUGraph") as mock_npu_graph, \
-             patch("torch.npu.graph") as mock_npu_graph_ctx, \
-             patch("torch.npu.Stream") as mock_npu_stream:
+    def wrapper_and_context(self):
+        """Create a wrapper with a mocked forward context."""
+        with patch("torch.npu.NPUGraph") as mock_graph_cls, \
+             patch("torch.npu.graph") as mock_graph_ctx, \
+             patch("omni_npu.compilation.acl_graph.get_forward_context") \
+                as mock_get_ctx:
+
             mock_graph_instance = MagicMock()
-            mock_graph_instance.replay = MagicMock()
-            mock_graph_instance.update = MagicMock()
-            mock_npu_graph.return_value = mock_graph_instance
+            mock_graph_cls.return_value = mock_graph_instance
+            mock_graph_ctx.return_value.__enter__ = lambda self: None
+            mock_graph_ctx.return_value.__exit__ = lambda *a: None
 
-            # mock torch.npu.graph context manager to avoid executing the actual logic within the with statement
-            mock_npu_graph_ctx.return_value.__enter__ = lambda self: None
-            mock_npu_graph_ctx.return_value.__exit__ = lambda *args: None
+            ctx = MagicMock()
+            ctx.batch_descriptor = MagicMock()
+            ctx.batch_descriptor.num_tokens = 4
+            ctx.batch_descriptor.num_reqs = 2
+            ctx.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            ctx.attn_metadata = {}
+            mock_get_ctx.return_value = ctx
 
-            mock_npu_stream.return_value = MagicMock()
+            wrapper = ACLGraphWrapper(
+                runnable=MagicMock(return_value=torch.tensor([1.0])),
+                vllm_config=MagicMock(spec=VllmConfig),
+                runtime_mode=CUDAGraphMode.PIECEWISE,
+                graph_pool=MagicMock(),
+            )
+            wrapper.aclgraph_options = MagicMock(
+                gc_disable=False, debug_log_enable=False,
+                weak_ref_output=False)
 
-            yield mock_graph_instance
+            yield wrapper, ctx, mock_graph_instance
 
+    def test_none_mode_runs_directly(self, wrapper_and_context):
+        wrapper, ctx, _ = wrapper_and_context
+        ctx.cudagraph_runtime_mode = CUDAGraphMode.NONE
+
+        result = wrapper(torch.tensor([1.0]))
+
+        wrapper.runnable.assert_called_once()
+        assert result == wrapper.runnable.return_value
+        assert not wrapper.concrete_aclgraph_entries
+
+    def test_mismatched_mode_runs_directly(self, wrapper_and_context):
+        wrapper, ctx, _ = wrapper_and_context
+        ctx.cudagraph_runtime_mode = CUDAGraphMode.FULL
+
+        result = wrapper(torch.tensor([1.0]))
+
+        wrapper.runnable.assert_called_once()
+        assert not wrapper.concrete_aclgraph_entries
+
+    def test_first_time_captures_graph(self, wrapper_and_context):
+        wrapper, ctx, mock_graph = wrapper_and_context
+
+        with patch("omni_npu.compilation.acl_graph."
+                    "validate_cudagraph_capturing_enabled"), \
+             patch("omni_npu.compilation.acl_graph."
+                    "ensure_weak_ref_graph_params"):
+            result = wrapper(torch.tensor([1.0]))
+
+        wrapper.runnable.assert_called_once()
+        bd = ctx.batch_descriptor
+        assert bd in wrapper.concrete_aclgraph_entries
+        entry = wrapper.concrete_aclgraph_entries[bd]
+        assert entry.aclgraph is mock_graph
+
+    def test_replay_returns_cached_output(self, wrapper_and_context):
+        wrapper, ctx, _ = wrapper_and_context
+        wrapper.is_debugging_mode = False
+        bd = ctx.batch_descriptor
+
+        mock_aclgraph = MagicMock()
+        cached_output = torch.tensor([42.0])
+        entry = ACLGraphEntry(batch_descriptor=bd)
+        entry.aclgraph = mock_aclgraph
+        entry.output = cached_output
+        wrapper.concrete_aclgraph_entries[bd] = entry
+
+        # task_entries and workspaces must be non-empty to pass the
+        # emptiness check in _update_graph_tasks; the layer name won't
+        # match attn_layer_names (empty by default) so no update runs.
+        dummy_ws_fn = MagicMock()
+        with patch("omni_npu.compilation.acl_graph.get_graph_params") \
+                as mock_gp, \
+             patch("torch.npu.stream"), \
+             patch("torch.npu.graph_task_update_begin"), \
+             patch("torch.npu.graph_task_update_end"):
+            gp = MagicMock()
+            gp.task_entries = {4: {"_dummy": MagicMock()}}
+            gp.workspaces = {4: {dummy_ws_fn: MagicMock()}}
+            mock_gp.return_value = gp
+
+            result = wrapper(torch.tensor([1.0]))
+
+        wrapper.runnable.assert_not_called()
+        mock_aclgraph.replay.assert_called_once()
+        assert torch.equal(result, cached_output)
+
+    def test_debug_address_mismatch_raises(self, wrapper_and_context):
+        wrapper, ctx, _ = wrapper_and_context
+        wrapper.is_debugging_mode = True
+        bd = ctx.batch_descriptor
+
+        test_tensor = torch.tensor([1.0])
+        entry = ACLGraphEntry(batch_descriptor=bd)
+        entry.aclgraph = MagicMock()
+        entry.input_addresses = [test_tensor.data_ptr() + 999]
+        wrapper.concrete_aclgraph_entries[bd] = entry
+
+        with pytest.raises(AssertionError, match="Input addresses"):
+            wrapper(test_tensor)
+
+
+# ---------------------------------------------------------------------------
+# ACLGraphWrapper._update_graph_tasks
+# ---------------------------------------------------------------------------
+
+class TestUpdateGraphTasks:
 
     @pytest.fixture
-    def default_aclgraph_wrapper(self, default_npu_graph):
-        with patch("omni_npu.compilation.acl_graph.get_forward_context") as mock_get_forward_context:
-            mock_context = MagicMock()
-            mock_batch_descriptor = MagicMock()
-            mock_batch_descriptor.num_reqs = None
-            mock_batch_descriptor.num_tokens = None
-            mock_context.batch_descriptor = mock_batch_descriptor
-            mock_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-            mock_context.attn_metadata = None
-            mock_get_forward_context.return_value = mock_context
+    def wrapper_and_ctx(self):
+        """Create a wrapper with update_stream and a forward context."""
+        with patch("torch.npu.NPUGraph"), \
+             patch("torch.npu.graph"), \
+             patch("omni_npu.compilation.acl_graph.get_forward_context") \
+                as mock_get_ctx:
+
+            ctx = MagicMock()
+            ctx.batch_descriptor = MagicMock()
+            ctx.batch_descriptor.num_tokens = 4
+            ctx.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            mock_get_ctx.return_value = ctx
+
+            update_stream = MagicMock()
 
             wrapper = ACLGraphWrapper(
                 runnable=MagicMock(),
                 vllm_config=MagicMock(spec=VllmConfig),
                 runtime_mode=CUDAGraphMode.PIECEWISE,
-                graph_pool=MagicMock()
+                graph_pool=MagicMock(),
+                update_stream=update_stream,
+                attn_layer_names=["layer0"],
             )
-            wrapper._forward_context = mock_context
-            wrapper.concrete_aclgraph_entries = {}
-            wrapper.aclgraph_options = MagicMock(gc_disable=False, debug_log_enable=False)
-            wrapper.default_npu_graph = default_npu_graph
-            yield wrapper
 
-
-    def test_acl_graph_wrapper_init_normal(self):
-        """Test ACLGraphWrapper initialization"""
-        runnable = MagicMock()
-        vllm_config = MagicMock(spec=VllmConfig)
-        runtime_mode = CUDAGraphMode.PIECEWISE
-        graph_pool = MagicMock()
-        cudagraph_options = MagicMock()
-
-        wrapper = ACLGraphWrapper(runnable, vllm_config, runtime_mode, graph_pool, cudagraph_options)
-
-        assert wrapper.runnable == runnable
-        assert wrapper.vllm_config == vllm_config
-        assert wrapper.graph_pool == graph_pool
-        assert wrapper.runtime_mode == runtime_mode
-        assert wrapper.aclgraph_options == cudagraph_options
-        assert wrapper.first_run_finished is False
-        assert isinstance(wrapper.concrete_aclgraph_entries, dict)
-
-
-    def test_acl_graph_wrapper_init_with_none_graph_pool(self):
-        """Test ACLGraphWrapper initialization when graph_pool is None"""
-        runnable = MagicMock()
-        vllm_config = MagicMock(spec=VllmConfig)
-        runtime_mode = CUDAGraphMode.PIECEWISE
-        cudagraph_options = MagicMock()
-
-        mock_graph_pool = MagicMock()
-        with patch("omni_npu.compilation.acl_graph.current_platform.get_global_graph_pool", return_value=mock_graph_pool) as mock_get_global_graph_pool:
-            wrapper = ACLGraphWrapper(runnable, vllm_config, runtime_mode, None, cudagraph_options)
-
-            assert wrapper.graph_pool == mock_graph_pool
-            mock_get_global_graph_pool.assert_called_once()
-
-
-    def test_acl_graph_wrapper_init_with_none_cudagraph_options(self):
-        """Test ACLGraphWrapper initialization when cudagraph_options is None"""
-        runnable = MagicMock()
-        vllm_config = MagicMock(spec=VllmConfig)
-        runtime_mode = CUDAGraphMode.PIECEWISE
-        graph_pool = MagicMock()
-
-        with patch("omni_npu.compilation.acl_graph.CUDAGraphOptions", return_value=MagicMock(spec=CUDAGraphOptions)) as mock_cudagraph_options:
-            wrapper = ACLGraphWrapper(runnable, vllm_config, runtime_mode, graph_pool, None)
-
-            # Verify whether the type of aclgraph_options is CUDAGraphOptions
-            assert isinstance(wrapper.aclgraph_options, CUDAGraphOptions)
-            mock_cudagraph_options.assert_called_once()
-
-    
-    def test_acl_graph_wrapper_getattr(self):
-        """Test ACLGraphWrapper __get_attr__ method"""
-        # Allow runnable to have the key attribute
-        runnable = MagicMock(spec_set=["key"])
-        runnable.key = "value"
-        
-        wrapper = ACLGraphWrapper(runnable, MagicMock(), CUDAGraphMode.PIECEWISE)
-
-        assert wrapper.key == "value"
-        with pytest.raises(AttributeError):
-            _ = wrapper.nonexistent_attr
-
-
-    def test_acl_graph_wrapper_unwrap(self):
-        """Test ACLGraphWrapper unwrap method"""
-        runnable = MagicMock()
-        wrapper = ACLGraphWrapper(runnable, MagicMock(), CUDAGraphMode.PIECEWISE)
-        assert wrapper.unwrap() == runnable
-
-
-    def test_pad_list(self):
-        """Test ACLGraphWrapper _pad_list function"""
-        wrapper = ACLGraphWrapper(MagicMock(), MagicMock(), CUDAGraphMode.PIECEWISE)
-        assert wrapper._pad_list([], 3) == []
-        assert wrapper._pad_list([1, 2, 3], 3) == [1, 2, 3]
-        assert wrapper._pad_list([1, 2, 3], 5) == [1, 2, 3, 3, 3]
-        assert wrapper._pad_list([1, 2, 3], 2) == [1, 2]
-    
-
-    def test_call_non_aclgraph_runtime_mode(self, default_aclgraph_wrapper):
-        """Test the direct invocation of the runnable in the CUDAGraphMode.NONE mode."""
-        default_aclgraph_wrapper.runtime_mode = CUDAGraphMode.NONE
-        default_aclgraph_wrapper._forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
-        
-        result = default_aclgraph_wrapper(torch.tensor([1.0]))
-
-        # Verify direct invocation of the runnable method
-        default_aclgraph_wrapper.runnable.assert_called_once()
-        # Verify the returned value is the return value of the runnable.
-        assert result == default_aclgraph_wrapper.runnable.return_value
-        # Verify not create a new entry for batch descriptor
-        assert not default_aclgraph_wrapper.concrete_aclgraph_entries
-
-
-    def test_call_with_non_none_aclgraph_runtime_mode(self, default_aclgraph_wrapper):
-        """Test the aclgraph replay behavior in a non-NONE aclgraph_runtime_mode."""
-        default_aclgraph_wrapper.runtime_mode = CUDAGraphMode.PIECEWISE
-        default_aclgraph_wrapper._forward_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-        
-        default_aclgraph_wrapper._forward_context.attn_metadata = {
-            "metadata1": MagicMock(query_start_loc=[0, 1], seq_lens=torch.tensor([2]))
-        }
-        batch_descriptor = default_aclgraph_wrapper._forward_context.batch_descriptor
-        batch_descriptor.num_reqs = 3
-        batch_descriptor.num_tokens = 3
-        default_aclgraph_wrapper.vllm_config.scheduler_config.max_num_seqs = 10
-
-        with patch.object(default_aclgraph_wrapper, "concrete_aclgraph_entries", new_callable=dict) as mock_concrete_aclgraph_entries:
-            # simulate the captured aclgraph
-            mock_entry = MagicMock(spec=ACLGraphEntry)
-            mock_aclgraph = MagicMock()
-            mock_aclgraph.replay = MagicMock()
-
-            mock_entry.aclgraph = mock_aclgraph
-            mock_entry.output = torch.tensor([2.0])
-            mock_concrete_aclgraph_entries[batch_descriptor] = mock_entry
-            
-            with patch("omni_npu.compilation.acl_graph.get_graph_params") as mock_get_graph_params, \
-                 patch("torch.npu.stream"), \
-                 patch("torch.npu.graph_task_update_begin"), \
-                 patch("torch.npu.graph_task_update_end"):
-                # Mock get_graph_params to provide valid graph params
-                mock_graph_params = MagicMock()
-                mock_graph_params.attn_params = {3:[]}
-                mock_graph_params.handles = {3:[]}
-                mock_graph_params.events = {3:[]}
-                mock_graph_params.workspaces = {3:None}
-                mock_get_graph_params.return_value = mock_graph_params
-
-                result = default_aclgraph_wrapper(torch.tensor([1.0]))
-
-            # Verify runnable should not be called
-            default_aclgraph_wrapper.runnable.assert_not_called()
-            # Verify replay and update should be called
-            mock_aclgraph.replay.assert_called_once()
-            assert result == mock_entry.output
-            assert batch_descriptor in default_aclgraph_wrapper.concrete_aclgraph_entries
-
-
-    def test_call_with_aslkv_none(self, default_aclgraph_wrapper):
-        """Test __call__ method raise error when attn_metadata is None."""
-        default_aclgraph_wrapper._forward_context.attn_metadata = None
-        batch_descriptor = default_aclgraph_wrapper._forward_context.batch_descriptor
-        batch_descriptor.num_reqs = 3
-        batch_descriptor.num_tokens = 3
-        with patch.object(default_aclgraph_wrapper, "concrete_aclgraph_entries", new_callable=dict) as mock_concrete_aclgraph_entries:
-            mock_entry = MagicMock(spec=ACLGraphEntry)
-            mock_aclgraph = MagicMock()
-            mock_aclgraph.replay = MagicMock()
-            mock_concrete_aclgraph_entries[batch_descriptor] = mock_entry
-
-            with pytest.raises(RuntimeError):
-                default_aclgraph_wrapper(torch.tensor([1.0]))
-            
-            mock_entry.aclgraph.replay.assert_called_once()
-
-
-    def test_call_attn_metadata_gqa_mode(self, default_aclgraph_wrapper):
-        """Test __call__ method executes normally under the GQA mode."""
-        mock_attn_metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
-        mock_attn_metadata.query_start_loc = [0, 1]
-        mock_attn_metadata.seq_lens = torch.tensor([2])
-        default_aclgraph_wrapper._forward_context.attn_metadata = {
-            "metadata1": mock_attn_metadata
-        }
-        default_aclgraph_wrapper.runnable = MagicMock(return_value=torch.tensor([1.0]))
-
-        result = default_aclgraph_wrapper(torch.tensor([1.0]))
-
-        default_aclgraph_wrapper.runnable.assert_called_once()
-        assert torch.equal(result, torch.tensor([1.0]))
-
-
-    def test_call_attn_metadata_mla_mode(self, default_aclgraph_wrapper):
-        """Test __call__ method executes normally under the MLA mode."""
-        mock_attn_metadata = MagicMock()
-        mock_attn_metadata.decode = MagicMock()
-        mock_attn_metadata.decode.query_cumlens = torch.tensor([1])
-        mock_attn_metadata.decode.seq_lens = torch.tensor([2])
-        mock_attn_metadata.decode.seq_sink_len = torch.tensor([3])
-        default_aclgraph_wrapper._forward_context.attn_metadata = {
-            "metadata1": mock_attn_metadata
-        }
-        default_aclgraph_wrapper.runnable = MagicMock(return_value=torch.tensor([1.0]))
-
-        result = default_aclgraph_wrapper(torch.tensor([1.0]))
-
-        default_aclgraph_wrapper.runnable.assert_called_once()
-        assert torch.equal(result, torch.tensor([1.0]))
-
-
-    def test_call_with_input_address_mismatch(self, default_aclgraph_wrapper):
-        """Test the behavior when input address do not match in debugging mode."""
-        default_aclgraph_wrapper.is_debugging_mode = True
-        default_aclgraph_wrapper.runnable = MagicMock(return_value=torch.tensor([1.0]))
-
-        test_tensor = torch.tensor([1.0])
-        new_input_address = [test_tensor.data_ptr()]
-        old_input_address = [new_input_address[0] + 1]
-
-        batch_descriptor = default_aclgraph_wrapper._forward_context.batch_descriptor
-        default_aclgraph_wrapper.runnable = MagicMock(return_value=torch.tensor([1.0]))
-
-        with patch.object(default_aclgraph_wrapper, "concrete_aclgraph_entries", new_callable=dict) as mock_concrete_aclgraph_entries:
-            mock_entry = MagicMock(spec=ACLGraphEntry)
-            mock_entry.input_addresses = old_input_address
-            mock_concrete_aclgraph_entries[batch_descriptor] = mock_entry
-
-            with pytest.raises(AssertionError):
-                default_aclgraph_wrapper(test_tensor)
-
-            mock_entry.aclgraph.replay.assert_not_called()
-
-
-
-def test_weak_ref_workspaces():
-    """Test weak_ref_workspaces function"""
-    params = GraphParams(
-        {1: None, 2: [], 3: []},
-        {1: None, 2: None, 3: None},
-        {1: [], 2: [], 3: []},
-        {1: [], 2: [], 3: []}
-    )
-
-    # Test with None params
-    weak_ref_workspaces(None)
-
-    # Test with params containing None workspaces
-    weak_ref_workspaces(params)
-    assert params.workspaces.get(1) is None
-
-    # Test with params containing tensor workspaces
-    workspace_tensor = torch.tensor([1.0, 2.0, 3.0])
-    params.workspaces[2] = [workspace_tensor]
-
-    weak_ref_workspaces(params)
-
-    # Verify weak_ref was applied
-    result_tensor = params.workspaces[2][0]
-    assert torch.equal(result_tensor, workspace_tensor)
-
-
-class TestACLGraphWrapperUpdateMethods:
-    """Test class for ACLGraphWrapper update method"""
-
-    @pytest.fixture
-    def wrapper_with_update_stream(self):
-        with patch("torch.npu.NPUGraph"), \
-             patch("torch.npu.graph"), \
-             patch("torch.npu.Stream") as mock_stream, \
-             patch("omni_npu.compilation.acl_graph.get_forward_context") as mock_get_forward_context:
-
-            mock_stream_instance = MagicMock()
-            mock_stream.return_value = mock_stream_instance
-            mock_stream_instance.__enter__ = lambda self: mock_stream_instance
-            mock_stream_instance.__exit__ = lambda *args: None
-
-            mock_context = MagicMock()
-            mock_batch_descriptor = MagicMock()
-            mock_batch_descriptor.num_reqs = 3
-            mock_batch_descriptor.num_tokens = 4
-            mock_context.batch_descriptor = mock_batch_descriptor
-            mock_context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-            mock_get_forward_context.return_value = mock_context
-
-            vllm_config = MagicMock(spec=VllmConfig)
-            vllm_config.model_config.use_mla = False
-            vllm_config.scheduler_config.max_num_seqs = 10
-
-            wrapper = ACLGraphWrapper(
-                runnable=MagicMock(),
-                vllm_config=vllm_config,
-                runtime_mode=CUDAGraphMode.PIECEWISE,
-                update_stream=mock_stream_instance
-            )
-            wrapper._forward_context = mock_context
-
-            yield wrapper, mock_context, mock_stream_instance
-
-    def test_update_fia_params_with_list_aslkv(self, wrapper_with_update_stream):
-        """Test _update_fia_params with list aslkv"""
-        wrapper, forward_context, _ = wrapper_with_update_stream
-
-        # Setup metadata without decode attribute (GQA mode)
-        metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
-        metadata.query_start_loc = [1, 2]
-        metadata.seq_lens = [2, 3]
-
-        forward_context.attn_metadata = {0: metadata}
-
-        asl, aslkv = wrapper._update_fia_params(forward_context, 0)
-
-        # Verify padding was applied
-        # query_start_loc[1:] = [2], after padding with num_tokens=4 becomes [2, 4]
-        assert asl == [2, 2, 4]
-        assert aslkv == [2, 3, 0]
-
-    def test_update_fia_params_with_tensor_aslkv(self, wrapper_with_update_stream):
-        """Test _update_fia_params with tensor aslkv"""
-        wrapper, forward_context, _ = wrapper_with_update_stream
-
-        # Setup metadata with decode attribute and tensor
-        asl_tensor = torch.tensor([1, 2])
-        aslkv_tensor = torch.tensor([2, 3])
-
-        class DecodeMetadata:
-            query_cumlens = asl_tensor
-            seq_lens = aslkv_tensor
-
-        class Metadata:
-            decode = DecodeMetadata()
-
-        forward_context.attn_metadata = {0: Metadata()}
-
-        asl, aslkv = wrapper._update_fia_params(forward_context, 0)
-
-        # Verify tensors are returned as-is
-        assert torch.equal(asl, asl_tensor)
-        assert torch.equal(aslkv, aslkv_tensor)
-
-    def test_update_fia_params_with_seq_sink_len(self, wrapper_with_update_stream):
-        """Test _update_fia_params with seq_sink_len"""
-        wrapper, forward_context, _ = wrapper_with_update_stream
-
-        # Setup metadata with decode and seq_sink_len
-        metadata = MagicMock()
-        metadata.decode = MagicMock()
-        metadata.decode.query_cumlens = [1, 2]
-        metadata.decode.seq_lens = [2, 3]
-        metadata.decode.seq_sink_len = [3, 4]
-
-        forward_context.attn_metadata = {0: metadata}
-
-        asl, aslkv = wrapper._update_fia_params(forward_context, 0)
-
-        # Verify seq_sink_len is used for kv lengths
-        assert asl == [1, 2, 4]
-        assert aslkv == [2, 3, 0]
-
-    def test_update_fia_params_with_zero_aslkv_last_element(self, wrapper_with_update_stream):
-        """Test _update_fia_params when last element of aslkv is zero"""
-        wrapper, forward_context, _ = wrapper_with_update_stream
-
-        # Setup metadata with zero in last position
-        metadata = MagicMock(spec_set=["query_start_loc", "seq_lens"])
-        metadata.query_start_loc = [1, 2]
-        metadata.seq_lens = [2, 0]
-
-        forward_context.attn_metadata = {0: metadata}
-
-        asl, aslkv = wrapper._update_fia_params(forward_context, 0)
-
-        # Verify extension is not applied when last element is zero
-        # query_start_loc[1:] = [2], after padding becomes [2, 4]
-        assert asl == [2, 2, 4]
-        assert aslkv == [2, 0, 0]
-
-    def test_update_fia_params_with_none_num_reqs(self, wrapper_with_update_stream):
-        """Test _update_fia_params when num_reqs is None"""
-        wrapper, forward_context, _ = wrapper_with_update_stream
-
-        # Setup metadata
-        asl_list = [1, 2]
-        aslkv_list = [2, 3]
-
-        class Metadata:
-            query_start_loc = asl_list
-            seq_lens = aslkv_list
-
-        forward_context.attn_metadata = {0: Metadata()}
-        forward_context.batch_descriptor.num_reqs = None
-        forward_context.batch_descriptor.num_tokens = 4
-
-        asl, aslkv = wrapper._update_fia_params(forward_context, 0)
-
-        # Verify padding uses max_num_seqs when num_reqs is None
-        # When num_reqs is None, padding_lens = min(10, 4) = 4
-        assert len(asl) == 4  # padding length is min(10, 4) = 4
-        assert len(aslkv) == 4
-        assert asl[-1] == 4  # num_tokens
-
-    def test_update_attn_fia_params_with_none_attn_metadata(self, wrapper_with_update_stream):
-        """Test _update_attn_fia_params raises error when attn_metadata is None"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
-
-        forward_context.attn_metadata = None
-
-        with pytest.raises(RuntimeError, match="attn_metadata is None"):
-            wrapper._update_attn_fia_params(update_stream, forward_context, 1)
-
-    def test_update_attn_fia_params_with_empty_attn_metadata(self, wrapper_with_update_stream):
-        """Test _update_attn_fia_params with empty attn_metadata"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
-
-        forward_context.attn_metadata = {}
-
-        # Should not raise error, just return early
-        wrapper._update_attn_fia_params(update_stream, forward_context, 1)
-
-    def _setup_graph_params(self, op_name="npu_fused_infer_attention_score", is_mla=False):
-        """Helper to setup common graph params"""
-        mock_graph_params = MagicMock()
-        mock_attn_param = {
-            "op_name": op_name,
-            "query": MagicMock(), "key": MagicMock(), "value": MagicMock(),
-            "num_key_value_heads": 8, "input_layout": "layout1",
-            "block_table": MagicMock(), "block_size": 16, "sparse_mode": 0,
-            "atten_mask": MagicMock(), "attn_output": MagicMock(), "softmax_lse": MagicMock(),
-        }
-
-        if op_name == "npu_fused_infer_attention_score":
-            mock_attn_param.update({"num_heads": 8, "scale": 1.0})
-        else:
-            mock_attn_param.update({"num_query_heads": 8, "softmax_scale": 1.0})
-
-        if is_mla:
-            mock_attn_param.update({"query_rope": MagicMock(), "key_rope": MagicMock(),
-                                    "pre_tokens": 2147483647, "next_tokens": 2147483647,})
-            if op_name == "npu_fused_infer_attention_score":
-                mock_attn_param.update({"antiquant_mode": 0, "softmax_lse_flag": False})
-            else:
-                mock_attn_param.update({"sink_number": 0})
-
-        mock_graph_params.attn_params = {1: [mock_attn_param]}
-        mock_graph_params.handles = {1: [MagicMock()]}
-        mock_graph_params.events = {1: [MagicMock()]}
-        mock_graph_params.workspaces = {1: MagicMock()}
-        return mock_graph_params
-
-    def _setup_metadata(self, is_mla=False):
-        """Helper to setup common metadata"""
-        metadata = MagicMock()
-        if is_mla:
-            metadata.decode.query_cumlens = [1, 2]
-            metadata.decode.seq_lens = [2, 3]
-        else:
-            metadata.query_cumlens = [1, 2]
-            metadata.seq_lens = [2, 3]
-        return metadata
-
-    @patch("torch_npu.npu_fused_infer_attention_score.out")
-    def test_update_attn_fia_params_fia_v1(self, mock_fia_out, wrapper_with_update_stream):
-        """Test _update_attn_fia_params with FIA v1"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
-
-        with patch("omni_npu.compilation.acl_graph.get_graph_params") as mock_get_graph_params, \
-             patch("torch.npu.stream"), \
-             patch("torch.npu.graph_task_update_begin") as mock_update_begin, \
-             patch("torch.npu.graph_task_update_end") as mock_update_end:
-
-            mock_get_graph_params.return_value = self._setup_graph_params("npu_fused_infer_attention_score", is_mla=False)
-            forward_context.attn_metadata = {0: self._setup_metadata(is_mla=False)}
-
-            wrapper._update_attn_fia_params(update_stream, forward_context, 1)
-
-            mock_update_begin.assert_called_once()
-            mock_fia_out.assert_called_once()
-            mock_update_end.assert_called_once()
-            mock_get_graph_params.return_value.events[1][0].record.assert_called_once()
-
-    @patch("torch_npu.npu_fused_infer_attention_score_v2.out")
-    def test_update_attn_fia_params_fia_v2(self, mock_fia_out, wrapper_with_update_stream):
-        """Test _update_attn_fia_params with FIA v2"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
-
-        with patch("omni_npu.compilation.acl_graph.get_graph_params") as mock_get_graph_params, \
-             patch("torch.npu.stream"), \
-             patch("torch.npu.graph_task_update_begin") as mock_update_begin, \
-             patch("torch.npu.graph_task_update_end") as mock_update_end:
-
-            mock_get_graph_params.return_value = self._setup_graph_params("npu_fused_infer_attention_score_v2", is_mla=False)
-            forward_context.attn_metadata = {0: self._setup_metadata(is_mla=False)}
-
-            wrapper._update_attn_fia_params(update_stream, forward_context, 1)
-
-            mock_update_begin.assert_called_once()
-            mock_fia_out.assert_called_once()
-            mock_update_end.assert_called_once()
-            mock_get_graph_params.return_value.events[1][0].record.assert_called_once()
-
-    @patch("torch.ops.custom.npu_fused_infer_attention_sink.out")
-    def test_update_attn_fia_params_sink(self, mock_sink_out, wrapper_with_update_stream):
-        """Test _update_attn_fia_params with npu_fused_infer_attention_sink op"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
-
-        # Setup graph params for sink attention
-        mock_graph_params = MagicMock()
-        mock_attn_param = {
-            "op_name": "npu_fused_infer_attention_sink",
-            "query": MagicMock(),
-            "key": MagicMock(),
-            "value": MagicMock(),
-            "num_query_heads": 8,
-            "num_key_value_heads": 8,
-            "input_layout": "layout1",
-            "softmax_scale": 1.0,
-            "sink_number": 4,
-            "pre_tokens": 2147483647,
-            "next_tokens": 2147483647,
-            "attn_output": MagicMock(),
-            "softmax_lse": MagicMock(),
-            "sparse_mode": 0,
-            "atten_mask": MagicMock(),
-            "block_table": MagicMock(),
-            "block_size": 16,
-        }
-        mock_graph_params.attn_params = {1: [mock_attn_param]}
-        mock_graph_params.handles = {1: [MagicMock()]}
-        mock_graph_params.events = {1: [MagicMock()]}
-        mock_graph_params.workspaces = {1: MagicMock()}
-
-        # Setup metadata
-        metadata = MagicMock()
-        metadata.query_cumlens = [1, 2]
-        metadata.seq_lens = [2, 3]
-        forward_context.attn_metadata = {0: metadata}
-
-        with patch("omni_npu.compilation.acl_graph.get_graph_params") as mock_get_graph_params, \
-             patch("torch.npu.stream"), \
-             patch("torch.npu.graph_task_update_begin") as mock_update_begin, \
-             patch("torch.npu.graph_task_update_end") as mock_update_end:
-
-            mock_get_graph_params.return_value = mock_graph_params
-
-            wrapper._update_attn_fia_params(update_stream, forward_context, 1)
-
-            # Verify sink branch was called
-            mock_update_begin.assert_called_once()
-            mock_sink_out.assert_called_once()
-            mock_update_end.assert_called_once()
-            mock_get_graph_params.return_value.events[1][0].record.assert_called_once()
-
-            # Verify sink-specific parameters were passed
-            call_kwargs = mock_sink_out.call_args.kwargs
-            assert "sink_number" in call_kwargs
-            assert call_kwargs["sink_number"] == 4
-
-    @patch("torch.npu.stream")
-    @patch("omni_npu.compilation.acl_graph.get_graph_params")
-    def test_update_attn_fia_params_unsupported_op_name(self, mock_get_graph_params, mock_npu_stream,
-                                                         wrapper_with_update_stream):
-        """Test _update_attn_fia_params with unsupported op_name raises RuntimeError"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
-
-        # Setup graph params with unsupported op name
-        mock_graph_params = MagicMock()
-        mock_attn_param = {
-            "op_name": "unsupported_attention_op",
-            "query": MagicMock(),
-            "key": MagicMock(),
-            "value": MagicMock(),
-        }
-        mock_graph_params.attn_params = {1: [mock_attn_param]}
-        mock_graph_params.handles = {1: [MagicMock()]}
-        mock_graph_params.events = {1: [MagicMock()]}
-        mock_graph_params.workspaces = {1: MagicMock()}
-
-        # Setup metadata
-        metadata = MagicMock()
-        metadata.query_cumlens = [1, 2]
-        metadata.seq_lens = [2, 3]
-        forward_context.attn_metadata = {0: metadata}
-
-        mock_get_graph_params.return_value = mock_graph_params
-
-        with pytest.raises(RuntimeError, match="Unsupported op name for attention"):
-            wrapper._update_attn_fia_params(update_stream, forward_context, 1)
-
-    @patch("torch_npu.npu_fused_infer_attention_score.out")
-    def test_update_mla_attn_params_fia_v1(self, mock_fia_out, wrapper_with_update_stream):
-        """Test _update_mla_attn_params with FIA v1"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
-
-        with patch("omni_npu.compilation.acl_graph.get_graph_params") as mock_get_graph_params, \
-             patch("torch.npu.stream"), \
-             patch("torch.npu.graph_task_update_begin") as mock_update_begin, \
-             patch("torch.npu.graph_task_update_end") as mock_update_end:
-
-            mock_get_graph_params.return_value = self._setup_graph_params("npu_fused_infer_attention_score", is_mla=True)
-            forward_context.attn_metadata = {0: self._setup_metadata(is_mla=True)}
-
-            wrapper._update_mla_attn_params(update_stream, forward_context, 1)
-
-            mock_update_begin.assert_called_once()
-            mock_fia_out.assert_called_once()
-            mock_update_end.assert_called_once()
-            mock_get_graph_params.return_value.events[1][0].record.assert_called_once()
-
-    @patch("torch.ops.custom.npu_fused_infer_attention_sink.out")
-    def test_update_mla_attn_params_fia_sink(self, mock_fia_out, wrapper_with_update_stream):
-        """Test _update_mla_attn_params with FIA sink"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
-
-        with patch("omni_npu.compilation.acl_graph.get_graph_params") as mock_get_graph_params, \
-             patch("torch.npu.stream"), \
-             patch("torch.npu.graph_task_update_begin") as mock_update_begin, \
-             patch("torch.npu.graph_task_update_end") as mock_update_end:
-
-            mock_get_graph_params.return_value = self._setup_graph_params("npu_fused_infer_attention_sink", is_mla=True)
-            forward_context.attn_metadata = {0: self._setup_metadata(is_mla=True)}
-
-            wrapper._update_mla_attn_params(update_stream, forward_context, 1)
-
-            mock_update_begin.assert_called_once()
-            mock_fia_out.assert_called_once()
-            mock_update_end.assert_called_once()
-            mock_get_graph_params.return_value.events[1][0].record.assert_called_once()
-
-    def test_wrapper_initialization_with_update_stream(self):
-        """Test ACLGraphWrapper initialization with update_stream parameter"""
-        runnable = MagicMock()
-        vllm_config = MagicMock(spec=VllmConfig)
-        runtime_mode = CUDAGraphMode.PIECEWISE
-        graph_pool = MagicMock()
-        update_stream = MagicMock(spec=torch.npu.Stream)
-
-        wrapper = ACLGraphWrapper(
-            runnable, vllm_config, runtime_mode, graph_pool,
-            cudagraph_options=None, update_stream=update_stream
+            yield wrapper, ctx, update_stream
+
+    def _make_entry(self, compute_fn=None, op_out_fn=None):
+        op_desc = OpDescriptor(
+            op_out_fn=op_out_fn or MagicMock(),
+            workspace_fn=MagicMock(),
+            weak_ref_keys=("query",),
+            compute_dynamic_kwargs=compute_fn,
+        )
+        return GraphTaskEntry(
+            op_desc=op_desc,
+            captured_kwargs={"query": MagicMock(), "scale": 1.0},
+            out_tensors=[MagicMock()],
+            handle=MagicMock(),
+            event=MagicMock(),
         )
 
-        assert wrapper.update_stream == update_stream
+    def _make_graph_params(self, entry, runtime_shape=4):
+        gp = MagicMock()
+        gp.task_entries = {runtime_shape: {"layer0": entry}}
+        gp.workspaces = {
+            runtime_shape: {entry.op_desc.workspace_fn: MagicMock()}}
+        return gp
 
-    @patch("torch.npu.stream")
-    @patch("omni_npu.compilation.acl_graph.get_graph_params")
-    @patch("torch.npu.graph_task_update_begin")
-    @patch("torch.npu.graph_task_update_end")
-    def test_update_attn_fia_params_with_pre_tokens(self, mock_update_end, mock_update_begin,
-                                                    mock_get_graph_params, mock_npu_stream, wrapper_with_update_stream):
-        """Test _update_attn_fia_params with pre_tokens and next_tokens"""
-        wrapper, forward_context, update_stream = wrapper_with_update_stream
+    def test_none_metadata_raises(self, wrapper_and_ctx):
+        wrapper, ctx, stream = wrapper_and_ctx
+        ctx.attn_metadata = None
 
-        # Setup graph params with v2 FIA including pre_tokens and next_tokens
-        mock_graph_params = MagicMock()
-        mock_attn_param = {
-            "op_name": "npu_fused_infer_attention_score_v2",
-            "query": MagicMock(),
-            "key": MagicMock(),
-            "value": MagicMock(),
-            "num_query_heads": 8,
-            "num_key_value_heads": 8,
-            "input_layout": "layout1",
-            "softmax_scale": 1.0,
-            "block_table": MagicMock(),
-            "block_size": 16,
-            "sparse_mode": 0,
-            "atten_mask": MagicMock(),
-            "attn_output": MagicMock(),
-            "softmax_lse": MagicMock(),
-            "pre_tokens": 10,
-            "next_tokens": 20,
-            "learnable_sink": MagicMock()
-        }
-        mock_graph_params.attn_params = {1: [mock_attn_param]}
-        mock_graph_params.handles = {1: [MagicMock()]}
-        mock_graph_params.events = {1: [MagicMock()]}
-        mock_graph_params.workspaces = {1: MagicMock()}
+        with pytest.raises(RuntimeError, match="attn_metadata"):
+            wrapper._update_graph_tasks(stream, ctx)
 
-        mock_get_graph_params.return_value = mock_graph_params
+    def test_empty_entries_raises(self, wrapper_and_ctx):
+        wrapper, ctx, stream = wrapper_and_ctx
+        ctx.attn_metadata = {}
 
-        # Setup metadata
-        metadata = MagicMock()
-        metadata.query_cumlens = [1, 2]
-        metadata.seq_lens = [2, 3]
-        forward_context.attn_metadata = {0: metadata}
+        with patch("omni_npu.compilation.acl_graph.get_graph_params") as m:
+            gp = MagicMock()
+            gp.task_entries = {4: {}}
+            gp.workspaces = {4: {}}
+            m.return_value = gp
 
-        # Mock the FIA function to avoid actual execution
-        with patch("torch_npu.npu_fused_infer_attention_score_v2.out") as mock_fia_out:
-            wrapper._update_attn_fia_params(update_stream, forward_context, 1)
+            with pytest.raises(RuntimeError, match="runtime_shape"):
+                wrapper._update_graph_tasks(stream, ctx)
 
-            # Verify update was called with pre_tokens and next_tokens
-            call_args = mock_get_graph_params.return_value.attn_params[1][0]
-            assert call_args.get("pre_tokens") == 10
-            assert call_args.get("next_tokens") == 20
+    def test_calls_compute_fn_and_issues_op(self, wrapper_and_ctx):
+        wrapper, ctx, stream = wrapper_and_ctx
+        ctx.attn_metadata = {"layer0": MagicMock()}
+
+        mock_op = MagicMock()
+        dynamic = {"scale": 2.0}
+        mock_compute = MagicMock(return_value=dynamic)
+        entry = self._make_entry(compute_fn=mock_compute, op_out_fn=mock_op)
+        gp = self._make_graph_params(entry)
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=gp), \
+             patch("torch.npu.stream"), \
+             patch("torch.npu.graph_task_update_begin") as begin, \
+             patch("torch.npu.graph_task_update_end") as end:
+
+            wrapper._update_graph_tasks(stream, ctx)
+
+        mock_compute.assert_called_once_with(
+            ctx, "layer0", wrapper.vllm_config)
+        begin.assert_called_once_with(stream, entry.handle)
+        mock_op.assert_called_once()
+        # verify dynamic kwargs were merged
+        call_kwargs = mock_op.call_args.kwargs
+        assert call_kwargs["scale"] == 2.0
+        end.assert_called_once_with(stream)
+        entry.event.record.assert_called_once_with(stream)
+
+    def test_skips_none_compute_fn(self, wrapper_and_ctx):
+        wrapper, ctx, stream = wrapper_and_ctx
+        ctx.attn_metadata = {"layer0": MagicMock()}
+
+        entry = self._make_entry(compute_fn=None)
+        gp = self._make_graph_params(entry)
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=gp), \
+             patch("torch.npu.stream"), \
+             patch("torch.npu.graph_task_update_begin") as begin, \
+             patch("torch.npu.graph_task_update_end"):
+
+            wrapper._update_graph_tasks(stream, ctx)
+
+        begin.assert_not_called()
+        entry.op_desc.op_out_fn.assert_not_called()
+        entry.event.record.assert_called_once_with(stream)
+
+    def test_skips_none_dynamic_result(self, wrapper_and_ctx):
+        wrapper, ctx, stream = wrapper_and_ctx
+        ctx.attn_metadata = {"layer0": MagicMock()}
+
+        mock_compute = MagicMock(return_value=None)
+        entry = self._make_entry(compute_fn=mock_compute)
+        gp = self._make_graph_params(entry)
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=gp), \
+             patch("torch.npu.stream"), \
+             patch("torch.npu.graph_task_update_begin") as begin, \
+             patch("torch.npu.graph_task_update_end"):
+
+            wrapper._update_graph_tasks(stream, ctx)
+
+        mock_compute.assert_called_once()
+        begin.assert_not_called()
+        entry.event.record.assert_called_once_with(stream)
+
+    def test_skips_non_attn_layer(self, wrapper_and_ctx):
+        wrapper, ctx, stream = wrapper_and_ctx
+        ctx.attn_metadata = {"other_layer": MagicMock()}
+        wrapper.attn_layer_names = ["layer0"]
+
+        mock_compute = MagicMock()
+        entry = self._make_entry(compute_fn=mock_compute)
+        gp = MagicMock()
+        gp.task_entries = {4: {"other_layer": entry}}
+        gp.workspaces = {4: {entry.op_desc.workspace_fn: MagicMock()}}
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=gp), \
+             patch("torch.npu.stream"), \
+             patch("torch.npu.graph_task_update_begin") as begin, \
+             patch("torch.npu.graph_task_update_end"):
+
+            wrapper._update_graph_tasks(stream, ctx)
+
+        mock_compute.assert_not_called()
+        begin.assert_not_called()
+
+    def test_passes_correct_workspace(self, wrapper_and_ctx):
+        wrapper, ctx, stream = wrapper_and_ctx
+        ctx.attn_metadata = {"layer0": MagicMock()}
+
+        mock_op = MagicMock()
+        mock_compute = MagicMock(return_value={"x": 1})
+        entry = self._make_entry(compute_fn=mock_compute, op_out_fn=mock_op)
+        mock_workspace = MagicMock()
+        gp = MagicMock()
+        gp.task_entries = {4: {"layer0": entry}}
+        gp.workspaces = {4: {entry.op_desc.workspace_fn: mock_workspace}}
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=gp), \
+             patch("torch.npu.stream"), \
+             patch("torch.npu.graph_task_update_begin"), \
+             patch("torch.npu.graph_task_update_end"):
+
+            wrapper._update_graph_tasks(stream, ctx)
+
+        call_kwargs = mock_op.call_args.kwargs
+        assert call_kwargs["workspace"] is mock_workspace
 
 
 if __name__ == "__main__":

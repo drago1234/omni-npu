@@ -45,8 +45,9 @@ import omni_training_custom_ops
 import omni_custom_ops
 
 from omni_npu.compilation.utils import (
-    capture_multi_fia_graph_size,
-    capture_multi_fia_sink_graph_size,
+    capture_graph_task,
+    OP_FIA_V1,
+    OP_FIA_SINK,
 )
 
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -397,11 +398,11 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
             if forward_context.capturing:
-                capture_multi_fia_sink_graph_size(
-                    attn_output=attn_output,
-                    softmax_lse=softmax_lse ,
+                capture_graph_task(
+                    op_desc=OP_FIA_SINK,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
                     num_tokens=num_tokens,
-                    const_args=kwargs,
                     layer_name=layer_name,
                 )
             else:
@@ -438,11 +439,11 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
             if forward_context.capturing:
-                capture_multi_fia_graph_size(
-                    attn_output=attn_output,
-                    softmax_lse=softmax_lse ,
+                capture_graph_task(
+                    op_desc=OP_FIA_V1,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
                     num_tokens=num_tokens,
-                    const_args=kwargs,
                     layer_name=layer_name,
                 )
             else:

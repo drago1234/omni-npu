@@ -36,7 +36,11 @@ from omni_npu.layers.attention.npu_sparse_attentions import (
     MomeAttention,
 )
 
-from omni_npu.compilation.utils import capture_multi_fia_sink_graph_size, capture_multi_pioneer_graph_size
+from omni_npu.compilation.utils import (
+    capture_graph_task,
+    OP_FIA_SINK,
+    OP_FIA_PIONEER,
+)
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -978,12 +982,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
             })
             forward_context = get_forward_context()
             if forward_context.capturing:
-                capture_multi_pioneer_graph_size(
-                    attn_output=attn_output,
-                    softmax_lse=softmax_lse,
+                capture_graph_task(
+                    op_desc=OP_FIA_PIONEER,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
                     num_tokens=num_tokens,
-                    const_args=kwargs,
-                    layer_name=f"{self.prefix}.attn",
+                    layer_name=self.attn.layer_name,
                 )
             else:
                 attn_output[:, :num_actual_tokens] = torch_npu._npu_attention_pioneer(**kwargs)[0]
@@ -996,12 +1000,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
             })
             forward_context = get_forward_context()
             if forward_context.capturing:
-                capture_multi_fia_sink_graph_size(
-                    attn_output=attn_output,
-                    softmax_lse=softmax_lse,
+                capture_graph_task(
+                    op_desc=OP_FIA_SINK,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
                     num_tokens=num_tokens,
-                    const_args=kwargs,
-                    layer_name=f"{self.prefix}.attn", 
+                    layer_name=self.attn.layer_name,
                 )
             else:
                 attn_output[:, :num_actual_tokens] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]

@@ -37,8 +37,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from omni_npu.attention import ops
 from vllm.forward_context import get_forward_context
 from omni_npu.compilation.utils import (
-    capture_multi_fia_graph_size,
-    capture_multi_fia_sink_graph_size,
+    capture_graph_task,
+    OP_FIA_V1,
+    OP_FIA_SINK,
 )
 from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches
 from omni_npu.model_config.config_loader.loader import model_extra_config
@@ -746,11 +747,11 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             attn_output = torch.empty(attn_output_shape, dtype=decode_ql_nope.dtype, device=decode_ql_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=decode_ql_nope.dtype, device=decode_ql_nope.device)
             if forward_context.capturing:
-                capture_multi_fia_sink_graph_size(
-                    attn_output=attn_output,
-                    softmax_lse=softmax_lse ,
+                capture_graph_task(
+                    op_desc=OP_FIA_SINK,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
                     num_tokens=num_tokens,
-                    const_args=kwargs,
                     layer_name=layer.layer_name,
                 )
                 o = attn_output.transpose(0, 1).contiguous()
@@ -787,11 +788,11 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 "sparse_mode":  sparse_mode
             }
             if forward_context.capturing:
-                capture_multi_fia_graph_size(
-                    attn_output=attn_output,
-                    softmax_lse=softmax_lse ,
+                capture_graph_task(
+                    op_desc=OP_FIA_V1,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
                     num_tokens=num_tokens,
-                    const_args=kwargs,
                     layer_name=layer.layer_name,
                 )
                 o = attn_output
