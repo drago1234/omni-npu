@@ -2125,7 +2125,7 @@ class TestUnregisterAndReregisterKVCaches:
         runner.vllm_config = SimpleNamespace()
         runner.vllm_config.kv_transfer_config = SimpleNamespace()
         runner.vllm_config.kv_transfer_config.kv_connector = "LLMDataDistConnector"
-        runner.kv_caches = {"layer.0": torch.zeros(2, 3)}
+        runner.kv_caches_dict = {"layer.0": torch.zeros(2, 3)}
 
         from omni_npu.worker.npu_model_runner import NPUModelRunner
         runner.reregister_kv_caches = NPUModelRunner.reregister_kv_caches.__get__(runner, type(runner))
@@ -2145,7 +2145,108 @@ class TestUnregisterAndReregisterKVCaches:
 
         runner.reregister_kv_caches()
 
-        mock_kv_group.register_kv_caches.assert_called_once_with(runner.kv_caches)
+        mock_kv_group.register_kv_caches.assert_called_once_with(runner.kv_caches_dict)
+
+    def test_initialize_kv_cache_tensors_with_kv_transfer_group(self, monkeypatch):
+        """Test initialize_kv_cache_tensors when has_kv_transfer_group returns True."""
+        # Use real NPUModelRunner instance for super() to work
+        vllm_cfg = create_vllm_config()
+        npu_device = torch.device("npu:0")
+        runner = NPUModelRunner(vllm_cfg, npu_device)
+
+        # Mock the parent class method to return a fake kv_caches dict
+        fake_kv_caches = {"layer.0": torch.zeros(2, 3), "layer.1": torch.zeros(2, 3)}
+
+        # Mock super().initialize_kv_cache_tensors by patching GPUModelRunner method
+        def mock_super_initialize(self, kv_cache_config, kernel_block_sizes):
+            return fake_kv_caches
+
+        monkeypatch.setattr(
+            GPUModelRunner, "initialize_kv_cache_tensors",
+            mock_super_initialize
+        )
+
+        # Mock has_kv_transfer_group to return True
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: True
+        )
+
+        # Call the method
+        kv_cache_config = MagicMock()
+        kernel_block_sizes = [16]
+        result = runner.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
+
+        # Verify the result is the kv_caches from parent
+        assert result == fake_kv_caches
+        # Verify kv_caches_dict is set
+        assert runner.kv_caches_dict == fake_kv_caches
+
+    def test_initialize_kv_cache_tensors_without_kv_transfer_group(self, monkeypatch):
+        """Test initialize_kv_cache_tensors when has_kv_transfer_group returns False."""
+        # Use real NPUModelRunner instance for super() to work
+        vllm_cfg = create_vllm_config()
+        npu_device = torch.device("npu:0")
+        runner = NPUModelRunner(vllm_cfg, npu_device)
+
+        # Mock the parent class method to return a fake kv_caches dict
+        fake_kv_caches = {"layer.0": torch.zeros(2, 3), "layer.1": torch.zeros(2, 3)}
+
+        # Mock super().initialize_kv_cache_tensors by patching GPUModelRunner method
+        def mock_super_initialize(self, kv_cache_config, kernel_block_sizes):
+            return fake_kv_caches
+
+        monkeypatch.setattr(
+            GPUModelRunner, "initialize_kv_cache_tensors",
+            mock_super_initialize
+        )
+
+        # Mock has_kv_transfer_group to return False
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: False
+        )
+
+        # Call the method
+        kv_cache_config = MagicMock()
+        kernel_block_sizes = [16]
+        result = runner.initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
+
+        # Verify the result is the kv_caches from parent
+        assert result == fake_kv_caches
+        # Verify kv_caches_dict is NOT set (since has_kv_transfer_group is False)
+        assert not hasattr(runner, "kv_caches_dict")
+
+    def test_reregister_kv_caches_with_kv_caches_dict(self, monkeypatch):
+        """Test reregister_kv_caches uses kv_caches_dict instead of kv_caches."""
+        from types import SimpleNamespace
+
+        runner = SimpleNamespace()
+        runner.vllm_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config = SimpleNamespace()
+        runner.vllm_config.kv_transfer_config.kv_connector = "LLMDataDistConnector"
+        runner.kv_caches_dict = {"layer.0": torch.zeros(2, 3)}
+
+        from omni_npu.worker.npu_model_runner import NPUModelRunner
+        runner.reregister_kv_caches = NPUModelRunner.reregister_kv_caches.__get__(runner, type(runner))
+
+        # Mock has_kv_transfer_group and get_kv_transfer_group
+        mock_kv_group = MagicMock()
+        mock_kv_group.register_kv_caches = MagicMock()
+
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.has_kv_transfer_group",
+            lambda: True
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.get_kv_transfer_group",
+            lambda: mock_kv_group
+        )
+
+        runner.reregister_kv_caches()
+
+        # Verify register_kv_caches is called with kv_caches_dict
+        mock_kv_group.register_kv_caches.assert_called_once_with(runner.kv_caches_dict)
 
     def test_reregister_kv_caches_without_kv_transfer_config(self, monkeypatch):
         """Test reregister_kv_caches when kv_transfer_config is None."""

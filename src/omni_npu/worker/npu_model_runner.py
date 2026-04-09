@@ -967,6 +967,15 @@ class NPUModelRunner(GPUModelRunner):
             DecodeOmniCache.maybe_update_selection_kv_block_status(input_batch, omni_cache)
 
         return input_batch
+
+    def initialize_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+    ) -> dict[str, torch.Tensor]:
+        kv_caches = super().initialize_kv_cache_tensors(kv_cache_config, kernel_block_sizes)
+        if has_kv_transfer_group():
+            self.kv_caches_dict = kv_caches
+        return kv_caches
+    
     def kv_cache_after_wake_up(self) -> None:
         attn_layers = self.compilation_config.static_forward_context
         if self.model_config.enable_sleep_mode:
@@ -1009,4 +1018,4 @@ class NPUModelRunner(GPUModelRunner):
         if self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.kv_connector == "LLMDataDistConnector":
             if has_kv_transfer_group():
                 logger.info(f"reregister_kv_caches")
-                get_kv_transfer_group().register_kv_caches(self.kv_caches)
+                get_kv_transfer_group().register_kv_caches(self.kv_caches_dict)
