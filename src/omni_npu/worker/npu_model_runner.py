@@ -513,25 +513,23 @@ class NPUModelRunner(GPUModelRunner):
                     logger.debug("<<< Wrapped drafter model with ACLGraphWrapper")
                 else:
                     mtp_start_layer_idx = self.drafter.model.config.num_hidden_layers
-                    self.draft_update_stream_list: list[torch.npu.Stream] = [
-                        torch.npu.Stream for _ in range(n_predict)]
+                    self.draft_update_stream: torch.npu.Stream = torch.npu.Stream()
                     
                     wrapped_layers = dict()
                     for i in range(n_predict):
-                        now_layer = mtp_start_layer_idx + i
-                        one_attn_layer_names = [
+                        mtp_layer_i = mtp_start_layer_idx + i
+                        mtp_layer_i_attn_names = [
                             item for item in self.drafter.attn_layer_names
-                            if self.drafter.model.get_spec_layer(item) == now_layer
+                            if self.drafter.model.get_spec_layer(item) == mtp_layer_i
                         ]
-                        wrapped_layers[str(now_layer)] = ACLGraphWrapper(
-                            self.drafter.model.model.layers[str(now_layer)],
+                        wrapped_layers[str(mtp_layer_i)] = ACLGraphWrapper(
+                            self.drafter.model.model.layers[str(mtp_layer_i)],
                             self.vllm_config,
                             runtime_mode=CUDAGraphMode.FULL,
-                            update_stream=self.draft_update_stream_list[i],
-                            attn_layer_names=one_attn_layer_names,
+                            update_stream=self.draft_update_stream,
+                            attn_layer_names=mtp_layer_i_attn_names,
                         )
-                    self.drafter.model.model.runnable = self.drafter.model.layers
-                    self.drafter.model.model.layers = wrapped_layers
+                    self.drafter.model.model.wrapped_layers = wrapped_layers
                     logger.debug("<<< Wrapped multi mtp layers of drafter model with ACLGraphWrapper")
 
     def capture_model(self) -> int:

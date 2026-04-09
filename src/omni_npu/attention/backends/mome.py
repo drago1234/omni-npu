@@ -86,7 +86,7 @@ class NPUMomeAttentionMetadata:
 class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold: int = 1
-    supports_update_block_table: bool = True
+    supports_update_block_table: bool = False
 
     def __init__(
         self,

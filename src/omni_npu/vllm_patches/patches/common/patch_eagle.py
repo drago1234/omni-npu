@@ -250,6 +250,9 @@ class EagleProposerPatch(VLLMPatch):
                 if self.supports_mm_inputs:
                     input_ids = None
                     inputs_embeds = self.inputs_embeds[:num_input_tokens]
+                elif self.n_predict > 1:
+                    input_ids = None
+                    inputs_embeds = self.inputs_embeds[:num_input_tokens]
                 else:
                     input_ids = self.input_ids[:num_input_tokens]
                     inputs_embeds = None
@@ -672,7 +675,12 @@ class EagleProposerPatch(VLLMPatch):
                 multimodal_embeddings=mm_embeds,
                 is_multimodal=is_mm_embed,
             )
-
+            input_ids = None
+            inputs_embeds = self.inputs_embeds[:num_input_tokens]
+        elif self.n_predict > 1:
+            self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
+                self.input_ids[:num_tokens],
+            )
             input_ids = None
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
         else:
@@ -956,8 +964,11 @@ class EagleProposerPatch(VLLMPatch):
                     input_ids = None
                     inputs_embeds = self.inputs_embeds[:num_input_tokens]
                 else:
-                    input_ids = self.input_ids[:num_input_tokens]
-                    inputs_embeds = None
+                    self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
+                        self.input_ids[:num_tokens],
+                    )
+                    input_ids = None
+                    inputs_embeds = self.inputs_embeds[:num_input_tokens]
 
                 ret_hidden_states = self.model(
                     input_ids=input_ids,
