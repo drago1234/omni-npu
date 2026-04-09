@@ -8,7 +8,10 @@ import torch_npu
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 from vllm.platforms import current_platform
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size, 
+    get_tp_group,
+)
 from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.forward_context import get_forward_context
@@ -24,11 +27,20 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 try: # UT won't include pangu_sink_swa_mla patches
     from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention, PanguSinkAttentionBase
-    from vllm.model_executor.layers.mome import AggregateConv
 except ImportError:
     logger.warning("PanguSinkAttentionBase has not being defined, skipping...")
     class PanguSinkAttentionBase:
         pass
+
+try:
+    from vllm.model_executor.layers.npumome import MomeAttention
+except ImportError:
+    logger.warning("MomeAttention has not being defined, skipping...")
+
+try:
+    from vllm.model_executor.layers.mome import AggregateConv
+except ImportError:
+    logger.warning("AggregateConv has not being defined, skipping...")
 
 from omni_npu.attention.backends.mla import NPUMLAImpl, NPUMLAMetadata
 from omni_npu.v1.layers.utils import (
@@ -41,8 +53,14 @@ from omni_npu.v1.layers.linear import (
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.attention import ops
-import omni_training_custom_ops
-import omni_custom_ops
+try:
+    import omni_training_custom_ops
+except:
+    logger.warning_once("Failed to import omni_training_custom_ops")
+try:
+    import omni_custom_ops
+except:
+    logger.warning_once("Failed to import omni_custom_ops")
 
 from omni_npu.compilation.utils import (
     capture_graph_task,
@@ -68,9 +86,11 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         v_head_dim: int,
         q_lora_rank: int | None,
         kv_lora_rank: int,
+        block_size_padded: int = 128,
         max_position_embeddings: int = 8192,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        page_size_padded: int | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -92,6 +112,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.quant_symbol = quant_config is not None
         self.prefix = prefix
+        self.block_size_padded = block_size_padded
 
         self.q_a_proj = ReplicatedLinear(
             self.hidden_size,
@@ -131,6 +152,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=model_extra_config.operator_opt_config.use_noncontiguous_kv,
         )
 
         if config.rope_parameters["rope_type"] != "default":
@@ -169,17 +191,44 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 elif hasattr(config, "sliding_window"):
                     sliding_window = config.sliding_window
         self.sliding_window = sliding_window
-        self.merge_q_kv_conv = model_extra_config.operator_opt_config.merge_q_kv_conv
+        self.num_spec_tokens = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config is not None else 0
         # MOME
         if getattr(config, "use_mome", False):
-            self.qa_conv = AggregateConv(self.q_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
-            self.compresskv_conv = AggregateConv(self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
-            if self.merge_q_kv_conv:
-                self.merge_conv = AggregateConv(self.q_lora_rank + self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
+            self.merge_q_kv_conv = model_extra_config.operator_opt_config.merge_q_kv_conv
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                self.mome_state_shapes = (
+                    (self.q_lora_rank,),
+                    (self.kv_lora_rank,),
+                    (self.num_heads * self.v_head_dim,),
+                )
+                self.mome_state_dtypes = (
+                    torch.bfloat16,
+                    torch.bfloat16,
+                    torch.bfloat16,
+                )
+                self.kernel_size = getattr(config, 'router_sliding_window', 0)
+                self.cache_dtype_str = None
+                mome_kwargs = {
+                    "kernel_size": self.kernel_size,
+                    "num_spec_tokens": self.num_spec_tokens,
+                    "state_dtypes": self.mome_state_dtypes,
+                    "state_shapes": self.mome_state_shapes,
+                    "quant_config": None,
+                    "cache_config": vllm_config.cache_config,
+                    "prefix": f"{prefix}.conv",
+                    "page_size_padded": page_size_padded,
+                }
+                self.conv = MomeAttention(**mome_kwargs)
             else:
-                self.merge_conv = None
-            self.o_conv = AggregateConv(self.num_local_heads * self.v_head_dim, config, vllm_config, output_parallel=True, attn_prefix=f"{prefix}.attn")
+                self.qa_conv = AggregateConv(self.q_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
+                self.compresskv_conv = AggregateConv(self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
+                if self.merge_q_kv_conv:
+                    self.merge_conv = AggregateConv(self.q_lora_rank + self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
+                else:
+                    self.merge_conv = None
+                self.o_conv = AggregateConv(self.num_local_heads * self.v_head_dim, config, vllm_config, output_parallel=True, attn_prefix=f"{prefix}.attn")
         else:
+            self.conv = None
             self.qa_conv = None
             self.compresskv_conv = None
             self.merge_conv = None
@@ -219,6 +268,8 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 indexer=None,
                 sink_len=self.param_sink_number,
                 sliding_window=self.sliding_window,
+                page_size_padded=page_size_padded,
+                block_size_padded=block_size_padded,
             )
         
         if self.param_sink_number > 0:
@@ -303,23 +354,43 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         q_lora = self.q_a_proj(hidden_states)[0]
         kv = self.kv_a_proj_with_mqa(hidden_states)[0]
 
-        if self.compresskv_conv is not None or self.merge_conv is not None:
-            kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            if self.merge_q_kv_conv:
-                merge_data = torch.cat([q_lora, kv_c], dim=-1)
-                merge_conv = self.merge_conv(merge_data, force_decode=force_decode, short_prefill=short_prefill) + merge_data
-                q_lora, kv_c = merge_conv.split(
-                    [self.q_lora_rank, self.kv_lora_rank],
-                    dim=-1,
-                )
-            else:
-                kv_c = self.compresskv_conv(kv_c, force_decode=force_decode, short_prefill=short_prefill) + kv_c
-            if not self.rope_interleaved:
-                k_pe = self.even_odd_indexing(k_pe)
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            if self.conv is not None:
+                kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                if self.merge_q_kv_conv:
+                    merge_data = torch.cat([q_lora, kv_c], dim=-1)
+                    merge_conv = self.conv(merge_data, state_indice=3)
+                    q_lora, kv_c = merge_conv.split(
+                        [self.q_lora_rank, self.kv_lora_rank],
+                        dim=-1,
+                    )
+                else:
+                    kv_c = self.conv(kv_c, state_indice=1)
             kv = torch.cat([kv_c, k_pe], dim=-1)
 
-        if self.qa_conv is not None and self.merge_conv is None:
-            q_lora = self.qa_conv(q_lora, force_decode=force_decode, short_prefill=short_prefill) + q_lora
+            if self.conv is not None and not self.merge_q_kv_conv:
+                q_lora = self.conv(q_lora, state_indice=0)
+        else:
+            if self.compresskv_conv is not None or self.merge_conv is not None:
+                kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                if self.merge_q_kv_conv:
+                    merge_data = torch.cat([q_lora, kv_c], dim=-1)
+                    merge_conv = self.merge_conv(merge_data, force_decode=force_decode, short_prefill=short_prefill) + merge_data
+                    q_lora, kv_c = merge_conv.split(
+                        [self.q_lora_rank, self.kv_lora_rank],
+                        dim=-1,
+                    )
+                else:
+                    kv_c = self.compresskv_conv(kv_c, force_decode=force_decode, short_prefill=short_prefill) + kv_c
+                if not self.rope_interleaved:
+                    k_pe = k_pe.view(-1, 2, self.qk_rope_head_dim // 2) \
+                        .transpose(-1, -2) \
+                        .reshape(-1, self.qk_rope_head_dim)
+                kv = torch.cat([kv_c, k_pe], dim=-1)
+
+            if self.qa_conv is not None and self.merge_conv is None:
+                q_lora = self.qa_conv(q_lora, force_decode=force_decode, short_prefill=short_prefill) + q_lora
+
         q_norm = self.q_a_layernorm(q_lora)
         q = self.q_b_proj(q_norm)[0]
 
@@ -331,27 +402,46 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         q_nope = q_nope.view(bsz, 1, self.num_local_heads, -1)
 
         block_num, block_size, _ = kv_cache[0].shape
-        k_rope, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
-            kv.unsqueeze(1).unsqueeze(1),
-            self.kv_a_layernorm.weight,
-            cos,
-            sin,
-            attn_metadata.slot_mapping,
-            kv_cache[1].unsqueeze(2),
-            kv_cache[0].unsqueeze(2),
-            epsilon=self.kv_a_layernorm.variance_epsilon,
-            cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
-        )
-
-        if model_extra_config.operator_opt_config.kv_nz:
-            k_nope = k_nope.view(block_num, 1, self.kv_lora_rank // nz_block_size, block_size, nz_block_size)
-            k_rope = k_rope.view(block_num, 1, self.qk_rope_head_dim // KVCACHE_NZ_DIM, block_size, KVCACHE_NZ_DIM)
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            k_rope, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(
+                kv.unsqueeze(1).unsqueeze(1),
+                self.kv_a_layernorm.weight,
+                cos,
+                sin,
+                attn_metadata.slot_mapping,
+                kv_cache[1].unsqueeze(2),
+                kv_cache[0].unsqueeze(2),
+                k_rope_scale=None,
+                k_rope_offset=None,
+                epsilon=self.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
+                rotary_mode="half" if not self.rope_interleaved else "interleave",
+                quant_mode="none",
+                is_output_kv=True
+            )
         else:
-            k_nope = k_nope.view(block_num, block_size, self.kv_lora_rank)
-            k_rope = k_rope.view(block_num, block_size, self.qk_rope_head_dim)
+            k_rope, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
+                kv.unsqueeze(1).unsqueeze(1),
+                self.kv_a_layernorm.weight,
+                cos,
+                sin,
+                attn_metadata.slot_mapping,
+                kv_cache[1].unsqueeze(2),
+                kv_cache[0].unsqueeze(2),
+                epsilon=self.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
+            )
+
+            if model_extra_config.operator_opt_config.kv_nz:
+                k_nope = k_nope.view(block_num, 1, self.kv_lora_rank // nz_block_size, block_size, nz_block_size)
+                k_rope = k_rope.view(block_num, 1, self.qk_rope_head_dim // KVCACHE_NZ_DIM, block_size, KVCACHE_NZ_DIM)
+            else:
+                k_nope = k_nope.view(block_num, block_size, self.kv_lora_rank)
+                k_rope = k_rope.view(block_num, block_size, self.qk_rope_head_dim)
         if not self.rope_interleaved:
-            q_pe = self.even_odd_indexing(q_pe)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin)
+        else:
+            q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
         q_nope = q_nope.view(bsz, self.num_local_heads, self.kv_lora_rank)
         q_pe = q_pe.view(bsz, self.num_local_heads, -1)
 
@@ -385,15 +475,24 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 "input_layout": "TND",
                 "softmax_scale": self.scaling,
                 "block_table": attn_metadata.block_table,
-                "block_size": 128,
+                "block_size": self.block_size_padded,
                 "actual_seq_qlen": actual_query_cumlens,
                 "actual_seq_kvlen": attn_metadata.seq_lens,
                 "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
                 "sparse_mode": 4,
-                "sink_number": self.param_sink_number,
                 "pre_tokens": window_size,
                 "next_tokens": 0,
             }
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                kwargs.update(
+                    {"key_sink" : self.attn.sink_compressed_kv.unsqueeze(1),
+                    "value_sink" : self.attn.sink_compressed_kv.unsqueeze(1),
+                    "key_rope_sink" : self.attn.sink_k_pe.unsqueeze(1)}
+                )
+            else:
+                kwargs.update(
+                    {"sink_number": self.param_sink_number}
+                )
             attn_output_shape = (num_tokens, query_heads, self.kv_lora_rank)
             attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
@@ -411,6 +510,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 )[0]
             attn_output = attn_output.transpose(0, 1).contiguous() # TND -> NTD
         else:
+            actual_query_cumlens = attn_metadata.query_cumlens
             sparse_mode = 3
             input_layout = "TND_NTD"
             attn_output_shape = (self.num_local_heads, num_tokens, self.kv_lora_rank)
@@ -418,10 +518,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             num_key_value_heads = 1
             block_size = 128
             kwargs = {
-                "query": q_nope,
+                "query": q_nope[:actual_query_cumlens[-1]],
                 "key": k_nope,
                 "value": k_nope,
-                "query_rope": q_pe,
+                "query_rope": q_pe[:actual_query_cumlens[-1]],
                 "key_rope": k_rope,
                 "num_heads": self.num_local_heads,
                 "num_key_value_heads": num_key_value_heads,
@@ -433,10 +533,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 "antiquant_scale": None,
                 "block_table": attn_metadata.block_table,
                 "block_size": block_size,
-                "actual_seq_lengths": attn_metadata.query_cumlens,
+                "actual_seq_lengths": actual_query_cumlens,
                 "actual_seq_lengths_kv": attn_metadata.seq_lens,
             }
-            attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
             if forward_context.capturing:
                 capture_graph_task(
@@ -447,7 +547,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                     layer_name=layer_name,
                 )
             else:
-                attn_output = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
+                attn_output[:,:actual_query_cumlens[-1],:] = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
 
         if self.param_sink_number > 0:
             attn_output = attn_output[:self.num_local_heads]
@@ -456,8 +556,15 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         attn_output = attn_output.view(self.num_local_heads, bsz, self.kv_lora_rank) # adapter BSND_NBSD
         attn_output = torch_npu.npu_transpose_batchmatmul(attn_output, self.attn.impl.W_UV, perm_y=(1, 0, 2))
         attn_output = attn_output.reshape(bsz, 1, -1).view(-1, self.num_local_heads * self.v_head_dim)
-        if self.o_conv is not None:
-            attn_output = self.o_conv(attn_output, force_decode=force_decode, short_prefill=short_prefill) + attn_output
+
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            if self.conv is not None:
+                attn_output = get_tp_group().all_gather(attn_output, dim=1)
+                attn_output = self.conv(attn_output, state_indice=2)
+        else:
+            if self.o_conv is not None:
+                attn_output = self.o_conv(attn_output, force_decode=force_decode, short_prefill=short_prefill) + attn_output
+
         return self.o_proj.forward(attn_output)[0]
 
     def _forward_prefill(
@@ -479,19 +586,31 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             latent_cache = latent_cache.view(-1, 1, latent_cache.size(-1))
             kv_a, k_pe = torch.split(latent_cache, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            if self.compresskv_conv is not None or self.merge_conv is not None:
-                kv_a = self.compresskv_conv(kv_a) + kv_a
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                if self.conv is not None:
+                    kv_a = self.conv(kv_a, state_indice=1, is_prefill=True)
+            else:
+                if self.compresskv_conv is not None or self.merge_conv is not None:
+                    kv_a = self.compresskv_conv(kv_a) + kv_a
+
             kv_a = self.kv_a_layernorm(kv_a)
             k_pe = k_pe.unsqueeze(2)
             k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
             k_pe = k_pe.squeeze(2)
             attn_output.fill_(0)
             attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
-            if self.o_conv is not None:
-                attn_output = self.o_conv(attn_output) + attn_output
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                if self.conv is not None:
+                    attn_output = get_tp_group().all_gather(attn_output, dim=1)
+                    attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
+            else:
+                if self.o_conv is not None:
+                    attn_output = self.o_conv(attn_output) + attn_output
+
             output = self.o_proj.forward(attn_output)[0]
             return output
 
+        actual_seq_kvlen = attn_metadata.seq_lens
         actual_seq_qlen = attn_metadata.query_cumlens
         if attn_metadata.max_query_len > 1:
             attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE
@@ -506,23 +625,44 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
 
         with torch.npu.stream(sub_stream):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-            if self.compresskv_conv is not None:
-                kv_c, k_pe = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                if self.merge_q_kv_conv:
-                    merge_data = torch.cat([q, kv_c], dim=-1)
-                    merge_conv = self.merge_conv(merge_data, only_prefill=only_prefill) + merge_data
-                    q, kv_c = merge_conv.split(
-                        [self.q_lora_rank, self.kv_lora_rank],
-                        dim=-1,
-                    )
-                else:
-                    kv_c = self.compresskv_conv(kv_c, only_prefill=only_prefill) + kv_c
-                if not self.rope_interleaved:
-                    k_pe = self.even_odd_indexing(k_pe)
-                latent_cache = torch.cat([kv_c, k_pe], dim=-1)
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                if self.conv is not None:
+                    kv_c, k_pe = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                    if self.merge_q_kv_conv:
+                        merge_data = torch.cat([q, kv_c], dim=-1)
+                        merge_conv = self.conv(merge_data, state_indice=3, is_prefill=True)
+                        q, kv_c = merge_conv.split(
+                            [self.q_lora_rank, self.kv_lora_rank],
+                            dim=-1,
+                        )
+                    else:
+                        kv_c = self.conv(kv_c, state_indice=1, is_prefill=True)
+                    latent_cache = torch.cat([kv_c, k_pe], dim=-1)
+            else:
+                if self.compresskv_conv is not None:
+                    kv_c, k_pe = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+                    if self.merge_q_kv_conv:
+                        merge_data = torch.cat([q, kv_c], dim=-1)
+                        merge_conv = self.merge_conv(merge_data, only_prefill=only_prefill) + merge_data
+                        q, kv_c = merge_conv.split(
+                            [self.q_lora_rank, self.kv_lora_rank],
+                            dim=-1,
+                        )
+                    else:
+                        kv_c = self.compresskv_conv(kv_c, only_prefill=only_prefill) + kv_c
+                    if not self.rope_interleaved:
+                        k_pe = k_pe.view(-1, 2, self.qk_rope_head_dim // 2) \
+                            .transpose(-1, -2) \
+                            .reshape(-1, self.qk_rope_head_dim)
+                    latent_cache = torch.cat([kv_c, k_pe], dim=-1)
 
-        if self.qa_conv is not None and self.merge_conv is None:
-            q = self.qa_conv(q, only_prefill=only_prefill) + q
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            if self.conv is not None and not self.merge_q_kv_conv:
+                q = self.conv(q, state_indice=0, is_prefill=True)
+        else:
+            if self.qa_conv is not None and self.merge_conv is None:
+                q = self.qa_conv(q, only_prefill=only_prefill) + q
+
         q = self.q_a_layernorm(q)
         if self.quant_symbol:
             q, pertoken_scale = torch_npu.npu_dynamic_quant(q)
@@ -534,20 +674,38 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         with torch.npu.stream(sub_stream):
             kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
-            _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
-                latent_cache.view(-1, 1, 1, 576), # bnsd
-                self.kv_a_layernorm.weight,
-                cos.view(-1, 1, 1, self.qk_rope_head_dim),
-                sin.view(-1, 1, 1, self.qk_rope_head_dim),
-                attn_metadata.slot_mapping,
-                kv_cache[1].unsqueeze(2),
-                kv_cache[0].unsqueeze(2),
-                k_rope_scale=None,
-                k_rope_offset=None,
-                epsilon=self.kv_a_layernorm.variance_epsilon,
-                cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
-                is_output_kv=True
-            )
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                k_pe, kv_a = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(
+                    latent_cache.view(-1, 1, 1, 576),
+                    self.kv_a_layernorm.weight,
+                    cos.view(-1, 1, 1, self.qk_rope_head_dim),
+                    sin.view(-1, 1, 1, self.qk_rope_head_dim),
+                    attn_metadata.slot_mapping,
+                    kv_cache[1].unsqueeze(2),
+                    kv_cache[0].unsqueeze(2),
+                    k_rope_scale=None,
+                    k_rope_offset=None,
+                    epsilon=self.kv_a_layernorm.variance_epsilon,
+                    cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
+                    rotary_mode="half" if not self.rope_interleaved else "interleave",
+                    quant_mode="none",
+                    is_output_kv=True
+                )
+            else:
+                _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+                    latent_cache.view(-1, 1, 1, 576), # bnsd
+                    self.kv_a_layernorm.weight,
+                    cos.view(-1, 1, 1, self.qk_rope_head_dim),
+                    sin.view(-1, 1, 1, self.qk_rope_head_dim),
+                    attn_metadata.slot_mapping,
+                    kv_cache[1].unsqueeze(2),
+                    kv_cache[0].unsqueeze(2),
+                    k_rope_scale=None,
+                    k_rope_offset=None,
+                    epsilon=self.kv_a_layernorm.variance_epsilon,
+                    cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
+                    is_output_kv=True
+                )
 
         cur_stream.wait_stream(sub_stream)
         sub_stream.wait_stream(cur_stream)
@@ -555,26 +713,30 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim],  dim=-1)
         q_pe = q_pe.unsqueeze(2)
         if not self.rope_interleaved:
-            q_pe = self.even_odd_indexing(q_pe)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin)
+        else:
+            q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
         q_pe = q_pe.squeeze(2) # BSH
         with torch.npu.stream(sub_stream):
             prefill_kv_a = kv_a[:actual_seq_qlen[-1]]
             prefill_k_pe = k_pe[:actual_seq_qlen[-1]]
             # When sink tokens are used, we need to insert cached sink tokens at the beginning of each sequence
-            if self.param_sink_number > 0:
-                prefill_k_pe = prefill_k_pe.squeeze(2).squeeze(1)
-                prefill_k_pe = self._insert_tensor_by_start_loc(
-                    prefill_k_pe,
-                    self.attn.sink_k_pe,
-                    attn_metadata.query_start_loc,
-                )
-                prefill_kv_a = prefill_kv_a.squeeze(2).squeeze(1)
-                prefill_kv_a = self._insert_tensor_by_start_loc(
-                    prefill_kv_a,
-                    self.attn.sink_compressed_kv,
-                    attn_metadata.query_start_loc,
-                )
+            if not model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                if self.param_sink_number > 0:
+                    prefill_k_pe = prefill_k_pe.squeeze(2).squeeze(1)
+                    prefill_k_pe = self._insert_tensor_by_start_loc(
+                        prefill_k_pe,
+                        self.attn.sink_k_pe,
+                        attn_metadata.query_start_loc,
+                    )
+                    prefill_kv_a = prefill_kv_a.squeeze(2).squeeze(1)
+                    prefill_kv_a = self._insert_tensor_by_start_loc(
+                        prefill_kv_a,
+                        self.attn.sink_compressed_kv,
+                        attn_metadata.query_start_loc,
+                    )
+            else:
+                sink_kv = self.kv_b_proj.forward(self.attn.sink_compressed_kv)[0]
             kv = self.kv_b_proj.forward(prefill_kv_a)[0]
 
         cur_stream.wait_stream(sub_stream)
@@ -583,38 +745,57 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         prefill_k_rope = prefill_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
 
-        if self.param_sink_number > 0:
-            # When sink tokens are used, the actual sequence lengths for key and value are different.
-            num_prefills = len(actual_seq_qlen)
-            sink_len_offset = [self.param_sink_number * (i + 1) for i in range(num_prefills)]
-            kv_cumlens = [x + y for x, y in zip(actual_seq_qlen, sink_len_offset)]
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            sink_k_pe = self.attn.sink_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
+            sink_k_nope, sink_v = torch.split(
+                sink_kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim),
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=-1,
+            )
         else:
-            kv_cumlens = actual_seq_qlen
+            if self.param_sink_number > 0:
+                # When sink tokens are used, the actual sequence lengths for key and value are different.
+                num_prefills = len(actual_seq_qlen)
+                sink_len_offset = [self.param_sink_number * (i + 1) for i in range(num_prefills)]
+                kv_cumlens = [x + y for x, y in zip(actual_seq_qlen, sink_len_offset)]
+            else:
+                kv_cumlens = actual_seq_qlen
 
         if self.param_sink_number > 0:
             if self.sliding_window is not None:
                 window_size = self.sliding_window-1
             else:
                 window_size = NPUMLAImpl.MAX_WINDOW_SIZE
-            output = torch.ops.custom.npu_fused_infer_attention_sink(
-                q_nope[:actual_seq_qlen[-1]].contiguous(),
-                k_nope.contiguous(),
-                v.contiguous(),
-                query_rope=q_pe[:actual_seq_qlen[-1]],
-                key_rope=prefill_k_rope,
-                num_query_heads=self.num_local_heads,
-                num_key_value_heads=self.num_local_heads,
-                input_layout="TND",
-                sparse_mode=4,
-                atten_mask=NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
-                actual_seq_qlen=actual_seq_qlen,
-                actual_seq_kvlen=kv_cumlens,
-                softmax_scale=self.scaling,
-                sink_number=self.param_sink_number,
-                pre_tokens=window_size,
-                next_tokens=0,
-            )[0]
-            attn_output[:actual_seq_qlen[-1]] = output
+
+            kwargs = {
+                "query": q_nope[:actual_seq_qlen[-1]].contiguous(),
+                "query_rope": q_pe[:actual_seq_qlen[-1]],
+                "key": k_nope.contiguous(),
+                "value": v.contiguous(),
+                "key_rope": prefill_k_rope,
+                "num_query_heads": self.num_local_heads,
+                "num_key_value_heads": self.num_local_heads,
+                "input_layout": "TND",
+                "softmax_scale": self.scaling,
+                "sparse_mode": 4,
+                "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                "actual_seq_qlen": actual_seq_qlen,
+                "pre_tokens": window_size,
+                "next_tokens": 0,
+            }
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                kwargs.update(
+                    {"actual_seq_kvlen": actual_seq_qlen,
+                    "key_sink": sink_k_nope.contiguous(),
+                    "value_sink": sink_v.contiguous(),
+                    "key_rope_sink": sink_k_pe}
+                )
+            else:
+                kwargs.update(
+                    {"actual_seq_kvlen": kv_cumlens,
+                    "sink_number": self.param_sink_number,}
+                )
+            attn_output[:actual_seq_qlen[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
         else:
             attn_output[:actual_seq_qlen[-1]] = torch.ops.npu.npu_fused_infer_attention_score(
                 q_nope[:actual_seq_qlen[-1]],
@@ -634,8 +815,15 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             )[0]
 
         attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
-        if self.o_conv is not None:
-            attn_output = self.o_conv(attn_output, only_prefill=only_prefill) + attn_output
+
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            if self.conv is not None:
+                attn_output = get_tp_group().all_gather(attn_output, dim=1)
+                attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
+        else:
+            if self.o_conv is not None:
+                attn_output = self.o_conv(attn_output, only_prefill=only_prefill) + attn_output
+
         output = self.o_proj.forward(attn_output)[0]
         return output
 
@@ -646,9 +834,13 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             else:
                 param_sink_compressed_kv = self.param_sink_compressed_kv
             self.attn.update_sink_kv(self.param_sink_k_pe, param_sink_compressed_kv)
-        if self.merge_q_kv_conv and self.merge_conv is not None:
-            self.merge_conv.merge_conv.weight.data = torch.cat([self.qa_conv.merge_conv.weight.data, self.compresskv_conv.merge_conv.weight.data], dim=0).contiguous()
-            self.merge_conv.conv_weight = self.merge_conv.merge_conv.weight.data.squeeze(1).transpose(0, 1).contiguous()
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            if self.merge_q_kv_conv and self.conv is not None:
+                self.conv.merge_conv.weight.data = torch.cat([self.conv.qa_conv.weight.data, self.conv.compresskv_conv.weight.data], dim=1).contiguous()
+        else:
+            if self.merge_q_kv_conv and self.merge_conv is not None:
+                self.merge_conv.merge_conv.weight.data = torch.cat([self.qa_conv.merge_conv.weight.data, self.compresskv_conv.merge_conv.weight.data], dim=0).contiguous()
+                self.merge_conv.conv_weight = self.merge_conv.merge_conv.weight.data.squeeze(1).transpose(0, 1).contiguous()
 
     @staticmethod
     def _insert_tensor_by_start_loc(
@@ -670,23 +862,6 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             result[offset:offset+seg_len] = raw_tensor[start_loc[i]:start_loc[i+1]]
             offset += seg_len
 
-        return result
-
-    @staticmethod
-    def even_odd_indexing(x):
-        """
-        使用索引实现：偶数位置←前半部分，奇数位置←后半部分
-        """
-        *prefix, dim = x.shape
-        assert dim % 2 == 0, "最后维度必须是偶数"
-        
-        half = dim // 2
-        
-        result = torch.zeros_like(x)
-        
-        result[..., 0::2] = x[..., :half]
-        result[..., 1::2] = x[..., half:]
-        
         return result
 
 def npu_mla_forward(  
@@ -713,44 +888,47 @@ def npu_mla_forward(
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     attn_metadata = forward_context.attn_metadata
-    if self.quant_symbol:
-        hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
-        hidden_states = {'x_int8': hidden_states, 'pertoken_scale': pertoken_scale}
-                
     if isinstance(attn_metadata, dict):
         attn_metadata = attn_metadata[f"{self.prefix}.attn"]
 
-    if self.param_sink_number > 0:
-        assert self.attn.sink_k_pe is not None and self.attn.sink_compressed_kv is not None, (
-            "sink_k_pe and sink_compressed_kv have not been prepared"
-        )
-        if not self.attn.sink_populated:
-            self_kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
-            if self_kv_cache is not None and len(self_kv_cache) > 0:
-                self.attn.populate_sink_kv(self_kv_cache[0], self_kv_cache[1])
+    if not model_extra_config.operator_opt_config.use_noncontiguous_kv:
+        if self.param_sink_number > 0:
+            assert self.attn.sink_k_pe is not None and self.attn.sink_compressed_kv is not None, (
+                "sink_k_pe and sink_compressed_kv have not been prepared"
+            )
+            if not self.attn.sink_populated:
+                self_kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
+                if self_kv_cache is not None and len(self_kv_cache) > 0:
+                    self.attn.populate_sink_kv(self_kv_cache[0], self_kv_cache[1])
+
+    def _maybe_quant(hs):
+        if not self.quant_symbol:
+            return hs
+        x_int8, scale = torch_npu.npu_dynamic_quant(hs)
+        return {"x_int8": x_int8, "pertoken_scale": scale}
 
     if attn_metadata is None:
-        return self._forward_prefill(hidden_states, cos, sin, attn_metadata)
+        return self._forward_prefill(_maybe_quant(hidden_states), cos, sin, attn_metadata)
 
-    num_actual_toks = attn_metadata.num_actual_tokens
+    num_actual_tokens = attn_metadata.num_actual_tokens
+    num_decode_tokens = attn_metadata.num_decode_tokens
     has_decode = attn_metadata.num_decodes > 0
     has_prefill = attn_metadata.num_prefills > 0
-    num_decode_tokens = attn_metadata.num_decode_tokens
 
     if has_decode and has_prefill:
-        prefill_hidden_states = hidden_states[num_decode_tokens:num_actual_toks, ...]
-        prefill_cos = cos[num_decode_tokens:num_actual_toks, ...]
-        prefill_sin = sin[num_decode_tokens:num_actual_toks, ...]
-        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_toks]
-        prefill_output = self._forward_prefill(prefill_hidden_states, prefill_cos, prefill_sin, attn_metadata.prefill, pd_mixed_flag=True)
+        prefill_hs = hidden_states[num_decode_tokens:num_actual_tokens]
+        prefill_cos = cos[num_decode_tokens:num_actual_tokens]
+        prefill_sin = sin[num_decode_tokens:num_actual_tokens]
+        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+        prefill_output = self._forward_prefill(_maybe_quant(prefill_hs), prefill_cos, prefill_sin, attn_metadata.prefill, pd_mixed_flag=True)
 
-        decode_hidden_states = hidden_states[:num_decode_tokens]
+        decode_hs = hidden_states[:num_decode_tokens]
         decode_cos = cos[:num_decode_tokens]
         decode_sin = sin[:num_decode_tokens]
         attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
         pd_mixed_flag = 2 if num_decode_tokens > attn_metadata.num_decodes else 1 # short prefill in decode or pure decode 
         decode_output = self._forward_decode(
-            decode_hidden_states,
+            _maybe_quant(decode_hs),
             decode_cos,
             decode_sin,
             attn_metadata.decode,
@@ -759,34 +937,22 @@ def npu_mla_forward(
         )
 
         mixed_output = torch.cat([decode_output, prefill_output], dim=0)
-        if mixed_output.shape[0] != num_actual_toks:
-            raise RuntimeError(
-                f"mixed attention output tokens ({mixed_output.shape[0]}) do not match num_actual_tokens ({num_actual_toks})"
-            )
         return _pad_output_to_input_tokens(mixed_output)
 
-    if attn_metadata.prefill is not None:
-        # Keep prefill inputs aligned with slot_mapping length expected by
-        # npu_kv_rmsnorm_rope_cache (index size must equal B*S).
-        prefill_hidden_states = hidden_states[:num_actual_toks, ...]
-        prefill_cos = cos[:num_actual_toks, ...]
-        prefill_sin = sin[:num_actual_toks, ...]
-        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[:num_actual_toks]
-        prefill_output = self._forward_prefill(prefill_hidden_states, prefill_cos, prefill_sin, attn_metadata.prefill)
-        if prefill_output.shape[0] != num_actual_toks:
-            raise RuntimeError(
-                f"prefill attention output tokens ({prefill_output.shape[0]}) do not match num_actual_tokens ({num_actual_toks})"
-            )
+    if has_prefill:
+        prefill_hs = hidden_states[num_decode_tokens:num_actual_tokens]
+        prefill_cos = cos[num_decode_tokens:num_actual_tokens]
+        prefill_sin = sin[num_decode_tokens:num_actual_tokens]
+        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+        prefill_output = self._forward_prefill(_maybe_quant(prefill_hs), prefill_cos, prefill_sin, attn_metadata.prefill)
         return _pad_output_to_input_tokens(prefill_output)
     else:
-        # Keep decode-only inputs aligned with slot_mapping length expected by
-        # npu_kv_rmsnorm_rope_cache (index size must equal B*S).
-        decode_hidden_states = hidden_states[:num_actual_toks, ...]
-        decode_cos = cos[:num_actual_toks, ...]
-        decode_sin = sin[:num_actual_toks, ...]
-        attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_actual_toks]
+        decode_hs = hidden_states[:num_decode_tokens]
+        decode_cos = cos[:num_decode_tokens]
+        decode_sin = sin[:num_decode_tokens]
+        attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
         decode_output = self._forward_decode(
-            decode_hidden_states,
+            _maybe_quant(decode_hs),
             decode_cos,
             decode_sin,
             attn_metadata.decode,

@@ -164,7 +164,7 @@ class NPUmHC(torch.nn.Module):
                         self.branch_alpha,
                         self.branch_beta,
                         gamma=self.norm_gamma.view(self.num_stream, -1),
-                        norm_eps=self.norm_eps,
+                        norm_eps=self.hc_eps,
                         hc_eps=self.hc_eps,
                 )
             else:

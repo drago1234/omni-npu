@@ -6,10 +6,10 @@ from typing import cast
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, DeepseekV2Config, DeepseekV3Config
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import ParallelConfig, VllmConfig
+from vllm.config import ParallelConfig, VllmConfig, CacheConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -47,11 +47,12 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
 from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
 from omni_npu.v1.layers.vocab_parallel_embedding import NPUVocabParallelEmbedding
 from omni_npu.model_config.config_loader.loader import model_extra_config
-from omni_models.models.pangu.openpangu import OpenPanguMLAAttention, mHCModule
+from omni_npu.layers.mhc.npu_mhc import NPUmHC
 
 
 def check_ffn_act_fn(act_fn: str) -> None:
@@ -272,7 +273,39 @@ class OpenPanguDecoderLayer(nn.Module):
 
         _normalize_rope_parameters(config, max_position_embeddings=max_position_embeddings)
 
-        self.self_attn = NPUDeepseekMLAAttention(
+        if getattr(config, "use_mome", False):
+            self.mome_state_shapes = (
+                (config.q_lora_rank if hasattr(config, "q_lora_rank") else None,),
+                (config.kv_lora_rank,),
+                (config.num_attention_heads * config.v_head_dim,),
+            )
+
+            self.mome_state_dtypes = (
+                torch.bfloat16,
+                torch.bfloat16,
+                torch.bfloat16,
+            )
+            self.kernel_size = getattr(config, 'router_sliding_window', 0)
+
+        self.num_speculative_tokens = 0 if not vllm_config.speculative_config else vllm_config.speculative_config.num_speculative_tokens
+
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            page_size_padded, block_size_padded = self._calculate_page_size_padded(
+                cache_config=vllm_config.cache_config,
+                cache_dtype_str=None,
+                config=config,
+            )
+        else:
+            page_size_padded = None
+            block_size_padded = vllm_config.cache_config.block_size
+
+        is_dsa = hasattr(config, "index_topk") and (not hasattr(config, "dsa_layers") or layer_idx in config.dsa_layers)
+        if is_dsa:
+            attn_cls = NPUDeepseekSparseAttention
+        else:
+            attn_cls = NPUDeepseekMLAAttention
+
+        self.self_attn = attn_cls(
             vllm_config=vllm_config,
             config=config,
             hidden_size=self.hidden_size,
@@ -288,6 +321,8 @@ class OpenPanguDecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            page_size_padded=page_size_padded,
+            block_size_padded=block_size_padded,
         )
 
         if (
@@ -330,18 +365,88 @@ class OpenPanguDecoderLayer(nn.Module):
         block_post_layernorm_hidden_size = config.hidden_size
         self.use_mhc = getattr(config, "use_mhc", False)
         if self.use_mhc:
-            self.attn_mhc_module = mHCModule(
+            self.attn_mhc_module = NPUmHC(
                 config=config,
+                pre_only=False,
                 prefix=f"{prefix}.attn_mhc_module",
             )
-            self.mlp_mhc_module = mHCModule(
+            self.mlp_mhc_module = NPUmHC(
                 config=config,
+                pre_only=False,
                 prefix=f"{prefix}.mlp_mhc_module",
             )
             block_post_layernorm_hidden_size *= getattr(config, "mhc_num_stream", 4)
         self.has_block_post_layernorm = layer_idx in getattr(config, "block_post_layernorm_idx", [])
         if self.has_block_post_layernorm:
             self.block_post_layernorm = RMSNorm(block_post_layernorm_hidden_size, eps=config.rms_norm_eps)
+
+    def _calculate_page_size_padded(
+        self,
+        cache_config: CacheConfig,
+        cache_dtype_str: str | None,
+        config: DeepseekV2Config | DeepseekV3Config,
+    ) -> int | None:
+        """
+        Calculate page_size_padded for alignment across different attention mechanisms.
+
+        Alignment priority:
+        1. If DSA exists: align to DSA page size
+        2. Otherwise: align to max(MOME page size, MLA/SWA page size)
+
+        Args:
+            cache_config: Cache configuration
+            cache_dtype_str: Quantization dtype string (e.g., "fp8_ds_mla", "hif8_ds_mla", "int8_ds_mla")
+            config: Model configuration
+
+        Returns:
+            page_size_padded in bytes, or None if no padding needed
+        """
+        from vllm.utils.torch_utils import get_dtype_size
+        from math import prod
+
+        block_size = cache_config.block_size
+        dtype = torch.bfloat16  # Default dtype
+        dtype_size = get_dtype_size(dtype)
+
+        # Calculate MLA/SWA page size
+        mla_head_size = config.kv_lora_rank + config.qk_rope_head_dim
+        mla_page_dim = mla_head_size * dtype_size
+
+        # Calculate DSA page size if DSA layer exists
+        dsa_page_dim = None
+        if hasattr(config, "index_topk") and config.index_topk > 0:
+            index_head_dim = getattr(config, "index_head_dim", 0)
+            # Non-quant case: standard attention format
+            dsa_page_dim = (mla_head_size + index_head_dim) * dtype_size
+
+        # Calculate MOME page size if MOME is enabled
+        mome_page_size = None
+        if getattr(config, "use_mome", False):
+            num_total_tokens = self.kernel_size - 1 + self.num_speculative_tokens
+            mome_page_size = sum(
+                prod(shape) * get_dtype_size(dtype)
+                for (shape, dtype) in zip(self.mome_state_shapes, self.mome_state_dtypes)
+            ) * num_total_tokens
+
+        if dsa_page_dim is None:
+            denominator = mla_page_dim
+        else:
+            denominator = mla_page_dim if mla_page_dim < dsa_page_dim else dsa_page_dim
+
+        v = mome_page_size // denominator - 1
+        lower = 1 << (v.bit_length() - 1)
+        block_size = lower << 1
+
+        # Determine alignment priority
+        if dsa_page_dim is not None:
+            target_page_size = dsa_page_dim * block_size
+        elif mome_page_size is not None:
+            target_page_size = max(mome_page_size, mla_page_dim * block_size)
+        else:
+            block_size = cache_config.block_size
+            target_page_size = mla_page_dim * block_size
+
+        return int(target_page_size), int(block_size)
 
     def forward(
         self,
@@ -394,25 +499,24 @@ class OpenPanguDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states, h_post, h_res = self.attn_mhc_module.hc_pre(hidden_states)
+        hidden_states, h_post, h_res = self.attn_mhc_module.mhc_pre(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
-        
         hidden_states = self.self_attn(hidden_states, cos, sin)
         if self.sandwich_norm:
             hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.attn_mhc_module.hc_post(hidden_states, residual, h_post, h_res)
+        h_res = self.attn_mhc_module.mhc_sinkhorn(h_res)
+        hidden_states = self.attn_mhc_module.mhc_post(hidden_states, h_post, residual, h_res)
         
         residual = hidden_states
-        hidden_states, h_post, h_res = self.mlp_mhc_module.hc_pre(hidden_states)
+        hidden_states, h_post, h_res = self.mlp_mhc_module.mhc_pre(hidden_states)
 
         hidden_states = self.pre_mlp_layernorm(hidden_states)
         # Fully Connected
-        
         hidden_states = self.mlp(hidden_states)
-        
         if self.sandwich_norm:
             hidden_states = self.post_mlp_layernorm(hidden_states)
-        hidden_states = self.mlp_mhc_module.hc_post(hidden_states, residual, h_post, h_res)
+        h_res = self.mlp_mhc_module.mhc_sinkhorn(h_res)
+        hidden_states = self.mlp_mhc_module.mhc_post(hidden_states, h_post, residual, h_res)
         if self.has_block_post_layernorm:
             hidden_states = self.block_post_layernorm(hidden_states)
         
@@ -463,10 +567,10 @@ class OpenPanguModel(nn.Module):
         self.use_mhc = getattr(config, "use_mhc", False)
         if self.use_mhc:
             self.num_stream = getattr(config, "mhc_num_stream", 4)
-            self.merge_mhc_module = mHCModule(
+            self.merge_mhc_module = NPUmHC(
                 config=config,
-                merge_layer_only_pre=True,
-                prefix=f"{prefix}.attn_mhc_module",
+                pre_only=True,
+                prefix=f"{prefix}.merge_mhc_module",
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -505,7 +609,7 @@ class OpenPanguModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         if self.use_mhc:
-            hidden_states, _, _ = self.merge_mhc_module.hc_pre(hidden_states)
+            hidden_states, _, _ = self.merge_mhc_module.mhc_pre(hidden_states)
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
@@ -752,7 +856,10 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
                 continue
 
             if "_conv" in remapped_name:
-                remapped_name = remapped_name.replace("_conv", "_conv.merge_conv")
+                if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                    remapped_name = insert_conv_before(remapped_name)
+                else:
+                    remapped_name = remapped_name.replace("_conv", "_conv.merge_conv")
                 if model_extra_config.operator_opt_config.merge_q_kv_conv and "qa_conv" in remapped_name:
                     merge_conv_name = remapped_name.replace("qa_conv", "merge_conv")
                     if merge_conv_name not in record_conv_name:
@@ -774,6 +881,13 @@ class OpenPanguMoEModel(OpenPanguModelBase, MixtureOfExperts):
             if hasattr(module, "post_weight_load"):
                 module.post_weight_load()
 
+def insert_conv_before(name: str) -> str:
+    parts = name.split('.')
+    for i in range(len(parts) - 1, -1, -1):
+        if '_conv' in parts[i]:
+            parts.insert(i, 'conv')
+            break
+    return '.'.join(parts)
 
 class PanguUltraMoEForCausalLM(OpenPanguMoEModel):
     pass

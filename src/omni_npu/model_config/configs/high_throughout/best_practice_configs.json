@@ -149,6 +149,10 @@
         "configs":{
             "hybrid":{
                 "config_file":"openpangu_v2/openpangu_v2_bf16_a3_hybrid.json"
+            },
+            "1P1D": {
+                "prefill_config_file": "openpangu_v2/openpangu_v2_bf16_a3_1p1d_hybrid_p.json",
+                "decode_config_file": "openpangu_v2/openpangu_v2_bf16_a3_1p1d_hybrid_d.json"
             }
         }
     }

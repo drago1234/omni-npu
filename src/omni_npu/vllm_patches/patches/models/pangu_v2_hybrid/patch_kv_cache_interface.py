@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 
+from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
@@ -92,6 +93,7 @@ class DSAAttentionSpec(FullAttentionSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class ShareKVSlidingWindowSpec(SlidingWindowSpec):
+
     """
     A variant of SlidingWindowSpec that shares key and value in
     underlying storage, e.g., MLA and MQA.
@@ -138,14 +140,14 @@ class MomeSpec(MambaSpec):
         return page_size
 
     def max_memory_usage_bytes(self, vllm_config) -> int:
-        max_model_len = vllm_config.model_config.max_model_len
-        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+        return cdiv(self.num_total_tokens, self.block_size) * self.page_size_bytes
 
     def __post_init__(self):
-        if len(self.shapes) != 3:
-            raise ValueError(f"Mome has three components, but got {len(self.shapes)} shapes.")
-        if len(self.dtypes) != 3:
-            raise ValueError(f"Mome has three components, but got {len(self.dtypes)} dtypes.")
+        accepted_num = 2 if model_extra_config.operator_opt_config.merge_q_kv_conv else 3
+        if len(self.shapes) != accepted_num:
+            raise ValueError(f"Mome has {accepted_num} components, but got {len(self.shapes)} shapes.")
+        if len(self.dtypes) != accepted_num:
+            raise ValueError(f"Mome has {accepted_num} components, but got {len(self.dtypes)} dtypes.")
         if self.kernel_size <= 0:
             raise ValueError(f"Mome should have positive kernel_size, but got {self.kernel_size}.")
 
@@ -204,12 +206,42 @@ class UniformTypeKVCacheSpecsPatch(VLLMPatch):
                 f"Unsupported KV cache spec type: {type(one_spec)}"
             )
 
+from typing_extensions import Self
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+@dataclass(frozen=True)
+class SinkMLAAttentionSpec(MLAAttentionSpec):
+    sink_len: int = 0
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be MLAAttentionSpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        assert len(cache_dtype_str_set) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "quantization method."
+        )
+        head_size_set = set(spec.head_size for spec in specs)
+        assert len(head_size_set) == 1, (
+            "All attention layers in the same KV cache group must use the same head_size."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            sink_len=specs[0].sink_len,
+        )
 
 @register_patch("PanguNewKVCacheSpecsPatch", kv_cache_interface)
 class PanguNewKVCacheSpecsPatch(VLLMPatch):
     """Patch to add new kv cache specs."""
 
-    _attr_names_to_apply = ["DSAAttentionSpec", "ShareKVSlidingWindowSpec", "MomeSpec"]
+    _attr_names_to_apply = ["DSAAttentionSpec", "ShareKVSlidingWindowSpec", "MomeSpec","SinkMLAAttentionSpec"]
     DSAAttentionSpec = DSAAttentionSpec
     ShareKVSlidingWindowSpec = ShareKVSlidingWindowSpec
     MomeSpec = MomeSpec
+    SinkMLAAttentionSpec = SinkMLAAttentionSpec

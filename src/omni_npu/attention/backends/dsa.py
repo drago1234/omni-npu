@@ -134,11 +134,13 @@ class NPUDSAPrefillMetadata(MLACommonPrefillMetadata):
     seq_lens: torch.Tensor = None
 
     prefix_meta: Optional[Any] = None
+    slot_mapping: torch.Tensor = None
 
 @dataclass
 class NPUDSADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
     mc2_mask: torch.Tensor = None
+    slot_mapping: torch.Tensor = None
 
 
 @dataclass

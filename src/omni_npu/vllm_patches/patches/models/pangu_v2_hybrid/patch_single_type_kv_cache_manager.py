@@ -20,6 +20,7 @@ from .patch_kv_cache_interface import (
     MomeSpec,
     DSAAttentionSpec,
     ShareKVSlidingWindowSpec,
+    SinkMLAAttentionSpec
 )
 
 
@@ -113,12 +114,13 @@ class MomeManager(SingleTypeKVCacheManager):
         """
         return max(0, num_computed_tokens - self.kernel_size + 1)
 
-
+from vllm.v1.core.single_type_kv_cache_manager import SinkFullAttentionManager
 # Update spec_manager_map and add MomeManager to the module
 original_spec_manager_map = dict(single_type_kv_cache_manager.spec_manager_map)
 original_spec_manager_map[DSAAttentionSpec] = FullAttentionManager
 original_spec_manager_map[ShareKVSlidingWindowSpec] = SlidingWindowManager
 original_spec_manager_map[MomeSpec] = MomeManager
+original_spec_manager_map[SinkMLAAttentionSpec] = SinkFullAttentionManager
 
 
 # Create a patch to update spec_manager_map

@@ -33,7 +33,7 @@ from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 _original_chat_completion_full_generator = OpenAIServingChat.chat_completion_full_generator
 _original_preprocess_chat = OpenAIServingChat._preprocess_chat
 _original_preprocess_chat_engine = OpenAIServing._preprocess_chat
-_original_update_waiting_for_remote_kv = Scheduler._update_waiting_for_remote_kv
+# _original_update_waiting_for_remote_kv = Scheduler._update_waiting_for_remote_kv
 _original_generate = AsyncLLM.generate
 _ROUTED_EXPERT_KEYS = (
     "routed_experts_shape",
@@ -41,6 +41,32 @@ _ROUTED_EXPERT_KEYS = (
     "routed_experts_str_len",
     "routed_experts_str",
 )
+
+def _update_waiting_for_remote_kv_patched(self: Scheduler, request: Request) -> bool:
+    assert self.connector is not None
+    if request.request_id not in self.finished_recving_kv_req_ids:
+        return False
+
+    if request.request_id in self.failed_recving_kv_req_ids:
+        # Request had KV load failures; num_computed_tokens was already
+        # updated in _update_requests_with_invalid_blocks
+        if request.num_computed_tokens:
+            # Cache any valid computed tokens.
+            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+        else:
+            # No valid computed tokens, release allocated blocks.
+            # There may be a local cache hit on retry.
+            self.kv_cache_manager.free(request)
+
+        self.failed_recving_kv_req_ids.remove(request.request_id)
+    else:
+        num_computed_tokens = request.num_tokens - 1
+        self.kv_cache_manager.cache_blocks(request, num_computed_tokens)
+        request.num_computed_tokens = num_computed_tokens
+
+    # Return that we are ready.
+    self.finished_recving_kv_req_ids.remove(request.request_id)
+    return True
 
 async def to_async_iterator(input: RequestOutput) -> AsyncIterator[RequestOutput]:
     yield input
@@ -248,7 +274,7 @@ class SchedulerPatch(VLLMPatch):
     _attr_names_to_apply = ['_update_waiting_for_remote_kv']
 
     def _update_waiting_for_remote_kv(self, request: Request) -> bool:
-        result = _original_update_waiting_for_remote_kv(self, request)
+        result = _update_waiting_for_remote_kv_patched(self, request)
         if result:
             import os
             reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS", "0") == "1"

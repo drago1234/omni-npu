@@ -10,9 +10,9 @@ multiple attention layers per decoder block.
 from collections import defaultdict
 import torch
 
-from vllm.v1.worker import utils as worker_utils
 from vllm.attention.layer import Attention
 from vllm.model_executor.models.utils import extract_layer_index
+import vllm.v1.worker.gpu_model_runner as gpu_model_runner
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
@@ -42,7 +42,7 @@ def bind_kv_cache_patched(kv_caches: dict[str, torch.Tensor],
 
 
 # Register the patch
-@register_patch("WorkerUtilsPatch", worker_utils)
+@register_patch("WorkerUtilsPatch", gpu_model_runner)
 class WorkerUtilsPatch(VLLMPatch):
     """Patch to remove layer name check in bind_kv_cache"""
 

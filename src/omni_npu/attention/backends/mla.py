@@ -297,7 +297,8 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
 class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
     can_return_lse_for_decode: bool = True
     SHARE_MASK_TRIL_SPARSE = None
-    MAX_WINDOW_SIZE = 2**31 - 1
+    DECORE_ATTN_MASK = None
+    MAX_WINDOW_SIZE = 2**20 - 1
 
     def __init__(
         self,

@@ -1,0 +1,9 @@
+{
+    "operator_optimization_config": {
+        "use_noncontiguous_kv": true,
+        "enable_kv_rmsnorm_rope_cache": true,
+        "decode_moe_dispatch_combine": true,
+        "kv_nz": false,
+        "merge_q_kv_conv": false
+    }
+}
