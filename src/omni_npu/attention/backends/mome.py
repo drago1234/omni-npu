@@ -402,4 +402,10 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             cache_indices = persistent_cache_indices
 
         new_metadata.cache_indices = cache_indices
+        if new_metadata.prefill is not None:
+            new_metadata.prefill = copy.copy(metadata.prefill)
+            new_metadata.prefill.cache_indices = cache_indices[metadata.num_decodes:]
+        if new_metadata.decode is not None:
+            new_metadata.decode = copy.copy(metadata.decode)
+            new_metadata.decode.cache_indices = cache_indices[:metadata.num_decodes]
         return new_metadata
