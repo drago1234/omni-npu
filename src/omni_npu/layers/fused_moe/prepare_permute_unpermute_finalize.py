@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional, Union, Tuple
@@ -24,7 +25,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-DEFAULT_ALL2ALL_THRESHOLD = 64
+DEFAULT_MAX_DISPATCH_COMBINE_THRESHOLD = 64
 GROUPED_FINALIZE_ROW_INDEX_STRIDE = 991
 
 
@@ -416,7 +417,6 @@ class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFina
 
 
 class CommunicationStrategySelector:
-    all2all_threshold: int = DEFAULT_ALL2ALL_THRESHOLD
 
     def __init__(self, moe: torch.nn.Module):
         device_name = torch_npu.npu.get_device_name(0)
@@ -424,6 +424,15 @@ class CommunicationStrategySelector:
         self.is_a5_device = device_name.startswith("Ascend950")
         self.tp_size = get_tensor_model_parallel_world_size()
         self.dp_size = get_dp_group().world_size
+
+        self.max_dispatch_combine_threshold = os.getenv('MAX_DISPATCH_COMBINE_THRESHOLD',
+                                                        DEFAULT_MAX_DISPATCH_COMBINE_THRESHOLD)
+        if self.is_a2_device:
+            assert self.max_dispatch_combine_threshold <= 256, \
+            f"{self.max_dispatch_combine_threshold=} should be no larger than 256 on A2 devices."
+        elif not self.is_a5_device:
+            assert self.max_dispatch_combine_threshold <= 512, \
+            f"{self.max_dispatch_combine_threshold=} should be no larger than 512 on A3 devices."
 
         self.prepare_permute_and_unpermute_finalize_dict = {
             "all2all": All2AllPrepPmtAndUnpmtFinal(moe),
@@ -456,7 +465,7 @@ class CommunicationStrategySelector:
             if self.dp_size == 1 or self.tp_size == 1:
                 # tokens per rank
                 local_num_tokens = cdiv(num_tokens, self.tp_size)
-                if local_num_tokens > self.all2all_threshold:
+                if local_num_tokens > self.max_dispatch_combine_threshold:
                     strategy = "all2all"
                 else:
                     strategy = "dispatch_combine"
