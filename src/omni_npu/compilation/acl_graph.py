@@ -9,17 +9,25 @@ from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 
 import numpy as np
+import time
 import torch
 import torch_npu
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphOptions
-from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
+global_recapture = False
+
+def set_aclgraph_recapture(enable: bool):
+    global global_recapture
+    global_recapture = enable
+
+def get_aclgraph_recapture():
+    return global_recapture
 
 def weak_ref_tensor(tensor: Any) -> Any:
     """
@@ -80,6 +88,7 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: Optional[list[int]] = None
+    recapture: bool = False # whether to recapture the aclgraph
 
 
 class ACLGraphWrapper:
@@ -151,8 +160,15 @@ class ACLGraphWrapper:
         # in case we need to access the original runnable.
         return self.runnable
 
+    def update_graph_recapture(self):
+        if get_aclgraph_recapture():
+            for _, entry in self.concrete_aclgraph_entries.items():
+                entry.recapture = True
+            set_aclgraph_recapture(False)
+
     def __call__(self, *args, **kwargs):
         logger.debug("<<< ACLGraphWrapper is being called.")
+        begin = time.time()
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
@@ -169,6 +185,8 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
+        self.update_graph_recapture()
+
         if batch_descriptor not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
             self.concrete_aclgraph_entries[batch_descriptor] = \
@@ -176,7 +194,7 @@ class ACLGraphWrapper:
 
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
-        if entry.aclgraph is None:
+        if entry.aclgraph is None or entry.recapture:
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -184,8 +202,6 @@ class ACLGraphWrapper:
                 # piecewise mode.
                 logger.debug("Capturing a aclgraph on (%s,%s)",
                              self.runtime_mode.name, entry.batch_descriptor)
-            # validate that aclgraph capturing is legal at this point.
-            validate_cudagraph_capturing_enabled()
 
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
@@ -227,9 +243,18 @@ class ACLGraphWrapper:
             # here we always use weak ref for the output
             # to save memory
             entry.output = weak_ref_tensors(output)
+
+            # reset the aclgraph if recapture is true
+            if entry.recapture:
+                entry.recapture = False
+                if entry.aclgraph is not None:
+                    entry.aclgraph.reset()
+
             entry.aclgraph = aclgraph
 
             compilation_counter.num_cudagraph_captured += 1
+            end = time.time()
+            logger.debug(f"<<< Capturing aclgraph time {end - begin =}s")
 
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly
