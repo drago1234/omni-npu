@@ -86,7 +86,7 @@ class NPUMomeAttentionMetadata:
 class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold: int = 1
-    supports_update_block_table: bool = False
+    supports_update_block_table: bool = True
 
     def __init__(
         self,
@@ -389,6 +389,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         new_metadata = copy.copy(metadata)
         prefix_caching = self.vllm_config.cache_config.enable_prefix_caching
         cache_indices = blk_table if prefix_caching else blk_table[:, 0]
+        num_accepted_tokens = metadata.num_accepted_tokens
         num_reqs = blk_table.shape[0]
 
         # For CUDA graphs, copy to persistent buffer
@@ -401,11 +402,23 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             persistent_cache_indices.copy_(cache_indices, non_blocking=True)
             cache_indices = persistent_cache_indices
 
+            if num_accepted_tokens is not None:
+                persistent_num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
+                persistent_num_accepted_tokens.copy_(num_accepted_tokens, non_blocking=True)
+                num_accepted_tokens = persistent_num_accepted_tokens
+
         new_metadata.cache_indices = cache_indices
+        new_metadata.num_accepted_tokens = num_accepted_tokens
+
         if new_metadata.prefill is not None:
             new_metadata.prefill = copy.copy(metadata.prefill)
             new_metadata.prefill.cache_indices = cache_indices[metadata.num_decodes:]
+            if num_accepted_tokens is not None:
+                new_metadata.prefill.num_accepted_tokens = num_accepted_tokens[metadata.num_decodes:]
         if new_metadata.decode is not None:
             new_metadata.decode = copy.copy(metadata.decode)
             new_metadata.decode.cache_indices = cache_indices[:metadata.num_decodes]
+            if num_accepted_tokens is not None:
+                new_metadata.decode.num_accepted_tokens = num_accepted_tokens[:metadata.num_decodes]
+
         return new_metadata
