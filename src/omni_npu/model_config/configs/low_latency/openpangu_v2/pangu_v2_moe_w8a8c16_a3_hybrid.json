@@ -1,6 +1,7 @@
 {
     "model_parallel_config": {
         "ena_context_parallel": false,
+        "enable_flashcomm2": false,
         "layer_parallel_config": {
         }
     },

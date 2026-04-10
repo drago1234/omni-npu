@@ -505,6 +505,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.param_sink_number = param_sink_number
         self.on_ascend950 = on_ascend950()
         assert model_extra_config.operator_opt_config.use_noncontiguous_kv
+        self.enable_flashcomm2 = model_extra_config.parall_config.enable_flashcomm2
         self.dummy_value_cache = torch.zeros(
             (1, cache_config.block_size, 1, self.kv_lora_rank),
             device='npu',
@@ -583,7 +584,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             reduce_results=False,
             prefix=f"{self.layer_name}.o_proj",
             return_bias=False,
-            disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
+            disable_tp=True if (self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel) or (self.enable_flashcomm2 and not self.is_dsa_layer) else False,
         )
 
     def _init_rotary_emb(self):
@@ -896,12 +897,23 @@ class NPUPanguSparseAttention(torch.nn.Module):
             dtype=hidden_states.dtype,
         )
 
+        if self.enable_flashcomm2 and not self.is_dsa_layer:
+            # FlashComm2.0 dummy: simulate all_to_all + full o_proj
+            x = attn_output.view(self.tp_size, -1, attn_output.shape[-1])
+            output = torch.empty_like(x)
+            torch.distributed.all_to_all_single(output.flatten(), x.flatten(), group=get_tp_group().device_group)
+            attn_output = output.transpose(0, 1).reshape(attn_output.shape[0] // self.tp_size, -1)
+
         hidden_states = self.o_proj(attn_output)
+
         if self.tp_size > 1:
-            if self.all2all_backend == "naive":
+            if self.enable_flashcomm2 and not self.is_dsa_layer:
+                pass  # all_to_all + full o_proj already complete
+            elif self.all2all_backend == "naive":
                 hidden_states = get_tp_group().all_reduce(hidden_states)
             else:
                 hidden_states = get_tp_group().reduce_scatter(hidden_states, dim=0)
+
         return hidden_states
 
     def _forward_decode(
@@ -1302,6 +1314,114 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         return self._mla_epilog(attn_output, attn_metadata, mome_metadata)
 
+    def _forward_prefill_FC2(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_metadata: Optional[MLACommonMetadata] = None,
+        mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
+    ) -> torch.Tensor:
+        """FlashComm2.0 prefill path: MLA prolog -> SWA attention -> FC2 epilog."""
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+
+        prefill_hidden = hidden_states[num_decode_tokens:num_actual_tokens]
+        prefill_cos = cos[num_decode_tokens:num_actual_tokens]
+        prefill_sin = sin[num_decode_tokens:num_actual_tokens]
+
+        # get KV cache for this layer
+        kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
+
+        ### Q stream begins ###
+        q_lora = self.q_a_proj(prefill_hidden)
+        if self.use_mome:
+            q_lora = self._apply_MOME(
+                q_lora,
+                self.qa_conv,
+                0,
+                attn_metadata,
+                mome_metadata,
+            )
+        q_lora = self.q_a_layernorm(q_lora)
+        q = self.q_b_proj(q_lora)
+        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(
+            q,
+            [self.qk_nope_head_dim, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        # FC2 is non-DSA prefill-only: no W_UK_T absorption needed
+
+        q_pe = torch_npu.npu_rotary_mul(
+            q_pe.view(-1, 1, self.num_local_heads, self.qk_rope_head_dim),
+            prefill_cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            prefill_sin.view(-1, 1, 1, self.qk_rope_head_dim),
+            rotary_mode="half" if not self.rope_interleaved else "interleave",
+        ).squeeze(1)
+        q_nope = q_nope.contiguous()
+        q_pe = q_pe.contiguous()
+        ### Q stream ends ###
+
+        ### KV stream begins ###
+        kv = self.kv_a_proj_with_mqa(prefill_hidden)
+        k_nope, k_pe = torch.split(
+            kv,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        if self.use_mome:
+            k_nope = self._apply_MOME(
+                k_nope,
+                self.compresskv_conv,
+                1,
+                attn_metadata,
+                mome_metadata,
+            )
+
+        k_up_nope, k_pe, v_up = self._npu_kvrmsnorm_rope_cache(
+            k_nope,
+            k_pe,
+            kv_cache,
+            prefill_cos,
+            prefill_sin,
+            attn_metadata,
+            None,
+        )
+        ### KV stream ends ###
+
+        # --- SWA Attention ---
+        attn_output = self._apply_SWA_attention_prefill(
+            q_nope,
+            q_pe,
+            k_up_nope,
+            k_pe,
+            v_up,
+            attn_metadata,
+        )
+
+        # --- FC2 MLA Epilog ---
+        if self.use_mome:
+            attn_output = self._apply_MOME(
+                attn_output,
+                self.o_conv,
+                2,
+                attn_metadata,
+                mome_metadata,
+            )
+
+        # Write raw attn [num_prefill, local_heads*v_dim] into full N_total buffer
+        # so all_to_all distributes tokens matching _maybe_padding_and_slice.
+        attn_buf = torch.zeros(
+            hidden_states.shape[0], attn_output.shape[-1],
+            device=hidden_states.device, dtype=hidden_states.dtype)
+        attn_buf[num_decode_tokens:num_actual_tokens] = attn_output
+        # all_to_all: [tp_size, N_local, local_dim] -> [N_local, num_heads*v_dim]
+        attn_buf = attn_buf.view(self.tp_size, -1, attn_output.shape[-1])
+        output = torch.empty_like(attn_buf)
+        torch.distributed.all_to_all_single(output.flatten(), attn_buf.flatten(), group=get_tp_group().device_group)
+        attn_output = output.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
+        return self.o_proj(attn_output)
 
     def _apply_SWA_attention_prefill(
         self,
@@ -1791,10 +1911,24 @@ class NPUPanguSparseAttention(torch.nn.Module):
             attn_output = self._apply_MOME(
                 attn_output,
                 self.o_conv,
-                2, 
+                2,
                 attn_metadata,
                 mome_metadata,
             )
+
+        if self.enable_flashcomm2 and not self.is_dsa_layer:
+            # Decode / mixed batch path: o_proj has disable_tp=True (full weight
+            # [HS, num_heads*v_dim]), but attn_output has local heads only.
+            # Zero-pad input to full heads dim so we can use self.o_proj directly
+            # (supports INT8 quantized weights). Only local heads are non-zero,
+            # so the result is a partial contribution — reduce_scatter sums all ranks. 
+            tp_rank = get_tp_group().rank_in_group
+            local_dim = self.num_local_heads * self.v_head_dim
+            full_input = torch.zeros(
+                attn_output.shape[0], self.num_heads * self.v_head_dim,
+                device=attn_output.device, dtype=attn_output.dtype)
+            full_input[:, tp_rank * local_dim : (tp_rank + 1) * local_dim] = attn_output
+            return self.o_proj(full_input)
 
         hidden_states = self.o_proj(attn_output)
 
@@ -1828,6 +1962,8 @@ def npu_pangu_forward(
 
         enable_cp = model_extra_config.parall_config.ena_context_parallel and self.is_dsa_layer \
                     and not has_decode and num_actual_tokens > attn_metadata.num_prefills * self.tp_size * 2
+        enable_flashcomm2 = self.enable_flashcomm2 and not self.is_dsa_layer
+
         if self.tp_size > 1:
             if not self.all2all_backend == "naive" and not enable_cp:
                 hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
@@ -1864,6 +2000,14 @@ def npu_pangu_forward(
             if enable_cp:
                 assert self.all2all_backend != "naive", "Context parallel is not supported with naive all2all backend"
                 return self._forward_prefill_cp(
+                    hidden_states,
+                    cos,
+                    sin,
+                    attn_metadata,
+                    mome_metadata,
+                )
+            elif enable_flashcomm2:
+                return self._forward_prefill_FC2(
                     hidden_states,
                     cos,
                     sin,

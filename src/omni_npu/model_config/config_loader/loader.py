@@ -98,6 +98,7 @@ class ModelParallelConfig:
     layer_parallel_config: dict[str, Any] = field(default_factory=dict)
     input_split: bool = False
     ena_context_parallel: bool = False
+    enable_flashcomm2: bool = False
 
  
 @dataclass
