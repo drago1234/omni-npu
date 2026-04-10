@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # New KV cache dtype types to add: maps dtype string -> torch dtype
 NEW_CACHE_DTYPES: dict[str, "torch.dtype"] = {
     "hif8_ds_mla": torch.uint8,
+    "int8_ds_mla": torch.int8,
 }
 
 # A valid upstream cache_dtype used as a placeholder during Pydantic validation
@@ -30,6 +31,7 @@ _EXTENDED_CACHE_DTYPE = Literal[
     "fp8_inc",
     "fp8_ds_mla",
     "hif8_ds_mla",
+    "int8_ds_mla",
 ]
 
 

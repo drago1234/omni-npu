@@ -154,11 +154,13 @@ class DSAAttention(MLAAttention):
         prefix: str = "",
         cache_dtype_str: str | None = None,
         page_size_padded: Optional[int] = None,
+        block_size: int | None = None,
         **extra_impl_args,
     ):
         self.cache_dtype_str = cache_dtype_str
         self.page_size_padded = page_size_padded
         self.indexer_head_dim = indexer_head_dim
+        self.block_size = block_size
 
         super().__init__(
             num_heads=num_heads,
@@ -193,7 +195,7 @@ class DSAAttention(MLAAttention):
         )
 
         return DSAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=self.block_size or vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size + self.indexer_head_dim,
             dtype=kv_cache_dtype,
