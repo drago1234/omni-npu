@@ -44,7 +44,7 @@ except ImportError:
 
 from omni_npu.attention.backends.mla import NPUMLAImpl, NPUMLAMetadata
 from omni_npu.v1.layers.utils import (
-    yarn_get_mscale, 
+    yarn_get_mscale,
     named_stream,
 )
 from omni_npu.v1.layers.linear import (
@@ -113,6 +113,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         self.quant_symbol = quant_config is not None
         self.prefix = prefix
         self.block_size_padded = block_size_padded
+        self._init_wuk_t_uv = False
 
         self.q_a_proj = ReplicatedLinear(
             self.hidden_size,
@@ -828,6 +829,15 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         return output
 
     def post_weight_load(self) -> None:
+        if self._init_wuk_t_uv and getattr(self.attn.impl, "W_UK_T", None) is not None:
+            is_weight_nz = getattr(self.kv_b_proj.weight, "is_weight_nz", False)
+            if is_weight_nz:
+                self.kv_b_proj.weight.data = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, torch_npu.Format.ND)
+            self.attn.impl.process_weights_after_loading(self.kv_b_proj.weight.dtype)
+            if is_weight_nz:
+                self.kv_b_proj.weight.data = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, torch_npu.Format.FRACTAL_NZ)
+        else:
+            self._init_wuk_t_uv = True
         if getattr(self, 'param_sink_number', 0) > 0:
             if getattr(self, "kv_a_layernorm", None) is not None:
                 param_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)

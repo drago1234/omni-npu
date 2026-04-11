@@ -31,11 +31,11 @@ from omni_npu.layers.utils import named_stream
 from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp
 from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteResult
 from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
-
+from omni_npu.model_config.config_loader.loader import model_extra_config
+from omni_npu.compilation.acl_graph import set_aclgraph_recapture
 
 torch.npu.config.allow_internal_format = True
 logger = init_logger(__name__)
-
 
 @UnquantizedFusedMoEMethod.register_oot
 class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodBase):
@@ -178,11 +178,17 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         super().process_weights_after_loading(layer)
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
-        current_method = multiprocessing.get_start_method()
-        multiprocessing.set_start_method('spawn', force=True)
-        layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29)
-        layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
-        multiprocessing.set_start_method(current_method, force=True)
+        if model_extra_config.operator_opt_config.gmm_nz:
+            current_method = multiprocessing.get_start_method()
+            multiprocessing.set_start_method('spawn', force=True)
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, torch_npu.Format.FRACTAL_NZ)
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, torch_npu.Format.FRACTAL_NZ)
+            multiprocessing.set_start_method(current_method, force=True)
+            opt_raw = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT") # bytes
+            allow_internal_format = opt_raw.strip().lower() == b"enable"
+            if allow_internal_format:
+                set_weight_attrs(layer.w13_weight, {"is_weight_nz": True})
+                set_weight_attrs(layer.w2_weight, {"is_weight_nz": True})
         set_weight_attrs(layer.w13_weight, {"is_weight_transposed": True})
         set_weight_attrs(layer.w2_weight, {"is_weight_transposed": True})
 
@@ -242,6 +248,8 @@ class NPUFusedMoE(FusedMoE):
     ) -> bool | None:
         # Some NPU-packed weights are kept transposed in memory for kernels.
         # Temporarily switch to canonical layout for parent loading logic.
+        if getattr(param, "is_weight_nz", False):
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
         full_load = loaded_weight.ndim == 3
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
 
@@ -278,7 +286,9 @@ class NPUFusedMoE(FusedMoE):
 
         if is_weight_transposed:
             param.data = param.data.transpose(1, 2)
-
+        if getattr(param, "is_weight_nz", False):
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
+            set_aclgraph_recapture(True)
         return result
         
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):

@@ -507,7 +507,6 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         # Verify output shape combines both outputs
         self.assertEqual(out.shape, (num_actual_tokens, m.hidden_size))
 
-
 class TestNPUMLAMergeConvInit(unittest.TestCase):
     """Test merge_conv initialization logic in __init__ method."""
 

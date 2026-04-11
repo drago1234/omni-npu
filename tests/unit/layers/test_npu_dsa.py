@@ -475,7 +475,6 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         }
         m.num_speculative_tokens = 0
         m.tp_size = 1
-
         return m
 
     def test_forward_prefill_attn_metadata_none_hits_zeros_attention_and_epilog(self):

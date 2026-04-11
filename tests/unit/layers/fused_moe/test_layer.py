@@ -13,6 +13,12 @@ import torch
 def layer_module(monkeypatch):
     torch_npu = sys.modules["torch_npu"]
     torch_npu.npu_format_cast = MagicMock(side_effect=lambda tensor, _: tensor)
+    if not hasattr(torch_npu, "Format"):
+        torch_npu.Format = SimpleNamespace(ND=2, FRACTAL_NZ=29)
+    if not hasattr(torch_npu, "_C"):
+        torch_npu._C = SimpleNamespace(
+            _npu_getOption=lambda _name: b"enable",
+        )
     torch_npu.npu_grouped_matmul = MagicMock(
         side_effect=lambda inputs, _weights, **kwargs: [inputs[0]]
     )
@@ -529,8 +535,13 @@ def test_apply_slice_path_without_padding_slices_router_logits(layer_module, mon
 
 
 @pytest.mark.unit
-def test_process_weights_after_loading_transposes_and_marks(layer_module, monkeypatch):
+def test_process_weights_after_loading_transposes_and_weight_nz(layer_module, monkeypatch):
     module, torch_npu, _ = layer_module
+    monkeypatch.setattr(
+        module.model_extra_config.operator_opt_config,
+        "gmm_nz",
+        True,
+    )
     monkeypatch.setattr(
         module.UnquantizedFusedMoEMethod,
         "process_weights_after_loading",
@@ -549,6 +560,8 @@ def test_process_weights_after_loading_transposes_and_marks(layer_module, monkey
     assert layer.w2_weight.shape == (2, 6, 5)
     assert getattr(layer.w13_weight, "is_weight_transposed", False) is True
     assert getattr(layer.w2_weight, "is_weight_transposed", False) is True
+    assert getattr(layer.w13_weight, "is_weight_nz", False) is True
+    assert getattr(layer.w2_weight, "is_weight_nz", False) is True
     assert torch_npu.npu_format_cast.call_count == 2
 
 
@@ -591,6 +604,32 @@ def test_weight_loader_handles_non_full_load_transposed_branch(layer_module, mon
     assert param.shape == (2, 4, 4)
     assert super_weight_loader.call_count == 1
 
+@pytest.mark.unit
+def test_weight_loader_is_weight_nz_casts_format_2_then_29_super_path(layer_module, monkeypatch):
+    module, torch_npu, _ = layer_module
+    super_weight_loader = MagicMock(return_value=None)
+    monkeypatch.setattr(module.FusedMoE, "weight_loader", super_weight_loader, raising=False)
+    fused = module.NPUFusedMoE.__new__(module.NPUFusedMoE)
+
+    param = torch.nn.Parameter(torch.arange(8, dtype=torch.float32).view(2, 2, 2))
+    setattr(param, "is_weight_nz", True)
+    setattr(param, "is_weight_transposed", False)
+
+    torch_npu.npu_format_cast.reset_mock()
+
+    fused.weight_loader(
+        param=param,
+        loaded_weight=torch.zeros(2, 2, 2),
+        weight_name="w13_weight",
+        shard_id="0",
+        expert_id=0,
+        return_success=False,
+    )
+
+    assert torch_npu.npu_format_cast.call_count == 2
+    assert torch_npu.npu_format_cast.call_args_list[0][0][1] == 2
+    assert torch_npu.npu_format_cast.call_args_list[1][0][1] == 29
+    super_weight_loader.assert_called_once()
 
 @pytest.mark.unit
 def test_maybe_init_modular_kernel_returns_none(layer_module):

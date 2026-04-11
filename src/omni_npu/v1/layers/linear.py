@@ -32,7 +32,8 @@ from omni_npu.v1.distributed.parallel_state_ext import (
     get_layer_parallel_rank
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config
-from omni_npu.v1.utils import (get_last_two_parts, ACL_FORMAT_FRACTAL_NZ)
+from omni_npu.v1.utils import get_last_two_parts
+from omni_npu.compilation.acl_graph import set_aclgraph_recapture
 
 logger = init_logger(__name__)
 
@@ -107,8 +108,12 @@ class UnquantizedFlashCommLinearMethod(FlashCommLinearMethodBase):
         if model_extra_config.operator_opt_config.enable_mlaprolog and "kv_b_proj" in layer.prefix:
             layer.weight.data = layer.weight.data.t().contiguous()
         else:
-            weight_data = torch_npu.npu_format_cast(layer.weight.data.t().contiguous(), ACL_FORMAT_FRACTAL_NZ)
+            weight_data = torch_npu.npu_format_cast(layer.weight.data.t().contiguous(), torch_npu.Format.FRACTAL_NZ)
             layer.weight.data = weight_data
+            opt_raw = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT") # bytes
+            allow_internal_format = opt_raw.strip().lower() == b"enable"
+            if allow_internal_format:
+                set_weight_attrs(layer.weight, {"is_weight_nz": True})
         if not hasattr(layer.weight, "is_weight_transposed"):
             set_weight_attrs(layer.weight, {"is_weight_transposed": True})
 
@@ -238,7 +243,10 @@ class ReplicatedFlashCommLinear(FlashCommLinearBase):
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         # veRL special case: transpose the weight back to original shape
+        is_weight_nz = getattr(param, "is_weight_nz", False)
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
         if is_weight_transposed:
             param.data = param.data.t_()
 
@@ -251,7 +259,10 @@ class ReplicatedFlashCommLinear(FlashCommLinearBase):
 
         # veRL special case: transpose the weight to use torch npu operator
         if is_weight_transposed:
-            param.data = torch_npu.npu_format_cast(param.data.t_(), ACL_FORMAT_FRACTAL_NZ)
+            param.data = param.data.t_()
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
+            set_aclgraph_recapture(True)
 
     def forward(
         self,
@@ -341,7 +352,10 @@ class ColumnParallelFlashCommLinear(FlashCommLinearBase):
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         # veRL special case: transpose the weight back to original shape
+        is_weight_nz = getattr(param, "is_weight_nz", False)
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
         if is_weight_transposed:
             param.data = param.data.t_()
         output_dim = getattr(param, "output_dim", None)
@@ -360,7 +374,10 @@ class ColumnParallelFlashCommLinear(FlashCommLinearBase):
         param_data.copy_(loaded_weight)
         # veRL special case: transpose the weight to use torch npu operator
         if is_weight_transposed:
-            param.data = torch_npu.npu_format_cast(param.data.t_(), ACL_FORMAT_FRACTAL_NZ)
+            param.data = param.data.t_()
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
+            set_aclgraph_recapture(True)
 
     def forward(
         self,
@@ -452,7 +469,10 @@ class QKVParallelFlashCommLinear(ColumnParallelFlashCommLinear):
             self.load_qkv_weights_interleaved(param, loaded_weight)
             return
         # veRL special case: transpose the weight back to original shape
+        is_weight_nz = getattr(param, "is_weight_nz", False)
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
         if is_weight_transposed:
             param.data = param.data.t_()
         param_data = param.data
@@ -506,7 +526,10 @@ class QKVParallelFlashCommLinear(ColumnParallelFlashCommLinear):
         param_data.copy_(loaded_weight)
         # veRL special case: transpose the weight to use torch npu operator
         if is_weight_transposed:
-            param.data = torch_npu.npu_format_cast(param.data.t_(), ACL_FORMAT_FRACTAL_NZ)
+            param.data = param.data.t_()
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
+            set_aclgraph_recapture(True)
 
     # When y_transform = ALL2ALL for the weight_loader, weights must be rearranged.
     # before rearranged: | q_head1 | q_head2 | q_head3 | q_head4 | q_head5 | q_head6 | q_head7 | q_head8 | k_head1 | k_head2 | k_head3 | k_head4 | v_head1 | v_head2 | v_head3 | v_head4
@@ -518,7 +541,10 @@ class QKVParallelFlashCommLinear(ColumnParallelFlashCommLinear):
     def load_qkv_weights_interleaved(self,
                                      param: Parameter,
                                      loaded_weight: torch.Tensor):
+        is_weight_nz = getattr(param, "is_weight_nz", False)
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
         if is_weight_transposed:
             param.data = param.data.t_()
         param_data = param.data
@@ -583,7 +609,10 @@ class QKVParallelFlashCommLinear(ColumnParallelFlashCommLinear):
         assert loaded_weight.shape[output_dim] == q_total_size + k_total_size + v_total_size, f"Loaded weight dimension {loaded_weight.shape[output_dim]} != Q+K+V size"
 
         if is_weight_transposed:
-            param.data = torch_npu.npu_format_cast(param.data.t_(), ACL_FORMAT_FRACTAL_NZ)
+            param.data = param.data.t_()
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
+            set_aclgraph_recapture(True)
 
 
 class MergedColumnParallelFlashCommLinear(ColumnParallelFlashCommLinear):
@@ -625,7 +654,10 @@ class MergedColumnParallelFlashCommLinear(ColumnParallelFlashCommLinear):
                       loaded_weight: torch.Tensor,
                       loaded_shard_id: Optional[int] = None):
         # veRL special case: transpose the weight back to original shape
+        is_weight_nz = getattr(param, "is_weight_nz", False)
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
         if is_weight_transposed:
             param.data = param.data.t_()
         param_data = param.data
@@ -650,7 +682,10 @@ class MergedColumnParallelFlashCommLinear(ColumnParallelFlashCommLinear):
         param_data.copy_(loaded_weight)
         # veRL special case: transpose the weight to use torch npu operator
         if is_weight_transposed:
-            param.data = torch_npu.npu_format_cast(param.data.t_(), ACL_FORMAT_FRACTAL_NZ)
+            param.data = param.data.t_()
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
+            set_aclgraph_recapture(True)
 
 
 class RowParallelFlashCommLinear(FlashCommLinearBase):
@@ -718,7 +753,10 @@ class RowParallelFlashCommLinear(FlashCommLinearBase):
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         # veRL special case: transpose the weight back to original shape
+        is_weight_nz = getattr(param, "is_weight_nz", False)
         is_weight_transposed = getattr(param, "is_weight_transposed", False)
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.ND)
         if is_weight_transposed:
             param.data = param.data.t_()
         input_dim = getattr(param, "input_dim", None)
@@ -737,7 +775,10 @@ class RowParallelFlashCommLinear(FlashCommLinearBase):
         param_data.copy_(loaded_weight)
         # veRL special case: transpose the weight to use torch npu operator
         if is_weight_transposed:
-            param.data = torch_npu.npu_format_cast(param.data.t_(), ACL_FORMAT_FRACTAL_NZ)
+            param.data = param.data.t_()
+        if is_weight_nz:
+            param.data = torch_npu.npu_format_cast(param.data, torch_npu.Format.FRACTAL_NZ)
+            set_aclgraph_recapture(True)
 
     def forward(
         self,

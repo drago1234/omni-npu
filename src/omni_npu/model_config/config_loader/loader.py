@@ -105,6 +105,7 @@ class ModelParallelConfig:
 class ModelOperatorOptConfig:
     enable_kv_rmsnorm_rope_cache: bool = False
     kv_nz: bool = True
+    gmm_nz: bool = True
     moe_multi_stream_tune: bool = False
     unquant_bmm_nz: bool = False
     decode_moe_dispatch_combine: bool = False
