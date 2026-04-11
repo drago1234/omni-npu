@@ -274,17 +274,20 @@ class SchedulerPatch(VLLMPatch):
     _attr_names_to_apply = ['_update_waiting_for_remote_kv']
 
     def _update_waiting_for_remote_kv(self, request: Request) -> bool:
-        result = _update_waiting_for_remote_kv_patched(self, request)
-        if result:
-            import os
-            reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS", "0") == "1"
-            if reuse_prefilled_tokens:
-                if request.sampling_params.extra_args['kv_transfer_params'] and "prefilled_token" in request.sampling_params.extra_args['kv_transfer_params']:
-                    request.prompt_token_ids.extend(
-                        request.sampling_params.extra_args['kv_transfer_params']['prefilled_token'])
-                    request.append_output_token_ids(
-                        request.sampling_params.extra_args['kv_transfer_params']['prefilled_token'])
-        return result
+        reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS", "0") == "1"
+        if (reuse_prefilled_tokens and
+                request.request_id in self.finished_recving_kv_req_ids and
+                request.request_id not in self.failed_recving_kv_req_ids):
+            extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+            kv_params = extra_args.get("kv_transfer_params")
+            prefilled_token = kv_params.get("prefilled_token") if kv_params else None
+            if prefilled_token:
+                request.prompt_token_ids.extend(prefilled_token)
+                request.append_output_token_ids(prefilled_token)
+                # Consume once to avoid repeated append in subsequent scheduler ticks.
+                kv_params.pop("prefilled_token", None)
+
+        return _update_waiting_for_remote_kv_patched(self, request)
 
 
 @register_patch("PrefilledTokenSkipAsyncLLM", AsyncLLM)
@@ -305,30 +308,48 @@ class AsyncLLMPatch(VLLMPatch):
     )-> AsyncGenerator[RequestOutput, None]:
         import os
         reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS", "0") == "1"
-        if reuse_prefilled_tokens and not isinstance(prompt, EngineCoreRequest):
-            if "prefilled_token_ids" in prompt and prompt["prefilled_token_ids"] != []:
-                if sampling_params.n == 1:
-                    output = RequestOutput(request_id=request_id,
-                                           prompt=None, finished=False, prompt_logprobs=None,
-                                           prompt_token_ids=prompt["prompt_token_ids"],
-                                           outputs=[CompletionOutput(index=0,
-                                                                     cumulative_logprob=None, logprobs=None,
-                                                                     text=prompt["prefilled_texts"],
-                                                                     token_ids=prompt["prefilled_token_ids"])])
-                else:
-                    # Fan out child requests (for n>1).
-                    parent_request = ParentRequest(request_id, sampling_params)
-                    for idx in range(sampling_params.n):
-                        request_id_child, params = parent_request.get_child_info(idx)
-                        output = RequestOutput(request_id=request_id_child,
-                                               prompt=None, finished=False, prompt_logprobs=None,
-                                               prompt_token_ids=prompt["prompt_token_ids"],
-                                               outputs=[CompletionOutput(index=idx,
-                                                                         cumulative_logprob=None, logprobs=None,
-                                                                         text=prompt["prefilled_texts"],
-                                                                         token_ids=prompt["prefilled_token_ids"])])
-                prompt["prefilled_token_ids"] = []
-                yield output
+        if reuse_prefilled_tokens:
+            prefilled_token_ids: list[int] = []
+            prompt_token_ids: list[int] | None = None
+            prefilled_text = ""
+
+            if isinstance(prompt, EngineCoreRequest):
+                prompt_token_ids = prompt.prompt_token_ids
+                extra_args = getattr(sampling_params, "extra_args", None) or {}
+                kv_transfer_params = extra_args.get("kv_transfer_params", None)
+                if kv_transfer_params and "prefilled_token" in kv_transfer_params:
+                    prefilled_token_ids = kv_transfer_params["prefilled_token"] or []
+                    if prefilled_token_ids:
+                        tokenizer = getattr(self.input_processor, "tokenizer", None)
+                        if tokenizer is not None:
+                            token = tokenizer.convert_ids_to_tokens(prefilled_token_ids[0])
+                            prefilled_text = tokenizer.convert_tokens_to_string([token])
+            elif isinstance(prompt, Mapping):
+                if "prefilled_token_ids" in prompt:
+                    prefilled_token_ids = prompt["prefilled_token_ids"] or []
+                    prompt_token_ids = prompt.get("prompt_token_ids")
+                    prefilled_text = prompt.get("prefilled_texts", "")
+                    # Consume once to avoid repeated synthetic output.
+                    prompt["prefilled_token_ids"] = []
+
+            if prefilled_token_ids:
+                for idx in range(sampling_params.n):
+                    yield RequestOutput(
+                        request_id=request_id,
+                        prompt=None,
+                        finished=False,
+                        prompt_logprobs=None,
+                        prompt_token_ids=prompt_token_ids,
+                        outputs=[
+                            CompletionOutput(
+                                index=idx,
+                                cumulative_logprob=None,
+                                logprobs=None,
+                                text=prefilled_text,
+                                token_ids=prefilled_token_ids,
+                            )
+                        ],
+                    )
         async for res in _original_generate(self, prompt, sampling_params, request_id, prompt_text = prompt_text, lora_request=lora_request,
                                  tokenization_kwargs=tokenization_kwargs, trace_headers=trace_headers, priority=priority, data_parallel_rank=data_parallel_rank):
             yield res

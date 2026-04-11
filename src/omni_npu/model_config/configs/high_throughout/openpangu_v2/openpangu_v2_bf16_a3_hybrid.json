@@ -1,5 +1,16 @@
 {
     "model_parallel_config": {
+        "layer_parallel_config": {
+            "self_attn.o_proj": {
+                "tp_size_or_ranks": 1
+            },
+            "mlp.gate_up_proj": {
+                "tp_size_or_ranks": 1
+            },
+            "mlp.down_proj": {
+                "tp_size_or_ranks": 1
+            }
+        }
     },
     "operator_optimization_config": {
         "use_noncontiguous_kv": false,
