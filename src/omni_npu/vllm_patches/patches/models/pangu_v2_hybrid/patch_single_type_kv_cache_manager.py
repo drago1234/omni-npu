@@ -5,7 +5,7 @@
 Add MomeManager class and update spec_manager_map for Pangu V2 hybrid attention.
 """
 
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, SinkFullAttentionSpec
 from vllm.v1.core import single_type_kv_cache_manager
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
@@ -114,7 +114,30 @@ class MomeManager(SingleTypeKVCacheManager):
         """
         return max(0, num_computed_tokens - self.kernel_size + 1)
 
-from vllm.v1.core.single_type_kv_cache_manager import SinkFullAttentionManager
+class SinkFullAttentionManager(FullAttentionManager):
+    def __init__(
+        self,
+        kv_cache_spec: SinkFullAttentionSpec,
+        block_pool: BlockPool,
+        enable_caching: bool,
+        kv_cache_group_id: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ):
+        FullAttentionManager.__init__(
+            kv_cache_spec,
+            block_pool,
+            enable_caching,
+            kv_cache_group_id,
+            dcp_world_size,
+            pcp_world_size,
+        )
+        sink_len = kv_cache_spec.sink_len
+        # assert sink_len is not None and sink_len > 0 and sink_len % self.block_size == 0
+        num_sink_block = sink_len // self.block_size
+        self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
+
+
 # Update spec_manager_map and add MomeManager to the module
 original_spec_manager_map = dict(single_type_kv_cache_manager.spec_manager_map)
 original_spec_manager_map[DSAAttentionSpec] = FullAttentionManager

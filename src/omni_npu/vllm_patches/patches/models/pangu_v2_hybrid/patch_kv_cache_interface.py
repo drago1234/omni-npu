@@ -26,7 +26,6 @@ from vllm.v1.kv_cache_interface import (
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 
-from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
@@ -143,11 +142,10 @@ class MomeSpec(MambaSpec):
         return cdiv(self.num_total_tokens, self.block_size) * self.page_size_bytes
 
     def __post_init__(self):
-        accepted_num = 2 if model_extra_config.operator_opt_config.merge_q_kv_conv else 3
-        if len(self.shapes) != accepted_num:
-            raise ValueError(f"Mome has {accepted_num} components, but got {len(self.shapes)} shapes.")
-        if len(self.dtypes) != accepted_num:
-            raise ValueError(f"Mome has {accepted_num} components, but got {len(self.dtypes)} dtypes.")
+        if len(self.shapes) != 3:
+            raise ValueError(f"Mome has 3 components, but got {len(self.shapes)} shapes.")
+        if len(self.dtypes) != 3:
+            raise ValueError(f"Mome has 3 components, but got {len(self.dtypes)} dtypes.")
         if self.kernel_size <= 0:
             raise ValueError(f"Mome should have positive kernel_size, but got {self.kernel_size}.")
 

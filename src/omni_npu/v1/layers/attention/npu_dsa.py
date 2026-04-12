@@ -4,6 +4,7 @@
 from typing import Optional, Tuple
 
 import torch
+from torch import nn
 import torch_npu
 from transformers import DeepseekV2Config, DeepseekV3Config
 
@@ -12,6 +13,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    split_tensor_along_last_dim,
 )
 from vllm.config import VllmConfig, CacheConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -22,15 +24,18 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.attention.layer import MLAAttention
 from vllm.logger import init_logger
 logger = init_logger(__name__)
-try: # UT won't include pangu_sink_swa_mla patches
-    from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention, PanguSinkAttentionBase
+
+try:
+    from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention
+except ImportError:
+    logger.warning("StaticSinkMLAAttention has not being defined, skipping...")
+
+try:
     from vllm.model_executor.layers.mome import AggregateConv
 except ImportError:
-    logger.warning("PanguSinkAttentionBase has not being defined, skipping...")
-    class PanguSinkAttentionBase:
-        pass
+    logger.warning("AggregateConv has not being defined, skipping...")
 
-try: # UT won't include pangu_sink_swa_mla patches
+try: 
     from vllm.model_executor.layers.npumome import MomeAttention
 except ImportError:
     logger.warning("MomeAttention has not being defined, skipping...")
@@ -42,7 +47,7 @@ from omni_npu.attention.backends.utils import (
     DummySPManager,
     lazy_init_cos_sin,
 )
-from omni_npu.v1.layers.utils import yarn_get_mscale
+from omni_npu.v1.layers.utils import yarn_get_mscale, calculate_page_size_padded
 from omni_npu.v1.layers.linear import (
     RowParallelFlashCommLinear,
     ColumnParallelFlashCommLinear,
@@ -50,11 +55,6 @@ from omni_npu.v1.layers.linear import (
 )
 from omni_npu.model_config.config_loader.loader import  model_extra_config
 from omni_npu.v1.utils import current_stream
-
-
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 class Indexer(torch.nn.Module):
     def __init__(
@@ -232,7 +232,7 @@ class Indexer(torch.nn.Module):
         return tok_idx, ki
 
 
-class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
+class NPUDeepseekSparseAttention(torch.nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -244,11 +244,9 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
         v_head_dim: int,
         q_lora_rank: int | None,
         kv_lora_rank: int,
-        block_size_padded: int = 128,
         max_position_embeddings: int = 8192,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
-        page_size_padded: int | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -269,7 +267,6 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.prefix = prefix
         self.quant_symbol = quant_config is not None
-        self.block_size_padded = block_size_padded
         self._init_wuk_t_uv = False
 
         if self.q_lora_rank is not None:
@@ -327,7 +324,6 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            disable_tp=model_extra_config.operator_opt_config.use_noncontiguous_kv,
         )
 
         self.rope_interleaved = getattr(config,"rope_interleaved", True)
@@ -389,6 +385,17 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
                 )
                 self.kernel_size = getattr(config, 'router_sliding_window', 0)
                 self.cache_dtype_str = None
+
+                page_size_padded, block_size_padded = calculate_page_size_padded(
+                    cache_config=vllm_config.cache_config,
+                    cache_dtype_str=None,
+                    config=config,
+                    mome_state_shapes=self.mome_state_shapes,
+                    mome_state_dtypes=self.mome_state_dtypes,
+                    kernel_size=self.kernel_size,
+                    num_speculative_tokens=self.num_speculative_tokens,
+                )
+
                 mome_kwargs = {
                     "kernel_size": self.kernel_size,
                     "num_spec_tokens": self.num_speculative_tokens,
@@ -404,11 +411,15 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
                 self.qa_conv = AggregateConv(self.q_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
                 self.compresskv_conv = AggregateConv(self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
                 self.o_conv = AggregateConv(self.num_local_heads * self.v_head_dim, config, vllm_config, output_parallel=True, attn_prefix=f"{prefix}.attn")
+                page_size_padded = None
+                block_size_padded = vllm_config.cache_config.block_size
         else:
             self.qa_conv = None
             self.compresskv_conv = None
             self.o_conv = None
             self.conv = None
+            page_size_padded = None
+            block_size_padded = vllm_config.cache_config.block_size
 
         if self.param_sink_number == 0:
             assert self.q_b_proj.tp_size == self.kv_b_proj.tp_size
@@ -462,7 +473,7 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
                 self.param_sink_k_pe,
                 {
                     "output_dim": 1,
-                    "weight_loader": self.weight_loader,
+                    "weight_loader": self.sink_kv_weight_loader,
                 },
             )
             if self.param_sink_with_value:
@@ -480,7 +491,7 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
                     self.param_sink_compressed_kv,
                     {
                         "output_dim": 1,
-                        "weight_loader": self.weight_loader,
+                        "weight_loader": self.sink_kv_weight_loader,
                     },
                 )
             else:
@@ -496,7 +507,7 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
         self.post_weight_load()
 
         self.dummy_value_cache = torch.zeros(
-            (1, self.block_size_padded, 1, self.kv_lora_rank),
+            (1, block_size_padded, 1, self.kv_lora_rank),
             device='npu',
             dtype=torch.bfloat16,
         )
@@ -514,7 +525,6 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
         elif vllm_config.compilation_config.cudagraph_capture_sizes is not None:
             gear_list = vllm_config.compilation_config.cudagraph_capture_sizes
 
-        logger.warning(f"<<< {gear_list=}")
         for batch_size in gear_list:
             self.actual_seq_lengths[batch_size] = (1 + self.num_speculative_tokens) * \
                                                   torch.arange(1, batch_size * self.tp_size // (
@@ -684,7 +694,7 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
                 )
                 # nope_cache.unsqueeze_(2)
                 # rope_cache.unsqueeze_(2)
-                k_nope, k_pe = torch.split(latent_kv, [L, R], dim=-1)
+                k_nope, k_pe = nope_cache, rope_cache
             else:
                 rope_cache, nope_cache, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
                     latent_kv.view(-1, 1, 1, L + R), # BNSD
@@ -934,6 +944,9 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
             if self.conv is not None:
                 out = get_tp_group().all_gather(out, dim=1)
                 out = self.conv(out, state_indice=2, is_prefill=True)
+                if self.o_proj.tp_size > 1:
+                    out = split_tensor_along_last_dim(out, num_partitions=self.o_proj.tp_size)
+                    out = out[self.o_proj.tp_rank].contiguous()
         else:
             if self.o_conv is not None:
                 out = self.o_conv(out, only_prefill=only_prefill) + out
@@ -1130,6 +1143,9 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
             if self.conv is not None:
                 out = get_tp_group().all_gather(out, dim=1)
                 out = self.conv(out, state_indice=2)
+                if self.o_proj.tp_size > 1:
+                    out = split_tensor_along_last_dim(out, num_partitions=self.o_proj.tp_size)
+                    out = out[self.o_proj.tp_rank].contiguous()
         else:
             if self.o_conv is not None:
                 out = self.o_conv(out, force_decode=force_decode, short_prefill=short_prefill) + out
@@ -1151,3 +1167,36 @@ class NPUDeepseekSparseAttention(PanguSinkAttentionBase, torch.nn.Module):
             else:
                 param_sink_compressed_kv = self.param_sink_compressed_kv
             self.attn.update_sink_kv(self.param_sink_k_pe, param_sink_compressed_kv)
+
+    def sink_kv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        output_dim = getattr(param, "output_dim", None)
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
+        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+        # bitsandbytes loads the weights of the specific portion
+        # no need to narrow
+        is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+        # Special case for GGUF
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, nn.UninitializedParameter):
+            final_shape = list(loaded_weight.shape)
+            if output_dim is not None:
+                tp_size = getattr(self, "tp_size", 1)
+                assert final_shape[output_dim] % tp_size == 0
+                final_shape[output_dim] = final_shape[output_dim] // tp_size
+            param.materialize(final_shape, dtype=loaded_weight.dtype)
+        param_data = param.data
+        if output_dim is not None and not is_sharded_weight:
+            shard_size = param_data.shape[output_dim]
+            tp_rank = getattr(self, "tp_rank", 0)
+            start_idx = tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)

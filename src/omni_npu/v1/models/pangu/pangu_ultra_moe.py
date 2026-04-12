@@ -6,7 +6,7 @@ from typing import cast
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig, DeepseekV2Config, DeepseekV3Config
+from transformers import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ParallelConfig, VllmConfig, CacheConfig
@@ -273,32 +273,6 @@ class OpenPanguDecoderLayer(nn.Module):
 
         _normalize_rope_parameters(config, max_position_embeddings=max_position_embeddings)
 
-        if getattr(config, "use_mome", False):
-            self.mome_state_shapes = (
-                (config.q_lora_rank if hasattr(config, "q_lora_rank") else None,),
-                (config.kv_lora_rank,),
-                (config.num_attention_heads * config.v_head_dim,),
-            )
-
-            self.mome_state_dtypes = (
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.bfloat16,
-            )
-            self.kernel_size = getattr(config, 'router_sliding_window', 0)
-
-        self.num_speculative_tokens = 0 if not vllm_config.speculative_config else vllm_config.speculative_config.num_speculative_tokens
-
-        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-            page_size_padded, block_size_padded = self._calculate_page_size_padded(
-                cache_config=vllm_config.cache_config,
-                cache_dtype_str=None,
-                config=config,
-            )
-        else:
-            page_size_padded = None
-            block_size_padded = vllm_config.cache_config.block_size
-
         is_dsa = hasattr(config, "index_topk") and (not hasattr(config, "dsa_layers") or layer_idx in config.dsa_layers)
         if is_dsa:
             attn_cls = NPUDeepseekSparseAttention
@@ -321,8 +295,6 @@ class OpenPanguDecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
-            page_size_padded=page_size_padded,
-            block_size_padded=block_size_padded,
         )
 
         if (
@@ -379,74 +351,6 @@ class OpenPanguDecoderLayer(nn.Module):
         self.has_block_post_layernorm = layer_idx in getattr(config, "block_post_layernorm_idx", [])
         if self.has_block_post_layernorm:
             self.block_post_layernorm = RMSNorm(block_post_layernorm_hidden_size, eps=config.rms_norm_eps)
-
-    def _calculate_page_size_padded(
-        self,
-        cache_config: CacheConfig,
-        cache_dtype_str: str | None,
-        config: DeepseekV2Config | DeepseekV3Config,
-    ) -> int | None:
-        """
-        Calculate page_size_padded for alignment across different attention mechanisms.
-
-        Alignment priority:
-        1. If DSA exists: align to DSA page size
-        2. Otherwise: align to max(MOME page size, MLA/SWA page size)
-
-        Args:
-            cache_config: Cache configuration
-            cache_dtype_str: Quantization dtype string (e.g., "fp8_ds_mla", "hif8_ds_mla", "int8_ds_mla")
-            config: Model configuration
-
-        Returns:
-            page_size_padded in bytes, or None if no padding needed
-        """
-        from vllm.utils.torch_utils import get_dtype_size
-        from math import prod
-
-        block_size = cache_config.block_size
-        dtype = torch.bfloat16  # Default dtype
-        dtype_size = get_dtype_size(dtype)
-
-        # Calculate MLA/SWA page size
-        mla_head_size = config.kv_lora_rank + config.qk_rope_head_dim
-        mla_page_dim = mla_head_size * dtype_size
-
-        # Calculate DSA page size if DSA layer exists
-        dsa_page_dim = None
-        if hasattr(config, "index_topk") and config.index_topk > 0:
-            index_head_dim = getattr(config, "index_head_dim", 0)
-            # Non-quant case: standard attention format
-            dsa_page_dim = (mla_head_size + index_head_dim) * dtype_size
-
-        # Calculate MOME page size if MOME is enabled
-        mome_page_size = None
-        if getattr(config, "use_mome", False):
-            num_total_tokens = self.kernel_size - 1 + self.num_speculative_tokens
-            mome_page_size = sum(
-                prod(shape) * get_dtype_size(dtype)
-                for (shape, dtype) in zip(self.mome_state_shapes, self.mome_state_dtypes)
-            ) * num_total_tokens
-
-        if dsa_page_dim is None:
-            denominator = mla_page_dim
-        else:
-            denominator = mla_page_dim if mla_page_dim < dsa_page_dim else dsa_page_dim
-
-        v = mome_page_size // denominator - 1
-        lower = 1 << (v.bit_length() - 1)
-        block_size = lower << 1
-
-        # Determine alignment priority
-        if dsa_page_dim is not None:
-            target_page_size = dsa_page_dim * block_size
-        elif mome_page_size is not None:
-            target_page_size = max(mome_page_size, mla_page_dim * block_size)
-        else:
-            block_size = cache_config.block_size
-            target_page_size = mla_page_dim * block_size
-
-        return int(target_page_size), int(block_size)
 
     def forward(
         self,

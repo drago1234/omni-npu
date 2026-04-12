@@ -23,7 +23,6 @@ from vllm.v1.attention.backends.mla.common import MLACommonMetadata
 from omni_npu.attention.backends.mome import NPUPanguMomeBackend, NPUMomeAttentionMetadata
 from omni_npu.layers.mome.npu_mome import ColumnParallelMOME
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
-from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
 logger = init_logger(__name__)
@@ -100,20 +99,9 @@ class NPUMoMEPatch(VLLMPatch):
             # Store parameters for MOME convolutions
             self.q_lora_rank = state_shapes[0][0]
             self.kv_lora_rank = state_shapes[1][0]
-            self.o_dim = state_shapes[2][0]
-
-            if model_extra_config.operator_opt_config.merge_q_kv_conv:
-                self.state_shapes = (
-                    (self.q_lora_rank + self.kv_lora_rank,),
-                    state_shapes[2],
-                )
-                self.state_dtypes = (
-                    torch.bfloat16,
-                    torch.bfloat16,
-                )
-            else:            
-                self.state_shapes = state_shapes
-                self.state_dtypes = state_dtypes
+            self.o_dim = state_shapes[2][0]           
+            self.state_shapes = state_shapes
+            self.state_dtypes = state_dtypes
 
             # KV cache will be set by model runner during initialization
             # Shape: tuple of (q_cache, kv_cache, o_cache)
@@ -140,14 +128,6 @@ class NPUMoMEPatch(VLLMPatch):
             These convolutions use the kernel_size from config (router_sliding_window)
             and are implemented as depthwise conv1d operations with TP support.
             """
-            if model_extra_config.operator_opt_config.merge_q_kv_conv:
-                self.merge_conv = ColumnParallelMOME(
-                    dim=self.q_lora_rank+self.kv_lora_rank,
-                    kernel_width=self.kernel_size,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.merge_conv",
-                    disable_tp=True,
-                )
             # qa_conv: applied to q_lora before q projection
             self.qa_conv = ColumnParallelMOME(
                 dim=self.q_lora_rank,
@@ -218,11 +198,15 @@ class NPUMoMEPatch(VLLMPatch):
             5. num_total_tokens = kernel_size - 1 + num_spec_tokens
             """
             from vllm.v1.kv_cache_interface import MomeSpec
+            enable_prefix_caching =	vllm_config.cache_config.enable_prefix_caching
+            block_size = vllm_config.cache_config.block_size
+            max_model_len = vllm_config.model_config.max_model_len
+            mamba_block_size = block_size if enable_prefix_caching else max_model_len
 
             return MomeSpec(
                 shapes=self.get_state_shape(),
                 dtypes=self.get_state_dtype(),
-                block_size=vllm_config.cache_config.block_size,
+                block_size=mamba_block_size,
                 page_size_padded=self.page_size_padded,
                 mamba_type=self.mamba_type,
                 kernel_size=self.kernel_size,
@@ -275,22 +259,12 @@ class NPUMoMEPatch(VLLMPatch):
 
             mome_metadata = metadata[self.prefix]
 
-            if not model_extra_config.operator_opt_config.merge_q_kv_conv:
-                merge_conv = self.qa_conv
-                if state_indice == 1:
-                    merge_conv = self.compresskv_conv
-                elif state_indice == 2:
-                    merge_conv = self.o_conv
-                conv_state = kv_cache[state_indice]
-            else:
-                if state_indice == 2:
-                    merge_conv = self.o_conv
-                    conv_state = kv_cache[1]
-                elif state_indice == 3:
-                    merge_conv = self.merge_conv
-                    conv_state = kv_cache[0]
-                else:
-                    raise ValueError(f"When enable merge_q_kv_conv, state_indice only supports 2 or 3, but found {state_indice}")
+            merge_conv = self.qa_conv
+            if state_indice == 1:
+                merge_conv = self.compresskv_conv
+            elif state_indice == 2:
+                merge_conv = self.o_conv
+            conv_state = kv_cache[state_indice]
 
             # Apply MOME convolutions separately for decode and prefill
             return self.apply_mome_conv(

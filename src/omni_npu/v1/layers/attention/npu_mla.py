@@ -5,12 +5,14 @@ from typing import Optional, Union
 
 import torch
 import torch_npu
-from transformers import DeepseekV2Config, DeepseekV3Config
+from torch import nn
+from transformers import PretrainedConfig
 
 from vllm.platforms import current_platform
 from vllm.distributed import (
     get_tensor_model_parallel_world_size, 
     get_tp_group,
+    split_tensor_along_last_dim,
 )
 from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -25,12 +27,11 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.logger import init_logger
 logger = init_logger(__name__)
-try: # UT won't include pangu_sink_swa_mla patches
-    from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention, PanguSinkAttentionBase
+
+try:
+    from vllm.model_executor.layers.attention.static_sink_attention import StaticSinkMLAAttention
 except ImportError:
-    logger.warning("PanguSinkAttentionBase has not being defined, skipping...")
-    class PanguSinkAttentionBase:
-        pass
+    logger.warning("StaticSinkMLAAttention has not being defined, skipping...")
 
 try:
     from vllm.model_executor.layers.npumome import MomeAttention
@@ -46,6 +47,7 @@ from omni_npu.attention.backends.mla import NPUMLAImpl, NPUMLAMetadata
 from omni_npu.v1.layers.utils import (
     yarn_get_mscale,
     named_stream,
+    calculate_page_size_padded,
 )
 from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
@@ -74,11 +76,11 @@ from vllm.utils.torch_utils import direct_register_custom_op
 KVCACHE_NZ_DIM = 16
 
 
-class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
+class NPUDeepseekMLAAttention(torch.nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        config: DeepseekV2Config | DeepseekV3Config,
+        config: PretrainedConfig,
         hidden_size: int,
         num_heads: int,
         qk_nope_head_dim: int,
@@ -86,11 +88,9 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         v_head_dim: int,
         q_lora_rank: int | None,
         kv_lora_rank: int,
-        block_size_padded: int = 128,
         max_position_embeddings: int = 8192,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
-        page_size_padded: int | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -112,7 +112,6 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.quant_symbol = quant_config is not None
         self.prefix = prefix
-        self.block_size_padded = block_size_padded
         self._init_wuk_t_uv = False
 
         self.q_a_proj = ReplicatedLinear(
@@ -153,7 +152,6 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            disable_tp=model_extra_config.operator_opt_config.use_noncontiguous_kv,
         )
 
         if config.rope_parameters["rope_type"] != "default":
@@ -195,7 +193,6 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         self.num_spec_tokens = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config is not None else 0
         # MOME
         if getattr(config, "use_mome", False):
-            self.merge_q_kv_conv = model_extra_config.operator_opt_config.merge_q_kv_conv
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
                 self.mome_state_shapes = (
                     (self.q_lora_rank,),
@@ -209,6 +206,17 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 )
                 self.kernel_size = getattr(config, 'router_sliding_window', 0)
                 self.cache_dtype_str = None
+
+                page_size_padded, block_size_padded = calculate_page_size_padded(
+                    cache_config=vllm_config.cache_config,
+                    cache_dtype_str=None,
+                    config=config,
+                    mome_state_shapes=self.mome_state_shapes,
+                    mome_state_dtypes=self.mome_state_dtypes,
+                    kernel_size=self.kernel_size,
+                    num_speculative_tokens=self.num_spec_tokens,
+                )
+
                 mome_kwargs = {
                     "kernel_size": self.kernel_size,
                     "num_spec_tokens": self.num_spec_tokens,
@@ -221,6 +229,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 }
                 self.conv = MomeAttention(**mome_kwargs)
             else:
+                self.merge_q_kv_conv = model_extra_config.operator_opt_config.merge_q_kv_conv
                 self.qa_conv = AggregateConv(self.q_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
                 self.compresskv_conv = AggregateConv(self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
                 if self.merge_q_kv_conv:
@@ -228,6 +237,8 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 else:
                     self.merge_conv = None
                 self.o_conv = AggregateConv(self.num_local_heads * self.v_head_dim, config, vllm_config, output_parallel=True, attn_prefix=f"{prefix}.attn")
+                page_size_padded = None
+                block_size_padded = vllm_config.cache_config.block_size
         else:
             self.conv = None
             self.qa_conv = None
@@ -235,6 +246,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             self.merge_conv = None
             self.o_conv = None
             self.merge_q_kv_conv = False
+            page_size_padded = None
+            block_size_padded = vllm_config.cache_config.block_size
+
+        self.block_size_padded = block_size_padded
 
         if self.param_sink_number == 0:
             self.attn = MLAAttention(
@@ -288,7 +303,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 self.param_sink_k_pe,
                 {
                     "output_dim": 1,
-                    "weight_loader": self.weight_loader,
+                    "weight_loader": self.sink_kv_weight_loader,
                 },
             )
             if self.param_sink_with_value:
@@ -306,7 +321,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                     self.param_sink_compressed_kv,
                     {
                         "output_dim": 1,
-                        "weight_loader": self.weight_loader,
+                        "weight_loader": self.sink_kv_weight_loader,
                     },
                 )
             else:
@@ -358,18 +373,10 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
             if self.conv is not None:
                 kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                if self.merge_q_kv_conv:
-                    merge_data = torch.cat([q_lora, kv_c], dim=-1)
-                    merge_conv = self.conv(merge_data, state_indice=3)
-                    q_lora, kv_c = merge_conv.split(
-                        [self.q_lora_rank, self.kv_lora_rank],
-                        dim=-1,
-                    )
-                else:
-                    kv_c = self.conv(kv_c, state_indice=1)
+                kv_c = self.conv(kv_c, state_indice=1)
             kv = torch.cat([kv_c, k_pe], dim=-1)
 
-            if self.conv is not None and not self.merge_q_kv_conv:
+            if self.conv is not None:
                 q_lora = self.conv(q_lora, state_indice=0)
         else:
             if self.compresskv_conv is not None or self.merge_conv is not None:
@@ -446,16 +453,6 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
         q_nope = q_nope.view(bsz, self.num_local_heads, self.kv_lora_rank)
         q_pe = q_pe.view(bsz, self.num_local_heads, -1)
 
-        if self.param_sink_number > 0:
-            query_heads = 1 << (self.num_local_heads - 1).bit_length()
-            pad_len = query_heads - self.num_local_heads
-            q_nope_pad = q_nope.new_empty((q_nope.shape[0], pad_len, q_nope.shape[-1]))
-            q_nope = torch.cat([q_nope, q_nope_pad], dim=1)
-            q_pe_pad = q_pe.new_empty((q_pe.shape[0], pad_len, q_pe.shape[-1]))
-            q_pe = torch.cat([q_pe, q_pe_pad], dim=1)
-        else:
-            query_heads = self.num_local_heads 
-
         NPUMLAImpl.ensure_decode_attn_mask()
         num_tokens = q_nope.size(0)
         forward_context = get_forward_context()
@@ -471,7 +468,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 "key": kv_cache[0], 
                 "value": kv_cache[0],
                 "key_rope": kv_cache[1],
-                "num_query_heads": query_heads,
+                "num_query_heads": self.num_local_heads,
                 "num_key_value_heads": 1,
                 "input_layout": "TND",
                 "softmax_scale": self.scaling,
@@ -494,8 +491,8 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 kwargs.update(
                     {"sink_number": self.param_sink_number}
                 )
-            attn_output_shape = (num_tokens, query_heads, self.kv_lora_rank)
-            attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            attn_output_shape = (num_tokens, self.num_local_heads, self.kv_lora_rank)
+            attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
             if forward_context.capturing:
                 capture_graph_task(
@@ -550,9 +547,6 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             else:
                 attn_output[:,:actual_query_cumlens[-1],:] = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
 
-        if self.param_sink_number > 0:
-            attn_output = attn_output[:self.num_local_heads]
-
         # Apply UV, (N, B, L) @ W_UV (N, L, V) -> (N, B, V)
         attn_output = attn_output.view(self.num_local_heads, bsz, self.kv_lora_rank) # adapter BSND_NBSD
         attn_output = torch_npu.npu_transpose_batchmatmul(attn_output, self.attn.impl.W_UV, perm_y=(1, 0, 2))
@@ -562,6 +556,9 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             if self.conv is not None:
                 attn_output = get_tp_group().all_gather(attn_output, dim=1)
                 attn_output = self.conv(attn_output, state_indice=2)
+                if self.o_proj.tp_size > 1:
+                    attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
+                    attn_output = attn_output[self.o_proj.tp_rank].contiguous()
         else:
             if self.o_conv is not None:
                 attn_output = self.o_conv(attn_output, force_decode=force_decode, short_prefill=short_prefill) + attn_output
@@ -604,6 +601,9 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                 if self.conv is not None:
                     attn_output = get_tp_group().all_gather(attn_output, dim=1)
                     attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
+                    if self.o_proj.tp_size > 1:
+                        attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
+                        attn_output = attn_output[self.o_proj.tp_rank].contiguous()
             else:
                 if self.o_conv is not None:
                     attn_output = self.o_conv(attn_output) + attn_output
@@ -629,15 +629,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
                 if self.conv is not None:
                     kv_c, k_pe = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                    if self.merge_q_kv_conv:
-                        merge_data = torch.cat([q, kv_c], dim=-1)
-                        merge_conv = self.conv(merge_data, state_indice=3, is_prefill=True)
-                        q, kv_c = merge_conv.split(
-                            [self.q_lora_rank, self.kv_lora_rank],
-                            dim=-1,
-                        )
-                    else:
-                        kv_c = self.conv(kv_c, state_indice=1, is_prefill=True)
+                    kv_c = self.conv(kv_c, state_indice=1, is_prefill=True)
                     latent_cache = torch.cat([kv_c, k_pe], dim=-1)
             else:
                 if self.compresskv_conv is not None:
@@ -658,7 +650,7 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
                     latent_cache = torch.cat([kv_c, k_pe], dim=-1)
 
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-            if self.conv is not None and not self.merge_q_kv_conv:
+            if self.conv is not None:
                 q = self.conv(q, state_indice=0, is_prefill=True)
         else:
             if self.qa_conv is not None and self.merge_conv is None:
@@ -821,6 +813,9 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             if self.conv is not None:
                 attn_output = get_tp_group().all_gather(attn_output, dim=1)
                 attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
+                if self.o_proj.tp_size > 1:
+                    attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
+                    attn_output = attn_output[self.o_proj.tp_rank].contiguous()
         else:
             if self.o_conv is not None:
                 attn_output = self.o_conv(attn_output, only_prefill=only_prefill) + attn_output
@@ -844,13 +839,43 @@ class NPUDeepseekMLAAttention(PanguSinkAttentionBase, torch.nn.Module):
             else:
                 param_sink_compressed_kv = self.param_sink_compressed_kv
             self.attn.update_sink_kv(self.param_sink_k_pe, param_sink_compressed_kv)
-        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-            if self.merge_q_kv_conv and self.conv is not None:
-                self.conv.merge_conv.weight.data = torch.cat([self.conv.qa_conv.weight.data, self.conv.compresskv_conv.weight.data], dim=1).contiguous()
-        else:
+        if not model_extra_config.operator_opt_config.use_noncontiguous_kv:
             if self.merge_q_kv_conv and self.merge_conv is not None:
                 self.merge_conv.merge_conv.weight.data = torch.cat([self.qa_conv.merge_conv.weight.data, self.compresskv_conv.merge_conv.weight.data], dim=0).contiguous()
                 self.merge_conv.conv_weight = self.merge_conv.merge_conv.weight.data.squeeze(1).transpose(0, 1).contiguous()
+
+    def sink_kv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        output_dim = getattr(param, "output_dim", None)
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
+        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+        # bitsandbytes loads the weights of the specific portion
+        # no need to narrow
+        is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+        # Special case for GGUF
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+        # Materialize GGUF UninitializedParameter
+        if is_gguf_weight and isinstance(param, nn.UninitializedParameter):
+            final_shape = list(loaded_weight.shape)
+            if output_dim is not None:
+                tp_size = getattr(self, "tp_size", 1)
+                assert final_shape[output_dim] % tp_size == 0
+                final_shape[output_dim] = final_shape[output_dim] // tp_size
+            param.materialize(final_shape, dtype=loaded_weight.dtype)
+        param_data = param.data
+        if output_dim is not None and not is_sharded_weight:
+            shard_size = param_data.shape[output_dim]
+            tp_rank = getattr(self, "tp_rank", 0)
+            start_idx = tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
 
     @staticmethod
     def _insert_tensor_by_start_loc(
