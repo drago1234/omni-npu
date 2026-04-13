@@ -120,6 +120,14 @@ class NPUPanguIndexer(torch.nn.Module):
             unquant_output = self._apply_lightning_indexer_unquant(*args, **kwargs)
             return unquant_output
 
+    def _apply_lightning_indexer_cp(self, *args, **kwargs):
+        if self.cache_config.cache_dtype in self.quant_cache_dtype:
+            quant_output = self._apply_lightning_indexer_cp_quant(*args, **kwargs)
+            return quant_output
+        else:
+            unquant_output = self._apply_lightning_indexer_cp_unquant(*args, **kwargs)
+            return unquant_output
+
     def _update_indexer_cache(self, *args, **kwargs):
         if quant_output := self._update_indexer_cache_quant(*args, **kwargs):
             return quant_output
@@ -201,6 +209,58 @@ class NPUPanguIndexer(torch.nn.Module):
                 actual_seq_lengths_query=metadata.query_cumlens,
                 actual_seq_lengths_key=metadata.seq_lens,
                 block_table=metadata.block_table,
+                query_quant_mode=0,
+                key_quant_mode=0,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+            )
+
+    def _apply_lightning_indexer_cp_unquant(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        sp_manager: Optional[MLACommonMetadata] = None,
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        actual_seq_lengths_query, actual_seq_lengths_kv, _, block_table = sp_manager.cp_attn_meta()
+
+        return torch.ops.custom.npu_lightning_indexer_enhance(
+            query=q,
+            key=kv_cache[1].unsqueeze(2),
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_kv,
+            block_table=block_table,
+            layout_key="PA_BSND",
+            layout_query="TND",
+            sparse_count=self.index_topk,
+            sparse_mode=3,
+            sparse_block_size=1,
+            sparse_block_mode=False,
+        )[0]
+
+    def _apply_lightning_indexer_cp_quant(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        sp_manager: Optional[MLACommonMetadata] = None,
+        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        actual_seq_lengths_query, actual_seq_lengths_kv, _, block_table = sp_manager.cp_attn_meta()
+
+        if self.cache_config.cache_dtype in ["int8_ds_mla"]:
+            q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
+            return torch_npu.torch.ops.custom.npu_ai_infra_quant_lightning_indexer(
+                query=q_int8,
+                key=kv_cache[1][..., :128].unsqueeze(2),
+                weights=weights.to(torch.float16),
+                query_dequant_scale=q_scale.to(torch.float16),
+                key_dequant_scale=kv_cache[1][..., 128:].view(torch.float16),
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_kv,
+                block_table=block_table,
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -346,30 +406,6 @@ class NPUPanguIndexer(torch.nn.Module):
             attn_metadata,
             kv_cache,
         )
-
-    def _apply_lightning_indexer_cp(
-        self,
-        q: torch.Tensor,
-        weights: torch.Tensor,
-        sp_manager: Optional[MLACommonMetadata] = None,
-        kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        actual_seq_lengths_query, actual_seq_lengths_kv, _, block_table = sp_manager.cp_attn_meta()
-
-        return torch.ops.custom.npu_lightning_indexer_enhance(
-            query=q,
-            key=kv_cache[1].unsqueeze(2),
-            weights=weights,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_kv,
-            block_table=block_table,
-            layout_key="PA_BSND",
-            layout_query="TND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-            sparse_block_size=1,
-            sparse_block_mode=False,
-        )[0]
 
     def forward_cp(
         self,
@@ -1089,25 +1125,49 @@ class NPUPanguSparseAttention(torch.nn.Module):
         sink_k_pe = self.param_sink_k_pe.unsqueeze(1)
         sink_kv = torch.cat([sink_k_nope, sink_k_pe], dim=-1)
 
-        attn_output = torch.ops.custom.npu_ai_infra_sparse_flash_attention_pioneer(
-            query=q,
-            key=kv_cache[0].unsqueeze(2),
-            value=self.dummy_value_cache,
-            sparse_indices=topk_indices,
-            scale_value=self.scaling,
-            sparse_block_size=1,
-            block_table=block_table,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            pre_tokens=(1<<63)-1,
-            next_tokens=(1<<63)-1,
-            attention_mode=2,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-            key_sink=sink_kv,
-            value_sink=sink_k_nope,
-        )[0]
+        if self.cache_config.cache_dtype in ["int8_ds_mla"]:
+            attn_output = torch.ops.custom.npu_ai_infra_kv_quant_sparse_flash_attention(
+                query=q,
+                key=kv_cache[0].unsqueeze(2),
+                value=kv_cache[0].unsqueeze(2),
+                sparse_indices=topk_indices,
+                scale_value=self.scaling,
+                key_quant_mode=2,
+                value_quant_mode=2,
+                sparse_block_size=1,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                key_sink=sink_kv,
+                value_sink=sink_k_nope,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                block_table=block_table,
+                attention_mode=2,
+                quant_scale_repo_mode=1,
+                tile_size=128,
+                rope_head_dim=64,
+            )
+        else:
+            attn_output = torch.ops.custom.npu_ai_infra_sparse_flash_attention_pioneer(
+                query=q,
+                key=kv_cache[0].unsqueeze(2),
+                value=self.dummy_value_cache,
+                sparse_indices=topk_indices,
+                scale_value=self.scaling,
+                sparse_block_size=1,
+                block_table=block_table,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                pre_tokens=(1<<63)-1,
+                next_tokens=(1<<63)-1,
+                attention_mode=2,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                key_sink=sink_kv,
+                value_sink=sink_k_nope,
+            )[0]
 
         attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank)
@@ -1245,6 +1305,11 @@ class NPUPanguSparseAttention(torch.nn.Module):
             "quant_mode": "none",
             "is_output_kv": True,
         }
+
+        if self.cache_config.cache_dtype in ["int8_ds_mla"]:
+            kwargs.update({
+                "quant_mode": "pertile128",
+            })
 
         k_pe, k_nope = torch.ops.custom.npu_ai_infra_kv_rmsnorm_rope_cache_v2(**kwargs)
         ### KV stream ends ###
