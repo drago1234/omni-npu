@@ -164,3 +164,21 @@ dsa_attn_decorator = create_plugin_decorator(
     pre_method="pre_attn",
     post_method="post_attn"
 )
+
+mla_attn_decorator = create_plugin_decorator(
+    entry_point_group="omni.mla_attn_decorators",
+    pre_method="pre_attn",
+    post_method="post_attn"
+)
+
+mome_attn_decorator = create_plugin_decorator(
+    entry_point_group="omni.mome_attn_decorators",
+    pre_method="pre_attn",
+    post_method="post_attn"
+)
+
+post_model_forward_decorator = create_plugin_decorator(
+    entry_point_group="omni.model_forward_decorators",
+    pre_method="pre_model_forward",
+    post_method="post_model_forward"
+)

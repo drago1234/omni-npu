@@ -44,6 +44,7 @@ from vllm.sequence import IntermediateTensors
 
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.layers.mhc.npu_mhc import NPUmHC
+from omni_npu.plugin_decorators import post_model_forward_decorator
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
@@ -565,6 +566,7 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    @post_model_forward_decorator
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -22,6 +22,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.v1.attention.backends.mla.common import MLACommonMetadata
 from omni_npu.attention.backends.mome import NPUPanguMomeBackend, NPUMomeAttentionMetadata
 from omni_npu.layers.mome.npu_mome import ColumnParallelMOME
+from omni_npu.plugin_decorators import mome_attn_decorator
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 
@@ -275,6 +276,7 @@ class NPUMoMEPatch(VLLMPatch):
                 is_prefill=is_prefill,
             )
 
+        @mome_attn_decorator
         def apply_mome_conv(
             self,
             x: torch.Tensor,

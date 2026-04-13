@@ -70,6 +70,7 @@ from omni_npu.compilation.utils import (
     OP_FIA_V1,
     OP_FIA_SINK,
 )
+from omni_npu.plugin_decorators import mla_attn_decorator
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -454,99 +455,23 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         q_nope = q_nope.view(bsz, self.num_local_heads, self.kv_lora_rank)
         q_pe = q_pe.view(bsz, self.num_local_heads, -1)
 
-        NPUMLAImpl.ensure_decode_attn_mask()
         num_tokens = q_nope.size(0)
-        forward_context = get_forward_context()
-        if self.param_sink_number > 0:
-            if self.sliding_window is not None:
-                window_size = self.sliding_window-1
-            else:
-                window_size = NPUMLAImpl.MAX_WINDOW_SIZE
-            actual_query_cumlens = attn_metadata.query_cumlens
-            kwargs = {
-                "query": q_nope[:actual_query_cumlens[-1]], 
-                "query_rope": q_pe[:actual_query_cumlens[-1]],
-                "key": kv_cache[0], 
-                "value": kv_cache[0],
-                "key_rope": kv_cache[1],
-                "num_query_heads": self.num_local_heads,
-                "num_key_value_heads": 1,
-                "input_layout": "TND",
-                "softmax_scale": self.scaling,
-                "block_table": attn_metadata.block_table,
-                "block_size": self.block_size_padded,
-                "actual_seq_qlen": actual_query_cumlens,
-                "actual_seq_kvlen": attn_metadata.seq_lens,
-                "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
-                "sparse_mode": 4,
-                "pre_tokens": window_size,
-                "next_tokens": 0,
-            }
-            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-                kwargs.update(
-                    {"key_sink" : self.attn.sink_compressed_kv.unsqueeze(1),
-                    "value_sink" : self.attn.sink_compressed_kv.unsqueeze(1),
-                    "key_rope_sink" : self.attn.sink_k_pe.unsqueeze(1)}
-                )
-            else:
-                kwargs.update(
-                    {"sink_number": self.param_sink_number}
-                )
-            attn_output_shape = (num_tokens, self.num_local_heads, self.kv_lora_rank)
-            attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
-            softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
-            if forward_context.capturing:
-                capture_graph_task(
-                    op_desc=OP_FIA_SINK,
-                    op_kwargs=kwargs,
-                    out_tensors=[attn_output, softmax_lse],
-                    num_tokens=num_tokens,
-                    layer_name=layer_name,
-                )
-            else:
-                attn_output[:actual_query_cumlens[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(
-                    **kwargs
-                )[0]
-            attn_output = attn_output.transpose(0, 1).contiguous() # TND -> NTD
-        else:
-            actual_query_cumlens = attn_metadata.query_cumlens
-            sparse_mode = 3
-            input_layout = "TND_NTD"
-            attn_output_shape = (self.num_local_heads, num_tokens, self.kv_lora_rank)
-            attn_mask = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE
-            num_key_value_heads = 1
-            block_size = 128
-            kwargs = {
-                "query": q_nope[:actual_query_cumlens[-1]],
-                "key": k_nope,
-                "value": k_nope,
-                "query_rope": q_pe[:actual_query_cumlens[-1]],
-                "key_rope": k_rope,
-                "num_heads": self.num_local_heads,
-                "num_key_value_heads": num_key_value_heads,
-                "input_layout": input_layout,
-                "atten_mask": attn_mask,
-                "sparse_mode": sparse_mode,
-                "scale": self.scaling,
-                "antiquant_mode": 0,
-                "antiquant_scale": None,
-                "block_table": attn_metadata.block_table,
-                "block_size": block_size,
-                "actual_seq_lengths": actual_query_cumlens,
-                "actual_seq_lengths_kv": attn_metadata.seq_lens,
-            }
-            attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
-            softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
-            if forward_context.capturing:
-                capture_graph_task(
-                    op_desc=OP_FIA_V1,
-                    op_kwargs=kwargs,
-                    out_tensors=[attn_output, softmax_lse],
-                    num_tokens=num_tokens,
-                    layer_name=layer_name,
-                )
-            else:
-                attn_output[:,:actual_query_cumlens[-1],:] = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
+
+        # general _apply_attention method
+        attn_output = self._apply_attention(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_rope,
+            q_cumlens=attn_metadata.query_cumlens,
+            kv_lens=attn_metadata.seq_lens,
+            block_table=attn_metadata.block_table,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            num_tokens=num_tokens,
+            layer_name=layer_name,
+            is_prefill=False,
+        )
 
         # Apply UV, (N, B, L) @ W_UV (N, L, V) -> (N, B, V)
         attn_output = attn_output.view(self.num_local_heads, bsz, self.kv_lora_rank) # adapter BSND_NBSD
@@ -576,10 +501,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
     ) -> torch.Tensor:
         only_prefill = True if pd_mixed_flag else False
         q = self.q_a_proj(hidden_states)[0]
-        attn_output = q.new_empty(
-            q.shape[0],
-            self.num_local_heads,
-            self.v_head_dim)
 
         if attn_metadata is None: # for memory usage recording in dummy_run
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
@@ -596,8 +517,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             k_pe = k_pe.unsqueeze(2)
             k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin)
             k_pe = k_pe.squeeze(2)
-            attn_output.fill_(0)
-            attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
+            attn_output = q.new_zeros(q.shape[0], self.num_local_heads * self.v_head_dim)
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
                 if self.conv is not None:
                     attn_output = get_tp_group().all_gather(attn_output, dim=1)
@@ -739,6 +659,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         prefill_k_rope = prefill_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
 
+        # calculate kv_cumlens and sink tensors
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
             sink_k_pe = self.attn.sink_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
             sink_k_nope, sink_v = torch.split(
@@ -746,7 +667,9 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 [self.qk_nope_head_dim, self.v_head_dim],
                 dim=-1,
             )
+            kv_cumlens = actual_seq_qlen
         else:
+            sink_k_nope, sink_v, sink_k_pe = None, None, None
             if self.param_sink_number > 0:
                 # When sink tokens are used, the actual sequence lengths for key and value are different.
                 num_prefills = len(actual_seq_qlen)
@@ -755,58 +678,25 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             else:
                 kv_cumlens = actual_seq_qlen
 
-        if self.param_sink_number > 0:
-            if self.sliding_window is not None:
-                window_size = self.sliding_window-1
-            else:
-                window_size = NPUMLAImpl.MAX_WINDOW_SIZE
-
-            kwargs = {
-                "query": q_nope[:actual_seq_qlen[-1]].contiguous(),
-                "query_rope": q_pe[:actual_seq_qlen[-1]],
-                "key": k_nope.contiguous(),
-                "value": v.contiguous(),
-                "key_rope": prefill_k_rope,
-                "num_query_heads": self.num_local_heads,
-                "num_key_value_heads": self.num_local_heads,
-                "input_layout": "TND",
-                "softmax_scale": self.scaling,
-                "sparse_mode": 4,
-                "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
-                "actual_seq_qlen": actual_seq_qlen,
-                "pre_tokens": window_size,
-                "next_tokens": 0,
-            }
-            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-                kwargs.update(
-                    {"actual_seq_kvlen": actual_seq_qlen,
-                    "key_sink": sink_k_nope.contiguous(),
-                    "value_sink": sink_v.contiguous(),
-                    "key_rope_sink": sink_k_pe}
-                )
-            else:
-                kwargs.update(
-                    {"actual_seq_kvlen": kv_cumlens,
-                    "sink_number": self.param_sink_number,}
-                )
-            attn_output[:actual_seq_qlen[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
-        else:
-            attn_output[:actual_seq_qlen[-1]] = torch.ops.npu.npu_fused_infer_attention_score(
-                q_nope[:actual_seq_qlen[-1]],
-                k_nope,
-                v,
-                query_rope=q_pe[:actual_seq_qlen[-1]],
-                key_rope=prefill_k_rope,
-                num_heads=self.num_local_heads,
-                num_key_value_heads=self.num_local_heads,
-                input_layout="TND",
-                atten_mask=attn_mask,
-                sparse_mode=sparse_mode,
-                actual_seq_lengths=actual_seq_qlen,
-                actual_seq_lengths_kv=kv_cumlens,
-                scale=self.scaling,
-                next_tokens=0
-            )[0]
+        # use general _apply_attention method
+        attn_output = self._apply_attention(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=prefill_k_rope,
+            q_cumlens=actual_seq_qlen,
+            kv_lens=kv_cumlens,
+            block_table=None,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            num_tokens=actual_seq_qlen[-1],
+            layer_name="",
+            is_prefill=True,
+            v=v,
+            sink_k_nope=sink_k_nope,
+            sink_v=sink_v,
+            sink_k_pe=sink_k_pe,
+        )
 
         attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
 
@@ -899,6 +789,317 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             offset += seg_len
 
         return result
+
+    @mla_attn_decorator
+    def _apply_attention(
+        self,
+        q_nope: torch.Tensor,       # [T, N, kv_lora_rank]
+        q_pe: torch.Tensor,         # [T, N, qk_rope_head_dim]
+        k_nope: torch.Tensor,       # kv_cache, depends on use_noncontiguous_kv
+        k_pe: torch.Tensor,         # kv_cache style
+        q_cumlens: torch.Tensor = None,   # int32 [B]
+        kv_lens: torch.Tensor = None,     # int32 [B]
+        block_table: torch.Tensor = None, # int32 [T, *]
+        kv_cache: tuple[torch.Tensor] = None,  # (k_nope_cache, k_pe_cache)
+        attn_metadata: NPUMLAMetadata = None,
+        num_tokens: int = None,     # output shape
+        layer_name: str = "",       # for capture_graph_task
+        is_prefill: bool = False,   # check prefill/decode
+        v: torch.Tensor = None,     # Prefill value [T, N, v_head_dim]
+        sink_k_nope: torch.Tensor = None,  # Sink key for prefill sink attention
+        sink_v: torch.Tensor = None,       # Sink value for prefill sink attention
+        sink_k_pe: torch.Tensor = None,    # Sink rope for prefill sink attention
+    ) -> torch.Tensor:  # [N, T, kv_lora_rank] (decode) or [T, N, v_head_dim] (prefill)
+        """
+        Perform MLA attention calculation.
+
+        Args:
+            q_nope: Query nope part, absorbed with W_UK_T
+            q_pe: Query position embedding part
+            k_nope: Key nope part, format depends on use_noncontiguous_kv
+            k_pe: Key position embedding part
+            q_cumlens: Query cumulative lengths [B]
+            kv_lens: KV lengths [B]
+            block_table: Block table [T, *]
+            kv_cache: KV cache tuple (k_nope_cache, k_pe_cache)
+            attn_metadata: MLA attention metadata
+            num_tokens: Number of tokens, used for output shape
+            layer_name: Layer name, used for graph capture
+            is_prefill: Whether this is prefill stage
+            v: Value tensor for prefill stage [T, N, v_head_dim]
+            sink_k_nope: Sink key for prefill sink attention
+            sink_v: Sink value for prefill sink attention
+            sink_k_pe: Sink rope for prefill sink attention
+
+        Returns:
+            Attention output:
+            - Decode: [N, T, kv_lora_rank]
+            - Prefill: [T, N, v_head_dim]
+        """
+        if q_cumlens is None or kv_lens is None:
+            return torch.zeros_like(q_nope)  # dummy run
+
+        forward_context = get_forward_context()
+        query_heads = self.num_local_heads
+
+        # For sink attention, decode stage needs padding to power of 2
+        # Prefill stage does not need padding
+        if self.param_sink_number > 0 and not is_prefill:
+            query_heads = 1 << (self.num_local_heads - 1).bit_length()
+            pad_len = query_heads - self.num_local_heads
+            if pad_len > 0:
+                q_nope_pad = q_nope.new_zeros((q_nope.shape[0], pad_len, q_nope.shape[-1]))
+                q_nope = torch.cat([q_nope, q_nope_pad], dim=1)
+                q_pe_pad = q_pe.new_zeros((q_pe.shape[0], pad_len, q_pe.shape[-1]))
+                q_pe = torch.cat([q_pe, q_pe_pad], dim=1)
+
+        # Determine window size
+        if self.param_sink_number > 0:
+            if self.sliding_window is not None:
+                window_size = self.sliding_window - 1
+            else:
+                window_size = NPUMLAImpl.MAX_WINDOW_SIZE
+        else:
+            window_size = None
+
+        # Choose different attention implementation based on sink tokens
+        if self.param_sink_number > 0:
+            attn_output = self._apply_sink_attention(
+                q_nope, q_pe, k_nope, k_pe,
+                q_cumlens, kv_lens, block_table, kv_cache,
+                attn_metadata, num_tokens, layer_name,
+                is_prefill, query_heads, window_size, forward_context,
+                v, sink_k_nope, sink_v, sink_k_pe
+            )
+            # Remove padding (only for decode stage with NTD format)
+            if not is_prefill and query_heads > self.num_local_heads:
+                attn_output = attn_output[:self.num_local_heads]
+            return attn_output
+        else:
+            return self._apply_standard_attention(
+                q_nope, q_pe, k_nope, k_pe,
+                q_cumlens, kv_lens, block_table, kv_cache,
+                attn_metadata, num_tokens, layer_name,
+                is_prefill, query_heads, forward_context, v
+            )
+
+    def _apply_sink_attention(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        q_cumlens: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: NPUMLAMetadata,
+        num_tokens: int,
+        layer_name: str,
+        is_prefill: bool,
+        query_heads: int,
+        window_size: int,
+        forward_context,
+        v: torch.Tensor = None,
+        sink_k_nope: torch.Tensor = None,
+        sink_v: torch.Tensor = None,
+        sink_k_pe: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Sink attention implementation for param_sink_number > 0"""
+        NPUMLAImpl.ensure_decode_attn_mask()
+
+        if is_prefill:
+            # Prefill stage sink attention
+            # Use the passed v (v_head_dim dimension)
+            value = v if v is not None else k_nope
+            kwargs = {
+                "query": q_nope[:q_cumlens[-1]].contiguous(),
+                "query_rope": q_pe[:q_cumlens[-1]],
+                "key": k_nope.contiguous(),
+                "value": value.contiguous(),
+                "key_rope": k_pe,
+                "num_query_heads": self.num_local_heads,  # prefill does not need padding
+                "num_key_value_heads": self.num_local_heads,
+                "input_layout": "TND",
+                "softmax_scale": self.scaling,
+                "sparse_mode": 4,
+                "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                "actual_seq_qlen": q_cumlens,
+                "pre_tokens": window_size,
+                "next_tokens": 0,
+            }
+
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                # Prefill stage must pass correctly shaped sink tensors
+                # sink_k_nope: [sink_number, num_local_heads, qk_nope_head_dim]
+                # sink_v: [sink_number, num_local_heads, v_head_dim]
+                # sink_k_pe: [sink_number, num_local_heads, qk_rope_head_dim]
+                if sink_k_nope is None or sink_v is None or sink_k_pe is None:
+                    raise ValueError("sink_k_nope, sink_v, sink_k_pe must be provided for prefill with use_noncontiguous_kv")
+                kwargs.update({
+                    "actual_seq_kvlen": q_cumlens,
+                    "key_sink": sink_k_nope.contiguous(),
+                    "value_sink": sink_v.contiguous(),
+                    "key_rope_sink": sink_k_pe,
+                })
+            else:
+                kwargs.update({
+                    "actual_seq_kvlen": kv_lens,
+                    "sink_number": self.param_sink_number,
+                })
+
+            # Prefill output dimension is v_head_dim
+            # Note: num_tokens should equal q_cumlens[-1], using q_nope.shape[0] is safer
+            attn_output_shape = (q_nope.shape[0], self.num_local_heads, self.v_head_dim)
+            attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            attn_output[:q_cumlens[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
+            # Prefill stage keeps TND format
+        else:
+            # Decode stage sink attention
+            kwargs = {
+                "query": q_nope[:q_cumlens[-1]],
+                "query_rope": q_pe[:q_cumlens[-1]],
+                "key": kv_cache[0],
+                "value": kv_cache[0],
+                "key_rope": kv_cache[1],
+                "num_query_heads": query_heads,
+                "num_key_value_heads": 1,
+                "input_layout": "TND",
+                "softmax_scale": self.scaling,
+                "block_table": block_table,
+                "block_size": self.block_size_padded,
+                "actual_seq_qlen": q_cumlens,
+                "actual_seq_kvlen": kv_lens,
+                "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+                "sparse_mode": 4,
+                "pre_tokens": window_size,
+                "next_tokens": 0,
+            }
+
+            if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                kwargs.update({
+                    "key_sink": self.attn.sink_compressed_kv.unsqueeze(1),
+                    "value_sink": self.attn.sink_compressed_kv.unsqueeze(1),
+                    "key_rope_sink": self.attn.sink_k_pe.unsqueeze(1),
+                })
+            else:
+                kwargs.update({
+                    "sink_number": self.param_sink_number,
+                })
+
+            # Decode output dim kv_lora_rank
+            attn_output_shape = (num_tokens, query_heads, self.kv_lora_rank)
+            attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
+
+            if forward_context.capturing:
+                capture_graph_task(
+                    op_desc=OP_FIA_SINK,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
+                    num_tokens=num_tokens,
+                    layer_name=layer_name,
+                )
+            else:
+                attn_output[:q_cumlens[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
+
+            attn_output = attn_output.transpose(0, 1).contiguous()  # TND -> NTD
+
+        return attn_output
+
+    def _apply_standard_attention(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        q_cumlens: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        kv_cache: tuple[torch.Tensor],
+        attn_metadata: NPUMLAMetadata,
+        num_tokens: int,
+        layer_name: str,
+        is_prefill: bool,
+        query_heads: int,
+        forward_context,
+        v: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """standard attention, for param_sink_number == 0 """
+        if is_prefill:
+            # Prefill phase
+            sparse_mode = 3 if attn_metadata.max_query_len > 1 else 0
+            attn_mask = self.attn.impl.SHARE_MASK_TRIL_SPARSE if sparse_mode == 3 else None
+
+            # Prefill output dim v_head_dim
+            value = v if v is not None else k_nope
+            attn_output_shape = (q_nope.shape[0], self.num_local_heads, self.v_head_dim)
+            attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+
+            attn_output[:q_cumlens[-1]] = torch.ops.npu.npu_fused_infer_attention_score(
+                q_nope[:q_cumlens[-1]],
+                k_nope,
+                value,
+                query_rope=q_pe[:q_cumlens[-1]],
+                key_rope=k_pe,
+                num_heads=self.num_local_heads,
+                num_key_value_heads=self.num_local_heads,
+                input_layout="TND",
+                atten_mask=attn_mask,
+                sparse_mode=sparse_mode,
+                actual_seq_lengths=q_cumlens,
+                actual_seq_lengths_kv=kv_lens,
+                scale=self.scaling,
+                next_tokens=0
+            )[0]
+            # Prefill use TND
+
+        else:
+            # Decode phase
+            NPUMLAImpl.ensure_decode_attn_mask()
+            sparse_mode = 3
+            input_layout = "TND_NTD"
+            block_size = 128
+
+            # Decode output dim is kv_lora_rank
+            attn_output_shape = (self.num_local_heads, num_tokens, self.kv_lora_rank)
+            attn_mask = NPUMLAImpl.SHARE_MASK_TRIL_SPARSE
+
+            kwargs = {
+                "query": q_nope[:q_cumlens[-1]],
+                "key": k_nope,
+                "value": k_nope,
+                "query_rope": q_pe[:q_cumlens[-1]],
+                "key_rope": k_pe,
+                "num_heads": self.num_local_heads,
+                "num_key_value_heads": 1,
+                "input_layout": input_layout,
+                "atten_mask": attn_mask,
+                "sparse_mode": sparse_mode,
+                "scale": self.scaling,
+                "antiquant_mode": 0,
+                "antiquant_scale": None,
+                "block_table": block_table,
+                "block_size": block_size,
+                "actual_seq_lengths": q_cumlens,
+                "actual_seq_lengths_kv": kv_lens,
+            }
+
+            attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
+
+            if forward_context.capturing:
+                capture_graph_task(
+                    op_desc=OP_FIA_V1,
+                    op_kwargs=kwargs,
+                    out_tensors=[attn_output, softmax_lse],
+                    num_tokens=num_tokens,
+                    layer_name=layer_name,
+                )
+            else:
+                attn_output[:, :q_cumlens[-1], :] = torch.ops.npu.npu_fused_infer_attention_score(**kwargs)[0]
+
+        return attn_output
 
 def npu_mla_forward(  
     hidden_states: torch.Tensor,
