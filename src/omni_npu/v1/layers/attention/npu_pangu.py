@@ -1973,7 +1973,7 @@ def npu_pangu_forward(
                 hidden_states, cos, sin, attn_metadata, 
                 phase="prefill",
             )
-            prefill_output = self._forward_prefill(
+            hidden_states[num_decode_tokens:num_actual_tokens] = self._forward_prefill(
                 prefill_hidden_states,
                 prefill_cos,
                 prefill_sin,
@@ -1985,7 +1985,7 @@ def npu_pangu_forward(
                 hidden_states, cos, sin, attn_metadata, 
                 phase="decode",
             )
-            decode_output = self._forward_decode(
+            hidden_states[:num_decode_tokens] = self._forward_decode(
                 decode_hidden_states,
                 decode_cos,
                 decode_sin,
@@ -1995,7 +1995,6 @@ def npu_pangu_forward(
             
             self._restore_phase_metadata(attn_metadata)
 
-            hidden_states = torch.cat([decode_output, prefill_output], dim=0)
         elif attn_metadata.prefill is not None:
             if enable_cp:
                 assert self.all2all_backend != "naive", "Context parallel is not supported with naive all2all backend"
