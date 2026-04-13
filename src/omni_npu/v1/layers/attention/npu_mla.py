@@ -10,7 +10,8 @@ from transformers import PretrainedConfig
 
 from vllm.platforms import current_platform
 from vllm.distributed import (
-    get_tensor_model_parallel_world_size, 
+    get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     get_tp_group,
     split_tensor_along_last_dim,
 )
@@ -905,6 +906,9 @@ def npu_mla_forward(
     sin: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
+    if model_extra_config.parall_config.ena_seq_parallel:
+        hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
+
     full_hidden_states = hidden_states
     total_tokens = full_hidden_states.shape[0]
 
@@ -943,7 +947,10 @@ def npu_mla_forward(
         return {"x_int8": x_int8, "pertoken_scale": scale}
 
     if attn_metadata is None:
-        return self._forward_prefill(_maybe_quant(hidden_states), cos, sin, attn_metadata)
+        output = self._forward_prefill(_maybe_quant(hidden_states), cos, sin, attn_metadata)
+        if model_extra_config.parall_config.ena_seq_parallel:
+            output = get_tp_group().reduce_scatter(output, dim=0)
+        return output
 
     num_actual_tokens = attn_metadata.num_actual_tokens
     num_decode_tokens = attn_metadata.num_decode_tokens
@@ -972,15 +979,14 @@ def npu_mla_forward(
         )
 
         mixed_output = torch.cat([decode_output, prefill_output], dim=0)
-        return _pad_output_to_input_tokens(mixed_output)
-
-    if has_prefill:
+        output = _pad_output_to_input_tokens(mixed_output)
+    elif has_prefill:
         prefill_hs = hidden_states[num_decode_tokens:num_actual_tokens]
         prefill_cos = cos[num_decode_tokens:num_actual_tokens]
         prefill_sin = sin[num_decode_tokens:num_actual_tokens]
         attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
         prefill_output = self._forward_prefill(_maybe_quant(prefill_hs), prefill_cos, prefill_sin, attn_metadata.prefill)
-        return _pad_output_to_input_tokens(prefill_output)
+        output = _pad_output_to_input_tokens(prefill_output)
     else:
         decode_hs = hidden_states[:num_decode_tokens]
         decode_cos = cos[:num_decode_tokens]
@@ -993,9 +999,18 @@ def npu_mla_forward(
             attn_metadata.decode,
             layer_name=f"{layer_name}.attn",
         )
-        return _pad_output_to_input_tokens(decode_output)
-    
-    
+        output = _pad_output_to_input_tokens(decode_output)
+
+    if model_extra_config.parall_config.ena_seq_parallel:
+        if self.o_proj.tp_size == 1:
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            output = split_tensor_along_last_dim(output, num_partitions=tp_size)
+            output = output[tp_rank].contiguous()
+        else:
+            output = get_tp_group().reduce_scatter(output, dim=0)
+    return output
+
 def npu_mla_forward_fake(   
     hidden_states: torch.Tensor,
     cos: torch.Tensor,

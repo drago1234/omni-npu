@@ -22,10 +22,6 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -46,13 +42,15 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
-from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
-from omni_npu.layers.fused_moe.layer import NPUSharedFusedMoE
-from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
-from omni_npu.v1.layers.vocab_parallel_embedding import NPUVocabParallelEmbedding
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.layers.mhc.npu_mhc import NPUmHC
+from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
+from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
+from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
+from omni_npu.v1.layers.vocab_parallel_embedding import (
+    NPUParallelLMHead,
+    NPUVocabParallelEmbedding,
+)
 
 
 def check_ffn_act_fn(act_fn: str) -> None:
@@ -446,7 +444,7 @@ class OpenPanguModel(nn.Module):
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
-            self.embed_tokens = VocabParallelEmbedding(
+            self.embed_tokens = NPUVocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
@@ -478,7 +476,7 @@ class OpenPanguModel(nn.Module):
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return self.embed_tokens(input_ids, enable_scatter=model_extra_config.parall_config.ena_seq_parallel)
 
     def forward(
         self,
@@ -517,6 +515,9 @@ class OpenPanguModel(nn.Module):
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
+
+        if model_extra_config.parall_config.ena_seq_parallel:
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
         return hidden_states
 
 
@@ -546,7 +547,7 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
+            self.lm_head = NPUParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,

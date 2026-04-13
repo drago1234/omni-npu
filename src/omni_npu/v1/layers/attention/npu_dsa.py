@@ -262,7 +262,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
 
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
-        self.num_local_heads = num_heads // tp_size
+        self.num_local_heads = num_heads if model_extra_config.parall_config.ena_context_parallel else num_heads // tp_size
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -302,6 +302,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
+                disable_tp=model_extra_config.parall_config.ena_context_parallel,
             )
         else:
             self.q_proj = ColumnParallelFlashCommLinear(
@@ -310,6 +311,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
+                disable_tp=model_extra_config.parall_config.ena_context_parallel,
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelFlashCommLinear(
@@ -318,6 +320,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
+            disable_tp=model_extra_config.parall_config.ena_context_parallel,
         )
         self.o_proj = RowParallelFlashCommLinear(
             self.num_heads * self.v_head_dim,
@@ -325,6 +328,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=model_extra_config.parall_config.ena_context_parallel,
         )
 
         self.rope_interleaved = getattr(config,"rope_interleaved", True)
@@ -934,6 +938,43 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 out = self.o_conv(out, only_prefill=only_prefill) + out
         return self.o_proj(out)[0]
 
+    def _apply_mome_prefill_cp(
+        self,
+        x: torch.Tensor,
+        state_indice: int,
+        sp_manager: Optional[SPManager] = None,
+    ) -> torch.Tensor:
+        assert not model_extra_config.operator_opt_config.merge_q_kv_conv, "merge_q_kv_conv is not supported when prefill cp is enabled"
+        assert model_extra_config.operator_opt_config.use_noncontiguous_kv, "use_noncontiguous_kv is required when prefill cp is enabled"
+
+        merged_x = sp_manager.mome_suffix_exchange(x)
+        merged_x = sp_manager.broadcast_mome_req_tails_from_rank0(merged_x)
+
+        forward_context = get_forward_context()
+        metadata = forward_context.attn_metadata
+        if metadata is None:
+            return x
+        kv_cache = self.conv.kv_cache[forward_context.virtual_engine]
+
+        mome_metadata = metadata[self.conv.prefix]
+        if mome_metadata.prefill is None:
+            return x
+
+        merge_conv = self.conv.qa_conv
+        if state_indice == 1:
+            merge_conv = self.conv.compresskv_conv
+        elif state_indice == 2:
+            merge_conv = self.conv.o_conv
+
+        merged_x = merge_conv.forward_prefill(
+            x=merged_x,
+            conv_states=kv_cache[state_indice][:, :self.conv.kernel_size - 1],
+            cache_indices=mome_metadata.prefill.cache_indices,
+            query_start_loc=sp_manager.cp_mome_query_start_loc,
+        )
+
+        return sp_manager.mome_split_and_cat(merged_x)
+
     def _forward_prefill_cp(
         self,
         x: torch.Tensor,   # TD
@@ -965,15 +1006,18 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         sp_x, cp_x = x, sp_manager.sp_to_cp(x) # TD
 
         q_lora = self.q_a_proj(cp_x)[0]     # TD, cp
+        q_lora = self._apply_mome_prefill_cp(q_lora, state_indice=0, sp_manager=sp_manager)
         q_lora = self.q_a_layernorm(q_lora) # TD, cp
         q_nope, q_pe = self._q_absorb(q_lora, *cp_cos_sin) # TND, full head, cp
 
         kv = self.kv_a_proj_with_mqa(sp_x)[0] # TD, sp
         kv = sp_manager.ag_tokens(kv)         # TD
+        kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        if self.conv is not None:
+            kv_c = self.conv(kv_c, state_indice=1, is_prefill=True)
+        kv = torch.cat([kv_c, k_pe], dim=-1)
         _, _, k_nope, k_pe = self._kv_norm_rope_cache(
             kv, cos, sin, attn_metadata, kv_cache, fused_op=True)
-        k_nope = sp_manager.page_align(k_nope) # [*, pg, 1, D]
-        k_pe = sp_manager.page_align(k_pe)     # [*, pg, 1, D]
 
         wi, qi, ki = self.indexer._li_prolog_ext(
             cp_x, q_lora, sp_x, cp_cos_sin, sp_cos_sin)
@@ -989,12 +1033,11 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                     self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[1])
                 else:
                     self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[2])
-        ki = sp_manager.page_align(ki) # [*, pg, 1, D]
 
-        q_cumlens, kv_lens, blk_table = sp_manager.cp_attn_meta()
+        q_cumlens, kv_lens, _, blk_table = sp_manager.cp_attn_meta()
         topk_idx = self.indexer._apply_lightning_indexer(
             wi, qi,             # TND, cp
-            ki,                 # [*, pg, 1, D]
+            kv_cache[1] if attn_metadata is not None else None,
             q_cumlens, kv_lens, # int32 [2B]
             blk_table,          # int32 [T, *]
         ) # int32 [T, 1, K] or None for dummy_run
@@ -1005,9 +1048,11 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             q_cumlens, kv_lens, # int32 [2B]
             topk_idx,           # int32 [T, 1, K]
             blk_table,          # int32 [T, *]
+            kv_cache,
         )
 
         cp_out = self._mla_epilog(attn_out, reorg=self.o_proj.tp_size > 1)
+        cp_out = self._apply_mome_prefill_cp(cp_out, state_indice=2, sp_manager=sp_manager)
         cp_out= self.o_proj(cp_out)[0]
         return sp_manager.cp_to_sp(cp_out) if attn_metadata else cp_out
 

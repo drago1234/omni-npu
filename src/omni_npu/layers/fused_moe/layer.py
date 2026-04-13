@@ -80,7 +80,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         orig_num_tokens = hidden_states.shape[0]
         strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
 
-        is_need_slice = self.tp_size > 1 and (strategy == "all2all" or strategy == "dispatch_combine")
+        is_need_slice = not model_extra_config.parall_config.ena_seq_parallel and self.tp_size > 1
         x_slice = hidden_states
         if is_need_slice:
             padded_num_tokens = -(orig_num_tokens // -self.tp_size) * self.tp_size

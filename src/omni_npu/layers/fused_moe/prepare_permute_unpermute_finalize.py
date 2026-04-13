@@ -19,9 +19,11 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
-from omni_npu.v1.utils import on_ascend950
-
 from vllm.logger import init_logger
+
+from omni_npu.v1.utils import on_ascend950
+from omni_npu.model_config.config_loader.loader import model_extra_config
+
 
 logger = init_logger(__name__)
 
@@ -197,8 +199,8 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         expert_range = [experts_start_idx, experts_end_idx]
         row_idx_type = 0
         if layer.quant_config is None:
-            gathered_x = get_dp_group().all_gather(x, dim=0)
-            gathered_topk_ids = get_dp_group().all_gather(topk_ids, dim=0)
+            gathered_x = get_ep_group().all_gather(x, dim=0)
+            gathered_topk_ids = get_ep_group().all_gather(topk_ids, dim=0)
             expanded_x, expanded_row_idx, expert_tokens, _ = torch_npu.npu_moe_init_routing_v2(
                 gathered_x,
                 gathered_topk_ids,
@@ -225,9 +227,9 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
             elif layer.quant_method.moe_quant_config.use_int8_w8a8:
                 x_int8, x_scale = torch_npu.npu_dynamic_quant(x)
                 x_quant = x_int8
-            x_quant = get_dp_group().all_gather(x_quant, dim=0)
-            x_scale = get_dp_group().all_gather(x_scale, dim=0)
-            gathered_topk_ids = get_dp_group().all_gather(topk_ids, dim=0)
+            x_quant = get_ep_group().all_gather(x_quant, dim=0)
+            x_scale = get_ep_group().all_gather(x_scale, dim=0)
+            gathered_topk_ids = get_ep_group().all_gather(topk_ids, dim=0)
             expanded_x, expanded_row_idx, expert_tokens, dynamic_scale = torch_npu.npu_moe_init_routing_v2(
                 x_quant,
                 gathered_topk_ids,
@@ -271,7 +273,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         row_idx_type = agrs_prepare_permute_result.row_idx_type
         expert_tokens = agrs_prepare_permute_result.expert_tokens
 
-        gathered_topk_weights = get_dp_group().all_gather(topk_weights, dim=0)
+        gathered_topk_weights = get_ep_group().all_gather(topk_weights, dim=0)
 
         if layer.quant_config is not None:
             # TODO wjc: 1.hif8 gmmfr adaption 2. add share_experts_output.
@@ -288,11 +290,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 sorted_topk_weight = torch.index_select(topk_weights.reshape(-1), 0, expanded_row_idx)
                 row_index = expanded_row_idx // topk_ids.shape[-1]
                 row_index = row_index.to(torch.int64)
-                share_experts_output = torch.zeros(
-                    (batch_size // layer.dp_size, hidden_size),
-                    dtype=torch.bfloat16,
-                    device=current_platform.device_type
-                )
+
                 y = torch_npu.npu_grouped_matmul_finalize_routing(
                     x,
                     layer.w2_weight,
@@ -300,7 +298,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                     scale=layer.w2_weight_scale.to(torch.float),
                     bias=layer.w2_bias if hasattr(layer, "w2_bias") else None,
                     pertoken_scale=pertoken_scale,
-                    shared_input=share_experts_output,
+                    shared_input=None,
                     logit=sorted_topk_weight,
                     row_index=row_index,
                     output_bs=batch_size,
@@ -335,8 +333,7 @@ class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
                 export_for_source_row=gathered_topk_ids,
                 drop_pad_mode=3,
             )
-        y = get_dp_group().reduce_scatter(y, dim=0)
-        return get_tp_group().all_reduce(y)
+        return get_ep_group().reduce_scatter(y, dim=0)
 
 
 class DispatchCombinePrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
@@ -448,6 +445,12 @@ class CommunicationStrategySelector:
             attn_metadata = next(iter(attn_metadata.values()), None)
             decode_threshold = getattr(attn_metadata, "decode_threshold", 0)
 
+        if model_extra_config.parall_config.ena_seq_parallel:
+            local_num_tokens = num_tokens
+        else:
+            # tokens per rank
+            local_num_tokens = cdiv(num_tokens, self.tp_size)
+
         if self.is_a2_device:
             # TP or DP only
             if self.tp_size == 1 or self.dp_size == 1:
@@ -463,8 +466,6 @@ class CommunicationStrategySelector:
         else:
             # TP or DP only
             if self.dp_size == 1 or self.tp_size == 1:
-                # tokens per rank
-                local_num_tokens = cdiv(num_tokens, self.tp_size)
                 if local_num_tokens > self.max_dispatch_combine_threshold:
                     strategy = "all2all"
                 else:

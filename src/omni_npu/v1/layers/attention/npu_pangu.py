@@ -354,8 +354,7 @@ class NPUPanguIndexer(torch.nn.Module):
         sp_manager: Optional[MLACommonMetadata] = None,
         kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        actual_seq_lengths_query, actual_seq_lengths_kv, _ = sp_manager.cp_attn_meta()
-        block_table = sp_manager.cp_block_table
+        actual_seq_lengths_query, actual_seq_lengths_kv, _, block_table = sp_manager.cp_attn_meta()
 
         return torch.ops.custom.npu_lightning_indexer_enhance(
             query=q,
@@ -1082,8 +1081,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         topk_indices: torch.Tensor,
         sp_manager: Optional[SPManager] = None,
     ) -> torch.Tensor:
-        actual_seq_lengths_query, actual_seq_lengths_kv, _ = sp_manager.cp_attn_meta()
-        block_table = sp_manager.cp_block_table
+        actual_seq_lengths_query, actual_seq_lengths_kv, _, block_table = sp_manager.cp_attn_meta()
 
         q = torch.cat([q_nope, q_pe], dim=-1)
 

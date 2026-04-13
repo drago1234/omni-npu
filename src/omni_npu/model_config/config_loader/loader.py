@@ -97,6 +97,7 @@ class ModelParallelConfig:
     enable_share_expert_tp: bool = False
     layer_parallel_config: dict[str, Any] = field(default_factory=dict)
     input_split: bool = False
+    ena_seq_parallel: bool = False
     ena_context_parallel: bool = False
     enable_flashcomm2: bool = False
 

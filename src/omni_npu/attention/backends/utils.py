@@ -369,8 +369,8 @@ class SPManager:
         blk_base = seq_blks.cumsum(dim=0, dtype=torch.int32) - seq_blks
         table0 = torch.arange(self.table_size, dtype=torch.int32, device=cumlens.device)
         blk_table = (table0.view(1, -1) + blk_base.repeat_interleave(2, dim=0).view(-1, 1))
-        self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table)
-        self.cp_block_table = blk_table_ref.repeat_interleave(2, dim=0)
+        cp_block_table = blk_table_ref.repeat_interleave(2, dim=0)
+        self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table, cp_block_table)
         self.cp_slot_mapping = slot_mapping_ref.clone()
 
         seq_lens = seq_lens.tolist()
@@ -558,6 +558,7 @@ class SPManager:
             sp_rank={self.sp_rank}, 
             init_zigzag={self.init_zigzag},
             cp_mome_query_start_loc={self.cp_mome_query_start_loc},
+            cp_mome_req_split_sizes={self.cp_mome_req_split_sizes},
         )"""
 
 
@@ -589,7 +590,16 @@ class DummySPManager:
         return torch.cat([x] * self.sp_size)
 
     def cp_attn_meta(self) -> tuple:
-        return None, None, None
+        return None, None, None, None
+
+    def mome_suffix_exchange(self, x: torch.Tensor):
+        return x
+
+    def broadcast_mome_req_tails_from_rank0(self, x: torch.Tensor):
+        return x
+
+    def mome_split_and_cat(self, x: torch.Tensor):
+        return x
 
 
 def lazy_init_cos_sin(

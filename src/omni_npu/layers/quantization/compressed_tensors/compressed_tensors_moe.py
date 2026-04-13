@@ -27,6 +27,7 @@ from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp
 from omni_npu.layers.fused_moe.fused_moe_method_base import NPUFusedMoEMethodBase
 from omni_npu.layers.fused_moe.prepare_permute_unpermute_finalize import PreparePermuteResult
 from omni_npu.layers.utils import named_stream
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
 torch.npu.config.allow_internal_format = True
@@ -213,7 +214,7 @@ class NPUCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod, 
         orig_num_tokens = hidden_states.shape[0]
         strategy, strategy_impl = self.select_communication_strategy(orig_num_tokens)
 
-        is_need_slice = self.tp_size > 1 and (strategy == "all2all" or strategy == "dispatch_combine")
+        is_need_slice = not model_extra_config.parall_config.ena_seq_parallel and self.tp_size > 1
         x_slice = hidden_states
         if is_need_slice:
             padded_num_tokens = -(orig_num_tokens // -self.tp_size) * self.tp_size
