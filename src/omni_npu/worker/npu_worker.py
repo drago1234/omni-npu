@@ -40,6 +40,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from .npu_model_runner import NPUModelRunner
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
 from omni_npu.model_config.config_loader.loader import load_model_extra_config
+from omni_npu.plugin_decorators import load_model_decorator
 
 logger = init_logger(__name__)
 
@@ -191,10 +192,7 @@ class NPUWorker(WorkerBase):
             from contextlib import nullcontext
             context = nullcontext()
         with context:
-            if int(os.getenv("ENABLE_OMNI_CACHE", "0")):
-                self.model_runner.initialize_omni_kv_cache(kv_cache_config)
-            else:
-                self.model_runner.initialize_kv_cache(kv_cache_config)
+            self.model_runner.initialize_kv_cache(kv_cache_config)
 
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
@@ -222,13 +220,8 @@ class NPUWorker(WorkerBase):
     def get_model(self):
         return self.model_runner.get_model()
 
-    def load_model(self) -> None:
-        if int(os.getenv("ENABLE_OMNI_CACHE", "0")) and \
-            self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
-            from omni_cache.cache.omni_cache_define import DecodeOmniCache
-            # load_model after omni cache is created to register a lager host tensor in decode side
-            DecodeOmniCache.initialize_decode_omni_cache(self.vllm_config, self.model_runner)
-        
+    @load_model_decorator
+    def load_model(self) -> None:   
         if self.model_config.enable_sleep_mode:
             allocator = NpuMemAllocator.get_instance()
             if allocator.get_current_usage() != 0:

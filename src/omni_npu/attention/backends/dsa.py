@@ -38,8 +38,6 @@ from omni_npu.attention.backends.utils import register_attention_backend, _maybe
 from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
-ENABLE_OMNI_CACHE = int(os.getenv("ENABLE_OMNI_CACHE", "0")) == 1
-
 logger = init_logger(__name__)
 NPUDSA = "NPUDSA"
 
@@ -111,10 +109,7 @@ class NPUDSABackend(MLACommonBackend):
         block_size = kv_cache_spec.block_size
         dtype = kv_cache_spec.dtype
         raw_tensor = raw_tensor.view(dtype=dtype)
-        if ENABLE_OMNI_CACHE and not is_prefill:
-            shapes = [(num_blocks, block_size, 1, 128)] # for omni cache decode, only indexer is registered on device
-            dtypes = [dtype]
-        elif cache_dtype_str == 'hif8_ds_mla':
+        if cache_dtype_str == 'hif8_ds_mla':
             shapes = [(num_blocks, block_size, 1, 656), (num_blocks, block_size, 1, 128), (num_blocks, block_size, 1, 4)]
             dtypes = [dtype, dtype, torch.float32]
         else:
@@ -222,38 +217,6 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
                     init_zigzag=True,
                 )
 
-        if ENABLE_OMNI_CACHE:
-            from omni_cache.cache import omni_cache
-            from omni_cache.cache.omni_cache_define import PrefillOmniCache
-
-            # NOTE: APC related
-            if metadata.prefill is not None and self.vllm_config.kv_transfer_config is not None:
-                num_reqs = metadata.num_reqs
-                query_start_loc = common_attn_metadata.query_start_loc_cpu
-                query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-
-                query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-                query_lens = query_start_loc[1:] - query_start_loc[:-1]
-                query_lens_list = query_lens.tolist()
-                num_computed_tokens_cpu = common_attn_metadata.seq_lens_cpu - query_seq_lens_cpu - self.sink_len
-                prefix_meta = omni_cache.get_prefill_prefix_copy_meta(
-                    # block_size=self.block_size,
-                    self.vllm_config,
-                    kv_lens=num_computed_tokens_cpu[:num_reqs],
-                    query_lens_list=query_lens_list,
-                    block_tables=common_attn_metadata.block_table_tensor.cpu().numpy()[:num_reqs],
-                    # attn_state=self.runner.attn_state,
-                )
-                omni_cache.synchronize_h2d(
-                    prefix_meta=prefix_meta,
-                    layer_idx=0,
-                )
-                metadata.prefix_meta = prefix_meta
-
-            if isinstance(omni_cache, PrefillOmniCache) :
-                omni_cache.init_batch_token_indices(common_attn_metadata.slot_mapping)
-        else:
-            metadata.prefix_meta = None
         return metadata
 
     def _generate_activate_mask(self, actual_seqs_num):

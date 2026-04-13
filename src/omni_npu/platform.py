@@ -4,6 +4,7 @@ import os
 from typing import Optional
 import torch
 import os
+from importlib.metadata import entry_points
 from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum
 from omni_npu.logger import update_configure_vllm_root_logger
@@ -76,12 +77,16 @@ class NPUPlatform(Platform):
     def import_kernels(cls):
         from omni_npu.compilation.decorators import patch_compile_decorators
         patch_compile_decorators()
-        if "omni_cache" in os.environ.get("VLLM_PLUGINS", ""):
-            from omni_cache.connector import register_connectors
-            register_connectors()
-        else:
-            from omni_npu.connector import register_connectors
-            register_connectors()
+        
+        from omni_npu.connector import register_connectors
+        register_connectors()
+        
+        for ep in entry_points().select(group="omni.kv_connectors"):
+            try:
+                register_fn = ep.load()
+                register_fn()
+            except Exception as e:
+                logger.warning(f"Failed to load connector {ep.name}: {e}")
 
     @classmethod
     def get_current_memory_usage(cls, device: Optional[torch.types.Device] = None) -> float:
@@ -147,16 +152,19 @@ class NPUPlatform(Platform):
         selected_backend,
         attn_selector_config,
     ) -> str:
-        if "omni_models_v0" in os.environ.get("VLLM_PLUGINS", ""):
-            return "omni_npu.v0.layers.attention.backend.attention.NPUAttentionBackend"
-        else:
-            if attn_selector_config.use_mla:
-                if attn_selector_config.use_sparse:
-                    return "omni_npu.attention.backends.dsa.NPUDSABackend"
-                else:
-                    return "omni_npu.attention.backends.mla.NPUMLABackend"
+        # Import here to avoid circular import and ensure plugins are loaded
+        from omni_npu.attention.backends.utils import get_attention_backend
+        if attn_selector_config.use_mla:
+            if attn_selector_config.use_sparse:
+                backend_name = "NPUDSA"
             else:
-                return "omni_npu.attention.backends.attention.NPUAttentionBackend"
+                backend_name = "NPUMLA"
+        else:
+            backend_name = "VLLM_NPU_ATTN"
+
+        # Query registry first (allows plugins to override)
+        registered_path = get_attention_backend(backend_name)
+        return registered_path
 
     @property
     def simple_compile_backend(self):

@@ -55,6 +55,7 @@ from omni_npu.v1.layers.linear import (
 )
 from omni_npu.model_config.config_loader.loader import  model_extra_config
 from omni_npu.v1.utils import current_stream
+from omni_npu.plugin_decorators import dsa_attn_decorator
 
 class Indexer(torch.nn.Module):
     def __init__(
@@ -711,6 +712,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             k_pe = k_pe.view(-1, 1, R)
             return nope_cache, rope_cache, k_nope, k_pe
 
+    @dsa_attn_decorator
     def _apply_attention( # absorb
         self,
         q_nope: torch.Tensor, # [T, N, D]
@@ -722,6 +724,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         topk_idx: torch.Tensor = None,    # int32 [T, 1, K]
         block_table: torch.Tensor = None, # int32 [T, *]
         kv_cache: torch.Tensor = None,
+        attn_metadata: NPUDSAMetadata = None,
     ) -> torch.Tensor: # [T, N, L]
         if None in [q_cumlens, kv_lens, block_table, topk_idx]:
             return torch.zeros_like(q_nope) # dummy
@@ -807,11 +810,6 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             kv_lens = attn_metadata.seq_lens.to(torch.int32)
             q_cumlens = attn_metadata.query_cumlens.to(torch.int32)
             block_table = attn_metadata.block_table
-
-        if self.use_omni_cache and attn_metadata:
-            assert kv_cache is None, f"When using OmniCache, model should not have KV cache, but got {type(kv_cache)}."
-            from omni_cache.cache import omni_cache
-            kv_cache = omni_cache.device_cache
 
         # seq_parallel = model_extra_config.parall_config.ena_seq_parallel
         seq_parallel = False
@@ -917,24 +915,8 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             topk_idx,    # int32 [T, 1, K]
             block_table, # int32 [T, *]
             kv_cache,
+            attn_metadata=attn_metadata,
         ) # [T, N, L]
-
-        if self.use_omni_cache and attn_metadata is not None:
-            from omni_cache.cache import omni_cache
-            main_stream = current_stream()
-            kv_event = torch.npu.Event(blocking=False, enable_timing=False)
-            kv_event.record(main_stream)
-            kv_states = [tnd_k_nope, tnd_k_pe, ki]
-            omni_cache.synchronize_d2h(
-                kv_states,
-                self.layer_idx,
-                kv_event
-            )
-            # NOTE: APC related
-            omni_cache.synchronize_h2d(
-                prefix_meta=attn_metadata.prefix_meta,
-                layer_idx=self.layer_idx + 1,
-            )
 
         if sp_manager:
             attn_out = sp_manager.align_tokens(attn_out)

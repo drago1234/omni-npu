@@ -52,6 +52,10 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import ACLGraphWrapper, set_graph_params
+from omni_npu.plugin_decorators import (
+    init_config_decorator,
+    prepare_inputs_decorator,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -882,74 +886,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         return hidden_states, hidden_states[logit_indices_device]
 
-    def initialize_omni_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        kv_cache_config = deepcopy(kv_cache_config)
-        self.kv_cache_config = kv_cache_config
-        self.may_add_encoder_only_layers_to_kv_cache_config()
-        self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-        self.initialize_attn_backend(kv_cache_config)
-        # The kernel block size for all KV cache groups. For example, if
-        # kv_cache_manager uses block_size 256 for a given group, but the attention
-        # backends for that group only supports block_size 64, we will return
-        # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
-        # tokens each.
-        kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
-
-        # create metadata builders
-        self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
-
-        # Reinitialize need to after initialize_attn_backend
-        self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
-            # validate all draft model layers belong to the same kv cache
-            # group
-            self.drafter.validate_same_kv_cache_group(kv_cache_config)
-
-        logger.warning(f"<<< {self.kv_cache_config=}")
-
-        if self.vllm_config.kv_transfer_config.kv_role == "kv_producer":
-            # In decode side, the omni cache will be created before load_model
-            # for registering larger host tensor.
-            from omni_cache.cache.omni_cache_define import create_omni_cache
-            create_omni_cache(
-                kv_cache_config=self.kv_cache_config,
-                vllm_config=self.vllm_config,
-                runner=self,
-            )
-
-        from omni_cache.cache import omni_cache
-        self.omni_cache = omni_cache
-
-        omni_cache.update_kv_cache_spec(kv_cache_config, self.vllm_config)
-        omni_cache.update_model_runner(self)
-        omni_cache.ensure_device_cache_initialized() #
-        if self.vllm_config.kv_transfer_config.kv_role == "kv_consumer":
-            from vllm.v1.worker.utils import bind_kv_cache
-            assert omni_cache.device_cache is not None
-            # replace kv_a and k_pe in device.kv_caches by host swap caches
-            num_layers = len(self.kv_caches)
-            if self.omni_cache.enable_dsa:
-                for i, layer_name in enumerate(list(omni_cache.device_cache.keys())):
-                    rest = omni_cache.device_cache[layer_name]
-                    t0, t1 = omni_cache.host_swap_tensor[i][0], omni_cache.host_swap_tensor[i][1]
-                    logger.warning(f"<<< before bind_kv_cache: {t0.shape=}, {t1.shape=}, {rest[0].shape=}")
-                    omni_cache.device_cache[layer_name] = (t0, t1, *rest)
-            bind_kv_cache(
-                omni_cache.device_cache,
-                self.vllm_config.compilation_config.static_forward_context,
-                self.kv_caches,
-            )
-
-        if has_kv_transfer_group:
-            get_kv_transfer_group().register_kv_caches(
-                omni_cache.MEMMAP_PATH,
-                omni_cache.dtype,
-                block_len_dtype=omni_cache.block_len_dtype,
-                omni_cache=omni_cache
-            )
-
+    @prepare_inputs_decorator
     def prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -957,14 +894,11 @@ class NPUModelRunner(GPUModelRunner):
     ) -> "InputBatch":
         input_batch = super().prepare_inputs(scheduler_output, num_tokens_after_padding)
 
-        if (self.omni_cache.enable_dsa and
-            self.omni_cache.enable_omni_cache):
-            from omni_cache.cache import omni_cache
-            from omni_cache.cache.omni_cache_define import DecodeOmniCache
-            # for update selection_kv_block workspace when using gather selection
-            DecodeOmniCache.maybe_update_selection_kv_block_status(input_batch, omni_cache)
-
         return input_batch
+
+    @init_config_decorator
+    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        super().initialize_kv_cache(kv_cache_config)
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]

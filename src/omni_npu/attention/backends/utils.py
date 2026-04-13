@@ -3,6 +3,7 @@
 
 import torch
 import numpy as np
+from importlib.metadata import entry_points
 
 from vllm.utils.math_utils import cdiv
 from vllm.distributed import GroupCoordinator
@@ -123,6 +124,33 @@ def register_attention_backend(backend: str):
         return cls
 
     return decorator
+
+def get_attention_backend(name: str) -> str | None:
+    """Get a registered attention backend path string by name."""
+    return NPU_ATTENTION_BACKEND.get(name)
+
+def load_plugin_backends():
+    """
+    Load attention backend plugins from entry points.
+
+    This should be called during module initialization.
+    Plugins can override the base backends by registering with the same name.
+    """
+    eps = entry_points(group="omni.attention_backends")
+    for ep in eps:
+        try:
+            backend_cls = ep.load()
+            name = backend_cls.get_name()
+            attn_module = f"{backend_cls.__module__}.{backend_cls.__qualname__}"
+            logger.debug("Register attention plugin %s with module %s", name,
+                         attn_module)
+            logger.info("Loaded attention backend plugin: %s from %s", name, ep.name)
+        except Exception as e:
+            logger.warning("Failed to load backend plugin %s: %s", ep.name, e)
+
+def get_available_backends() -> list[str]:
+    """List all registered backend names."""
+    return list(NPU_ATTENTION_BACKEND.keys())
 
 
 class SPManager:
