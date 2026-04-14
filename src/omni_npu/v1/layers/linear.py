@@ -105,15 +105,19 @@ class UnquantizedFlashCommLinearMethod(FlashCommLinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
-        if model_extra_config.operator_opt_config.enable_mlaprolog and "kv_b_proj" in layer.prefix:
-            layer.weight.data = layer.weight.data.t().contiguous()
-        else:
-            weight_data = torch_npu.npu_format_cast(layer.weight.data.t().contiguous(), torch_npu.Format.FRACTAL_NZ)
-            layer.weight.data = weight_data
+        weight_nz = (
+            model_extra_config.operator_opt_config.unquant_bmm_nz 
+            and not (model_extra_config.operator_opt_config.enable_mlaprolog and "kv_b_proj" in layer.prefix)
+        )
+        weight_t = layer.weight.data.t().contiguous()
+        if weight_nz:
+            layer.weight.data = torch_npu.npu_format_cast(weight_t, torch_npu.Format.FRACTAL_NZ)
             opt_raw = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT") # bytes
             allow_internal_format = opt_raw.strip().lower() == b"enable"
             if allow_internal_format:
                 set_weight_attrs(layer.weight, {"is_weight_nz": True})
+        else:
+            layer.weight.data = weight_t
         if not hasattr(layer.weight, "is_weight_transposed"):
             set_weight_attrs(layer.weight, {"is_weight_transposed": True})
 

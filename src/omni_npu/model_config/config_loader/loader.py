@@ -108,7 +108,7 @@ class ModelOperatorOptConfig:
     kv_nz: bool = True
     gmm_nz: bool = True
     moe_multi_stream_tune: bool = False
-    unquant_bmm_nz: bool = False
+    unquant_bmm_nz: bool = True
     decode_moe_dispatch_combine: bool = False
     enable_super_kernel: bool = False
     enable_mlaprolog: bool = False

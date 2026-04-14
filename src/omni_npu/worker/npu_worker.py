@@ -41,6 +41,7 @@ from .npu_model_runner import NPUModelRunner
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
 from omni_npu.model_config.config_loader.loader import load_model_extra_config
 from omni_npu.plugin_decorators import load_model_decorator
+from omni_npu.compilation.acl_graph import set_aclgraph_recapture
 
 logger = init_logger(__name__)
 
@@ -345,6 +346,9 @@ class NPUWorker(WorkerBase):
         if tags is not None and "kv_cache" in tags:
             logger.info(f"re-register kv caches now")
             self.model_runner.reregister_kv_caches()
+            if not self.model_config.enforce_eager:
+                set_aclgraph_recapture(True)
+                self.model_runner.capture_model()
 
 def init_worker_distributed_environment(
     vllm_config,
