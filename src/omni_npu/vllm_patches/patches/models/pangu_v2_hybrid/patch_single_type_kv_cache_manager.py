@@ -124,7 +124,7 @@ class SinkFullAttentionManager(FullAttentionManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ):
-        FullAttentionManager.__init__(
+        super().__init__(
             kv_cache_spec,
             block_pool,
             enable_caching,

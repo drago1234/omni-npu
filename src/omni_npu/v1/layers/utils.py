@@ -93,7 +93,7 @@ def calculate_page_size_padded(
         denominator = dsa_page_dim if mla_page_dim < dsa_page_dim else mla_page_dim
 
     if mome_page_size is not None:
-        block_size = (mome_page_size / denominator + 16 - 1) // 16 * 16
+        block_size = (mome_page_size / denominator + 16) // 16 * 16
 
     # Determine alignment priority
     if dsa_page_dim is not None:
