@@ -491,9 +491,9 @@ class EagleProposerPatch(VLLMPatch):
         cm.slot_mapping = blk_table.slot_mapping.gpu[:base_cm.num_actual_tokens]
 
         if hasattr(base_cm, "num_reqs_unpadded"):
-            cm.block_table_tensor[base_cm.num_reqs_unpadded:].fill(PADDING_SLOT_ID)
+            cm.block_table_tensor[base_cm.num_reqs_unpadded:].fill_(PADDING_SLOT_ID)
         if hasattr(base_cm, "num_tokens_unpadded"):
-            cm.slot_mapping[base_cm.num_tokens_unpadded:].fill(PADDING_SLOT_ID)
+            cm.slot_mapping[base_cm.num_tokens_unpadded:].fill_(PADDING_SLOT_ID)
         return cm
 
     def _build_per_group_metadata(

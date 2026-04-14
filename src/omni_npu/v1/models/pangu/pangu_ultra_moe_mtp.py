@@ -15,12 +15,16 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 from .pangu_ultra_moe import OpenPanguDecoderLayer
-
+from omni_npu.layers.mhc.npu_mhc import NPUmHC
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 class SharedHead(nn.Module):
     def __init__(
@@ -58,6 +62,8 @@ class OpenPanguMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "shared_head"),
         )
+        config.use_mhc = False
+
         self.mtp_block = OpenPanguDecoderLayer(config, prefix, vllm_config)
 
     def forward(
@@ -199,6 +205,7 @@ class OpenPanguMTP(nn.Module, SupportsPP):
         ]
 
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -207,6 +214,7 @@ class OpenPanguMTP(nn.Module, SupportsPP):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        record_conv_name = []
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -274,6 +282,21 @@ class OpenPanguMTP(nn.Module, SupportsPP):
                     ):
                         continue
 
+                    if name.endswith("e_score_correction_bias"):
+                        name = name.replace(
+                            "e_score_correction_bias", "gate.e_score_correction_bias"
+                        )
+                    if "_conv" in name:
+                        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                            name = insert_conv_before(name)
+                        else:
+                            name = name.replace("_conv", "_conv.merge_conv")
+                        if model_extra_config.operator_opt_config.merge_q_kv_conv and "qa_conv" in name:
+                            merge_conv_name = name.replace("qa_conv", "merge_conv")
+                            if merge_conv_name not in record_conv_name:
+                                record_conv_name.append(merge_conv_name)
+                                loaded_params.add(merge_conv_name)
+
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -281,6 +304,13 @@ class OpenPanguMTP(nn.Module, SupportsPP):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+
+    def post_weight_load(self) -> None:
+        for name, module in self.named_modules():
+            if module is self:
+                continue
+            if hasattr(module, "post_weight_load"):
+                module.post_weight_load()
 
     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
         """
@@ -313,3 +343,11 @@ class OpenPanguMTP(nn.Module, SupportsPP):
             # treat shared weights as top level weights
             name = name.replace(f"model.layers.{spec_layer}.", "model.")
         return name
+
+def insert_conv_before(name: str) -> str:
+    parts = name.split('.')
+    for i in range(len(parts) - 1, -1, -1):
+        if '_conv' in parts[i]:
+            parts.insert(i, 'conv')
+            break
+    return '.'.join(parts)

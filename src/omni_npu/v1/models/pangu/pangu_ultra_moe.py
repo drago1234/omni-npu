@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ParallelConfig, VllmConfig, CacheConfig
 from vllm.distributed import (
+    divide,
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -26,7 +27,12 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.models.interfaces import (
+    IsHybrid,
     MixtureOfExperts,
     SupportsLoRA,
     SupportsPP,
@@ -170,7 +176,7 @@ class OpenPanguMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        if config.model_type == "openpangu_v2":
+        if config.model_type == "openpangu_v2" or config.model_type == "openpangu_mtp":
             self.experts = SharedFusedMoE(
                 shared_experts=self.shared_experts,
                 gate=self.gate,
@@ -796,8 +802,68 @@ def insert_conv_before(name: str) -> str:
             break
     return '.'.join(parts)
 
-class PanguUltraMoEForCausalLM(OpenPanguMoEModel):
-    pass
+class PanguUltraMoEForCausalLM(OpenPanguMoEModel, IsHybrid):
+    """
+    Hybrid architecture support (Attention + MOME conv states) for vLLM speculative 
+    decoding and Multi-Token Prediction (MTP) state management.
+
+    Key Functionalities:
+    1. State Synchronization: By setting `is_hybrid` and implementing `get_mamba_state_*` 
+       interfaces, the `GPUModelRunner` can automatically refresh `num_accepted_tokens` 
+       based on rejection-sampler outputs after model execution.
+    2. Memory Alignment: Block-size alignment for hybrid models utilizes 
+       `get_mamba_state_shape_from_config` as a footprint estimate for MambaSpec 
+       (refer to `MomeSpec` on attention layers).
+    3. Hybrid Detection Logic:
+       - If `hf_config.layer_types` exists and contains only "attention", 
+         `ModelConfig.is_hybrid` defaults to False.
+       - To enable hybrid features, use HF overrides to add non-attention markers 
+         or adjust `layer_types` accordingly.
+    """
+
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls, vllm_config: VllmConfig
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: VllmConfig
+    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+
+        hf = vllm_config.model_config.hf_text_config
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+
+        if not getattr(hf, "use_mome", False):
+            conv_shape = MambaStateShapeCalculator.short_conv_state_shape(
+                tp, divide(hf.hidden_size, tp), 2
+            )[0]
+            temporal_shape = (1, 1, 1)
+            return (conv_shape, temporal_shape)
+
+        kernel = int(getattr(hf, "router_sliding_window", 0) or 2)
+        state_len = kernel - 1 + num_spec
+        q_dim = getattr(hf, "q_lora_rank", hf.hidden_size)
+        kv_dim = hf.kv_lora_rank
+        o_dim = hf.num_attention_heads * hf.v_head_dim
+        combined = q_dim + kv_dim + o_dim
+        conv_shape = (state_len, divide(combined, tp))
+        temporal_shape = (
+            divide(hf.num_attention_heads, tp),
+            hf.v_head_dim,
+            1,
+        )
+        return (conv_shape, temporal_shape)
 
 
 def get_spec_layer_idx_from_weight_name(
