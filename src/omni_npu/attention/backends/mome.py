@@ -212,6 +212,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
+        num_prompt_tokens: torch.Tensor | None = None,
     ) -> NPUMomeAttentionMetadata:
         """
         Build Mome attention metadata from common attention metadata.
@@ -225,17 +226,22 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         )
 
-        num_computed_tokens = None
+        num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
         block_idx_last_computed_token = None
         block_idx_first_scheduled_token = None
         block_idx_last_scheduled_token = None
+
+        # For graph capture, num_prompt_tokens is None
+        if num_accepted_tokens is not None and num_prompt_tokens is not None:
+            num_accepted_tokens = num_accepted_tokens.clone()
+            # if the previous schedule is prefill (computed <= prompt), we reset num_accepted_tokens = num_spec + 1
+            # so the MoME kernel reads the last few tokens from the cache
+            num_accepted_tokens.masked_fill_(num_computed_tokens <= num_prompt_tokens, self.num_spec + 1)
 
         # Get cache indices
         apc_enabled = self.vllm_config.cache_config.enable_prefix_caching
         if apc_enabled:
             cache_indices = common_attn_metadata.block_table_tensor
-            num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
-            # TODO: need num_computed_tokens even if apc disabled
 
             (
                 block_idx_last_computed_token,
@@ -258,6 +264,13 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
             cache_indices = self.cache_indices_tensor[:num_decodes]  # NOTE: slice to num_decodes instead of num_decode_tokens
             self.cache_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
+
+            self.num_computed_tokens[:num_decodes].copy_(
+                num_computed_tokens, non_blocking=True
+            )
+            num_computed_tokens = self.num_computed_tokens[
+                :num_decodes  # NOTE: slice to num_decodes instead of num_decode_tokens
+            ]
 
             if num_accepted_tokens is not None:
                 self.num_accepted_tokens[:num_decodes].copy_(
@@ -284,13 +297,6 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     block_idx_last_scheduled_token, non_blocking=True
                 )
                 block_idx_last_scheduled_token = self.block_idx_last_scheduled_token[
-                    :num_decodes  # NOTE: slice to num_decodes instead of num_decode_tokens
-                ]
-
-                self.num_computed_tokens[:num_decodes].copy_(
-                    num_computed_tokens, non_blocking=True
-                )
-                num_computed_tokens = self.num_computed_tokens[
                     :num_decodes  # NOTE: slice to num_decodes instead of num_decode_tokens
                 ]
 
@@ -330,8 +336,8 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 max_query_len=max_query_len, 
                 pad_slot_id=PAD_SLOT_ID, 
                 B_size=self.mome_block_size, 
-                num_accepted_tokens=num_accepted_tokens[num_decodes:] if num_accepted_tokens is not None else None, 
-                num_computed_tokens=num_computed_tokens[num_decodes:] if apc_enabled else None, 
+                num_accepted_tokens=None, 
+                num_computed_tokens=num_computed_tokens[num_decodes:],
                 block_idx_last_computed_token=block_idx_last_computed_token[num_decodes:] if apc_enabled else None, 
                 block_idx_first_scheduled_token=block_idx_first_scheduled_token[num_decodes:] if apc_enabled else None, 
                 block_idx_last_scheduled_token=block_idx_last_scheduled_token[num_decodes:] if apc_enabled else None, 
@@ -351,7 +357,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 pad_slot_id=PAD_SLOT_ID, 
                 B_size=self.mome_block_size, 
                 num_accepted_tokens=num_accepted_tokens[:num_decodes] if num_accepted_tokens is not None else None, 
-                num_computed_tokens=num_computed_tokens[:num_decodes] if apc_enabled else None, 
+                num_computed_tokens=num_computed_tokens[:num_decodes],
                 block_idx_last_computed_token=block_idx_last_computed_token[:num_decodes] if apc_enabled else None, 
                 block_idx_first_scheduled_token=block_idx_first_scheduled_token[:num_decodes] if apc_enabled else None, 
                 block_idx_last_scheduled_token=block_idx_last_scheduled_token[:num_decodes] if apc_enabled else None, 
@@ -364,21 +370,38 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         draft_index: int,
         num_accepted_tokens: torch.Tensor | None = None,
+        num_prompt_tokens: torch.Tensor | None = None,
     ) -> NPUMomeAttentionMetadata:
         return self.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
             num_accepted_tokens=num_accepted_tokens,
             fast_build=True,
+            num_prompt_tokens=num_prompt_tokens,
         )
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ):
         """
-        Reuse the logic of GDN builder for aclgraph capture.
+        This method builds the metadata for full cudagraph capture.
+        Currently, only decode is supported for full cudagraphs with Mamba.
         """
-        return super().build_for_cudagraph_capture(common_attn_metadata)
+        m = common_attn_metadata
+
+        assert (
+            m.num_reqs <= self.decode_cudagraph_max_bs
+            and m.num_actual_tokens <= self.decode_cudagraph_max_bs
+        ), (
+            f"GDN only supports decode-only full CUDAGraph capture. "
+            f"Make sure batch size ({m.num_reqs}) <= "
+            f"cudagraph capture sizes ({self.decode_cudagraph_max_bs}), "
+            f"and number of tokens ({m.num_actual_tokens}) <= "
+            f"cudagraph capture sizes ({self.decode_cudagraph_max_bs})."
+        )
+
+        num_accepted_tokens = None if self.num_spec == 0 else torch.diff(m.query_start_loc)
+        return self.build(0, m, num_accepted_tokens=num_accepted_tokens)
 
     def update_block_table(
         self,
@@ -390,6 +413,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         prefix_caching = self.vllm_config.cache_config.enable_prefix_caching
         cache_indices = blk_table if prefix_caching else blk_table[:, 0]
         num_accepted_tokens = metadata.num_accepted_tokens
+        num_computed_tokens = metadata.num_computed_tokens
         num_reqs = blk_table.shape[0]
 
         # For CUDA graphs, copy to persistent buffer
@@ -402,6 +426,11 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             persistent_cache_indices.copy_(cache_indices, non_blocking=True)
             cache_indices = persistent_cache_indices
 
+            if num_computed_tokens is not None:
+                persistent_num_computed_tokens = self.num_computed_tokens[:num_reqs]
+                persistent_num_computed_tokens.copy_(num_computed_tokens, non_blocking=True)
+                num_computed_tokens = persistent_num_computed_tokens
+
             if num_accepted_tokens is not None:
                 persistent_num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
                 persistent_num_accepted_tokens.copy_(num_accepted_tokens, non_blocking=True)
@@ -409,15 +438,20 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         new_metadata.cache_indices = cache_indices
         new_metadata.num_accepted_tokens = num_accepted_tokens
+        new_metadata.num_computed_tokens = num_computed_tokens
 
         if new_metadata.prefill is not None:
             new_metadata.prefill = copy.copy(metadata.prefill)
             new_metadata.prefill.cache_indices = cache_indices[metadata.num_decodes:]
+            if num_computed_tokens is not None:
+                new_metadata.prefill.num_computed_tokens = num_computed_tokens[metadata.num_decodes:]
             if num_accepted_tokens is not None:
                 new_metadata.prefill.num_accepted_tokens = num_accepted_tokens[metadata.num_decodes:]
         if new_metadata.decode is not None:
             new_metadata.decode = copy.copy(metadata.decode)
             new_metadata.decode.cache_indices = cache_indices[:metadata.num_decodes]
+            if num_computed_tokens is not None:
+                new_metadata.decode.num_computed_tokens = num_computed_tokens[:metadata.num_decodes]
             if num_accepted_tokens is not None:
                 new_metadata.decode.num_accepted_tokens = num_accepted_tokens[:metadata.num_decodes]
 

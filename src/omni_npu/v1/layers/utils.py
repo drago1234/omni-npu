@@ -43,7 +43,7 @@ def calculate_page_size_padded(
         mome_state_shapes: tuple | None,
         mome_state_dtypes: tuple | None,
         kernel_size: int = 0,
-        num_speculative_tokens: int = 0,
+        fake_spec_tokens: int = 0,
     ) -> int | None:
     """
     Calculate page_size_padded for alignment across different attention mechanisms.
@@ -81,7 +81,7 @@ def calculate_page_size_padded(
     # Calculate MOME page size if MOME is enabled
     mome_page_size = None
     if getattr(config, "use_mome", False):
-        num_total_tokens = kernel_size - 1 + num_speculative_tokens
+        num_total_tokens = kernel_size - 1 + fake_spec_tokens
         mome_page_size = sum(
             prod(shape) * get_dtype_size(dtype)
             for (shape, dtype) in zip(mome_state_shapes, mome_state_dtypes)

@@ -115,6 +115,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         self.quant_symbol = quant_config is not None
         self.prefix = prefix
         self._init_wuk_t_uv = False
+        self.is_pd_disagg = vllm_config.kv_transfer_config is not None
 
         self.q_a_proj = ReplicatedLinear(
             self.hidden_size,
@@ -196,6 +197,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         # MOME
         if getattr(config, "use_mome", False):
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                num_extra_token = 1 if self.is_pd_disagg else 0
+                fake_num_spec_tokens = max(self.num_spec_tokens, num_extra_token)
                 self.mome_state_shapes = (
                     (self.q_lora_rank,),
                     (self.kv_lora_rank,),
@@ -216,16 +219,16 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     mome_state_shapes=self.mome_state_shapes,
                     mome_state_dtypes=self.mome_state_dtypes,
                     kernel_size=self.kernel_size,
-                    num_speculative_tokens=self.num_spec_tokens,
+                    fake_spec_tokens=fake_num_spec_tokens,
                 )
 
                 mome_kwargs = {
                     "kernel_size": self.kernel_size,
-                    "num_spec_tokens": self.num_spec_tokens,
+                    "num_spec_tokens": fake_num_spec_tokens,
                     "state_dtypes": self.mome_state_dtypes,
                     "state_shapes": self.mome_state_shapes,
                     "quant_config": None,
-                    "cache_config": vllm_config.cache_config,
+                    "vllm_config": vllm_config,
                     "prefix": f"{prefix}.conv",
                     "page_size_padded": page_size_padded,
                 }
@@ -1003,7 +1006,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             else:
                 attn_output[:q_cumlens[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
 
-            attn_output = attn_output.transpose(0, 1).contiguous()  # TND -> NTD
+            attn_output = attn_output.transpose(0, 1)  # TND -> NTD
 
         return attn_output
 
@@ -1206,8 +1209,10 @@ def npu_mla_forward(
         if self.o_proj.tp_size == 1:
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
-            output = split_tensor_along_last_dim(output, num_partitions=tp_size)
-            output = output[tp_rank].contiguous()
+            chunk_size = output.shape[0] // tp_size
+            begin = chunk_size * tp_rank
+            end = begin + chunk_size
+            output = output[begin:end]
         else:
             output = get_tp_group().reduce_scatter(output, dim=0)
     return output

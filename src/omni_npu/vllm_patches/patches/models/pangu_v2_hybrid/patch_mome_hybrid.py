@@ -8,7 +8,7 @@ import types
 
 import torch
 
-from vllm.config import VllmConfig, CacheConfig
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.logger import init_logger
 from vllm.model_executor import layers
@@ -19,9 +19,9 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 
-from vllm.v1.attention.backends.mla.common import MLACommonMetadata
 from omni_npu.attention.backends.mome import NPUPanguMomeBackend, NPUMomeAttentionMetadata
 from omni_npu.layers.mome.npu_mome import ColumnParallelMOME
+from omni_npu.v1.utils import on_ascend950
 from omni_npu.plugin_decorators import mome_attn_decorator
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
@@ -80,7 +80,7 @@ class NPUMoMEPatch(VLLMPatch):
             num_spec_tokens: int,
             state_dtypes: tuple[torch.dtype, ...],
             state_shapes: tuple[tuple[int, ...], ...],
-            cache_config: CacheConfig | None = None,
+            vllm_config: VllmConfig | None = None,
             quant_config: QuantizationConfig | None = None,
             prefix: str = "",
             page_size_padded: Optional[int] = None,
@@ -89,7 +89,7 @@ class NPUMoMEPatch(VLLMPatch):
 
             self.kernel_size = kernel_size
             self.num_spec_tokens = num_spec_tokens
-            self.cache_config = cache_config
+            self.vllm_config = vllm_config
             self.quant_config = quant_config
             self.page_size_padded = page_size_padded
             self.prefix = prefix
@@ -103,6 +103,10 @@ class NPUMoMEPatch(VLLMPatch):
             self.o_dim = state_shapes[2][0]           
             self.state_shapes = state_shapes
             self.state_dtypes = state_dtypes
+
+            self.on_ascend950 = on_ascend950()
+            self.is_prefill_node = vllm_config.kv_transfer_config is not None and \
+                vllm_config.kv_transfer_config.kv_role == "kv_producer"
 
             # KV cache will be set by model runner during initialization
             # Shape: tuple of (q_cache, kv_cache, o_cache)
@@ -296,26 +300,37 @@ class NPUMoMEPatch(VLLMPatch):
                 The cache tensor is updated in-place as a side effect.
             """
 
-            if is_prefill:
-                if mome_metadata.prefill is None:
-                    return x
+            metadata = mome_metadata.prefill if is_prefill else mome_metadata.decode
+            if metadata is None:
+                return x
+            
+            if not self.on_ascend950:
+                x = conv_layer.forward(
+                    x=x,
+                    conv_states=cache,
+                    mome_metadata=metadata,
+                    inplace=False,
+                )
+            elif is_prefill:
                 x = conv_layer.forward_prefill(
                     x=x,
                     conv_states=cache[:, :self.kernel_size - 1],
-                    cache_indices=mome_metadata.prefill.cache_indices,
-                    query_start_loc=mome_metadata.prefill.query_start_loc,
+                    cache_indices=metadata.cache_indices,
+                    query_start_loc=metadata.query_start_loc,
                 )
             else:
-                if mome_metadata.decode is None:
-                    return x
                 x = conv_layer.forward_decode(
                     x=x,
                     conv_states=cache,
-                    cache_indices=mome_metadata.decode.cache_indices,
-                    query_start_loc=mome_metadata.decode.query_start_loc,
-                    num_accepted_tokens=mome_metadata.decode.num_accepted_tokens,
-                    pad_slot_id=mome_metadata.decode.pad_slot_id,
+                    cache_indices=metadata.cache_indices,
+                    query_start_loc=metadata.query_start_loc,
+                    num_accepted_tokens=metadata.num_accepted_tokens,
+                    pad_slot_id=metadata.pad_slot_id,
                 )
+
+            if self.is_prefill_node:
+                cache_indices = metadata.cache_indices
+                cache[cache_indices, 1:] = cache[cache_indices, :-1]
             return x
 
     layers.npumome.MomeAttention = MomeAttention

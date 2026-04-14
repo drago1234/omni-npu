@@ -97,7 +97,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             x_slice = x_slice[start:end]
 
         if layer.gate is not None:
-            router_logits, _ = layer.gate(x_slice.float())
+            router_logits, _ = layer.gate(x_slice)
         else:
             assert router_logits is not None, "Expected gate or router_logits must be provided."
             if is_need_slice:

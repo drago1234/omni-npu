@@ -269,6 +269,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         self.prefix = prefix
         self.quant_symbol = quant_config is not None
         self._init_wuk_t_uv = False
+        self.is_pd_disagg = vllm_config.kv_transfer_config is not None
 
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedFlashCommLinear(
@@ -378,6 +379,8 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         # MOME
         if getattr(config, "use_mome", False):
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                num_extra_token = 1 if self.is_pd_disagg else 0
+                fake_num_spec_tokens = max(self.num_speculative_tokens, num_extra_token)
                 self.mome_state_shapes = (
                     (self.q_lora_rank,),
                     (self.kv_lora_rank,),
@@ -398,16 +401,16 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                     mome_state_shapes=self.mome_state_shapes,
                     mome_state_dtypes=self.mome_state_dtypes,
                     kernel_size=self.kernel_size,
-                    num_speculative_tokens=self.num_speculative_tokens,
+                    fake_spec_tokens=fake_num_spec_tokens,
                 )
 
                 mome_kwargs = {
                     "kernel_size": self.kernel_size,
-                    "num_spec_tokens": self.num_speculative_tokens,
+                    "num_spec_tokens": fake_num_spec_tokens,
                     "state_dtypes": self.mome_state_dtypes,
                     "state_shapes": self.mome_state_shapes,
                     "quant_config": None,
-                    "cache_config": vllm_config.cache_config,
+                    "vllm_config": vllm_config,
                     "prefix": f"{prefix}.conv",
                     "page_size_padded": page_size_padded,
                 }
