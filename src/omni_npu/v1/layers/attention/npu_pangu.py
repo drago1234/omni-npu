@@ -1385,19 +1385,36 @@ class NPUPanguSparseAttention(torch.nn.Module):
         attn_metadata: Optional[MLACommonMetadata] = None,
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
-        """FlashComm2.0 prefill path: MLA prolog -> SWA attention -> FC2 epilog."""
+        """FlashComm2.0 prefill path: MLA prolog -> SWA attention -> FC2 epilog.
+
+        FC2 optimization: hidden_states arrives ungathered (TP-local).
+        We project locally, then all_gather the smaller q_lora / kv tensors
+        and trim to num_actual_tokens to remove TP padding.
+        cos / sin are already global and need no gathering.
+        """
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
+        num_prefill_tokens = num_actual_tokens - num_decode_tokens
 
-        prefill_hidden = hidden_states[num_decode_tokens:num_actual_tokens]
+        # cos/sin are global tensors — slice to prefill range directly
         prefill_cos = cos[num_decode_tokens:num_actual_tokens]
         prefill_sin = sin[num_decode_tokens:num_actual_tokens]
+
+        # hidden_states is TP-local (ungathered); compute total padded size
+        local_tokens = hidden_states.shape[0]
+        total_padded_tokens = local_tokens * self.tp_size
 
         # get KV cache for this layer
         kv_cache = self.attn.kv_cache[get_forward_context().virtual_engine]
 
         ### Q stream begins ###
-        q_lora = self.q_a_proj(prefill_hidden)
+        # Project on local tokens, then gather the smaller q_lora tensor
+        q_lora = self.q_a_proj(hidden_states)
+        if self.tp_size > 1:
+            if not self.all2all_backend == "naive":
+                q_lora = get_tp_group().all_gather(q_lora, dim=0)
+        # Trim TP padding to keep only actual prefill tokens
+        q_lora = q_lora[:num_prefill_tokens]
         if self.use_mome:
             q_lora = self._apply_MOME(
                 q_lora,
@@ -1427,7 +1444,13 @@ class NPUPanguSparseAttention(torch.nn.Module):
         ### Q stream ends ###
 
         ### KV stream begins ###
-        kv = self.kv_a_proj_with_mqa(prefill_hidden)
+        # Project on local tokens, then gather the smaller kv tensor
+        kv = self.kv_a_proj_with_mqa(hidden_states)
+        if self.tp_size > 1:
+            if not self.all2all_backend == "naive":
+                kv = get_tp_group().all_gather(kv, dim=0)
+        # Trim TP padding to keep only actual prefill tokens
+        kv = kv[:num_prefill_tokens]
         k_nope, k_pe = torch.split(
             kv,
             [self.kv_lora_rank, self.qk_rope_head_dim],
@@ -1475,8 +1498,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         # Write raw attn [num_prefill, local_heads*v_dim] into full N_total buffer
         # so all_to_all distributes tokens matching _maybe_padding_and_slice.
+        # hidden_states is TP-local, so use total_padded_tokens for the full buffer.
         attn_buf = torch.zeros(
-            hidden_states.shape[0], attn_output.shape[-1],
+            total_padded_tokens, attn_output.shape[-1],
             device=hidden_states.device, dtype=hidden_states.dtype)
         attn_buf[num_decode_tokens:num_actual_tokens] = attn_output
         # all_to_all: [tp_size, N_local, local_dim] -> [N_local, num_heads*v_dim]
@@ -2027,8 +2051,10 @@ def npu_pangu_forward(
                     and not has_decode and num_actual_tokens > attn_metadata.num_prefills * self.tp_size * 2
         enable_flashcomm2 = self.enable_flashcomm2 and not self.is_dsa_layer
 
+        # Only skip the global all_gather when the FC2 path will actually run
+        # (pure prefill, no decode). Mixed batch and decode paths still need it.
         if self.tp_size > 1:
-            if not self.all2all_backend == "naive" and not enable_cp:
+            if not self.all2all_backend == "naive" and not enable_cp and not (enable_flashcomm2 and has_prefill and not has_decode):
                 hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
 
         if has_decode and has_prefill:
