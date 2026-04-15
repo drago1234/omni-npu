@@ -157,14 +157,13 @@ class NPUmHC(torch.nn.Module):
             hidden_states = hidden_states.view(-1, self.num_stream, self.hidden_size)
 
             if not self.on_ascend950:
-                phi_weight = self.phi.weight * self.norm_gamma
                 hidden_states, h_post, h_res, _, _, _ = \
                     torch.ops.custom.npu_manifold_constrained_hyper_connection_pre(
                         hidden_states,
-                        phi_weight,
+                        self.phi.weight,
                         self.branch_alpha,
                         self.branch_beta,
-                        gamma=None,
+                        gamma=self.norm_gamma.view(self.num_stream, -1),
                         norm_eps=self.hc_eps,
                         hc_eps=self.hc_eps,
                 )
