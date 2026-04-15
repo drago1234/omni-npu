@@ -53,10 +53,12 @@ def _bypass_prefill(self, *args, **kwargs):
     in MoE layers, which involves CPU operations and cannot be compiled.
     We use the non-compiled forward for this case.
     """
-    attn_metadata = get_forward_context().attn_metadata
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
     has_prefill = attn_metadata is None or attn_metadata[next(iter(attn_metadata))].num_prefills > 0
     # FIXME (zhao): currently we only support full cudagraph mode for compiled graphs.
-    if has_prefill or get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
+    need_compile = getattr(forward_context, 'need_compile', False)
+    if has_prefill or not need_compile:
         logger.debug(f"<<< use original forward")
         return True, self.forward(*args, **kwargs)
     return False, None
@@ -65,10 +67,8 @@ def _wrap_call(original_call):
     @functools.wraps(original_call)
     def _new_call(self, *args, **kwargs):
         hit, retval = _bypass_prefill(self, *args, **kwargs)
-        logger.debug(f"<<< {hit=}, {retval=}")
         if hit:
             return retval
-        logger.debug(f"<<< {hit=}, {retval=}, use original_call")
         model_output = original_call(self, *args, **kwargs)
         if isinstance(model_output, (tuple, list)) and len(model_output) == 1:
             hidden_states = model_output[0]

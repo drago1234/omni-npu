@@ -25,9 +25,9 @@ class GraphPassManager(PostGradPassManager):
         super().__init__()
 
     def __call__(self, graph: fx.Graph, example_inputs, config) -> fx.Graph:
-        runtime_shape = get_pass_context().runtime_shape
+        compile_range = get_pass_context().compile_range
         for pass_ in self.passes:
-            if pass_.is_applicable(runtime_shape):
+            if pass_.is_applicable_for_range(compile_range):
                 pass_(graph)
         graph.recompile()
         return graph

@@ -241,7 +241,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
             self.sink_populated = False
             self.sink_k_pe = None
             self.sink_compressed_kv = None
-
+            self.device = current_platform.current_device()
         def update_sink_kv(self, sink_k_pe, sink_compressed_kv) -> None:
             self.sink_k_pe = sink_k_pe
             self.sink_compressed_kv = sink_compressed_kv
@@ -262,7 +262,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
             sink_kv_slot_mapping = torch.arange(
                 self.block_size,
                 self.sink_len + self.block_size,
-                device=current_platform.current_device(),
+                device=self.device,
                 dtype=torch.long,
             ).view(-1, 1)
 
