@@ -164,7 +164,7 @@ class Indexer(torch.nn.Module):
             slots % block_size,
             ], dim=1,
         )
-        torch_npu.npu_scatter_nd_update_(
+        torch.ops.custom.npu_ai_infra_scatter_block_update_(
             ki_cache,
             slot_indices,
             ki.view(-1, D),
