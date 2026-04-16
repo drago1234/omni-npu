@@ -53,6 +53,9 @@ class DSAAttentionSpec(FullAttentionSpec):
         elif self.cache_dtype_str == "hif8_ds_mla":
             # HiF8 with scale: 656 bytes KV data + 128 bytes indexer + 4 bytes fp32 scale
             return self.block_size * (656 + 128 + 4)
+        elif self.cache_dtype_str == "li_int8_ds_mla":
+            # Li-Quant-Only case: 576 bf16 + 128 int8 + 1 bf16
+            return self.block_size * (576 * 2 + 128 + 2)
         # Non-quant case: standard attention format
         return (
             self.block_size

@@ -76,7 +76,7 @@ class NPUPanguIndexer(torch.nn.Module):
         self.block_size_c8 = 2 * self.block_size
         self.on_ascend950 = on_ascend950()
         self._init_indexer_weights()
-        self.quant_cache_dtype = ["hif8_ds_mla", "fp8_ds_mla", "int8_ds_mla"]
+        self.quant_cache_dtype = ["hif8_ds_mla", "fp8_ds_mla", "int8_ds_mla", "li_int8_ds_mla"]
 
     def _init_indexer_weights(self):
         self.wq_b = ReplicatedLinear(
@@ -198,7 +198,7 @@ class NPUPanguIndexer(torch.nn.Module):
                 query_dtype=torch_npu.hifloat8,
                 key_dtype=torch_npu.hifloat8
             )
-        elif self.cache_config.cache_dtype in ["int8_ds_mla"]:
+        elif self.cache_config.cache_dtype in ["int8_ds_mla", "li_int8_ds_mla"]:
             q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
             return torch_npu.torch.ops.custom.npu_ai_infra_quant_lightning_indexer(
                 query=q_int8,
@@ -250,7 +250,7 @@ class NPUPanguIndexer(torch.nn.Module):
     ) -> torch.Tensor:
         actual_seq_lengths_query, actual_seq_lengths_kv, _, block_table = sp_manager.cp_attn_meta()
 
-        if self.cache_config.cache_dtype in ["int8_ds_mla"]:
+        if self.cache_config.cache_dtype in ["int8_ds_mla", "li_int8_ds_mla"]:
             q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
             return torch_npu.torch.ops.custom.npu_ai_infra_quant_lightning_indexer(
                 query=q_int8,
@@ -321,17 +321,29 @@ class NPUPanguIndexer(torch.nn.Module):
             )
             return True
 
-        elif self.cache_config.cache_dtype in ["int8_ds_mla"]:
+        elif self.cache_config.cache_dtype in ["int8_ds_mla", "li_int8_ds_mla"]:
             k_int8, k_scale = torch_npu.npu_dynamic_quant(k)
             k_scale_fp16 = k_scale.to(torch.float16).view(-1, 1)
             k_scale_bytes = k_scale_fp16.view(torch.int8)
             k_packed = torch.cat([k_int8, k_scale_bytes], dim=-1)
 
-            torch.ops.custom.npu_ai_infra_scatter_block_update_(
-                kv_cache[1],
-                slot_indices_c8,
-                k_packed.view(-1, k_packed.shape[-1]),
-            )
+            if self.cache_config.cache_dtype == "li_int8_ds_mla":
+                slot_indices = torch.stack([
+                    slot_mapping // self.block_size,
+                    slot_mapping % self.block_size,
+                    ], dim=1,
+                )
+                torch.ops.custom.npu_ai_infra_scatter_block_update_(
+                    kv_cache[1],
+                    slot_indices,
+                    k_packed.view(-1, k_packed.shape[-1]),
+                )
+            else:
+                torch.ops.custom.npu_ai_infra_scatter_block_update_(
+                    kv_cache[1],
+                    slot_indices_c8,
+                    k_packed.view(-1, k_packed.shape[-1]),
+                )
             return True
 
         else:
@@ -857,6 +869,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
             elif cache_dtype_str == "int8_ds_mla":
                 # Quant case: 512 int8 + 64 bf16 + 4 fp32 + 128 int8 + 1 bf16
                 dsa_page_size = self.block_size_c8 * (656 + 128 + 2)
+            elif cache_dtype_str == "li_int8_ds_mla":
+                # Li-Quant-Only case: 576 bf16 + 128 int8 + 1 bf16
+                dsa_page_size = block_size * (576 * 2 + 128 + 2)
             else:
                 # Non-quant case: standard attention format
                 dsa_page_size = block_size * (mla_head_size + index_head_dim) * dtype_size

@@ -75,6 +75,9 @@ class NPUDSABackend(MLACommonBackend):
         elif kv_cache_spec.cache_dtype_str == "hif8_ds_mla":
             shapes = ( (656,), (128,), (1,))
             dtypes = (torch.uint8, torch.uint8, torch.float32)
+        elif kv_cache_spec.cache_dtype_str == "li_int8_ds_mla":
+            shapes = ( (576,), (130,) )
+            dtypes = (torch.bfloat16, torch.int8)
         else:
             shapes = ( (576,), (128,) )
             dtypes = (torch.bfloat16, torch.bfloat16)

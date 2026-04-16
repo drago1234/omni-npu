@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 NEW_CACHE_DTYPES: dict[str, "torch.dtype"] = {
     "hif8_ds_mla": torch.uint8,
     "int8_ds_mla": torch.int8,
+    "li_int8_ds_mla": torch.bfloat16,
 }
 
 # A valid upstream cache_dtype used as a placeholder during Pydantic validation
@@ -32,6 +33,7 @@ _EXTENDED_CACHE_DTYPE = Literal[
     "fp8_ds_mla",
     "hif8_ds_mla",
     "int8_ds_mla",
+    "li_int8_ds_mla",
 ]
 
 
