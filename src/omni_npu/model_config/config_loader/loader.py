@@ -105,6 +105,7 @@ class ModelParallelConfig:
 @dataclass
 class ModelOperatorOptConfig:
     enable_kv_rmsnorm_rope_cache: bool = False
+    enable_prefill_mla_absorb_pa: bool = False
     kv_nz: bool = True
     gmm_nz: bool = True
     moe_multi_stream_tune: bool = False

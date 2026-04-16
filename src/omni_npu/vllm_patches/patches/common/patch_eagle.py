@@ -510,11 +510,8 @@ class EagleProposerPatch(VLLMPatch):
                 num_reqs = common_attn_metadata.num_reqs
                 extra_attn_metadata_args['num_accepted_tokens'] = \
                     self.runner.num_accepted_tokens.gpu[:num_reqs]
-                num_prompt_tokens_np = self.runner.input_batch.num_prompt_tokens[:num_reqs]
-                num_prompt_tokens = torch.tensor(num_prompt_tokens_np, \
-                                                 device=self.runner.num_accepted_tokens.gpu.device, \
-                                                 dtype=torch.int32)
-                extra_attn_metadata_args['num_prompt_tokens'] = num_prompt_tokens
+                extra_attn_metadata_args['num_prompt_tokens'] = \
+                    self.runner.num_prompt_tokens.gpu[:num_reqs]
 
             cm = self._build_common_attn_metadata_for_group(
                 group.kv_cache_group_id,

@@ -96,6 +96,9 @@ class NPUModelRunner(GPUModelRunner):
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+        self.num_prompt_tokens = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
 
         # sampled_token_ids is int32 in npu, sampled_token_ids_pinned_cpu should
         # be same dtype to synchronize.

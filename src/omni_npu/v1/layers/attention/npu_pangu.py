@@ -557,6 +557,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.layer_name = prefix
         self.param_sink_number = param_sink_number
         self.on_ascend950 = on_ascend950()
+        self.is_pd_disagg = vllm_config.kv_transfer_config is not None
+        self.is_prefill_node = (self.is_pd_disagg and \
+            vllm_config.kv_transfer_config.kv_role == "kv_producer")
         assert model_extra_config.operator_opt_config.use_noncontiguous_kv
         self.enable_flashcomm2 = model_extra_config.parall_config.enable_flashcomm2
         self.dummy_value_cache = torch.zeros(
@@ -776,10 +779,13 @@ class NPUPanguSparseAttention(torch.nn.Module):
     def _init_mome_layer(self):
         if not self.use_mome:
             return
+        
+        num_extra_token = 1 if self.is_pd_disagg else 0
+        fake_num_spec_tokens = max(self.num_spec_tokens, num_extra_token)
 
         mome_kwargs = {
             "kernel_size": self.mome_kernel_width,
-            "num_spec_tokens": self.num_spec_tokens,
+            "num_spec_tokens": fake_num_spec_tokens,
             "state_dtypes": self.mome_state_dtypes,
             "state_shapes": self.mome_state_shapes,
             "quant_config": self.quant_config,
@@ -858,7 +864,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
         # Calculate MOME page size if MOME is enabled
         mome_page_size = None
         if self.use_mome:
-            num_total_tokens = self.mome_kernel_width - 1 + self.num_spec_tokens
+            num_extra_token = 1 if self.is_pd_disagg else 0
+            num_total_tokens = self.mome_kernel_width - 1 + \
+                max(self.num_spec_tokens, num_extra_token)
             mome_page_size = sum(
                 prod(shape) * get_dtype_size(dtype)
                 for (shape, dtype) in zip(self.mome_state_shapes, self.mome_state_dtypes)
@@ -1046,9 +1054,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
         width = self.mome_kernel_width
         kv_cache = self.mome_attn.kv_cache[get_forward_context().virtual_engine]
 
-        # todo: support continuous batching
-        
-        if mome_metadata.num_prefills > 0:
+        if not self.on_ascend950:
+            x = layer.forward(x, kv_cache[kv_index], mome_metadata, inplace=False)        
+        elif mome_metadata.num_prefills > 0:
             x = layer.forward_prefill(
                 x, 
                 kv_cache[kv_index][:, :width-1], 
@@ -1064,6 +1072,13 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 num_accepted_tokens=mome_metadata.num_accepted_tokens, 
                 pad_slot_id=mome_metadata.pad_slot_id, 
             )
+        
+        if self.is_prefill_node:
+            # In PD disaggregation, the decode node recomputes the last token of the prompt. 
+            # In the prefill node, we roll back the cache by one token so that
+            # the decode node gets the right cache to read.
+            cache_indices = mome_metadata.cache_indices
+            kv_cache[kv_index][cache_indices, 1:] = kv_cache[kv_index][cache_indices, :-1]
 
         x = torch.cat([x, x_padded], dim=0)
         return x
@@ -1398,7 +1413,10 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_metadata,
             )
         else:
-            q_nope, q_pe, k_up_nope, k_pe, v_up = self._mla_prolog(
+            enable_prefill_absorb_pa = (
+                model_extra_config.operator_opt_config.enable_prefill_mla_absorb_pa
+            )
+            mla_output = self._mla_prolog(
                 hidden_states,
                 cos,
                 sin,
@@ -1406,14 +1424,24 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_metadata,
                 mome_metadata,
             )
-            attn_output = self._apply_SWA_attention_prefill(
-                q_nope,
-                q_pe,
-                k_up_nope,
-                k_pe,
-                v_up,
-                attn_metadata,
-            )
+            if enable_prefill_absorb_pa:
+                q_nope, q_pe, kv_cache, _ = mla_output
+                attn_output = self._apply_SWA_attention_prefill_absorb(
+                    q_nope,
+                    q_pe,
+                    kv_cache,
+                    attn_metadata,
+                )
+            else:
+                q_nope, q_pe, k_up_nope, k_pe, v_up = mla_output
+                attn_output = self._apply_SWA_attention_prefill(
+                    q_nope,
+                    q_pe,
+                    k_up_nope,
+                    k_pe,
+                    v_up,
+                    attn_metadata,
+                )
 
         return self._mla_epilog(attn_output, attn_metadata, mome_metadata)
 
@@ -1549,6 +1577,68 @@ class NPUPanguSparseAttention(torch.nn.Module):
         torch.distributed.all_to_all_single(output.flatten(), attn_buf.flatten(), group=get_tp_group().device_group)
         attn_output = output.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
         return self.o_proj(attn_output)
+
+    def _apply_SWA_attention_prefill_absorb(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: Optional[MLACommonMetadata] = None,
+    ) -> torch.Tensor:
+        assert attn_metadata is not None and attn_metadata.prefill is not None
+
+        sink_k_nope = self.kv_a_layernorm(self.param_sink_compressed_kv).unsqueeze(1)
+        sink_k_pe = self.param_sink_k_pe.unsqueeze(1)
+
+        query_cumlens = attn_metadata.prefill.query_cumlens
+        seq_lens = attn_metadata.prefill.seq_lens
+        num_actual_tokens = query_cumlens[-1]
+
+        kwargs = {
+            "query": q_nope[:num_actual_tokens],
+            "key": kv_cache[0],
+            "value": kv_cache[0],
+            "query_rope": q_pe[:num_actual_tokens],
+            "key_rope": kv_cache[1],
+            "num_key_value_heads": 1,
+            "input_layout": "TND",
+            "atten_mask": self.attn.impl.SHARE_MASK_TRIL_SPARSE,
+            "sparse_mode": 4,
+            "pre_tokens": self.sliding_window - 1,
+            "next_tokens": 0,
+            "block_table": attn_metadata.prefill.block_table,
+            "block_size": self.block_size,
+            "key_sink": sink_k_nope,
+            "value_sink": sink_k_nope,
+            "key_rope_sink": sink_k_pe,
+        }
+
+        if self.on_ascend950:
+            kwargs.update({
+                "num_heads": self.num_local_heads,
+                "actual_seq_lengths": query_cumlens,
+                "actual_seq_lengths_kv": seq_lens,
+                "scale": self.scaling,
+            })
+            attn_output = torch_npu._npu_attention_pioneer(**kwargs)[0]
+        else:
+            kwargs.update({
+                "num_query_heads": self.num_local_heads,
+                "actual_seq_qlen": query_cumlens,
+                "actual_seq_kvlen": seq_lens,
+                "softmax_scale": self.scaling,
+            })
+            attn_output = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
+
+        attn_output = attn_output.transpose(0, 1).contiguous()
+        attn_output = (
+            torch.matmul(attn_output, self.attn.impl.W_UV)
+                .transpose(1, 0)
+                .reshape(-1, self.num_local_heads * self.v_head_dim)
+        )
+
+        return attn_output
+
 
     def _apply_SWA_attention_prefill(
         self,
@@ -1751,7 +1841,11 @@ class NPUPanguSparseAttention(torch.nn.Module):
             dim=-1,
         )
 
-        if attn_metadata.decode is not None or self.is_dsa_layer:
+        if (
+            attn_metadata.decode is not None
+            or self.is_dsa_layer
+            or model_extra_config.operator_opt_config.enable_prefill_mla_absorb_pa
+        ):
             q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim)
             q_nope = (
                 torch_npu.npu_transpose_batchmatmul(q_nope, self.W_UK_T, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
@@ -1975,7 +2069,10 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
             return kv_cache, topk_indices
 
-        elif attn_metadata.decode is not None:
+        elif (
+            attn_metadata.decode is not None
+            or model_extra_config.operator_opt_config.enable_prefill_mla_absorb_pa
+        ):
             # MLA/SWA absorb shape
             if self.on_ascend950:
                 k_pe, k_nope = self._naive_kvrmsnorm_rope_cache(
