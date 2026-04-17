@@ -133,19 +133,17 @@ class NPUDSAPrefillMetadata(MLACommonPrefillMetadata):
 
     prefix_meta: Optional[Any] = None
     slot_mapping: torch.Tensor = None
-    slot_mapping_2d: torch.Tensor = None
 
 @dataclass
 class NPUDSADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
     mc2_mask: torch.Tensor = None
     slot_mapping: torch.Tensor = None
-    slot_mapping_2d: torch.Tensor = None
 
 
 @dataclass
 class NPUDSAMetadata(MLACommonMetadata[NPUDSADecodeMetadata]):
-    slot_mapping_2d: torch.Tensor = None
+    pass
 
 
 class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
@@ -179,19 +177,6 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
         self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
         self.sink_len = getattr(self.vllm_config.model_config.hf_config, "param_sink_number", 0)
-
-        self.decode_cudagraph_max_bs = max_decode_tokens
-        if self.compilation_config.max_cudagraph_capture_size is not None:
-            self.decode_cudagraph_max_bs = min(
-                self.decode_cudagraph_max_bs,
-                self.compilation_config.max_cudagraph_capture_size,
-            )
-
-        self.slot_mapping_2d = torch.empty(
-            (self.decode_cudagraph_max_bs, 2),
-            dtype=torch.int32,
-            device=device,
-        )
 
     def _build_decode(
         self,
@@ -234,25 +219,6 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
                     cumlens=metadata.prefill.query_start_loc,
                     init_zigzag=True,
                 )
-
-        if metadata is not None:
-            slot_mapping_2d = torch.stack([
-                metadata.slot_mapping // self.kv_cache_spec.block_size,
-                metadata.slot_mapping % self.kv_cache_spec.block_size,
-            ], dim=-1)
-
-            # For cudagraph: copy to persistent buffer if applicable
-            if (
-                metadata.num_prefills == 0
-                and metadata.num_decodes <= self.decode_cudagraph_max_bs
-                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-            ):
-                self.slot_mapping_2d[:metadata.num_decodes].copy_(
-                    slot_mapping_2d[:metadata.num_decodes], non_blocking=True
-                )
-                slot_mapping_2d = self.slot_mapping_2d[:metadata.num_decodes]
-
-            metadata.slot_mapping_2d = slot_mapping_2d
 
         return metadata
 
