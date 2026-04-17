@@ -154,6 +154,8 @@ class NPUModelRunner(GPUModelRunner):
             torch.Tensor | None,
         ] | None = None
 
+        self._is_mm_encoder_only = False
+
 
     def _build_conv_context(self, dummy:bool = False):
         forward_context = get_forward_context()
@@ -538,6 +540,7 @@ class NPUModelRunner(GPUModelRunner):
                         )
                     self.drafter.model.model.wrapped_layers = wrapped_layers
                     logger.debug("<<< Wrapped multi mtp layers of drafter model with ACLGraphWrapper")
+        self._is_mm_encoder_only = supports_mm_encoder_only(self.model)
 
     def capture_model(self) -> int:
         logger.debug("<<< Capturing model in npu_model_runner")
@@ -608,7 +611,7 @@ class NPUModelRunner(GPUModelRunner):
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
         """
-        if supports_mm_encoder_only(self.model):
+        if self._is_mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
@@ -890,11 +893,7 @@ class NPUModelRunner(GPUModelRunner):
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
-        logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        logit_indices_device = torch.from_numpy(logit_indices).to(
-            self.device, non_blocking=True
-        )
-        return hidden_states, hidden_states[logit_indices_device]
+        return hidden_states, hidden_states[:num_reqs]
 
     @prepare_inputs_decorator
     def prepare_inputs(
