@@ -189,6 +189,35 @@ class TestNpuMemAllocator:
             # Revert after exit
             assert allocator.current_tag == original_tag
 
+    def test_use_memory_pool_reuses_allocator_and_pool_for_same_tag(self):
+        """Test same tag reuses existing pool on second call."""
+        allocator = NpuMemAllocator.get_instance()
+        original_tag = allocator.current_tag
+        temp_tag = "temp_tag"
+
+        first_pool = MagicMock(name="first_pool")
+        first_alloc = MagicMock(name="first_alloc")
+        first_data = (first_pool, first_alloc)
+
+        with patch("omni_npu.worker.npu_mem_pool.use_memory_pool_with_allocator") as mock_ctx, \
+             patch("torch.npu.memory.use_mem_pool") as mock_use_mem_pool:
+            mock_ctx.return_value.__enter__.return_value = first_data
+            mock_use_mem_pool.return_value.__enter__.return_value = None
+
+            # First call: create allocator+pool via use_memory_pool_with_allocator.
+            with allocator.use_memory_pool(tag=temp_tag):
+                assert allocator.current_tag == temp_tag
+                assert allocator.allocator_and_pools[temp_tag] == first_data
+
+            # Second call: should reuse existing allocator+pool.
+            with allocator.use_memory_pool(tag=temp_tag):
+                assert allocator.current_tag == temp_tag
+
+            assert mock_ctx.call_count == 1
+            mock_use_mem_pool.assert_called_once_with(first_pool)
+            assert allocator.allocator_and_pools[temp_tag] == first_data
+            assert allocator.current_tag == original_tag
+
     def test_get_current_usage(self):
         """Test memory usage statistics."""
         allocator = NpuMemAllocator.get_instance()

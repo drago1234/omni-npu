@@ -10,12 +10,14 @@ import torch
 import numpy as np
 import torch.nn as nn
 from dataclasses import replace
+from functools import wraps
 
 from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
     VllmConfig,
     get_layers_from_vllm_config,
+    set_current_vllm_config,
 )
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import (
@@ -49,6 +51,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.compilation.cuda_graph import CUDAGraphStat
 
+from omni_npu.worker.npu_mem_pool import NpuMemAllocator
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import ACLGraphWrapper, set_graph_params
@@ -470,6 +473,35 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
         )
 
+    def _hook_model_load_weights(self) -> None:
+        model = self.get_model()
+        if getattr(model, "_omni_npu_load_weights_hooked", False):
+            return
+
+        original_load_weights = getattr(model, "load_weights", None)
+        if not callable(original_load_weights):
+            logger.error("model.load_weights is not callable.")
+            return
+
+        @wraps(original_load_weights)
+        def wrapped_load_weights(*args, **kwargs):
+            logger.info("Before calling self.model.load_weights")
+            try:
+                allocator = NpuMemAllocator.get_instance()
+                context = allocator.use_memory_pool(tag="weights")
+                with context, set_current_vllm_config(self.vllm_config):
+                    original_load_weights(*args, **kwargs)
+
+                # this is for RL pause/resume scene, recapture the model after loading weights.
+                if not self.model_config.enable_sleep_mode:
+                    if not self.model_config.enforce_eager:
+                        self.capture_model()
+            finally:
+                logger.info("After calling self.model.load_weights")
+
+        model.load_weights = wrapped_load_weights
+        model._omni_npu_load_weights_hooked = True
+
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
         Args:
@@ -541,6 +573,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.drafter.model.model.wrapped_layers = wrapped_layers
                     logger.debug("<<< Wrapped multi mtp layers of drafter model with ACLGraphWrapper")
         self._is_mm_encoder_only = supports_mm_encoder_only(self.model)
+        self._hook_model_load_weights()
 
     def capture_model(self) -> int:
         logger.debug("<<< Capturing model in npu_model_runner")

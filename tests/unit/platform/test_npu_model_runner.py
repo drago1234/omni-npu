@@ -55,6 +55,12 @@ def mock_forward_context():
         if hasattr(runner_module, '_mock_forward_context'):
             delattr(runner_module, '_mock_forward_context')
 
+class FakeACLGraphWrapper:
+    def __init__(self, model, *args, **kwargs):
+        self._model = model
+
+    def unwrap(self):
+        return self._model
 
 class TestNPUModelRunner:
 
@@ -398,9 +404,8 @@ class TestNPUModelRunner:
         monkeypatch.setattr(GPUModelRunner, "load_model", mock_load_model)
 
         # Mock ACLGraphWrapper
-        mock_acl_graph_wrapper = MagicMock()
         monkeypatch.setattr("omni_npu.worker.npu_model_runner.ACLGraphWrapper",
-                            lambda *args, **kwargs: mock_acl_graph_wrapper)
+                            FakeACLGraphWrapper)
 
         # Set up drafter
         from vllm.v1.spec_decode.eagle import EagleProposer
@@ -416,7 +421,7 @@ class TestNPUModelRunner:
         runner.load_model(eep_scale_up=False)
 
         # Verify drafter.model was wrapped with ACLGraphWrapper
-        assert runner.drafter.model == mock_acl_graph_wrapper
+        assert isinstance(runner.drafter.model, FakeACLGraphWrapper)
 
     def test_capture_model_with_gegraph(self, monkeypatch):
         """Test capture_model with gegraph."""
@@ -897,11 +902,10 @@ class TestNPUModelRunner:
                 "called", True),
         )
 
-        # Mock ACLGraphWrapper and set_graph_params
-        wrapped_model = SimpleNamespace(unwrap=lambda: self.runner.model)
+        # Mock ACLGraphWrapper as a real type so isinstance(...) remains valid.
         monkeypatch.setattr(
             "omni_npu.worker.npu_model_runner.ACLGraphWrapper",
-            lambda model, vllm_config, runtime_mode, update_stream: wrapped_model,
+            FakeACLGraphWrapper,
         )
         monkeypatch.setattr(
             "omni_npu.worker.npu_model_runner.set_graph_params",
@@ -930,11 +934,136 @@ class TestNPUModelRunner:
             if not hasattr(self.runner.model, "runnable"):
                 self.runner.model.runnable = self.runner.model
 
+        wrapped_input = self.runner.model.runnable
         self.runner.load_model()
 
         assert super_called.get("called") is True
         assert self.runner.update_stream is fake_stream
-        assert self.runner.model is wrapped_model
+        assert isinstance(self.runner.model, FakeACLGraphWrapper)
+        assert self.runner.model.unwrap() is wrapped_input
+
+    def test_hook_model_load_weights_returns_if_already_hooked(self,
+                                                               monkeypatch):
+        """Test _hook_model_load_weights returns when model already hooked."""
+        original_load_weights = MagicMock()
+        model = SimpleNamespace(
+            _omni_npu_load_weights_hooked=True,
+            load_weights=original_load_weights,
+        )
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+
+        self.runner._hook_model_load_weights()
+
+        assert model.load_weights is original_load_weights
+        assert model._omni_npu_load_weights_hooked is True
+
+    def test_hook_model_load_weights_logs_error_when_not_callable(self,
+                                                                  monkeypatch):
+        """Test _hook_model_load_weights logs and returns for bad model."""
+        model = SimpleNamespace(
+            _omni_npu_load_weights_hooked=False,
+            load_weights=None,
+        )
+        log_error = MagicMock()
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.logger.error",
+                            log_error)
+
+        self.runner._hook_model_load_weights()
+
+        log_error.assert_called_once_with("model.load_weights is not callable.")
+        assert model._omni_npu_load_weights_hooked is False
+
+    def test_hook_model_load_weights_wraps_and_executes(self, monkeypatch):
+        """Test _hook_model_load_weights wrap path and wrapped execution."""
+        original_load_weights = MagicMock()
+        model = SimpleNamespace(
+            _omni_npu_load_weights_hooked=False,
+            load_weights=original_load_weights,
+        )
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+
+        log_info = MagicMock()
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.logger.info",
+                            log_info)
+
+        class DummyContextManager:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        allocator = MagicMock()
+        allocator.use_memory_pool.return_value = DummyContextManager()
+        get_instance = MagicMock(return_value=allocator)
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.NpuMemAllocator.get_instance",
+            get_instance,
+        )
+
+        set_cfg_context = MagicMock(return_value=DummyContextManager())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.set_current_vllm_config",
+                            set_cfg_context)
+
+        capture_model = MagicMock()
+        monkeypatch.setattr(self.runner, "capture_model", capture_model)
+        self.runner.model_config = SimpleNamespace(enable_sleep_mode=False,
+                                                   enforce_eager=False)
+
+        self.runner._hook_model_load_weights()
+
+        assert model._omni_npu_load_weights_hooked is True
+        wrapped = model.load_weights
+        assert wrapped is not original_load_weights
+
+        wrapped("arg0", kw="val")
+
+        original_load_weights.assert_called_once_with("arg0", kw="val")
+        get_instance.assert_called_once_with()
+        allocator.use_memory_pool.assert_called_once_with(tag="weights")
+        set_cfg_context.assert_called_once_with(self.runner.vllm_config)
+        capture_model.assert_called_once_with()
+        assert log_info.call_count == 2
+
+    def test_hook_model_load_weights_skip_capture_when_sleep_mode_enabled(
+            self, monkeypatch):
+        """Test wrapped load_weights does not capture when sleep mode is enabled."""
+        original_load_weights = MagicMock()
+        model = SimpleNamespace(
+            _omni_npu_load_weights_hooked=False,
+            load_weights=original_load_weights,
+        )
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+
+        class DummyContextManager:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        allocator = MagicMock()
+        allocator.use_memory_pool.return_value = DummyContextManager()
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.NpuMemAllocator.get_instance",
+            MagicMock(return_value=allocator),
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.set_current_vllm_config",
+            MagicMock(return_value=DummyContextManager()),
+        )
+
+        capture_model = MagicMock()
+        monkeypatch.setattr(self.runner, "capture_model", capture_model)
+        self.runner.model_config = SimpleNamespace(enable_sleep_mode=True,
+                                                   enforce_eager=False)
+
+        self.runner._hook_model_load_weights()
+        model.load_weights()
+
+        original_load_weights.assert_called_once_with()
+        capture_model.assert_not_called()
 
     def test_execute_model_uses_switch(self, monkeypatch):
         self.runner.use_async_scheduling = True

@@ -32,12 +32,12 @@ extern "C" {
 
 #define LOG_ERR(args)                                                           \
 do {                                                                            \
-    std::cerr << "[ ERROR " << __FILE__ << ":" << __LINE__ <<  "] " << args;    \
+    std::cerr << "[ ERROR " << __FILE__ << ":" << __LINE__ <<  "] " << args << std::endl;    \
 } while (0)
 
-// Global references to Python callables
-// NOTE: this is borrowed reference, so we don't need to DECREF them.
-// This brings the limitation that the allocator needs to be singleton.
+// Global references to Python callables.
+// Keep strong references because bound method objects passed from Python
+// may otherwise be reclaimed while the allocator still uses them.
 static PyObject* g_python_malloc_callback = nullptr;
 static PyObject* g_python_free_callback = nullptr;
 
@@ -172,6 +172,13 @@ ATTRIBUTE_VISIBILITY_DEFAULT void* my_malloc(ssize_t size, int device, aclrtStre
   // Acquire GIL (not in stable ABI officially, but often works)
   PyGILState_STATE gstate = PyGILState_Ensure();
 
+  if (!PyCallable_Check(g_python_malloc_callback)) {
+    LOG_ERR("g_python_malloc_callback is not callable.");
+    PyErr_Print();
+    PyGILState_Release(gstate);
+    return nullptr;
+  }
+
   PyObject* arg_tuple = create_tuple_from_c_integers(
       (unsigned long long)device, (unsigned long long)alignedSize,
       (unsigned long long)d_mem, (unsigned long long)p_memHandle);
@@ -187,6 +194,7 @@ ATTRIBUTE_VISIBILITY_DEFAULT void* my_malloc(ssize_t size, int device, aclrtStre
     return nullptr;
   }
 
+  Py_DECREF(py_result);
   PyGILState_Release(gstate);
 
   // do the final mapping
@@ -206,14 +214,25 @@ ATTRIBUTE_VISIBILITY_DEFAULT void my_free(void* ptr, ssize_t size, int device, a
   // Acquire GIL (not in stable ABI officially, but often works)
   PyGILState_STATE gstate = PyGILState_Ensure();
 
+  if (!PyCallable_Check(g_python_free_callback)) {
+    LOG_ERR("g_python_free_callback is not callable.");
+    PyErr_Print();
+    PyGILState_Release(gstate);
+    return;
+  }
+
   PyObject* py_ptr =
       PyLong_FromUnsignedLongLong(reinterpret_cast<unsigned long long>(ptr));
 
   PyObject* py_result =
       PyObject_CallFunctionObjArgs(g_python_free_callback, py_ptr, NULL);
+  Py_DECREF(py_ptr);
 
   if (!py_result || !PyTuple_Check(py_result) || PyTuple_Size(py_result) != 4) {
+    Py_XDECREF(py_result);
     PyErr_SetString(PyExc_TypeError, "Expected a tuple of size 4");
+    PyErr_Print();
+    PyGILState_Release(gstate);
     return;
   }
 
@@ -222,10 +241,14 @@ ATTRIBUTE_VISIBILITY_DEFAULT void my_free(void* ptr, ssize_t size, int device, a
   // Unpack the tuple into four C integers
   if (!PyArg_ParseTuple(py_result, "KKKK", &recv_device, &recv_size,
                         &recv_d_mem, &recv_p_memHandle)) {
+    Py_DECREF(py_result);
     PyErr_SetString(PyExc_TypeError, "Failed to parse my_free params");
+    PyErr_Print();
+    PyGILState_Release(gstate);
     return;
   }
 
+  Py_DECREF(py_result);
   PyGILState_Release(gstate);
 
   void *d_mem = (void*)recv_d_mem;
@@ -243,6 +266,14 @@ ATTRIBUTE_VISIBILITY_DEFAULT void my_free(void* ptr, ssize_t size, int device, a
 // ---------------------------------------------------------------------------
 // Python extension boilerplate:
 
+static void npu_allocator_module_free(void* module)
+{
+  Py_XDECREF(g_python_malloc_callback);
+  Py_XDECREF(g_python_free_callback);
+  g_python_malloc_callback = nullptr;
+  g_python_free_callback = nullptr;
+}
+
 // Python-exposed function: init_module(python_malloc, python_free)
 static PyObject* py_init_module(PyObject* self, PyObject* args)
 {
@@ -258,9 +289,18 @@ static PyObject* py_init_module(PyObject* self, PyObject* args)
     return nullptr;
   }
 
-  // Save the Python callables
-  // This module does not handle GC of these objects, so they must be kept alive
-  // outside of this module.
+  // Own strong references in C++ because these callbacks are stored in module
+  // globals and may be invoked long after init_module() returns.
+  // We do not rely on Python-side retention (e.g. self._python_malloc_cb /
+  // self._python_free_cb) because lifecycle guarantees must be local to this
+  // extension: callers can refactor or replace Python wrappers, while this
+  // module still needs callbacks with stable lifetime.
+  Py_INCREF(malloc_callback);
+  Py_INCREF(free_callback);
+
+  Py_XDECREF(g_python_malloc_callback);
+  Py_XDECREF(g_python_free_callback);
+
   g_python_malloc_callback = malloc_callback;
   g_python_free_callback = free_callback;
 
@@ -345,7 +385,8 @@ static PyMethodDef module_methods[] =
 static struct PyModuleDef npu_allocator_module =
 {
     PyModuleDef_HEAD_INIT, "npu_allocator_module",
-    "npu-mem-based allocator for NPUPluggableAllocator", -1, module_methods
+    "npu-mem-based allocator for NPUPluggableAllocator", -1, module_methods,
+    NULL, NULL, NULL, npu_allocator_module_free
 };
 
 PyMODINIT_FUNC PyInit_npu_mem_allocator(void)
