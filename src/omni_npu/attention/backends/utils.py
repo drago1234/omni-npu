@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import os
 import torch
 import numpy as np
 from importlib.metadata import entry_points
@@ -13,6 +14,9 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 NPU_ATTENTION_BACKEND = {}
+
+# NOTE: Cache for entry points to avoid repeated lookups
+_PLUGIN_BACKEND_CACHE = None  # type: dict[str, type] | None
 
 
 def _maybe_padded_raw_tensor_to_strided_caches(
@@ -107,6 +111,53 @@ def _maybe_padded_raw_tensor_to_strided_caches(
 
     return tuple(cache_tensors)
 
+def _load_plugin_backends_map() -> dict[str, type]:
+    """NOTE: Scan entry points once and build a name -> class map.
+
+    Each entry point under group ``omni.attention_backends`` is loaded
+    and indexed by the value returned by its ``get_name()`` method.
+    The result is cached so subsequent calls are free.
+    """
+    global _PLUGIN_BACKEND_CACHE
+    if _PLUGIN_BACKEND_CACHE is not None:
+        return _PLUGIN_BACKEND_CACHE
+
+    plugin_map: dict[str, type] = {}
+    try:
+        eps = entry_points(group="omni.attention_backends")
+    except Exception:
+        _PLUGIN_BACKEND_CACHE = plugin_map
+        return plugin_map
+
+    for ep in eps:
+        try:
+            backend_cls = ep.load()
+            name = backend_cls.get_name()
+            plugin_map[name] = backend_cls
+            logger.debug("Found plugin backend %s from entry point %s", name, ep.name)
+        except Exception as e:
+            logger.warning("Failed to load backend plugin %s: %s", ep.name, e)
+
+    _PLUGIN_BACKEND_CACHE = plugin_map
+    return plugin_map
+
+def _is_plugin_disabled(backend: str) -> bool:
+    """NOTE: Check whether a backend name is listed in the
+    ``DISABLE_PLUGIN_BACKENDS`` environment variable.
+
+    The env var is a comma-separated list of backend names that should
+    **not** be replaced by their plugin counterparts.  For example::
+
+        DISABLE_PLUGIN_BACKENDS=NPUDSA,NPUMLA
+
+    means the decorator will return the original base class for NPUDSA
+    and NPUMLA even if a plugin is available.
+    """
+    disabled = os.environ.get("DISABLE_PLUGIN_BACKENDS", "")
+    if not disabled:
+        return False
+    disabled_names = [s.strip() for s in disabled.split(",") if s.strip()]
+    return backend in disabled_names
 
 def register_attention_backend(backend: str):
 
@@ -129,24 +180,63 @@ def get_attention_backend(name: str) -> str | None:
     """Get a registered attention backend path string by name."""
     return NPU_ATTENTION_BACKEND.get(name)
 
-def load_plugin_backends():
-    """
-    Load attention backend plugins from entry points.
+def apply_plugin_overrides():
+    """NOTE: Replace registered backends with their plugin counterparts.
 
-    This should be called during module initialization.
-    Plugins can override the base backends by registering with the same name.
+    This must be called **after** all base backends have been imported
+    (and thus registered), to avoid circular-import issues — plugin
+    modules import base classes from omni_npu, so we cannot load them
+    while the base modules are still being imported.
+
+    For each registered backend name, we check whether an entry point
+    under ``omni.attention_backends`` provides a class whose
+    ``get_name()`` matches.  If it does and the backend is not listed
+    in the ``DISABLE_PLUGIN_BACKENDS`` environment variable, the
+    plugin class replaces the base class in ``NPU_ATTENTION_BACKEND``
+    and is also returned so the caller can rebind module-level names.
+
+    Returns:
+        A tuple ``(overrides, base_paths)`` where *overrides* maps
+        backend name to the plugin class (only for backends that were
+        actually overridden) and *base_paths* is the snapshot of
+        ``NPU_ATTENTION_BACKEND`` taken before any plugin was loaded.
     """
-    eps = entry_points(group="omni.attention_backends")
-    for ep in eps:
-        try:
-            backend_cls = ep.load()
-            name = backend_cls.get_name()
-            attn_module = f"{backend_cls.__module__}.{backend_cls.__qualname__}"
-            logger.debug("Register attention plugin %s with module %s", name,
-                         attn_module)
-            logger.info("Loaded attention backend plugin: %s from %s", name, ep.name)
-        except Exception as e:
-            logger.warning("Failed to load backend plugin %s: %s", ep.name, e)
+    overrides: dict[str, type] = {}
+
+    # Snapshot base paths before loading plugins, because loading
+    # plugin modules triggers their @register_attention_backend
+    # decorators which would overwrite the base paths.
+    base_paths = dict(NPU_ATTENTION_BACKEND)
+
+    # Build the plugin map (cached after first call).
+    # This loads plugin modules via entry points, which triggers
+    # their @register_attention_backend decorators.
+    plugin_map = _load_plugin_backends_map()
+
+    for backend_name, base_module in base_paths.items():
+        if _is_plugin_disabled(backend_name):
+            # If disabled, restore the base path in case a plugin
+            # decorator already overwrote it during _load_plugin_backends_map.
+            NPU_ATTENTION_BACKEND[backend_name] = base_module
+            logger.debug("Plugin override for %s disabled by env var", backend_name)
+            continue
+
+        plugin_cls = plugin_map.get(backend_name)
+        if plugin_cls is None:
+            continue
+
+        plugin_module = f"{plugin_cls.__module__}.{plugin_cls.__qualname__}"
+        if plugin_module == base_module:
+            continue  # same class, skip
+
+        logger.info(
+            "Plugin backend replaces %s: %s -> %s",
+            backend_name, base_module, plugin_module,
+        )
+        NPU_ATTENTION_BACKEND[backend_name] = plugin_module
+        overrides[backend_name] = plugin_cls
+
+    return overrides, base_paths
 
 def get_available_backends() -> list[str]:
     """List all registered backend names."""

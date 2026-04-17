@@ -905,6 +905,16 @@ class NPUModelRunner(GPUModelRunner):
 
         return input_batch
 
+    @prepare_inputs_decorator
+    def _prepare_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_tokens_after_padding: int,
+    ) -> tuple:
+        (logits_indices, spec_decode_metadata) = super()._prepare_inputs(scheduler_output, num_tokens_after_padding)
+
+        return (logits_indices, spec_decode_metadata)
+
     @init_config_decorator
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         super().initialize_kv_cache(kv_cache_config)
