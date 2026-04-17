@@ -78,6 +78,10 @@
         "configs": {
             "hybrid": {
                 "config_file": "openpangu_v2/pangu_v2_moe_bf16_a3_hybrid.json"
+            },
+            "1P1D": {
+                "prefill_config_file": "openpangu_v2/pangu_v2_moe_bf16_a3_hybrid_1p1d_p.json", 
+                "decode_config_file": "openpangu_v2/pangu_v2_moe_bf16_a3_hybrid_1p1d_d.json" 
             }
         }
     },
