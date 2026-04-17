@@ -269,7 +269,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
                         num_kv_heads=1,
                         head_size=self.head_size,
                         dtype=kv_cache_dtype,
-                        sliding_window=self.sliding_window,
+                        sliding_window=2048,
                         page_size_padded=self.page_size_padded,
                     )
 

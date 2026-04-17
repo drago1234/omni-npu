@@ -142,7 +142,8 @@ class MomeSpec(MambaSpec):
         return page_size
 
     def max_memory_usage_bytes(self, vllm_config) -> int:
-        return cdiv(self.num_total_tokens, self.block_size) * self.page_size_bytes
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     def __post_init__(self):
         if len(self.shapes) != 3:

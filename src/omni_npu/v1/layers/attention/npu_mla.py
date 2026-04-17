@@ -192,6 +192,9 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     sliding_window = config.sliding_window_list[config.swa_layers.index(layer_idx)]
                 elif hasattr(config, "sliding_window"):
                     sliding_window = config.sliding_window
+            elif layer_idx >= config.num_hidden_layers:
+                # MTP layer
+                self.sliding_window = config.sliding_window_list[-1]
         self.sliding_window = sliding_window
         self.num_spec_tokens = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config is not None else 0
         # MOME

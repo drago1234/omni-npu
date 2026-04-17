@@ -158,12 +158,15 @@ class Indexer(torch.nn.Module):
         ki_cache: torch.Tensor, # [*, pg, 1, D]
     ):
         D = self.head_dim
-        block_size = ki_cache.shape[1]
-        slot_indices = torch.stack([
-            slots // block_size,
-            slots % block_size,
-            ], dim=1,
-        )
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            slot_indices = slots
+        else:
+            block_size = ki_cache.shape[1]
+            slot_indices = torch.stack([
+                slots // block_size,
+                slots % block_size,
+                ], dim=1,
+            )
         torch.ops.custom.npu_ai_infra_scatter_block_update_(
             ki_cache,
             slot_indices,
@@ -223,7 +226,10 @@ class Indexer(torch.nn.Module):
         ki_cache: torch.Tensor, # [*, pg, 1, D]
     ) -> tuple[torch.Tensor]:
         wi, qi, ki = self._li_prolog(x, qr, cos, sin)
-        self._update_cache(ki, attn_metadata.slot_mapping, ki_cache)
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            self._update_cache(ki, attn_metadata.slot_mapping_2d, ki_cache)
+        else:
+            self._update_cache(ki, attn_metadata.slot_mapping, ki_cache)
         tok_idx = self._apply_lightning_indexer(
             wi, qi, ki_cache,
             q_cumlens=attn_metadata.query_cumlens.to(torch.int32),
@@ -591,12 +597,14 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             prefill_cos = cos[num_decode_tokens:num_actual_tokens]
             prefill_sin = sin[num_decode_tokens:num_actual_tokens]
             attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+            attn_metadata.prefill.slot_mapping_2d = attn_metadata.slot_mapping_2d[num_decode_tokens:num_actual_tokens]
             prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache, pd_mixed_flag=True)
 
             decode_hs = x[:num_decode_tokens]
             decode_cos = cos[:num_decode_tokens]
             decode_sin = sin[:num_decode_tokens]
             attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
+            attn_metadata.decode.slot_mapping_2d = attn_metadata.slot_mapping_2d[:num_decode_tokens]
             pd_mixed_flag = 2 if num_decode_tokens > attn_metadata.num_decodes else 1 # short prefill in decode or pure decode
             decode_output = self._forward_decode(decode_hs, decode_cos, decode_sin, attn_metadata.decode, kv_cache, pd_mixed_flag=pd_mixed_flag)
 
@@ -611,6 +619,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 prefill_cos = cos[num_decode_tokens:num_actual_tokens]
                 prefill_sin = sin[num_decode_tokens:num_actual_tokens]
                 attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+                attn_metadata.prefill.slot_mapping_2d = attn_metadata.slot_mapping_2d[num_decode_tokens:num_actual_tokens]
                 prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache)
                 return _pad_output_to_input_tokens(prefill_output)
         else:
@@ -618,6 +627,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             decode_cos = cos[:num_decode_tokens]
             decode_sin = sin[:num_decode_tokens]
             attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
+            attn_metadata.decode.slot_mapping_2d = attn_metadata.slot_mapping_2d[:num_decode_tokens]
             decode_output = self._forward_decode(decode_hs, decode_cos, decode_sin, attn_metadata.decode, kv_cache)
             return _pad_output_to_input_tokens(decode_output)
 
@@ -884,7 +894,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             cur_stream.wait_stream(com_stream)
         if attn_metadata:
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-                self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[1])
+                self.indexer._update_cache(ki, attn_metadata.slot_mapping_2d, kv_cache[1])
             else:
                 self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[2])
 
@@ -1033,7 +1043,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                     attn_metadata.prefill.cache_fn(ki.view(-1, ki.size(-1)), kv_cache[2])
             else:
                 if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-                    self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[1])
+                    self.indexer._update_cache(ki, attn_metadata.slot_mapping_2d, kv_cache[1])
                 else:
                     self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[2])
 

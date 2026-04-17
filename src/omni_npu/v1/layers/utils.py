@@ -67,6 +67,8 @@ def calculate_page_size_padded(
     dtype = torch.bfloat16  # Default dtype
     dtype_size = get_dtype_size(dtype)
 
+    assert block_size % 16 == 0, f"block size {block_size} must be divisible by 16."
+
     # Calculate MLA/SWA page size
     mla_head_size = config.kv_lora_rank + config.qk_rope_head_dim
     mla_page_dim = mla_head_size * dtype_size
@@ -86,14 +88,6 @@ def calculate_page_size_padded(
             prod(shape) * get_dtype_size(dtype)
             for (shape, dtype) in zip(mome_state_shapes, mome_state_dtypes)
         ) * num_total_tokens
-
-    if dsa_page_dim is None:
-        denominator = mla_page_dim
-    else:
-        denominator = dsa_page_dim if mla_page_dim < dsa_page_dim else mla_page_dim
-
-    if mome_page_size is not None:
-        block_size = (mome_page_size / denominator + 16) // 16 * 16
 
     # Determine alignment priority
     if dsa_page_dim is not None:
