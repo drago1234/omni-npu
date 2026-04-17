@@ -126,6 +126,8 @@ class OpenAIServingChatPatch(VLLMPatch):
                 final_res.kv_transfer_params["stop_reasons"] = [
                     output.stop_reason for output in final_res.outputs
                 ]
+                final_res.kv_transfer_params["prefilled_logprobs"] = final_res.outputs[0].logprobs
+                final_res.kv_transfer_params["prefilled_cumulative_logprob"] = final_res.outputs[0].cumulative_logprob
 
         request_kv_payload = None
         if request.kv_transfer_params and all(
@@ -235,6 +237,8 @@ class OpenAIServingChatPatch(VLLMPatch):
                         "prefilled_token_ids"] = request.kv_transfer_params[
                             "prefilled_token"]
                     engine_prompt["prefilled_texts"] = delta_text
+                    engine_prompt["prefilled_logprobs"] = request.kv_transfer_params["prefilled_logprobs"]
+                    engine_prompt["prefilled_cumulative_logprob"] = request.kv_transfer_params["prefilled_cumulative_logprob"]
         return conversation, [engine_prompt]
 
 @register_patch("PrefilledTokenSkipOpenAIServing", OpenAIServing)
@@ -307,6 +311,27 @@ class AsyncLLMPatch(VLLMPatch):
         data_parallel_rank: int | None = None,
     )-> AsyncGenerator[RequestOutput, None]:
         import os
+        from collections import namedtuple
+        from typing import List, Dict, Any
+
+        Logprob = namedtuple('Logprob', ['logprob', 'rank', 'decoded_token'])
+        def convert_to_standard_logprobs(prefilled_logprobs: List[Dict[str, Any]]) -> List[Dict[int, Logprob]]:
+            if prefilled_logprobs is None:
+                return None
+            result = []
+            for item in prefilled_logprobs:
+                new_item = {}
+                for token_id_str, data in item.items():
+                    token_id = int(token_id_str)
+                    logprob_obj = Logprob(
+                        logprob=data['logprob'],
+                        rank=data['rank'],
+                        decoded_token=data['decoded_token']
+                    )
+                    new_item[token_id] = logprob_obj
+                result.append(new_item)
+            return result
+
         reuse_prefilled_tokens = os.getenv("OMNI_REUSE_PREFILLED_TOKENS", "0") == "1"
         if reuse_prefilled_tokens:
             prefilled_token_ids: list[int] = []
@@ -324,6 +349,10 @@ class AsyncLLMPatch(VLLMPatch):
                         if tokenizer is not None:
                             token = tokenizer.convert_ids_to_tokens(prefilled_token_ids[0])
                             prefilled_text = tokenizer.convert_tokens_to_string([token])
+
+                    prefilled_logprobs = convert_to_standard_logprobs(kv_transfer_params["prefilled_logprobs"])
+                    prefill_cumulative_logprob = kv_transfer_params["prefilled_cumulative_logprob"]
+
             elif isinstance(prompt, Mapping):
                 if "prefilled_token_ids" in prompt:
                     prefilled_token_ids = prompt["prefilled_token_ids"] or []
@@ -331,6 +360,8 @@ class AsyncLLMPatch(VLLMPatch):
                     prefilled_text = prompt.get("prefilled_texts", "")
                     # Consume once to avoid repeated synthetic output.
                     prompt["prefilled_token_ids"] = []
+                    prefilled_logprobs = convert_to_standard_logprobs(kv_transfer_params["prefilled_logprobs"])
+                    prefill_cumulative_logprob = kv_transfer_params["prefilled_cumulative_logprob"]
 
             if prefilled_token_ids:
                 for idx in range(sampling_params.n):
@@ -343,8 +374,8 @@ class AsyncLLMPatch(VLLMPatch):
                         outputs=[
                             CompletionOutput(
                                 index=idx,
-                                cumulative_logprob=None,
-                                logprobs=None,
+                                cumulative_logprob=prefill_cumulative_logprob,
+                                logprobs=prefilled_logprobs,
                                 text=prefilled_text,
                                 token_ids=prefilled_token_ids,
                             )
