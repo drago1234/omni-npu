@@ -159,12 +159,15 @@ class Indexer(torch.nn.Module):
         ki_cache: torch.Tensor, # [*, pg, 1, D]
     ):
         D = self.head_dim
-        block_size = ki_cache.shape[1]
-        slot_indices = torch.stack([
-            slots // block_size,
-            slots % block_size,
-            ], dim=1,
-        )
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            slot_indices = slots
+        else:
+            block_size = ki_cache.shape[1]
+            slot_indices = torch.stack([
+                slots // block_size,
+                slots % block_size,
+                ], dim=1,
+            )
         torch.ops.custom.npu_ai_infra_scatter_block_update_(
             ki_cache,
             slot_indices,
@@ -224,7 +227,10 @@ class Indexer(torch.nn.Module):
         ki_cache: torch.Tensor, # [*, pg, 1, D]
     ) -> tuple[torch.Tensor]:
         wi, qi, ki = self._li_prolog(x, qr, cos, sin)
-        self._update_cache(ki, attn_metadata.slot_mapping, ki_cache)
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            self._update_cache(ki, attn_metadata.slot_mapping_2d, ki_cache)
+        else:
+            self._update_cache(ki, attn_metadata.slot_mapping, ki_cache)
         tok_idx = self._apply_lightning_indexer(
             wi, qi, ki_cache,
             q_cumlens=attn_metadata.query_cumlens.to(torch.int32),
@@ -572,8 +578,9 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             q_nope = (q_nope.transpose(0, 1) @ self.attn.impl.W_UK_T).transpose(1, 0)
         else:
             q_nope = torch_npu.npu_transpose_batchmatmul(
-                q_nope.transpose(0, 1),       # TND -> NTD
+                q_nope,
                 weight=self.attn.impl.W_UK_T, # [Q, L]
+                perm_x1=(1, 0, 2),
                 perm_y=(1, 0, 2),             # NTD -> TND
             )
         if not self.rope_interleaved:
@@ -672,13 +679,11 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         if None in [q_cumlens, kv_lens, block_table, topk_idx]:
             return torch.zeros_like(q_nope) # dummy
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-            sink_k_pe = self.param_sink_k_pe.unsqueeze(1)
-            sink_k_nope = self.attn.sink_compressed_kv.unsqueeze(1)
-            sink_kv = torch.cat([sink_k_nope, sink_k_pe], dim=-1)
             return torch.ops.custom.npu_ai_infra_sparse_flash_attention_pioneer(
-                query=torch.cat([q_nope, q_pe], dim=-1),
+                query=q_nope,
                 key=kv_cache[0].unsqueeze(2),
                 value=self.dummy_value_cache,
+                query_rope=q_pe,
                 sparse_indices=topk_idx,
                 scale_value=self.scaling,
                 sparse_block_size=1,
@@ -691,8 +696,8 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 layout_query="TND",
                 layout_kv="PA_BSND",
                 sparse_mode=3,
-                key_sink=sink_kv.contiguous(),
-                value_sink=sink_k_nope.contiguous(),
+                key_sink=self.attn.impl.sink_kv,
+                value_sink=self.attn.impl.sink_k_nope,
             )[0]
 
         return torch.ops.custom.npu_sparse_flash_attention_enhance(
@@ -717,8 +722,9 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         assert out.dim() == 3
 
         out = torch_npu.npu_transpose_batchmatmul(
-            out.transpose(0, 1),        # TND -> NTD
+            out,
             weight=self.attn.impl.W_UV, # [N, L, V]
+            perm_x1=(1, 0, 2),
             perm_y=(1, 0, 2),           # NTD -> TND
         ).reshape(out.size(0), -1)      # [T, NV]
 
@@ -820,7 +826,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             cur_stream.wait_stream(com_stream)
         if attn_metadata:
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-                self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[1])
+                self.indexer._update_cache(ki, attn_metadata.slot_mapping_2d, kv_cache[1])
             else:
                 self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[2])
 
@@ -969,7 +975,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                     attn_metadata.prefill.cache_fn(ki.view(-1, ki.size(-1)), kv_cache[2])
             else:
                 if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-                    self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[1])
+                    self.indexer._update_cache(ki, attn_metadata.slot_mapping_2d, kv_cache[1])
                 else:
                     self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[2])
 
@@ -1222,12 +1228,14 @@ def npu_dsa_forward(
         prefill_cos = cos[num_decode_tokens:num_actual_tokens]
         prefill_sin = sin[num_decode_tokens:num_actual_tokens]
         attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+        attn_metadata.prefill.slot_mapping_2d = attn_metadata.slot_mapping_2d[num_decode_tokens:num_actual_tokens]
         prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache, pd_mixed_flag=True)
 
         decode_hs = x[:num_decode_tokens]
         decode_cos = cos[:num_decode_tokens]
         decode_sin = sin[:num_decode_tokens]
         attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
+        attn_metadata.decode.slot_mapping_2d = attn_metadata.slot_mapping_2d[:num_decode_tokens]
         pd_mixed_flag = 2 if num_decode_tokens > attn_metadata.num_decodes else 1  # short prefill in decode or pure decode
         decode_output = self._forward_decode(decode_hs, decode_cos, decode_sin, attn_metadata.decode, kv_cache, pd_mixed_flag=pd_mixed_flag)
 
@@ -1242,6 +1250,7 @@ def npu_dsa_forward(
             prefill_cos = cos[num_decode_tokens:num_actual_tokens]
             prefill_sin = sin[num_decode_tokens:num_actual_tokens]
             attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+            attn_metadata.prefill.slot_mapping_2d = attn_metadata.slot_mapping_2d[num_decode_tokens:num_actual_tokens]
             prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache)
             return _pad_output_to_input_tokens(prefill_output)
     else:
@@ -1249,6 +1258,7 @@ def npu_dsa_forward(
         decode_cos = cos[:num_decode_tokens]
         decode_sin = sin[:num_decode_tokens]
         attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
+        attn_metadata.decode.slot_mapping_2d = attn_metadata.slot_mapping_2d[:num_decode_tokens]
         decode_output = self._forward_decode(decode_hs, decode_cos, decode_sin, attn_metadata.decode, kv_cache)
         return _pad_output_to_input_tokens(decode_output)
 

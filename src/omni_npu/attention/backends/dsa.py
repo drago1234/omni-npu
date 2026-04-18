@@ -133,17 +133,19 @@ class NPUDSAPrefillMetadata(MLACommonPrefillMetadata):
 
     prefix_meta: Optional[Any] = None
     slot_mapping: torch.Tensor = None
+    slot_mapping_2d: torch.Tensor = None
 
 @dataclass
 class NPUDSADecodeMetadata(MLACommonDecodeMetadata):
     query_cumlens: torch.Tensor
     mc2_mask: torch.Tensor = None
     slot_mapping: torch.Tensor = None
+    slot_mapping_2d: torch.Tensor = None
 
 
 @dataclass
 class NPUDSAMetadata(MLACommonMetadata[NPUDSADecodeMetadata]):
-    pass
+    slot_mapping_2d: torch.Tensor = None
 
 
 class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
@@ -177,6 +179,19 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * self.uniform_decode_query_len
         self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)
         self.sink_len = getattr(self.vllm_config.model_config.hf_config, "param_sink_number", 0)
+
+        self.decode_cudagraph_max_bs = max_decode_tokens
+        if self.compilation_config.max_cudagraph_capture_size is not None:
+            self.decode_cudagraph_max_bs = min(
+                self.decode_cudagraph_max_bs,
+                self.compilation_config.max_cudagraph_capture_size,
+            )
+
+        self.slot_mapping_2d = torch.empty(
+            (self.decode_cudagraph_max_bs, 2),
+            dtype=torch.int32,
+            device=device,
+        )
 
     def _build_decode(
         self,
@@ -219,6 +234,25 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
                     cumlens=metadata.prefill.query_start_loc,
                     init_zigzag=True,
                 )
+
+        if metadata is not None:
+            slot_mapping_2d = torch.stack([
+                metadata.slot_mapping // self.kv_cache_spec.block_size,
+                metadata.slot_mapping % self.kv_cache_spec.block_size,
+            ], dim=-1)
+
+            # For cudagraph: copy to persistent buffer if applicable
+            if (
+                metadata.num_prefills == 0
+                and metadata.num_decodes <= self.decode_cudagraph_max_bs
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                self.slot_mapping_2d[:metadata.num_decode_tokens].copy_(
+                    slot_mapping_2d[:metadata.num_decode_tokens], non_blocking=True
+                )
+                slot_mapping_2d = self.slot_mapping_2d[:metadata.num_decode_tokens]
+
+            metadata.slot_mapping_2d = slot_mapping_2d
 
         return metadata
 
@@ -290,6 +324,8 @@ class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
 
     def update_sink_kv(self, sink_k_pe: torch.Tensor, sink_compressed_kv: torch.Tensor) -> None:
         self.sink_len = sink_compressed_kv.shape[0]
+        self.sink_k_nope = sink_compressed_kv.unsqueeze(1).contiguous()
+        self.sink_kv = torch.cat([sink_compressed_kv.unsqueeze(1), sink_k_pe.unsqueeze(1)], dim=-1).contiguous()
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         x = x.transpose(0, 1)

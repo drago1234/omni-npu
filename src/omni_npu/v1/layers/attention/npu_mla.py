@@ -437,8 +437,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         bsz, _ = q.shape
         q = q.view(bsz, self.num_local_heads, 1, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) # b,n,s,d
-        q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim).transpose(0, 1) # n, bs, d
-        q_nope = torch_npu.npu_transpose_batchmatmul(q_nope, self.attn.impl.W_UK_T, perm_y=(1, 0, 2))
+        q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim)
+        q_nope = torch_npu.npu_transpose_batchmatmul(q_nope, self.attn.impl.W_UK_T, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
         q_nope = q_nope.view(bsz, 1, self.num_local_heads, -1)
 
         block_num, block_size, _ = kv_cache[0].shape
@@ -856,10 +856,10 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         Returns:
             Hidden states before ``o_proj`` (same layout as after conv in the standard prefill path).
         """
-        q_nope_for_sink = q_nope.transpose(0, 1)  # TND -> NTD
         ql_nope = torch_npu.npu_transpose_batchmatmul(
-            q_nope_for_sink,
+            q_nope,
             self.attn.impl.W_UK_T,
+            perm_x1=(1, 0, 2),
             perm_y=(1, 0, 2),
         )
 
@@ -903,17 +903,14 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         attn_output_shape = (q_nope.shape[0], self.num_local_heads, self.kv_lora_rank)
         attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
         attn_output[: actual_seq_qlen[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
-        attn_output = attn_output.transpose(0, 1)  # TND -> NTD
 
-        attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank)
         attn_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             self.attn.impl.W_UV,
+            perm_x1=(1, 0, 2),
             perm_y=(1, 0, 2),
         )
-        attn_output = attn_output.reshape(-1, 1, self.num_local_heads * self.v_head_dim).view(
-            -1, self.num_local_heads * self.v_head_dim
-        )
+        attn_output = attn_output.view(-1, self.num_local_heads * self.v_head_dim)
 
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
             if self.conv is not None:
@@ -980,17 +977,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         forward_context = get_forward_context()
         query_heads = self.num_local_heads
 
-        # For sink attention, decode stage needs padding to power of 2
-        # Prefill stage does not need padding
-        if self.param_sink_number > 0 and not is_prefill:
-            query_heads = 1 << (self.num_local_heads - 1).bit_length()
-            pad_len = query_heads - self.num_local_heads
-            if pad_len > 0:
-                q_nope_pad = q_nope.new_zeros((q_nope.shape[0], pad_len, q_nope.shape[-1]))
-                q_nope = torch.cat([q_nope, q_nope_pad], dim=1)
-                q_pe_pad = q_pe.new_zeros((q_pe.shape[0], pad_len, q_pe.shape[-1]))
-                q_pe = torch.cat([q_pe, q_pe_pad], dim=1)
-
         # Determine window size
         if self.param_sink_number > 0:
             if self.sliding_window is not None:
@@ -1009,9 +995,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 is_prefill, query_heads, window_size, forward_context,
                 v, sink_k_nope, sink_v, sink_k_pe
             )
-            # Remove padding (only for decode stage with NTD format)
-            if not is_prefill and query_heads > self.num_local_heads:
-                attn_output = attn_output[:self.num_local_heads]
             return attn_output
         else:
             return self._apply_standard_attention(
