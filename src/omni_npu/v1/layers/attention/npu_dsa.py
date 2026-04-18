@@ -15,7 +15,7 @@ from vllm.distributed import (
     get_tp_group,
     split_tensor_along_last_dim,
 )
-from vllm.config import VllmConfig, CacheConfig
+from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
@@ -23,6 +23,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.attention.layer import MLAAttention
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 try:
@@ -538,88 +539,23 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                                                   torch.arange(1, batch_size * self.tp_size // (
                                                               1 + self.num_speculative_tokens) + 1, dtype=torch.int64,
                                                                device=current_platform.device_type)
+
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
     def forward(
         self,
         x: torch.Tensor,   # TD
         cos: torch.Tensor, # BNSD
         sin: torch.Tensor, # BNSD
     ) -> torch.Tensor:
-        full_hidden_states = x
-        total_tokens = full_hidden_states.shape[0]
-
-        def _pad_output_to_input_tokens(attn_output: torch.Tensor) -> torch.Tensor:
-            output_tokens = attn_output.shape[0]
-            if output_tokens == total_tokens:
-                return attn_output
-            if output_tokens > total_tokens:
-                raise RuntimeError(
-                    f"npu_mla_forward output tokens ({output_tokens}) exceed input tokens ({total_tokens})"
-                )
-            full_output = full_hidden_states.clone()
-            full_output[:output_tokens, ...] = attn_output
-            return full_output
-
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
-
-        if isinstance(attn_metadata, dict):
-            attn_metadata = attn_metadata[f"{self.prefix}.attn"]
-
-        if self.param_sink_number > 0 and not model_extra_config.operator_opt_config.use_noncontiguous_kv:
-            assert self.attn.sink_k_pe is not None and self.attn.sink_compressed_kv is not None, (
-                "sink_k_pe and sink_compressed_kv have not been prepared"
-            )
-            if not self.attn.sink_populated:
-                self_kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
-                if self_kv_cache is not None and len(self_kv_cache) > 0:
-                    self.attn.populate_sink_kv(self_kv_cache[0], self_kv_cache[1])
-
-        if attn_metadata is None:
-            if model_extra_config.parall_config.ena_context_parallel:
-                return self._forward_prefill_cp(x, cos, sin, attn_metadata, kv_cache)
-            else:
-                return self._forward_prefill(x, cos, sin, attn_metadata, kv_cache)
-        
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        num_decode_tokens = attn_metadata.num_decode_tokens
-        has_decode = attn_metadata.num_decodes > 0
-        has_prefill = attn_metadata.num_prefills > 0
-
-        if has_decode and has_prefill:
-            prefill_hs = x[num_decode_tokens:num_actual_tokens]
-            prefill_cos = cos[num_decode_tokens:num_actual_tokens]
-            prefill_sin = sin[num_decode_tokens:num_actual_tokens]
-            attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
-            prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache, pd_mixed_flag=True)
-
-            decode_hs = x[:num_decode_tokens]
-            decode_cos = cos[:num_decode_tokens]
-            decode_sin = sin[:num_decode_tokens]
-            attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
-            pd_mixed_flag = 2 if num_decode_tokens > attn_metadata.num_decodes else 1 # short prefill in decode or pure decode
-            decode_output = self._forward_decode(decode_hs, decode_cos, decode_sin, attn_metadata.decode, kv_cache, pd_mixed_flag=pd_mixed_flag)
-
-            mixed_output = torch.cat([decode_output, prefill_output], dim=0)
-            return _pad_output_to_input_tokens(mixed_output)
-
-        if has_prefill:
-            if model_extra_config.parall_config.ena_context_parallel:
-                return self._forward_prefill_cp(x, cos, sin, attn_metadata, kv_cache)
-            else:
-                prefill_hs = x[num_decode_tokens:num_actual_tokens]
-                prefill_cos = cos[num_decode_tokens:num_actual_tokens]
-                prefill_sin = sin[num_decode_tokens:num_actual_tokens]
-                attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
-                prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache)
-                return _pad_output_to_input_tokens(prefill_output)
-        else:
-            decode_hs = x[:num_decode_tokens]
-            decode_cos = cos[:num_decode_tokens]
-            decode_sin = sin[:num_decode_tokens]
-            attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
-            decode_output = self._forward_decode(decode_hs, decode_cos, decode_sin, attn_metadata.decode, kv_cache)
-            return _pad_output_to_input_tokens(decode_output)
+        return torch.ops.vllm.npu_dsa_forward(
+            x=x,
+            cos=cos,
+            sin=sin,
+            layer_name=self.prefix)
 
     def _q_absorb(
         self,
@@ -1230,3 +1166,106 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             loaded_weight = loaded_weight.reshape(1)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+
+
+def npu_dsa_forward(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    full_hidden_states = x
+    total_tokens = full_hidden_states.shape[0]
+
+    def _pad_output_to_input_tokens(attn_output: torch.Tensor) -> torch.Tensor:
+        output_tokens = attn_output.shape[0]
+        if output_tokens == total_tokens:
+            return attn_output
+        if output_tokens > total_tokens:
+            raise RuntimeError(
+                f"npu_dsa_forward output tokens ({output_tokens}) exceed input tokens ({total_tokens})"
+            )
+        full_output = full_hidden_states.clone()
+        full_output[:output_tokens, ...] = attn_output
+        return full_output
+
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    attn_metadata = forward_context.attn_metadata
+    kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
+
+    if isinstance(attn_metadata, dict):
+        attn_metadata = attn_metadata[f"{self.prefix}.attn"]
+
+    if self.param_sink_number > 0 and not model_extra_config.operator_opt_config.use_noncontiguous_kv:
+        assert self.attn.sink_k_pe is not None and self.attn.sink_compressed_kv is not None, (
+            "sink_k_pe and sink_compressed_kv have not been prepared"
+        )
+        if not self.attn.sink_populated:
+            self_kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
+            if self_kv_cache is not None and len(self_kv_cache) > 0:
+                self.attn.populate_sink_kv(self_kv_cache[0], self_kv_cache[1])
+
+    if attn_metadata is None:
+        if model_extra_config.parall_config.ena_context_parallel:
+            return self._forward_prefill_cp(x, cos, sin, attn_metadata, kv_cache)
+        else:
+            return self._forward_prefill(x, cos, sin, attn_metadata, kv_cache)
+
+    num_actual_tokens = attn_metadata.num_actual_tokens
+    num_decode_tokens = attn_metadata.num_decode_tokens
+    has_decode = attn_metadata.num_decodes > 0
+    has_prefill = attn_metadata.num_prefills > 0
+
+    if has_decode and has_prefill:
+        prefill_hs = x[num_decode_tokens:num_actual_tokens]
+        prefill_cos = cos[num_decode_tokens:num_actual_tokens]
+        prefill_sin = sin[num_decode_tokens:num_actual_tokens]
+        attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+        prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache, pd_mixed_flag=True)
+
+        decode_hs = x[:num_decode_tokens]
+        decode_cos = cos[:num_decode_tokens]
+        decode_sin = sin[:num_decode_tokens]
+        attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
+        pd_mixed_flag = 2 if num_decode_tokens > attn_metadata.num_decodes else 1  # short prefill in decode or pure decode
+        decode_output = self._forward_decode(decode_hs, decode_cos, decode_sin, attn_metadata.decode, kv_cache, pd_mixed_flag=pd_mixed_flag)
+
+        mixed_output = torch.cat([decode_output, prefill_output], dim=0)
+        return _pad_output_to_input_tokens(mixed_output)
+
+    if has_prefill:
+        if model_extra_config.parall_config.ena_context_parallel:
+            return self._forward_prefill_cp(x, cos, sin, attn_metadata, kv_cache)
+        else:
+            prefill_hs = x[num_decode_tokens:num_actual_tokens]
+            prefill_cos = cos[num_decode_tokens:num_actual_tokens]
+            prefill_sin = sin[num_decode_tokens:num_actual_tokens]
+            attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+            prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache)
+            return _pad_output_to_input_tokens(prefill_output)
+    else:
+        decode_hs = x[:num_decode_tokens]
+        decode_cos = cos[:num_decode_tokens]
+        decode_sin = sin[:num_decode_tokens]
+        attn_metadata.decode.slot_mapping = attn_metadata.slot_mapping[:num_decode_tokens]
+        decode_output = self._forward_decode(decode_hs, decode_cos, decode_sin, attn_metadata.decode, kv_cache)
+        return _pad_output_to_input_tokens(decode_output)
+
+
+def npu_dsa_forward_fake(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="npu_dsa_forward",
+    op_func=npu_dsa_forward,
+    mutates_args=[],
+    fake_impl=npu_dsa_forward_fake,
+    dispatch_key="PrivateUse1",
+)

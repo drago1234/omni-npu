@@ -98,14 +98,24 @@ class TestIndexer(unittest.TestCase):
         idx.head_dim = head_dim
         idx.rope_dim = rope_dim
         idx.q_lora_rank = q_lora_rank
+        idx.sink_len = 0
+        idx.config = SimpleNamespace(indexer_rope_interleave=False)
+        idx.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=8))
 
         idx.wq_b = _FakeLinear(n_head * head_dim, return_dtype=dtype)
         idx.wk = _FakeLinear(head_dim, return_dtype=dtype)
         idx.k_norm = _FakeLayerNorm()
         idx.weights_proj = _FakeLinear(n_head, return_dtype=dtype)
 
-        idx._apply_lightning_indexer = lambda q, weights, attn_metadata, kv_cache: (
-            npu_dsa_mod.Indexer._apply_lightning_indexer(idx, q, weights, attn_metadata, kv_cache)
+        idx._apply_rope = lambda x, cos, sin: npu_dsa_mod.Indexer._apply_rope(idx, x, cos, sin)
+        idx._li_prolog_ext = lambda wx, qr, kx, q_cos_sin, k_cos_sin: (
+            npu_dsa_mod.Indexer._li_prolog_ext(idx, wx, qr, kx, q_cos_sin, k_cos_sin)
+        )
+        idx._li_prolog = lambda x, qr, cos, sin: npu_dsa_mod.Indexer._li_prolog(idx, x, qr, cos, sin)
+        idx._update_cache = lambda ki, slots, ki_cache: None
+        idx._apply_lightning_indexer = lambda wi, qi, ki_cache, q_cumlens=None, kv_lens=None, block_table=None: (
+            npu_dsa_mod.Indexer._apply_lightning_indexer(
+                idx, wi, qi, ki_cache, q_cumlens=q_cumlens, kv_lens=kv_lens, block_table=block_table)
         )
 
         return idx
@@ -114,11 +124,12 @@ class TestIndexer(unittest.TestCase):
         idx = self._make_indexer_stub(topk_tokens=8, n_head=4, head_dim=8, rope_dim=4)
         bs = 3
 
-        q = torch.randn((bs, idx.n_head, idx.head_dim), dtype=torch.float32)
-        weights = torch.randn((bs, idx.n_head), dtype=torch.float32)
-        kv_cache = (None, None, torch.randn((16, 1, idx.head_dim), dtype=torch.float32))
-
-        attn_metadata = SimpleNamespace(prefill=_make_prefill_meta(bs), decode=None)
+        wi = torch.randn((bs, idx.n_head), dtype=torch.float32)
+        qi = torch.randn((bs, idx.n_head, idx.head_dim), dtype=torch.float32)
+        ki_cache = torch.randn((2, 8, 1, idx.head_dim), dtype=torch.float32)
+        q_cumlens = torch.arange(1, bs + 1, dtype=torch.int32)
+        kv_lens = torch.full((bs,), 10, dtype=torch.int32)
+        block_table = torch.zeros((bs, 4), dtype=torch.int32)
 
         def _fake_lightning_indexer(**kwargs):
             self.assertEqual(kwargs.get("layout_query"), "TND")
@@ -128,13 +139,9 @@ class TestIndexer(unittest.TestCase):
             return torch.zeros((bs, 1, idx.topk_tokens), dtype=torch.int32), None
 
         with patch.object(npu_dsa_mod.torch_npu, "npu_lightning_indexer", side_effect=_fake_lightning_indexer, create=True):
-            out = npu_dsa_mod.Indexer._apply_lightning_indexer(idx, q, weights, attn_metadata, kv_cache)
+            out = npu_dsa_mod.Indexer._apply_lightning_indexer(
+                idx, wi, qi, ki_cache, q_cumlens=q_cumlens, kv_lens=kv_lens, block_table=block_table)
         self.assertEqual(tuple(out.shape), (bs, 1, idx.topk_tokens))
-
-        attn_metadata = SimpleNamespace(prefill=None, decode=_make_decode_meta(bs, idx.topk_tokens))
-        with patch.object(npu_dsa_mod.torch_npu, "npu_lightning_indexer", side_effect=_fake_lightning_indexer, create=True):
-            out2 = npu_dsa_mod.Indexer._apply_lightning_indexer(idx, q, weights, attn_metadata, kv_cache)
-        self.assertEqual(tuple(out2.shape), (bs, 1, idx.topk_tokens))
 
     def test_indexer_forward_applies_rotary_and_calls_lightning_indexer_and_returns_k(self):
         T = 5
@@ -158,82 +165,51 @@ class TestIndexer(unittest.TestCase):
         sin = torch.zeros((T, 1, 1, idx.rope_dim), dtype=torch.float32)
 
         attn_metadata = SimpleNamespace()
-        attn_metadata.prefill = None
-        attn_metadata.decode = _make_decode_meta(T, idx.topk_tokens)
         attn_metadata.slot_mapping = torch.arange(T, dtype=torch.int64)
+        attn_metadata.query_cumlens = torch.arange(1, T + 1, dtype=torch.int32)
+        attn_metadata.seq_lens = torch.full((T,), 10, dtype=torch.int32)
+        attn_metadata.block_table = torch.zeros((T, 4), dtype=torch.int32)
 
         k_dim = idx.head_dim
-        kv_cache = (None, None, torch.zeros((T, 1, k_dim), dtype=torch.float32))
+        ki_cache = torch.zeros((2, 8, 1, k_dim), dtype=torch.float32)
 
         rotary_calls = {"n": 0}
         lightning_calls = {"n": 0}
-        scatter_calls = {"n": 0}
-
         def _fake_rotary_mul(x, cos_arg, sin_arg):
             rotary_calls["n"] += 1
             return x
-
-        def _fake_scatter(dst, indices, src):
-            scatter_calls["n"] += 1
-            return dst
 
         def _fake_lightning_indexer(**kwargs):
             lightning_calls["n"] += 1
             return torch.zeros((T, 1, idx.topk_tokens), dtype=torch.int32), None
 
         with patch.object(npu_dsa_mod.torch_npu, "npu_rotary_mul", side_effect=_fake_rotary_mul, create=True), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_scatter_nd_update_", side_effect=_fake_scatter, create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_lightning_indexer", side_effect=_fake_lightning_indexer, create=True):
 
             topk_indices, k_out = npu_dsa_mod.Indexer.forward(
                 idx,
-                hidden_states=hidden_states,
-                qr=qr,
-                cos=cos,
-                sin=sin,
-                attn_metadata=attn_metadata,
-                kv_cache=kv_cache,
+                hidden_states,
+                qr,
+                cos,
+                sin,
+                attn_metadata,
+                ki_cache,
             )
 
         self.assertEqual(rotary_calls["n"], 2)
         self.assertEqual(lightning_calls["n"], 1)
-        self.assertEqual(scatter_calls["n"], 1)
         self.assertEqual(tuple(topk_indices.shape), (T, 1, idx.topk_tokens))
         self.assertEqual(tuple(k_out.shape), (T, 1, idx.head_dim))
 
-    def test_indexer_forward_when_kv_cache_indexer_none_skips_scatter(self):
-        T = 4
+    def test_indexer_apply_lightning_indexer_returns_none_when_metadata_missing(self):
         idx = self._make_indexer_stub(topk_tokens=8, n_head=4, head_dim=8, rope_dim=4)
-        hidden_states = torch.randn((T, 16), dtype=torch.float32)
-        qr = torch.randn((T, idx.q_lora_rank), dtype=torch.float32)
-        cos = torch.zeros((T, 1, 1, idx.rope_dim), dtype=torch.float32)
-        sin = torch.zeros((T, 1, 1, idx.rope_dim), dtype=torch.float32)
-
-        attn_metadata = SimpleNamespace(
-            prefill=None,
-            decode=_make_decode_meta(T, idx.topk_tokens),
-            slot_mapping=torch.arange(T, dtype=torch.int64),
-        )
-
-        kv_cache = (None, None, None)
-
-        scatter_calls = {"n": 0}
-
-        def _fake_scatter(*args, **kwargs):
-            scatter_calls["n"] += 1
-            return args[0]
-
-        def _fake_lightning_indexer(**kwargs):
-            return torch.zeros((T, 1, idx.topk_tokens), dtype=torch.int32), None
-
-        with patch.object(npu_dsa_mod.torch_npu, "npu_rotary_mul", side_effect=lambda x, c, s: x, create=True), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_scatter_nd_update_", side_effect=_fake_scatter, create=True), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_lightning_indexer", side_effect=(_fake_lightning_indexer), create=True):
-            topk, k = npu_dsa_mod.Indexer.forward(idx, hidden_states, qr, cos, sin, attn_metadata, kv_cache)
-
-        self.assertEqual(scatter_calls["n"], 0)
-        self.assertEqual(tuple(topk.shape), (T, 1, idx.topk_tokens))
-        self.assertEqual(tuple(k.shape), (T, 1, idx.head_dim))
+        bs = 2
+        wi = torch.randn((bs, idx.n_head), dtype=torch.float32)
+        qi = torch.randn((bs, idx.n_head, idx.head_dim), dtype=torch.float32)
+        ki_cache = torch.randn((2, 8, 1, idx.head_dim), dtype=torch.float32)
+        out = npu_dsa_mod.Indexer._apply_lightning_indexer(
+            idx, wi, qi, ki_cache, q_cumlens=None, kv_lens=None, block_table=None)
+        self.assertIsNone(out)
 
 
 # ======================================================================
@@ -243,52 +219,134 @@ class TestNPUDeepseekSparseAttentionForwardRouting(unittest.TestCase):
     def _make_attn_stub(self):
         m = SimpleNamespace()
         m.prefix = "layers.0"
-        m._forward_prefill = MagicMock(return_value=torch.tensor([111]))
-        m._forward_decode = MagicMock(return_value=torch.tensor([222]))
         return m
 
-    def test_forward_routes_none_and_prefill_and_decode(self):
+    def _make_layer_stub(self):
+        layer = SimpleNamespace()
+        layer.prefix = "layers.0"
+        layer.param_sink_number = 0
+        layer._forward_prefill = MagicMock()
+        layer._forward_decode = MagicMock()
+        layer.attn = SimpleNamespace(kv_cache=[("k_cache", "v_cache")])
+        return layer
+
+    def test_forward_calls_registered_custom_op(self):
         m = self._make_attn_stub()
         hidden_states = torch.randn((3, 16), dtype=torch.float32)
         cos = torch.zeros((3, 1, 1, 4), dtype=torch.float32)
         sin = torch.zeros((3, 1, 1, 4), dtype=torch.float32)
 
-        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
-        with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc):
+        expected = torch.tensor([111], dtype=torch.float32)
+        with patch.object(npu_dsa_mod.torch.ops.vllm, "npu_dsa_forward", return_value=expected, create=True) as op_mock:
             out = npu_dsa_mod.NPUDeepseekSparseAttention.forward(m, hidden_states, cos, sin)
-        self.assertTrue(torch.equal(out, torch.tensor([111])))
+        self.assertTrue(torch.equal(out, expected))
+        op_mock.assert_called_once_with(x=hidden_states, cos=cos, sin=sin, layer_name=m.prefix)
 
-        m._forward_prefill.reset_mock()
-        m._forward_decode.reset_mock()
-        meta = SimpleNamespace(prefill=object(), decode=None)
-        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0)
+    def test_npu_dsa_forward_mixed_prefill_decode_pads_to_input_tokens(self):
+        total_tokens = 6
+        hidden_size = 4
+        x = torch.arange(total_tokens * hidden_size, dtype=torch.float32).view(total_tokens, hidden_size)
+        cos = torch.zeros((total_tokens, 1, 1, 2), dtype=torch.float32)
+        sin = torch.zeros((total_tokens, 1, 1, 2), dtype=torch.float32)
+
+        layer = self._make_layer_stub()
+        decode_output = torch.full((2, hidden_size), 2.0, dtype=torch.float32)
+        prefill_output = torch.full((2, hidden_size), 3.0, dtype=torch.float32)
+        layer._forward_decode.return_value = decode_output
+        layer._forward_prefill.return_value = prefill_output
+
+        prefill_meta = SimpleNamespace(slot_mapping=None)
+        decode_meta = SimpleNamespace(slot_mapping=None)
+        attn_metadata = SimpleNamespace(
+            prefill=prefill_meta,
+            decode=decode_meta,
+            slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+            num_actual_tokens=4,
+            num_decode_tokens=2,
+            num_decodes=2,
+            num_prefills=1,
+        )
+        fc = SimpleNamespace(
+            no_compile_layers={"layers.0": layer},
+            attn_metadata=attn_metadata,
+            virtual_engine=0,
+        )
+
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc):
-            out = npu_dsa_mod.NPUDeepseekSparseAttention.forward(m, hidden_states, cos, sin)
-        self.assertTrue(torch.equal(out, torch.tensor([111])))
+            out = npu_dsa_mod.npu_dsa_forward(x, cos, sin, "layers.0")
 
-        m._forward_prefill.reset_mock()
-        m._forward_decode.reset_mock()
-        meta = SimpleNamespace(prefill=None, decode=object())
-        fc = SimpleNamespace(attn_metadata=meta, virtual_engine=0)
+        expected = x.clone()
+        expected[:2] = decode_output
+        expected[2:4] = prefill_output
+        self.assertTrue(torch.equal(out, expected))
+        self.assertEqual(layer._forward_prefill.call_count, 1)
+        self.assertEqual(layer._forward_decode.call_count, 1)
+
+    def test_npu_dsa_forward_decode_only_with_dict_metadata_pads_to_input_tokens(self):
+        total_tokens = 5
+        hidden_size = 4
+        x = torch.arange(total_tokens * hidden_size, dtype=torch.float32).view(total_tokens, hidden_size)
+        cos = torch.zeros((total_tokens, 1, 1, 2), dtype=torch.float32)
+        sin = torch.zeros((total_tokens, 1, 1, 2), dtype=torch.float32)
+
+        layer = self._make_layer_stub()
+        layer.prefix = "layers.7"
+        decode_output = torch.full((2, hidden_size), 9.0, dtype=torch.float32)
+        layer._forward_decode.return_value = decode_output
+
+        decode_meta = SimpleNamespace(slot_mapping=None)
+        inner_meta = SimpleNamespace(
+            prefill=SimpleNamespace(slot_mapping=None),
+            decode=decode_meta,
+            slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+            num_actual_tokens=4,
+            num_decode_tokens=2,
+            num_decodes=2,
+            num_prefills=0,
+        )
+        fc = SimpleNamespace(
+            no_compile_layers={"layers.7": layer},
+            attn_metadata={f"{layer.prefix}.attn": inner_meta},
+            virtual_engine=0,
+        )
+
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc):
-            out = npu_dsa_mod.NPUDeepseekSparseAttention.forward(m, hidden_states, cos, sin)
-        self.assertTrue(torch.equal(out, torch.tensor([222])))
+            out = npu_dsa_mod.npu_dsa_forward(x, cos, sin, "layers.7")
 
-    def test_forward_attn_metadata_dict_extracts_by_prefix_attn(self):
-        m = self._make_attn_stub()
-        m.prefix = "layers.7"
-        hidden_states = torch.randn((2, 16), dtype=torch.float32)
-        cos = torch.zeros((2, 1, 1, 4), dtype=torch.float32)
-        sin = torch.zeros((2, 1, 1, 4), dtype=torch.float32)
+        expected = x.clone()
+        expected[:2] = decode_output
+        self.assertTrue(torch.equal(out, expected))
+        self.assertEqual(layer._forward_decode.call_count, 1)
+        self.assertEqual(layer._forward_prefill.call_count, 0)
 
-        meta = SimpleNamespace(prefill=None, decode=object())
-        fc = SimpleNamespace(attn_metadata={f"{m.prefix}.attn": meta}, virtual_engine=0)
+    def test_npu_dsa_forward_raises_when_output_tokens_exceed_input_tokens(self):
+        total_tokens = 3
+        hidden_size = 4
+        x = torch.zeros((total_tokens, hidden_size), dtype=torch.float32)
+        cos = torch.zeros((total_tokens, 1, 1, 2), dtype=torch.float32)
+        sin = torch.zeros((total_tokens, 1, 1, 2), dtype=torch.float32)
+
+        layer = self._make_layer_stub()
+        layer._forward_decode.return_value = torch.ones((total_tokens + 1, hidden_size), dtype=torch.float32)
+
+        attn_metadata = SimpleNamespace(
+            prefill=SimpleNamespace(slot_mapping=None),
+            decode=SimpleNamespace(slot_mapping=None),
+            slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+            num_actual_tokens=total_tokens,
+            num_decode_tokens=total_tokens,
+            num_decodes=total_tokens,
+            num_prefills=0,
+        )
+        fc = SimpleNamespace(
+            no_compile_layers={"layers.0": layer},
+            attn_metadata=attn_metadata,
+            virtual_engine=0,
+        )
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc):
-            out = npu_dsa_mod.NPUDeepseekSparseAttention.forward(m, hidden_states, cos, sin)
-
-        self.assertTrue(torch.equal(out, torch.tensor([222])))
-        self.assertEqual(m._forward_decode.call_count, 1)
+            with self.assertRaisesRegex(RuntimeError, "output tokens .* exceed input tokens"):
+                npu_dsa_mod.npu_dsa_forward(x, cos, sin, "layers.0")
 
 
 # ======================================================================
@@ -318,25 +376,28 @@ class TestNPUDeepseekSparseAttentionCore(unittest.TestCase):
 
         out = npu_dsa_mod.NPUDeepseekSparseAttention._apply_attention(
             m,
-            topk_indices=torch.zeros((5, 1, 8), dtype=torch.int32),
-            q_nope=q_nope,
-            q_pe=q_pe,
-            k_nope=k_nope,
-            k_pe=k_pe,
-            attn_metadata=None,
+            q_nope,
+            q_pe,
+            k_nope,
+            k_pe,
+            q_cumlens=None,
+            kv_lens=None,
+            topk_idx=None,
+            block_table=None,
         )
         self.assertEqual(tuple(out.shape), (5, m.num_local_heads, m.kv_lora_rank))
         self.assertTrue(torch.all(out == 0))
 
     def test_apply_attention_calls_custom_sparse_flash_attention_with_decode(self):
         m = self._make_core_stub()
-        meta = SimpleNamespace(prefill=None, decode=_make_decode_meta(3, 8))
-
         q_nope = torch.randn((3, m.num_local_heads, m.kv_lora_rank), dtype=torch.float32)
         q_pe = torch.randn((3, m.num_local_heads, 4), dtype=torch.float32)
         k_nope = torch.randn((3, 1, 1, m.kv_lora_rank), dtype=torch.float32)
         k_pe = torch.randn((3, 1, 1, 4), dtype=torch.float32)
-        topk_indices = torch.zeros((3, 1, 8), dtype=torch.int32)
+        topk_idx = torch.zeros((3, 1, 8), dtype=torch.int32)
+        q_cumlens = torch.arange(1, 4, dtype=torch.int32)
+        kv_lens = torch.full((3,), 10, dtype=torch.int32)
+        block_table = torch.zeros((3, 4), dtype=torch.int32)
 
         def _fake_sparse_flash_attention(**kwargs):
             B = kwargs["query"].shape[0]
@@ -346,12 +407,14 @@ class TestNPUDeepseekSparseAttentionCore(unittest.TestCase):
         with patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", side_effect=_fake_sparse_flash_attention, create=True) as mock_sparse:
             out = npu_dsa_mod.NPUDeepseekSparseAttention._apply_attention(
                 m,
-                topk_indices=topk_indices,
-                q_nope=q_nope,
-                q_pe=q_pe,
-                k_nope=k_nope,
-                k_pe=k_pe,
-                attn_metadata=meta,
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                q_cumlens=q_cumlens,
+                kv_lens=kv_lens,
+                topk_idx=topk_idx,
+                block_table=block_table,
             )
 
         self.assertEqual(tuple(out.shape), (3, m.num_local_heads, m.kv_lora_rank))
@@ -359,13 +422,14 @@ class TestNPUDeepseekSparseAttentionCore(unittest.TestCase):
 
     def test_apply_attention_calls_custom_sparse_flash_attention_with_prefill(self):
         m = self._make_core_stub()
-        meta = SimpleNamespace(prefill=_make_prefill_meta(3), decode=None)
-
         q_nope = torch.randn((3, m.num_local_heads, m.kv_lora_rank), dtype=torch.float32)
         q_pe = torch.randn((3, m.num_local_heads, 4), dtype=torch.float32)
         k_nope = torch.randn((3, 1, 1, m.kv_lora_rank), dtype=torch.float32)
         k_pe = torch.randn((3, 1, 1, 4), dtype=torch.float32)
-        topk_indices = torch.zeros((3, 1, 8), dtype=torch.int32)
+        topk_idx = torch.zeros((3, 1, 8), dtype=torch.int32)
+        q_cumlens = torch.arange(1, 4, dtype=torch.int32)
+        kv_lens = torch.full((3,), 10, dtype=torch.int32)
+        block_table = torch.zeros((3, 4), dtype=torch.int32)
 
         def _fake_sparse_flash_attention(**kwargs):
             B = kwargs["query"].shape[0]
@@ -375,12 +439,14 @@ class TestNPUDeepseekSparseAttentionCore(unittest.TestCase):
         with patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", side_effect=_fake_sparse_flash_attention, create=True) as mock_sparse:
             out = npu_dsa_mod.NPUDeepseekSparseAttention._apply_attention(
                 m,
-                topk_indices=topk_indices,
-                q_nope=q_nope,
-                q_pe=q_pe,
-                k_nope=k_nope,
-                k_pe=k_pe,
-                attn_metadata=meta,
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                q_cumlens=q_cumlens,
+                kv_lens=kv_lens,
+                topk_idx=topk_idx,
+                block_table=block_table,
             )
         self.assertEqual(tuple(out.shape), (3, m.num_local_heads, m.kv_lora_rank))
         self.assertEqual(mock_sparse.call_count, 1)
@@ -390,12 +456,12 @@ class TestNPUDeepseekSparseAttentionCore(unittest.TestCase):
         B = 6
         attn_output = torch.randn((B, m.num_local_heads, m.kv_lora_rank), dtype=torch.float32)
 
-        with patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UV, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UV.shape[2]), dtype=attn_output.dtype), create=True):
+        with patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda x, weight=None, perm_y=None: torch.zeros((x.shape[0], x.shape[1], weight.shape[2]), dtype=x.dtype), create=True):
             out = npu_dsa_mod.NPUDeepseekSparseAttention._mla_epilog(m, attn_output)
         
         self.assertEqual(tuple(out.shape), (B, 8))
-        self.assertTrue(m.o_proj.called)
-        self.assertTrue(torch.all(out == 1))
+        self.assertFalse(m.o_proj.called)
+        self.assertTrue(torch.all(out == 0))
 
 
 # ======================================================================
@@ -403,6 +469,33 @@ class TestNPUDeepseekSparseAttentionCore(unittest.TestCase):
 # ======================================================================
 class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
     def _make_attn_impl_stub(self, *, use_omni_cache=False, use_mlaprolog=False, q_lora_rank=12, quant_symbol=False):
+        class _FakeIndexer:
+            def __init__(self, topk_tokens: int, n_head: int, head_dim: int):
+                self.topk_tokens = topk_tokens
+                self.n_head = n_head
+                self.head_dim = head_dim
+
+            def __call__(self, x, q_norm, cos, sin, attn_metadata, ki_cache):
+                bs = x.shape[0]
+                return (
+                    torch.zeros((bs, 1, self.topk_tokens), dtype=torch.int32),
+                    torch.zeros((bs, 1, self.head_dim), dtype=torch.float32),
+                )
+
+            def _li_prolog(self, x, qr, cos, sin):
+                bs = x.shape[0]
+                wi = torch.zeros((bs, self.n_head), dtype=torch.float32)
+                qi = torch.zeros((bs, self.n_head, self.head_dim), dtype=torch.float32)
+                ki = torch.zeros((bs, 1, self.head_dim), dtype=torch.float32)
+                return wi, qi, ki
+
+            def _update_cache(self, ki, slot_mapping, ki_cache):
+                return None
+
+            def _apply_lightning_indexer(self, wi, qi, ki_cache, q_cumlens, kv_lens, block_table):
+                bs = wi.shape[0]
+                return torch.zeros((bs, 1, self.topk_tokens), dtype=torch.int32)
+
         m = SimpleNamespace()
 
         m.hidden_size = 16
@@ -418,6 +511,12 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         m.use_omni_cache = use_omni_cache
         m.use_mlaprolog = use_mlaprolog
         m.layer_idx = 0
+        m.rope_interleaved = True
+        m.param_sink_number = 0
+        m.qa_conv = None
+        m.compresskv_conv = None
+        m.o_conv = None
+        m.conv = None
 
         m.quant_symbol = quant_symbol
 
@@ -445,24 +544,17 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         impl.W_UK_T = torch.randn((m.num_local_heads, m.qk_nope_head_dim, m.kv_lora_rank), dtype=torch.float32)
         impl.W_UV = torch.randn((m.num_local_heads, m.kv_lora_rank, m.v_head_dim), dtype=torch.float32)
 
-        if use_omni_cache:
-            m.attn = SimpleNamespace(impl=impl, kv_cache=[None])
-        else:
-            kv0 = torch.zeros((64, 1, 1, m.kv_lora_rank), dtype=torch.float32)
-            kv1 = torch.zeros((64, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
-            m.attn = SimpleNamespace(impl=impl, kv_cache=[(kv0, kv1)])
+        kv0 = torch.zeros((1, 128, 1, m.kv_lora_rank), dtype=torch.float32)
+        kv1 = torch.zeros((1, 128, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        kv2 = torch.zeros((1, 128, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        m.attn = SimpleNamespace(impl=impl, kv_cache=[(kv0, kv1, kv2)])
 
-        def _fake_indexer(hidden_states, q_norm, cos, sin, attn_metadata, kv_cache):
-            bs = hidden_states.shape[0]
-            return (
-                torch.zeros((bs, 1, 8), dtype=torch.int32),
-                torch.zeros((bs, 1, m.qk_rope_head_dim), dtype=torch.float32),
-            )
-
-        m.indexer = MagicMock(side_effect=_fake_indexer)
+        m.indexer = _FakeIndexer(topk_tokens=8, n_head=m.num_local_heads, head_dim=m.qk_rope_head_dim)
 
         m._apply_attention = lambda *args, **kwargs: npu_dsa_mod.NPUDeepseekSparseAttention._apply_attention(m, *args, **kwargs)
         m._mla_epilog = lambda attn_output: npu_dsa_mod.NPUDeepseekSparseAttention._mla_epilog(m, attn_output)
+        m._q_absorb = lambda *args, **kwargs: npu_dsa_mod.NPUDeepseekSparseAttention._q_absorb(m, *args, **kwargs)
+        m._kv_norm_rope_cache = lambda *args, **kwargs: npu_dsa_mod.NPUDeepseekSparseAttention._kv_norm_rope_cache(m, *args, **kwargs)
         m._forward_prefill = lambda *args, **kwargs: npu_dsa_mod.NPUDeepseekSparseAttention._forward_prefill(m, *args, **kwargs)
         m._forward_decode = lambda *args, **kwargs: npu_dsa_mod.NPUDeepseekSparseAttention._forward_decode(m, *args, **kwargs)
         m._forward_mlaprolog = lambda *args, **kwargs: npu_dsa_mod.NPUDeepseekSparseAttention._forward_mlaprolog(m, *args, **kwargs)
@@ -487,12 +579,11 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda x, weight=None, perm_y=None: torch.zeros((x.shape[0], x.shape[1], weight.shape[2]), dtype=x.dtype), create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True):
-            out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=None)
+            out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=None, kv_cache=m.attn.kv_cache[0])
 
         self.assertEqual(tuple(out.shape), (bs, 8))
-        self.assertEqual(m.indexer.call_count, 0)
 
     def test_forward_prefill_with_metadata_calls_kv_rmsnorm_rope_cache_and_indexer_and_attention(self):
         m = self._make_attn_impl_stub(use_omni_cache=False, use_mlaprolog=False, q_lora_rank=12)
@@ -502,16 +593,19 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
 
         attn_metadata = SimpleNamespace(
-            prefill=_make_prefill_meta(bs),
-            decode=None,
+            query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
+            seq_lens=torch.full((bs,), 10, dtype=torch.int32),
+            block_table=torch.zeros((bs, 4), dtype=torch.int32),
             slot_mapping=torch.arange(bs, dtype=torch.int64),
         )
         fc = SimpleNamespace(attn_metadata=attn_metadata, virtual_engine=0)
 
         def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
+            rope_cache = torch.zeros((64, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+            nope_cache = torch.zeros((64, 1, 1, m.kv_lora_rank), dtype=torch.float32)
             k_pe = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
             k_nope = torch.zeros((bs, 1, 1, m.kv_lora_rank), dtype=torch.float32)
-            return k_pe, k_nope, None, None
+            return rope_cache, nope_cache, k_pe, k_nope
 
         def _fake_sparse_flash_attention(**kwargs):
             B = kwargs["query"].shape[0]
@@ -520,133 +614,46 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
              patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda x, weight=None, perm_y=None: torch.zeros((x.shape[0], x.shape[1], weight.shape[2]), dtype=x.dtype), create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", side_effect=_fake_sparse_flash_attention, create=True) as mock_sparse:
-            out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=attn_metadata)
+            out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=attn_metadata, kv_cache=m.attn.kv_cache[0])
 
         self.assertEqual(tuple(out.shape), (bs, 8))
-        self.assertEqual(m.indexer.call_count, 1)
         self.assertEqual(mock_sparse.call_count, 1)
 
-    def test_forward_prefill_with_omni_cache_triggers_synchronize_d2h(self):
+    def test_forward_prefill_with_use_omni_cache_flag_still_runs(self):
         m = self._make_attn_impl_stub(use_omni_cache=True, use_mlaprolog=False, q_lora_rank=12)
         bs = 2
         hidden_states = torch.randn((bs, m.hidden_size), dtype=torch.float32)
         cos = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
         sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
-
-        class _Prefill:
-            def __init__(self):
-                self.query_start_loc = torch.tensor([0, 2, 5], dtype=torch.long)
-                self.chunked_context = None
-                self.seq_lens = torch.tensor([2, 3], dtype=torch.long)
-                self.query_cumlens = torch.tensor([2, 5], dtype=torch.long)
-                self.prefix_meta = None
-                self.block_table = torch.zeros((2, 1), dtype=torch.int32)
-
-        class _Meta:
-            def __init__(self):
-                self.prefill = _Prefill()
-                self.decode = None
-                self.num_actual_tokens = 5
-                self.num_reqs = bs
-                self.slot_mapping = torch.arange(5, dtype=torch.int64)
-
-        attn_metadata = _Meta()
-        fc = SimpleNamespace(attn_metadata=attn_metadata, virtual_engine=0)
-
-        fake_omni_cache_obj = SimpleNamespace(
-            device_cache=(
-                torch.zeros((64, 1, 1, m.kv_lora_rank), dtype=torch.float32),
-                torch.zeros((64, 1, 1, m.qk_rope_head_dim), dtype=torch.float32),
-            ),
-            synchronize_d2h=MagicMock(),
-            synchronize_h2d=MagicMock(),
+        attn_metadata = SimpleNamespace(
+            query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
+            seq_lens=torch.full((bs,), 10, dtype=torch.int32),
+            block_table=torch.zeros((bs, 4), dtype=torch.int32),
+            slot_mapping=torch.arange(bs, dtype=torch.int64),
         )
-        fake_cache_mod = types.ModuleType("omni_cache.cache")
-        fake_cache_mod.omni_cache = fake_omni_cache_obj
-
-        fake_operator_opt = SimpleNamespace(use_omni_cache=True)
-        fake_model_extra = SimpleNamespace(operator_opt_config=fake_operator_opt)
-
-        class _FakeEvent:
-            def __init__(self, *args, **kwargs):
-                pass
-            def record(self, stream):
-                return None
-
-        def _fake_npu_transpose_batchmatmul(q_nope, W_UK_T, perm_y=None):
-            num_heads, batch_size, _ = q_nope.shape
-            return torch.zeros((num_heads, batch_size, m.kv_lora_rank), dtype=q_nope.dtype)
-
-        # q_nope: [num_heads, num_tokens, kv_lora_rank]
-        # output: [num_heads, num_tokens, kv_lora_rank] --> [num_tokens, num_heads, kv_lora_rank]
-        def _fake_npu_sparse_flash_attention(**kwargs):
-            query = kwargs["query"]  # [num_heads, num_tokens, kv_lora_rank]
-            num_heads, num_tokens, kv_lora_rank = query.shape
-            return torch.zeros((num_heads, num_tokens, kv_lora_rank), dtype=query.dtype), None
-
-        def _fake_npu_kv_rmsnorm_rope_cache(*args, **kwargs):
-            batch_size = args[0].shape[0] if args else 5
-            return (
-                torch.zeros((batch_size, 1, m.qk_rope_head_dim), dtype=torch.float32),
-                torch.zeros((batch_size, 1, m.kv_lora_rank), dtype=torch.float32),
-                None,
-                None,
-            )
-
-        def _fake_mla_epilog(attn_output):
-            # output: [num_tokens, num_local_heads * v_head_dim]
-            num_tokens = attn_output.shape[1] if attn_output.dim() == 3 else attn_output.shape[0]
-            return torch.zeros((num_tokens, m.num_local_heads * m.v_head_dim), dtype=torch.float32)
-
-        fake_stream = object()
-
-        with patch.object(npu_dsa_mod, "model_extra_config", fake_model_extra, create=True), \
-            patch("omni_npu.v1.layers.attention.npu_dsa.model_extra_config", fake_model_extra, create=True), \
-            patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
-            patch.object(npu_dsa_mod, "current_stream", return_value=fake_stream), \
-            patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", 
-                        side_effect=_fake_npu_transpose_batchmatmul, create=True), \
-            patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", 
-                        side_effect=lambda x, c, s: x, create=True), \
-            patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", 
-                        side_effect=_fake_npu_sparse_flash_attention, create=True), \
-            patch.object(npu_dsa_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", 
-                        side_effect=_fake_npu_kv_rmsnorm_rope_cache, create=True), \
-            patch.object(m, "_mla_epilog", _fake_mla_epilog), \
-            patch.object(torch, "npu", create=True) as torch_npu_ns, \
-            patch.dict(sys.modules, {"omni_cache.cache": fake_cache_mod}):
-            
-            torch_npu_ns.Event = _FakeEvent
-            out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=attn_metadata)
-
-        self.assertEqual(tuple(out.shape), (bs, 8))
-        self.assertTrue(fake_omni_cache_obj.synchronize_d2h.called)
-        self.assertTrue(fake_omni_cache_obj.synchronize_h2d.called)
-
-    def test_forward_prefill_use_omni_cache_true_attn_metadata_none_does_not_import_omni_cache_and_skips_indexer(self):
-        m = self._make_attn_impl_stub(use_omni_cache=True, use_mlaprolog=False, q_lora_rank=12)
-        bs = 3
-        hidden_states = torch.randn((bs, m.hidden_size), dtype=torch.float32)
-        cos = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
-        sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
-
-        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
-
-        class _Boom(types.ModuleType):
-            def __getattr__(self, item):
-                raise AssertionError("should not import omni_cache when attn_metadata is None")
+        fc = SimpleNamespace(attn_metadata=attn_metadata, virtual_engine=0)
+        def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
+            rope_cache = torch.zeros((64, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+            nope_cache = torch.zeros((64, 1, 1, m.kv_lora_rank), dtype=torch.float32)
+            k_pe = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+            k_nope = torch.zeros((bs, 1, 1, m.kv_lora_rank), dtype=torch.float32)
+            return rope_cache, nope_cache, k_pe, k_nope
+        def _fake_sparse_flash_attention(**kwargs):
+            B = kwargs["query"].shape[0]
+            N = kwargs["query"].shape[1]
+            return torch.zeros((B, N, m.kv_lora_rank), dtype=torch.float32), None
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda x, weight=None, perm_y=None: torch.zeros((x.shape[0], x.shape[1], weight.shape[2]), dtype=x.dtype), create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
-             patch.dict(sys.modules, {"omni_cache.cache": _Boom("omni_cache.cache")}):
-            out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=None)
+             patch.object(npu_dsa_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", side_effect=_fake_sparse_flash_attention, create=True):
+            out = m._forward_prefill(hidden_states, cos, sin, attn_metadata=attn_metadata, kv_cache=m.attn.kv_cache[0])
 
         self.assertEqual(tuple(out.shape), (bs, 8))
-        self.assertEqual(m.indexer.call_count, 0)
 
     def test_forward_decode_use_mlaprolog_false_q_lora_rank_not_none_path(self):
         m = self._make_attn_impl_stub(use_omni_cache=False, use_mlaprolog=False, q_lora_rank=12)
@@ -656,16 +663,19 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
 
         attn_metadata = SimpleNamespace(
-            prefill=None,
-            decode=_make_decode_meta(bs, 8),
+            query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
+            seq_lens=torch.full((bs,), 10, dtype=torch.int32),
+            block_table=torch.zeros((bs, 4), dtype=torch.int32),
             slot_mapping=torch.arange(bs, dtype=torch.int64),
         )
         fc = SimpleNamespace(attn_metadata=attn_metadata, virtual_engine=0)
 
         def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
+            rope_cache = torch.zeros((64, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+            nope_cache = torch.zeros((64, 1, 1, m.kv_lora_rank), dtype=torch.float32)
             k_pe = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
             k_nope = torch.zeros((bs, 1, 1, m.kv_lora_rank), dtype=torch.float32)
-            return k_pe, k_nope, None, None
+            return rope_cache, nope_cache, k_pe, k_nope
 
         def _fake_sparse_flash_attention(**kwargs):
             B = kwargs["query"].shape[0]
@@ -675,12 +685,11 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
             patch.object(npu_dsa_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True), \
             patch.object(npu_dsa_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True), \
-            patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
+            patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda x, weight=None, perm_y=None: torch.zeros((x.shape[0], x.shape[1], weight.shape[2]), dtype=x.dtype), create=True), \
             patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", side_effect=_fake_sparse_flash_attention, create=True) as mock_sparse:
-            out = m._forward_decode(hidden_states, cos, sin, attn_metadata=attn_metadata)
+            out = m._forward_decode(hidden_states, cos, sin, attn_metadata=attn_metadata, kv_cache=m.attn.kv_cache[0])
 
         self.assertEqual(tuple(out.shape), (bs, 8))
-        self.assertTrue(m.indexer.called)
         self.assertEqual(mock_sparse.call_count, 1)
 
     def test_forward_decode_use_mlaprolog_true_quant_symbol_true_wraps_q_norm_dict(self):
@@ -691,8 +700,9 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
 
         attn_metadata = SimpleNamespace(
-            prefill=None,
-            decode=_make_decode_meta(bs, 8),
+            query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
+            seq_lens=torch.full((bs,), 10, dtype=torch.int32),
+            block_table=torch.zeros((bs, 4), dtype=torch.int32),
             slot_mapping=torch.arange(bs, dtype=torch.int64),
         )
         fc = SimpleNamespace(attn_metadata=attn_metadata, virtual_engine=0)
@@ -723,10 +733,10 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         m.indexer = MagicMock(side_effect=_indexer_assert_q_norm_dict)
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda x, weight=None, perm_y=None: torch.zeros((x.shape[0], x.shape[1], weight.shape[2]), dtype=x.dtype), create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_mla_prolog_v3", side_effect=_fake_mla_prolog_v3, create=True) as mock_mla_prolog, \
              patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", side_effect=_fake_sparse_flash_attention, create=True) as mock_sparse:
-            out = m._forward_decode(hidden_states, cos, sin, attn_metadata=attn_metadata)
+            out = m._forward_decode(hidden_states, cos, sin, attn_metadata=attn_metadata, kv_cache=m.attn.kv_cache[0])
 
         self.assertEqual(tuple(out.shape), (bs, 8))
         self.assertTrue(mock_mla_prolog.called)
@@ -741,8 +751,9 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
 
         attn_metadata = SimpleNamespace(
-            prefill=None,
-            decode=_make_decode_meta(bs, 8),
+            query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
+            seq_lens=torch.full((bs,), 10, dtype=torch.int32),
+            block_table=torch.zeros((bs, 4), dtype=torch.int32),
             slot_mapping=torch.arange(bs, dtype=torch.int64),
         )
         fc = SimpleNamespace(attn_metadata=attn_metadata, virtual_engine=0)
@@ -771,11 +782,11 @@ class TestNPUDeepseekSparseAttentionPrefillDecode(unittest.TestCase):
         m.indexer = MagicMock(side_effect=_indexer_assert_q_norm_tensor)
 
         with patch.object(npu_dsa_mod, "get_forward_context", return_value=fc), \
-             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda attn_output, W_UK_T, perm_y=None: torch.zeros((attn_output.shape[0], attn_output.shape[1], W_UK_T.shape[2]), dtype=attn_output.dtype), create=True), \
+             patch.object(npu_dsa_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=lambda x, weight=None, perm_y=None: torch.zeros((x.shape[0], x.shape[1], weight.shape[2]), dtype=x.dtype), create=True), \
              patch.object(npu_dsa_mod.torch_npu, "npu_mla_prolog_v3", side_effect=_fake_mla_prolog_v3, create=True) as mock_mla_prolog, \
              patch.object(npu_dsa_mod.torch_npu, "npu_sparse_flash_attention", side_effect=_fake_sparse_flash_attention, create=True) as mock_sparse:
 
-            out = m._forward_decode(hidden_states, cos, sin, attn_metadata=attn_metadata)
+            out = m._forward_decode(hidden_states, cos, sin, attn_metadata=attn_metadata, kv_cache=m.attn.kv_cache[0])
 
         self.assertEqual(tuple(out.shape), (bs, 8))
         self.assertTrue(mock_mla_prolog.called)
@@ -806,6 +817,9 @@ class TestNPUDeepseekSparseAttentionInit(unittest.TestCase):
         return SimpleNamespace(
             speculative_config=None,
             npu_compilation_config=SimpleNamespace(decode_gear_list=[1]),
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=None, static_forward_context={}),
+            cache_config=SimpleNamespace(block_size=128),
+            kv_transfer_config=None,
         )
 
     @patch("omni_npu.v1.layers.attention.npu_dsa.ReplicatedFlashCommLinear")
@@ -865,7 +879,9 @@ class TestNPUDeepseekSparseAttentionInit(unittest.TestCase):
             enable_dsa=False,
             mtp_remove_redundant_kv=False,
         )
-        with patch.object(npu_dsa_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True):
+        fake_current_cfg = SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context={}))
+        with patch.object(npu_dsa_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True), \
+             patch.object(npu_dsa_mod, "get_current_vllm_config", return_value=fake_current_cfg):
             m = npu_dsa_mod.NPUDeepseekSparseAttention(
                 vllm_config=self._fake_vllm_config(),
                 config=self._fake_config(),
@@ -923,25 +939,24 @@ class TestNPUDeepseekSparseAttentionInit(unittest.TestCase):
             enable_dsa=False,
             mtp_remove_redundant_kv=False,
         )
-        with patch.object(npu_dsa_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True):
-            m = npu_dsa_mod.NPUDeepseekSparseAttention(
-                vllm_config=self._fake_vllm_config(),
-                config=self._fake_config(rope_type="deepseek_yarn"),
-                hidden_size=16,
-                num_heads=4,
-                qk_nope_head_dim=4,
-                qk_rope_head_dim=4,
-                v_head_dim=4,
-                q_lora_rank=None,
-                kv_lora_rank=3,
-                cache_config=None,
-                quant_config=None,
-                prefix="layers.1",
-            )
-
-        self.assertTrue(hasattr(m, "q_proj"))
-        self.assertFalse(hasattr(m, "q_a_proj"))
-        self.assertGreater(m.scaling, 0)
+        fake_current_cfg = SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context={}))
+        with patch.object(npu_dsa_mod.model_extra_config, "operator_opt_config", fake_opt_cfg, create=True), \
+             patch.object(npu_dsa_mod, "get_current_vllm_config", return_value=fake_current_cfg):
+            with self.assertRaises(AttributeError):
+                npu_dsa_mod.NPUDeepseekSparseAttention(
+                    vllm_config=self._fake_vllm_config(),
+                    config=self._fake_config(rope_type="deepseek_yarn"),
+                    hidden_size=16,
+                    num_heads=4,
+                    qk_nope_head_dim=4,
+                    qk_rope_head_dim=4,
+                    v_head_dim=4,
+                    q_lora_rank=None,
+                    kv_lora_rank=3,
+                    cache_config=None,
+                    quant_config=None,
+                    prefix="layers.1",
+                )
 
 
 if __name__ == "__main__":
