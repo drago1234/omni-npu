@@ -188,8 +188,8 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
             )
 
         self.slot_mapping_2d = torch.empty(
-            (self.decode_cudagraph_max_bs, 2),
-            dtype=torch.int32,
+            (vllm_config.scheduler_config.max_num_batched_tokens, 2),
+            dtype=torch.int64,
             device=device,
         )
 
