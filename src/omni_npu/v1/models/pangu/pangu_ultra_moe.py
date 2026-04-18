@@ -822,6 +822,9 @@ class PanguUltraMoEForCausalLM(OpenPanguMoEModel, IsHybrid):
     """
 
 
+    # Allow vLLM to keep APC enabled for this MOME-based model.
+    supports_mamba_prefix_caching = True
+
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig

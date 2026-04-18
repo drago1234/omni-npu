@@ -36,14 +36,8 @@ class _FakeLayerNorm:
 
 
 class _FakeAggregateConv:
-    def __call__(self, x, only_prefill=False, force_decode=False):
+    def __call__(self, x, only_prefill=False, force_decode=False, short_prefill=False):
         return x
-
-
-class _Fake_even_odd_indexing():
-    def __call__(self, x):
-        return x
-
 
 class _Fake_insert_tensor_by_start_loc():
     def __call__(self, x, insert_segment=None, start_loc=None):
@@ -70,7 +64,8 @@ def _make_prefill_meta(bs: int, *, max_query_len=2):
         query_cumlens=torch.arange(1, bs + 1, dtype=torch.int32),
         max_query_len=max_query_len,
         query_start_loc=[0] + torch.arange(1, bs + 1, dtype=torch.int32).tolist(),
-        slot_mapping=torch.arange(bs, dtype=torch.int64)
+        slot_mapping=torch.arange(bs, dtype=torch.int64),
+        block_table=torch.zeros((bs, 4), dtype=torch.int32),
     )
 
 
@@ -86,15 +81,23 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         m = SimpleNamespace()
         m.prefix = "layers.0"
         m.quant_symbol = False
-        m._forward_prefill = MagicMock(return_value=torch.tensor([1]))
-        m._forward_decode = MagicMock(return_value=torch.tensor([2]))
+        m._forward_prefill = MagicMock(
+            side_effect=lambda hidden_states, *_args, **_kwargs: (
+                hidden_states["x_int8"] if isinstance(hidden_states, dict) else hidden_states
+            ) + 1
+        )
+        m._forward_decode = MagicMock(
+            side_effect=lambda hidden_states, *_args, **_kwargs: (
+                hidden_states["x_int8"] if isinstance(hidden_states, dict) else hidden_states
+            ) + 2
+        )
         m.param_sink_number = 128
         m.param_sink_with_value = True
         m.kv_lora_rank = 512
         m.qk_rope_head_dim = 64
 
-        sink_k_pe = torch.zeros((128, m.kv_lora_rank), dtype=torch.bfloat16)
-        sink_compressed_kv = torch.zeros((128, m.qk_rope_head_dim), dtype=torch.bfloat16)
+        sink_k_pe = torch.zeros((128, m.qk_rope_head_dim), dtype=torch.bfloat16)
+        sink_compressed_kv = torch.zeros((128, m.kv_lora_rank), dtype=torch.bfloat16)
         m.attn = SimpleNamespace(sink_k_pe=sink_k_pe,
             sink_compressed_kv=sink_compressed_kv,
             sink_populated=True,
@@ -110,7 +113,7 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         fc = SimpleNamespace(attn_metadata=None, virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
-        self.assertTrue(torch.equal(out, torch.tensor([1])))
+        self.assertTrue(torch.equal(out, hs + 1))
 
         m._forward_prefill.reset_mock()
         prefill_meta = _make_prefill_meta(3, max_query_len=2)
@@ -120,7 +123,7 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
             virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
-        self.assertTrue(torch.equal(out, torch.tensor([1])))
+        self.assertTrue(torch.equal(out, hs + 1))
 
         m._forward_decode.reset_mock()
         decode_meta = _make_decode_meta(2)
@@ -130,7 +133,9 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
             virtual_engine=0, no_compile_layers={m.prefix: m}, capturing=False)
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
-        self.assertTrue(torch.equal(out, torch.tensor([2])))
+        expected = hs.clone()
+        expected[:2] = hs[:2] + 2
+        self.assertTrue(torch.equal(out, expected))
 
     def test_forward_attn_metadata_dict_extracts_prefix(self):
         m = self._make_stub()
@@ -147,7 +152,7 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
             out = npu_mla_mod.NPUDeepseekMLAAttention.forward(m, hs, cos, sin)
 
-        self.assertTrue(torch.equal(out, torch.tensor([2])))
+        self.assertTrue(torch.equal(out, hs + 2))
         self.assertEqual(m._forward_decode.call_count, 1)
 
     def test_forward_quant_symbol_wraps_hidden_states(self):
@@ -181,22 +186,6 @@ class TestNPUMLAForwardRouting(unittest.TestCase):
         expected = torch.tensor([[9], [8], [1], [2], [9], [8], [3], [4], [5]], dtype=torch.int32)
         self.assertTrue(torch.equal(out, expected))
 
-    def test_even_odd_indexing(self):
-        x = torch.tensor([
-            [1, 2, 3, 4],
-            [5, 6, 7, 8]
-        ])
-        expected = torch.tensor([
-            [1, 3, 2, 4],
-            [5, 7, 6, 8]
-        ])
-        
-        fc = SimpleNamespace(attn_metadata=None, virtual_engine=0)
-        with patch.object(npu_mla_mod, "get_forward_context", return_value=fc):
-            out = npu_mla_mod.NPUDeepseekMLAAttention.even_odd_indexing(x)
-        self.assertTrue(torch.equal(out, expected))
-
-
 class TestNPUMLAPrefillDecode(unittest.TestCase):
     def _make_stub(self):
         m = SimpleNamespace()
@@ -229,7 +218,6 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         m.compresskv_conv = _FakeAggregateConv()
         m.merge_conv = None
         m.o_conv = _FakeAggregateConv()
-        m.even_odd_indexing = _Fake_even_odd_indexing()
         m._insert_tensor_by_start_loc = _Fake_insert_tensor_by_start_loc()
 
         impl = SimpleNamespace(
@@ -239,12 +227,14 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         )
         kv0 = torch.zeros((2, 128, m.kv_lora_rank), dtype=torch.float32)
         kv1 = torch.zeros((2, 128, m.qk_rope_head_dim), dtype=torch.float32)
-        sink_k_pe = torch.zeros((128, m.kv_lora_rank), dtype=torch.bfloat16)
-        sink_compressed_kv = torch.zeros((128, m.qk_rope_head_dim), dtype=torch.bfloat16)
+        sink_k_pe = torch.zeros((128, m.qk_rope_head_dim), dtype=torch.bfloat16)
+        sink_compressed_kv = torch.zeros((128, m.kv_lora_rank), dtype=torch.bfloat16)
         m.attn = SimpleNamespace(impl=impl, kv_cache=[(kv0, kv1)], sink_k_pe=sink_k_pe,
                                 sink_compressed_kv=sink_compressed_kv,
                                 sink_populated=True)
         m.config = self._fake_cfg()
+        m.enable_chunked_prefill = False
+        m.enable_prefix_caching = False
         return m
 
     def _fake_cfg(self, model_type="openpangu_v2"):
@@ -287,9 +277,22 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             kv_a = torch.zeros((bs, 1, 1, m.kv_lora_rank), dtype=torch.float32)
             return None, None, k_pe, kv_a
 
-        def _fake_fused_attention(*args, **kwargs):
-            q_arg = args[0]
+        def _fake_tbm(x, w, perm_y=None):
+            return torch.zeros((x.shape[0], x.shape[1], w.shape[2]), dtype=torch.float32)
+
+        def _fake_fused_attention_score(*args, **kwargs):
+            q_arg = args[0] if len(args) > 0 else kwargs["query"]
             return torch.zeros((q_arg.shape[0], q_arg.shape[1], m.v_head_dim), dtype=torch.float32), None
+
+        def _fake_fused_attention_sink(*args, **kwargs):
+            q_arg = kwargs["query"] if "query" in kwargs else args[0]
+            query_heads = kwargs.get("num_query_heads", q_arg.shape[1])
+            qlens = kwargs.get("actual_seq_qlen", None)
+            if qlens is None:
+                q_tokens = q_arg.shape[0]
+            else:
+                q_tokens = int(qlens[-1])
+            return torch.zeros((q_tokens, query_heads, m.kv_lora_rank), dtype=torch.float32), None
 
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc), patch.object(
             npu_mla_mod, "named_stream", return_value=fake_stream
@@ -305,9 +308,13 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         ), patch.object(
             npu_mla_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True
         ), patch.object(
-            npu_mla_mod.torch.ops.npu, "npu_fused_infer_attention_score", side_effect=_fake_fused_attention, create=True
+            npu_mla_mod.torch_npu, "npu_rotary_mul", side_effect=lambda x, c, s: x, create=True
         ), patch.object(
-            npu_mla_mod.torch.ops.custom, "npu_fused_infer_attention_sink", side_effect=_fake_fused_attention, create=True
+            npu_mla_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=_fake_tbm, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.npu, "npu_fused_infer_attention_score", side_effect=_fake_fused_attention_score, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.custom, "npu_fused_infer_attention_sink", side_effect=_fake_fused_attention_sink, create=True
         ):
             torch_npu_ns.current_stream = lambda: fake_stream
             torch_npu_ns.stream = lambda _s: nullcontext()
@@ -342,6 +349,8 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             npu_mla_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True
         ), patch.object(
             npu_mla_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_rotary_mul", side_effect=lambda x, c, s: x, create=True
         ), patch.object(
             npu_mla_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=_fake_tbm, create=True
         ), patch.object(
@@ -382,9 +391,22 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             kv_a = torch.zeros((bs, 1, 1, m.kv_lora_rank), dtype=torch.float32)
             return None, None, k_pe, kv_a
 
-        def _fake_fused_attention(*args, **kwargs):
-            q_arg = args[0]
+        def _fake_tbm(x, w, perm_y=None):
+            return torch.zeros((x.shape[0], x.shape[1], w.shape[2]), dtype=torch.float32)
+
+        def _fake_fused_attention_score(*args, **kwargs):
+            q_arg = args[0] if len(args) > 0 else kwargs["query"]
             return torch.zeros((q_arg.shape[0], q_arg.shape[1], m.v_head_dim), dtype=torch.float32), None
+
+        def _fake_fused_attention_sink(*args, **kwargs):
+            q_arg = kwargs["query"] if "query" in kwargs else args[0]
+            query_heads = kwargs.get("num_query_heads", q_arg.shape[1])
+            qlens = kwargs.get("actual_seq_qlen", None)
+            if qlens is None:
+                q_tokens = q_arg.shape[0]
+            else:
+                q_tokens = int(qlens[-1])
+            return torch.zeros((q_tokens, query_heads, m.kv_lora_rank), dtype=torch.float32), None
 
         with patch.object(npu_mla_mod, "get_forward_context", return_value=fc), patch.object(
             npu_mla_mod, "named_stream", return_value=fake_stream
@@ -400,15 +422,136 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
         ), patch.object(
             npu_mla_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True
         ), patch.object(
-            npu_mla_mod.torch.ops.npu, "npu_fused_infer_attention_score", side_effect=_fake_fused_attention, create=True
+            npu_mla_mod.torch_npu, "npu_rotary_mul", side_effect=lambda x, c, s: x, create=True
         ), patch.object(
-            npu_mla_mod.torch.ops.custom, "npu_fused_infer_attention_sink", side_effect=_fake_fused_attention, create=True
+            npu_mla_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=_fake_tbm, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.npu, "npu_fused_infer_attention_score", side_effect=_fake_fused_attention_score, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.custom, "npu_fused_infer_attention_sink", side_effect=_fake_fused_attention_sink, create=True
         ):
             torch_npu_ns.current_stream = lambda: fake_stream
             torch_npu_ns.stream = lambda _s: nullcontext()
             out = npu_mla_mod.NPUDeepseekMLAAttention._forward_prefill(m, hs, cos, sin, attn_metadata=meta.prefill)
 
         self.assertEqual(tuple(out.shape), (bs, 16))
+
+    def test_forward_prefill_sink_path_uses_local_heads_and_runs_uv_epilog(self):
+        m = self._make_stub()
+        m.enable_chunked_prefill = True
+        m.num_local_heads = 3
+        m.q_b_proj = _FakeLinear(m.num_local_heads * m.qk_head_dim)
+        m.kv_b_proj = _FakeLinear(m.num_local_heads * (m.qk_nope_head_dim + m.v_head_dim))
+        m.o_conv = MagicMock(side_effect=lambda x, **kwargs: x)
+        m.attn.impl.W_UK_T = torch.zeros((m.num_local_heads, m.qk_nope_head_dim, m.kv_lora_rank), dtype=torch.float32)
+        m.attn.impl.W_UV = torch.zeros((m.num_local_heads, m.kv_lora_rank, m.v_head_dim), dtype=torch.float32)
+
+        bs = 3
+        hs = torch.randn((bs, m.hidden_size), dtype=torch.float32)
+        cos = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        prefill_meta = _make_prefill_meta(bs, max_query_len=2)
+        prefill_meta.seq_lens = [2 + m.param_sink_number, 3 + m.param_sink_number, 1 + m.param_sink_number]
+        prefill_meta.block_table = torch.zeros((bs, 4), dtype=torch.int32)
+        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=prefill_meta), virtual_engine=0, capturing=False)
+        fake_stream = _FakeStream()
+
+        def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
+            k_pe = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+            kv_a = torch.zeros((bs, 1, 1, m.kv_lora_rank), dtype=torch.float32)
+            return None, None, k_pe, kv_a
+
+        def _fake_tbm(x, w, perm_y=None):
+            return torch.zeros((x.shape[0], x.shape[1], w.shape[2]), dtype=torch.float32)
+
+        sink_calls = {}
+
+        def _fake_fused_attention_sink(*args, **kwargs):
+            sink_calls["kwargs"] = kwargs
+            q = kwargs["query"]
+            q_tokens = int(kwargs["actual_seq_qlen"][-1])
+            return torch.zeros((q_tokens, kwargs["num_query_heads"], m.kv_lora_rank), dtype=torch.float32), None
+
+        with patch.object(npu_mla_mod, "get_forward_context", return_value=fc), patch.object(
+            npu_mla_mod, "named_stream", return_value=fake_stream
+        ), patch.object(
+            npu_mla_mod.torch, "npu", create=True
+        ) as torch_npu_ns, patch.object(
+            npu_mla_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_rotary_mul", side_effect=lambda x, c, s: x, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=_fake_tbm, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.custom, "npu_fused_infer_attention_sink", side_effect=_fake_fused_attention_sink, create=True
+        ):
+            torch_npu_ns.current_stream = lambda: fake_stream
+            torch_npu_ns.stream = lambda _s: nullcontext()
+            out = npu_mla_mod.NPUDeepseekMLAAttention._forward_prefill(m, hs, cos, sin, attn_metadata=prefill_meta)
+
+        self.assertEqual(tuple(out.shape), (bs, 16))
+        self.assertEqual(sink_calls["kwargs"]["num_query_heads"], 3)
+        self.assertEqual(sink_calls["kwargs"]["actual_seq_kvlen"], prefill_meta.seq_lens)
+        self.assertTrue(m.o_conv.called)
+
+    def test_forward_prefill_sink_prefix_caching_triggers_absorbed_pa_path(self):
+        """APC (prefix caching) alone should select the same absorbed+PA sink path as chunked prefill."""
+        m = self._make_stub()
+        m.enable_chunked_prefill = False
+        m.enable_prefix_caching = True
+        m.num_local_heads = 3
+        m.q_b_proj = _FakeLinear(m.num_local_heads * m.qk_head_dim)
+        m.kv_b_proj = _FakeLinear(m.num_local_heads * (m.qk_nope_head_dim + m.v_head_dim))
+        m.o_conv = MagicMock(side_effect=lambda x, **kwargs: x)
+        m.attn.impl.W_UK_T = torch.zeros((m.num_local_heads, m.qk_nope_head_dim, m.kv_lora_rank), dtype=torch.float32)
+        m.attn.impl.W_UV = torch.zeros((m.num_local_heads, m.kv_lora_rank, m.v_head_dim), dtype=torch.float32)
+
+        bs = 3
+        hs = torch.randn((bs, m.hidden_size), dtype=torch.float32)
+        cos = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        sin = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+        prefill_meta = _make_prefill_meta(bs, max_query_len=2)
+        prefill_meta.seq_lens = [2 + m.param_sink_number, 3 + m.param_sink_number, 1 + m.param_sink_number]
+        prefill_meta.block_table = torch.zeros((bs, 4), dtype=torch.int32)
+        fc = SimpleNamespace(attn_metadata=SimpleNamespace(prefill=prefill_meta), virtual_engine=0, capturing=False)
+        fake_stream = _FakeStream()
+
+        def _fake_kv_rmsnorm_rope_cache(*args, **kwargs):
+            k_pe = torch.zeros((bs, 1, 1, m.qk_rope_head_dim), dtype=torch.float32)
+            kv_a = torch.zeros((bs, 1, 1, m.kv_lora_rank), dtype=torch.float32)
+            return None, None, k_pe, kv_a
+
+        def _fake_tbm(x, w, perm_y=None):
+            return torch.zeros((x.shape[0], x.shape[1], w.shape[2]), dtype=torch.float32)
+
+        sink_calls = {}
+
+        def _fake_fused_attention_sink(*args, **kwargs):
+            sink_calls["kwargs"] = kwargs
+            q = kwargs["query"]
+            q_tokens = int(kwargs["actual_seq_qlen"][-1])
+            return torch.zeros((q_tokens, kwargs["num_query_heads"], m.kv_lora_rank), dtype=torch.float32), None
+
+        with patch.object(npu_mla_mod, "get_forward_context", return_value=fc), patch.object(
+            npu_mla_mod, "named_stream", return_value=fake_stream
+        ), patch.object(
+            npu_mla_mod.torch, "npu", create=True
+        ) as torch_npu_ns, patch.object(
+            npu_mla_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_rotary_mul", side_effect=lambda x, c, s: x, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=_fake_tbm, create=True
+        ), patch.object(
+            npu_mla_mod.torch.ops.custom, "npu_fused_infer_attention_sink", side_effect=_fake_fused_attention_sink, create=True
+        ):
+            torch_npu_ns.current_stream = lambda: fake_stream
+            torch_npu_ns.stream = lambda _s: nullcontext()
+            out = npu_mla_mod.NPUDeepseekMLAAttention._forward_prefill(m, hs, cos, sin, attn_metadata=prefill_meta)
+
+        self.assertEqual(tuple(out.shape), (bs, 16))
+        self.assertIn("kwargs", sink_calls)
+        self.assertEqual(sink_calls["kwargs"]["num_query_heads"], 3)
 
     def test_forward_decode_runs_decode_attention_path(self):
         m = self._make_stub()
@@ -435,6 +578,8 @@ class TestNPUMLAPrefillDecode(unittest.TestCase):
             npu_mla_mod.torch_npu, "npu_kv_rmsnorm_rope_cache", side_effect=_fake_kv_rmsnorm_rope_cache, create=True
         ), patch.object(
             npu_mla_mod.torch_npu, "npu_interleave_rope", side_effect=lambda x, c, s: x, create=True
+        ), patch.object(
+            npu_mla_mod.torch_npu, "npu_rotary_mul", side_effect=lambda x, c, s: x, create=True
         ), patch.object(
             npu_mla_mod.torch_npu, "npu_transpose_batchmatmul", side_effect=_fake_tbm, create=True
         ), patch.object(

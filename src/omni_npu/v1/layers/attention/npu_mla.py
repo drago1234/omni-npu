@@ -115,7 +115,31 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         self.quant_symbol = quant_config is not None
         self.prefix = prefix
         self._init_wuk_t_uv = False
-        self.is_pd_disagg = vllm_config.kv_transfer_config is not None
+        self.is_pd_disagg = getattr(vllm_config, "kv_transfer_config", None) is not None
+        scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
+        self.enable_chunked_prefill = bool(
+            getattr(
+                scheduler_cfg,
+                "enable_chunked_prefill",
+                getattr(
+                    getattr(model_extra_config, "task_config", None),
+                    "enable_chunked_prefill",
+                    False,
+                ),
+            )
+        )
+        cache_cfg = getattr(vllm_config, "cache_config", None)
+        self.enable_prefix_caching = bool(
+            getattr(
+                cache_cfg,
+                "enable_prefix_caching",
+                getattr(
+                    getattr(model_extra_config, "task_config", None),
+                    "enable_prefix_caching",
+                    False,
+                ),
+            )
+        )
 
         self.q_a_proj = ReplicatedLinear(
             self.hidden_size,
@@ -637,6 +661,24 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         else:
             q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin) # BNSD
         q_pe = q_pe.squeeze(2) # BSH
+
+        use_sink_chunked_prefill = (
+            self.param_sink_number > 0
+            and (self.enable_chunked_prefill or self.enable_prefix_caching)
+            and getattr(attn_metadata, "block_table", None) is not None
+        )
+
+        if use_sink_chunked_prefill:
+            attn_output = self._apply_attention_sink_chunked_prefill(
+                q_nope=q_nope,
+                q_pe=q_pe,
+                kv_cache=kv_cache,
+                actual_seq_qlen=actual_seq_qlen,
+                attn_metadata=attn_metadata,
+                only_prefill=only_prefill,
+            )
+            return self.o_proj.forward(attn_output)[0]
+
         with torch.npu.stream(sub_stream):
             prefill_kv_a = kv_a[:actual_seq_qlen[-1]]
             prefill_k_pe = k_pe[:actual_seq_qlen[-1]]
@@ -795,6 +837,96 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             offset += seg_len
 
         return result
+
+    @mla_attn_decorator
+    def _apply_attention_sink_chunked_prefill(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        actual_seq_qlen,
+        attn_metadata: Union["NPUMLAPrefillMetadata", "NPUMLAMetadata"],
+        only_prefill: bool,
+    ) -> torch.Tensor:
+        """
+        Sink + paged prefill (chunked prefill and/or APC): absorbed queries (W_UK_T) + paged KV via
+        npu_fused_infer_attention_sink, then UV epilog (W_UV). Matches decode absorption + PA behavior
+        when scheduler enables chunked prefill or cache enables prefix caching (block_table present).
+
+        Returns:
+            Hidden states before ``o_proj`` (same layout as after conv in the standard prefill path).
+        """
+        q_nope_for_sink = q_nope.transpose(0, 1)  # TND -> NTD
+        ql_nope = torch_npu.npu_transpose_batchmatmul(
+            q_nope_for_sink,
+            self.attn.impl.W_UK_T,
+            perm_y=(1, 0, 2),
+        )
+
+        if self.sliding_window is not None:
+            window_size = self.sliding_window - 1
+        else:
+            window_size = NPUMLAImpl.MAX_WINDOW_SIZE
+
+        NPUMLAImpl.ensure_decode_attn_mask()
+        kwargs = {
+            "query": ql_nope[: actual_seq_qlen[-1]],
+            "key": kv_cache[0],
+            "value": kv_cache[0],
+            "query_rope": q_pe[: actual_seq_qlen[-1]],
+            "key_rope": kv_cache[1],
+            "num_query_heads": self.num_local_heads,
+            "num_key_value_heads": 1,
+            "input_layout": "TND",
+            "softmax_scale": self.scaling,
+            "block_table": attn_metadata.block_table,
+            "block_size": self.block_size_padded,
+            "actual_seq_qlen": actual_seq_qlen,
+            "actual_seq_kvlen": attn_metadata.seq_lens,
+            "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
+            "sparse_mode": 4,
+            "pre_tokens": window_size,
+            "next_tokens": 0,
+        }
+
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            kwargs.update(
+                {
+                    "key_sink": self.attn.sink_compressed_kv.unsqueeze(1),
+                    "value_sink": self.attn.sink_compressed_kv.unsqueeze(1),
+                    "key_rope_sink": self.attn.sink_k_pe.unsqueeze(1),
+                }
+            )
+        else:
+            kwargs.update({"sink_number": self.param_sink_number})
+
+        attn_output_shape = (q_nope.shape[0], self.num_local_heads, self.kv_lora_rank)
+        attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+        attn_output[: actual_seq_qlen[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
+        attn_output = attn_output.transpose(0, 1)  # TND -> NTD
+
+        attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank)
+        attn_output = torch_npu.npu_transpose_batchmatmul(
+            attn_output,
+            self.attn.impl.W_UV,
+            perm_y=(1, 0, 2),
+        )
+        attn_output = attn_output.reshape(-1, 1, self.num_local_heads * self.v_head_dim).view(
+            -1, self.num_local_heads * self.v_head_dim
+        )
+
+        if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            if self.conv is not None:
+                attn_output = get_tp_group().all_gather(attn_output, dim=1)
+                attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
+                if self.o_proj.tp_size > 1:
+                    attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
+                    attn_output = attn_output[self.o_proj.tp_rank].contiguous()
+        else:
+            if self.o_conv is not None:
+                attn_output = self.o_conv(attn_output, only_prefill=only_prefill) + attn_output
+
+        return attn_output
 
     @mla_attn_decorator
     def _apply_attention(

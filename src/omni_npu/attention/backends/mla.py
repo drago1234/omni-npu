@@ -136,7 +136,7 @@ class NPUMLAMetadata(MLACommonMetadata[NPUMLADecodeMetadata]):
 
 
 class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_uniform_spec_as_decode: ClassVar[bool] = True
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
@@ -160,8 +160,6 @@ class NPUMLAMetadataBuilder(MLACommonMetadataBuilder[NPUMLAMetadata]):
         if self.aot_schedule:
             raise ValueError("AOT schedule should be enabled.")
 
-        if self.compilation_config is not None:
-            self.reorder_batch_threshold = max(self.compilation_config.max_cudagraph_capture_size, self.reorder_batch_threshold)
         # FIXME (zhao): since current the max length of input of mc2_mask only support 256, so we clamp it to 256
         max_decode_tokens = min(256, self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold)
         self.mc2_mask = torch.zeros(max_decode_tokens, dtype=torch.bool, device=current_platform.device_type)

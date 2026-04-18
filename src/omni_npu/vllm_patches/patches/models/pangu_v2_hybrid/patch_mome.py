@@ -76,7 +76,7 @@ class MoMEPatch(VLLMPatch):
             elif force_decode:
                 cache_slot_id = forward_context.cache_slot_id[:attn_metadata.num_decodes]
             elif short_prefill:
-                query_start_loc = attn_metadata.query_start_loc[:attn_metadata.num_decodes]
+                query_start_loc = attn_metadata.query_start_loc[:attn_metadata.num_decodes + 1]
                 cache_slot_id = forward_context.cache_slot_id[:attn_metadata.num_decodes]
                 cache_idx_offset = 0
             else:

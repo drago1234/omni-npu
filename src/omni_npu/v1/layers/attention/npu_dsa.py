@@ -466,7 +466,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 page_size_padded=page_size_padded,
                 block_size_padded=block_size_padded,
             )
-
+        self.block_size_padded = block_size_padded
         if self.param_sink_number > 0:
             self.param_sink_k_pe = torch.nn.Parameter(
                 torch.empty(
@@ -645,8 +645,8 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                     self.kv_a_layernorm.weight,
                     cos, sin, # BNSD
                     attn_metadata.slot_mapping,
-                    kv_cache[1].view(-1, 128, 1, R),
-                    kv_cache[0].view(-1, 128, 1, L),
+                    kv_cache[1].view(-1, self.block_size_padded, 1, R),
+                    kv_cache[0].view(-1, self.block_size_padded, 1, L),
                     epsilon=self.kv_a_layernorm.variance_epsilon,
                     cache_mode="PA",
                     is_output_kv=True,
@@ -695,7 +695,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 value_sink=sink_k_nope.contiguous(),
             )[0]
 
-        return torch_npu.npu_sparse_flash_attention(
+        return torch.ops.custom.npu_sparse_flash_attention_enhance(
             query=q_nope,            # [T, N, L]
             key=k_nope,              # [*, pg, 1, L]
             value=k_nope,            # [*, pg, 1, L]
