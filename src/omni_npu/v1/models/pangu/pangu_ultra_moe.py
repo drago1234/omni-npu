@@ -340,7 +340,9 @@ class OpenPanguDecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
         block_post_layernorm_hidden_size = config.hidden_size
-        self.use_mhc = getattr(config, "use_mhc", False)
+        
+        is_mtp_layer = layer_idx >= getattr(config, "num_hidden_layers", float('inf'))
+        self.use_mhc = getattr(config, "use_mhc", False) and not is_mtp_layer
         if self.use_mhc:
             self.attn_mhc_module = NPUmHC(
                 config=config,

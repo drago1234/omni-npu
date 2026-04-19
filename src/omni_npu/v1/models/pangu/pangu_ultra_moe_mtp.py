@@ -62,7 +62,6 @@ class OpenPanguMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "shared_head"),
         )
-        config.use_mhc = False
 
         self.mtp_block = OpenPanguDecoderLayer(config, prefix, vllm_config)
 
