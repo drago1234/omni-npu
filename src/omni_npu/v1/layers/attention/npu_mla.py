@@ -48,7 +48,6 @@ from omni_npu.attention.backends.mla import NPUMLAImpl, NPUMLAMetadata
 from omni_npu.v1.layers.utils import (
     yarn_get_mscale,
     named_stream,
-    calculate_page_size_padded,
 )
 from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
@@ -96,6 +95,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.vllm_config = vllm_config
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -239,16 +239,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 self.kernel_size = getattr(config, 'router_sliding_window', 0)
                 self.cache_dtype_str = None
 
-                page_size_padded, block_size_padded = calculate_page_size_padded(
-                    cache_config=vllm_config.cache_config,
-                    cache_dtype_str=None,
-                    config=config,
-                    mome_state_shapes=self.mome_state_shapes,
-                    mome_state_dtypes=self.mome_state_dtypes,
-                    kernel_size=self.kernel_size,
-                    fake_spec_tokens=fake_num_spec_tokens,
-                )
-
                 mome_kwargs = {
                     "kernel_size": self.kernel_size,
                     "num_spec_tokens": fake_num_spec_tokens,
@@ -257,7 +247,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     "quant_config": None,
                     "vllm_config": vllm_config,
                     "prefix": f"{prefix}.conv",
-                    "page_size_padded": page_size_padded,
                 }
                 self.conv = MomeAttention(**mome_kwargs)
             else:
@@ -269,8 +258,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 else:
                     self.merge_conv = None
                 self.o_conv = AggregateConv(self.num_local_heads * self.v_head_dim, config, vllm_config, output_parallel=True, attn_prefix=f"{prefix}.attn")
-                page_size_padded = None
-                block_size_padded = vllm_config.cache_config.block_size
         else:
             self.conv = None
             self.qa_conv = None
@@ -278,10 +265,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             self.merge_conv = None
             self.o_conv = None
             self.merge_q_kv_conv = False
-            page_size_padded = None
-            block_size_padded = vllm_config.cache_config.block_size
-
-        self.block_size_padded = block_size_padded
 
         if self.param_sink_number == 0:
             self.attn = MLAAttention(
@@ -316,8 +299,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 indexer=None,
                 sink_len=self.param_sink_number,
                 sliding_window=self.sliding_window,
-                page_size_padded=page_size_padded,
-                block_size_padded=block_size_padded,
             )
         
         if self.param_sink_number > 0:
@@ -880,7 +861,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             "input_layout": "TND",
             "softmax_scale": self.scaling,
             "block_table": attn_metadata.block_table,
-            "block_size": self.block_size_padded,
+            "block_size": kv_cache[0].shape[1],
             "actual_seq_qlen": actual_seq_qlen,
             "actual_seq_kvlen": attn_metadata.seq_lens,
             "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,
@@ -1088,7 +1069,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 "input_layout": "TND",
                 "softmax_scale": self.scaling,
                 "block_table": block_table,
-                "block_size": self.block_size_padded,
+                "block_size": kv_cache[0].shape[1],
                 "actual_seq_qlen": q_cumlens,
                 "actual_seq_kvlen": kv_lens,
                 "atten_mask": NPUMLAImpl.SHARE_MASK_TRIL_SPARSE,

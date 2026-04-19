@@ -189,8 +189,6 @@ class StaticSinkAttentionPatch(VLLMPatch):
             indexer: object | None = None,
             sink_len: int | None = None,
             sliding_window: int | None = None,
-            page_size_padded: int | None = None,
-            block_size_padded = 128,
             **extra_impl_args,
         ):
             super().__init__(

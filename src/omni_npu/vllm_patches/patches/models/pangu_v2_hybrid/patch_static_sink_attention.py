@@ -154,8 +154,6 @@ class StaticSinkAttentionPatch(VLLMPatch):
             indexer: object | None = None,
             sink_len: int | None = None,
             sliding_window: int | None = None,
-            page_size_padded: int | None = None,
-            block_size_padded=128,
             **extra_impl_args,
         ):
             super().__init__(
@@ -215,8 +213,6 @@ class StaticSinkAttentionPatch(VLLMPatch):
             self.sink_k_pe = None
             self.sink_compressed_kv = None
             self.use_sparse = use_sparse
-            self.page_size_padded = page_size_padded
-            self.block_size_padded = block_size_padded
             self.indexer = indexer
 
         def update_sink_kv(self, sink_k_pe, sink_compressed_kv) -> None:
@@ -264,31 +260,34 @@ class StaticSinkAttentionPatch(VLLMPatch):
             )
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
                 if self.sliding_window:
+                    block_size = vllm_config.cache_config.block_size
+                    if self.use_sparse and vllm_config.quant_config is not None:
+                        block_size = block_size // 2
                     return ShareKVSlidingWindowSpec(
-                        block_size=self.block_size_padded,
+                        block_size=block_size,
                         num_kv_heads=1,
                         head_size=self.head_size,
-                        dtype=kv_cache_dtype,
+                        dtype=torch.bfloat16,
                         sliding_window=2048,
-                        page_size_padded=self.page_size_padded,
+                        page_size_padded=vllm_config.cache_config.mamba_page_size_padded,
                     )
 
                 if self.use_sparse:
                     return DSAAttentionSpec(
-                        block_size=self.block_size_padded,
+                        block_size=vllm_config.cache_config.block_size,
                         num_kv_heads=1,
                         head_size=self.head_size + self.indexer.head_dim,
                         dtype=kv_cache_dtype,
                         cache_dtype_str=vllm_config.cache_config.cache_dtype,
                     )
             return SinkMLAAttentionSpec(
-                block_size=self.block_size_padded,
+                block_size=vllm_config.cache_config.block_size,
                 num_kv_heads=1,
                 head_size=self.head_size,
                 dtype=kv_cache_dtype,
                 cache_dtype_str=vllm_config.cache_config.cache_dtype,
                 sink_len=self.sink_len,
-                page_size_padded=self.page_size_padded,
+                page_size_padded=vllm_config.cache_config.mamba_page_size_padded,
             )
 
     static_sink_attention.StaticSinkMLAAttention = StaticSinkMLAAttention

@@ -48,7 +48,7 @@ from omni_npu.attention.backends.utils import (
     DummySPManager,
     lazy_init_cos_sin,
 )
-from omni_npu.v1.layers.utils import yarn_get_mscale, calculate_page_size_padded
+from omni_npu.v1.layers.utils import yarn_get_mscale
 from omni_npu.v1.layers.linear import (
     RowParallelFlashCommLinear,
     ColumnParallelFlashCommLinear,
@@ -401,16 +401,6 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 self.kernel_size = getattr(config, 'router_sliding_window', 0)
                 self.cache_dtype_str = None
 
-                page_size_padded, block_size_padded = calculate_page_size_padded(
-                    cache_config=vllm_config.cache_config,
-                    cache_dtype_str=None,
-                    config=config,
-                    mome_state_shapes=self.mome_state_shapes,
-                    mome_state_dtypes=self.mome_state_dtypes,
-                    kernel_size=self.kernel_size,
-                    fake_spec_tokens=fake_num_spec_tokens,
-                )
-
                 mome_kwargs = {
                     "kernel_size": self.kernel_size,
                     "num_spec_tokens": fake_num_spec_tokens,
@@ -419,22 +409,17 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                     "quant_config": None,
                     "vllm_config": vllm_config,
                     "prefix": f"{prefix}.conv",
-                    "page_size_padded": page_size_padded,
                 }
                 self.conv = MomeAttention(**mome_kwargs)
             else:
                 self.qa_conv = AggregateConv(self.q_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
                 self.compresskv_conv = AggregateConv(self.kv_lora_rank, config, vllm_config, output_parallel=False, attn_prefix=f"{prefix}.attn")
                 self.o_conv = AggregateConv(self.num_local_heads * self.v_head_dim, config, vllm_config, output_parallel=True, attn_prefix=f"{prefix}.attn")
-                page_size_padded = None
-                block_size_padded = vllm_config.cache_config.block_size
         else:
             self.qa_conv = None
             self.compresskv_conv = None
             self.o_conv = None
             self.conv = None
-            page_size_padded = None
-            block_size_padded = vllm_config.cache_config.block_size
 
         if self.param_sink_number == 0:
             assert self.q_b_proj.tp_size == self.kv_b_proj.tp_size
@@ -469,10 +454,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 use_sparse=True,
                 indexer=self.indexer,
                 sink_len=self.param_sink_number,
-                page_size_padded=page_size_padded,
-                block_size_padded=block_size_padded,
             )
-        self.block_size_padded = block_size_padded
         if self.param_sink_number > 0:
             self.param_sink_k_pe = torch.nn.Parameter(
                 torch.empty(
@@ -522,7 +504,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         self.post_weight_load()
 
         self.dummy_value_cache = torch.zeros(
-            (1, block_size_padded, 1, self.kv_lora_rank),
+            (1, cache_config.block_size, 1, self.kv_lora_rank),
             device='npu',
             dtype=torch.bfloat16,
         )
@@ -652,8 +634,8 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                     self.kv_a_layernorm.weight,
                     cos, sin, # BNSD
                     attn_metadata.slot_mapping,
-                    kv_cache[1].view(-1, self.block_size_padded, 1, R),
-                    kv_cache[0].view(-1, self.block_size_padded, 1, L),
+                    kv_cache[1].view(-1, kv_cache[0].shape[1], 1, R),
+                    kv_cache[0].view(-1, kv_cache[0].shape[1], 1, L),
                     epsilon=self.kv_a_layernorm.variance_epsilon,
                     cache_mode="PA",
                     is_output_kv=True,

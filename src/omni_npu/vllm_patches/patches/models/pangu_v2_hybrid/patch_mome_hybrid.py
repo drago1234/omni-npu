@@ -67,7 +67,6 @@ class NPUMoMEPatch(VLLMPatch):
             cache_config: Cache configuration
             quant_config: Quantization configuration
             prefix: Layer name prefix
-            page_size_padded: Padded page size for KV cache
             q_lora_rank: Q projection low-rank dimension (for qa_conv)
             kv_lora_rank: KV compression low-rank dimension (for compresskv_conv)
             num_heads: Number of attention heads (for o_conv)
@@ -83,7 +82,6 @@ class NPUMoMEPatch(VLLMPatch):
             vllm_config: VllmConfig | None = None,
             quant_config: QuantizationConfig | None = None,
             prefix: str = "",
-            page_size_padded: Optional[int] = None,
         ):
             super().__init__()
 
@@ -91,7 +89,6 @@ class NPUMoMEPatch(VLLMPatch):
             self.num_spec_tokens = num_spec_tokens
             self.vllm_config = vllm_config
             self.quant_config = quant_config
-            self.page_size_padded = page_size_padded
             self.prefix = prefix
             
             # MOME parameters
@@ -203,16 +200,14 @@ class NPUMoMEPatch(VLLMPatch):
             5. num_total_tokens = kernel_size - 1 + num_spec_tokens
             """
             from vllm.v1.kv_cache_interface import MomeSpec
-            enable_prefix_caching =	vllm_config.cache_config.enable_prefix_caching
-            block_size = vllm_config.cache_config.block_size
-            max_model_len = vllm_config.model_config.max_model_len
-            mamba_block_size = block_size if enable_prefix_caching else max_model_len
+            mamba_block_size = vllm_config.cache_config.mamba_block_size
+            page_size_padded = vllm_config.cache_config.mamba_page_size_padded
 
             return MomeSpec(
                 shapes=self.get_state_shape(),
                 dtypes=self.get_state_dtype(),
                 block_size=mamba_block_size,
-                page_size_padded=self.page_size_padded,
+                page_size_padded=page_size_padded,
                 mamba_type=self.mamba_type,
                 kernel_size=self.kernel_size,
                 num_spec_tokens=self.num_spec_tokens,
