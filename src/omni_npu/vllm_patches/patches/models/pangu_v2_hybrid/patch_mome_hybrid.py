@@ -20,7 +20,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 
 from omni_npu.attention.backends.mome import NPUPanguMomeBackend, NPUMomeAttentionMetadata
-from omni_npu.layers.mome.npu_mome import ColumnParallelMOME
+from omni_npu.layers.mome.mome_rl import ColumnParallelMOMERL
 from omni_npu.v1.utils import on_ascend950
 from omni_npu.plugin_decorators import mome_attn_decorator
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
@@ -42,7 +42,7 @@ class NPUMoMEPatch(VLLMPatch):
         This variant uses MOME which is a more efficient attention mechanism.
         It inherits from MambaBase and:
         1. Overrides get_kv_cache_spec() to return MomeSpec with three state components
-        2. Integrates three convolutions (qa_conv, compresskv_conv, o_conv) using ColumnParallelMOME
+        2. Integrates three convolutions (qa_conv, compresskv_conv, o_conv) using ColumnParallelMOMERL
         3. Uses NPUPanguMomeBackend for attention backend
         4. Supports vLLM KV cache management through MomeSpec
         
@@ -51,7 +51,7 @@ class NPUMoMEPatch(VLLMPatch):
         2. Model runner allocates raw tensor (int8 buffer)
         3. NPUPanguMomeBackend.reshape_kv_cache() → strided tensors
         4. kv_cache bound to self.kv_cache
-        5. forward() uses self.kv_cache for state management via ColumnParallelMOME
+        5. forward() uses self.kv_cache for state management via ColumnParallelMOMERL
         
         The three convolutions share the same kernel width (router_sliding_window)
         and are applied in:
@@ -111,7 +111,7 @@ class NPUMoMEPatch(VLLMPatch):
             # self.kv_cache: tuple[torch.Tensor, ...] = None
             self.kv_cache = (torch.tensor([]), torch.tensor([]), torch.tensor([]))
             
-            # Initialize MOME convolutions using ColumnParallelMOME
+            # Initialize MOME convolutions using ColumnParallelMOMERL
             self._init_mome_convs(quant_config, prefix)
 
             compilation_config = get_current_vllm_config().compilation_config
@@ -125,13 +125,13 @@ class NPUMoMEPatch(VLLMPatch):
             prefix: str,
         ) -> None:
             """
-            Initialize three MOME convolutions using ColumnParallelMOME.
+            Initialize three MOME convolutions using ColumnParallelMOMERL.
             
             These convolutions use the kernel_size from config (router_sliding_window)
             and are implemented as depthwise conv1d operations with TP support.
             """
             # qa_conv: applied to q_lora before q projection
-            self.qa_conv = ColumnParallelMOME(
+            self.qa_conv = ColumnParallelMOMERL(
                 dim=self.q_lora_rank,
                 kernel_width=self.kernel_size,
                 quant_config=quant_config,
@@ -140,7 +140,7 @@ class NPUMoMEPatch(VLLMPatch):
             )
             
             # compresskv_conv: applied to compressed KV
-            self.compresskv_conv = ColumnParallelMOME(
+            self.compresskv_conv = ColumnParallelMOMERL(
                 dim=self.kv_lora_rank,
                 kernel_width=self.kernel_size,
                 quant_config=quant_config,
@@ -149,7 +149,7 @@ class NPUMoMEPatch(VLLMPatch):
             )
             
             # o_conv: applied to attention output
-            self.o_conv = ColumnParallelMOME(
+            self.o_conv = ColumnParallelMOMERL(
                 dim=self.o_dim,
                 kernel_width=self.kernel_size,
                 quant_config=quant_config,
@@ -224,7 +224,7 @@ class NPUMoMEPatch(VLLMPatch):
             Forward pass interface for MOME attention.
 
             This method provides access to KV cache and attention metadata.
-            The actual MOME convolution computation is delegated to ColumnParallelMOME,
+            The actual MOME convolution computation is delegated to ColumnParallelMOMERL,
             which is called by the model layer (e.g., NPUPanguSparseAttention).
 
             Args:
@@ -241,10 +241,10 @@ class NPUMoMEPatch(VLLMPatch):
                 This method is designed to be called by model layers that implement
                 the full attention computation. The model layer should:
                 1. Call this method to get KV cache and metadata
-                2. Apply qa_conv using ColumnParallelMOME.forward_prefill/forward_decode
-                3. Apply compresskv_conv using ColumnParallelMOME.forward_prefill/forward_decode
+                2. Apply qa_conv using ColumnParallelMOMERL.forward_prefill/forward_decode
+                3. Apply compresskv_conv using ColumnParallelMOMERL.forward_prefill/forward_decode
                 4. Compute MLA attention
-                5. Apply o_conv using ColumnParallelMOME.forward_prefill/forward_decode
+                5. Apply o_conv using ColumnParallelMOMERL.forward_prefill/forward_decode
             """
             forward_context = get_forward_context()
 
@@ -279,13 +279,13 @@ class NPUMoMEPatch(VLLMPatch):
         def apply_mome_conv(
             self,
             x: torch.Tensor,
-            conv_layer: ColumnParallelMOME,
+            conv_layer: ColumnParallelMOMERL,
             cache: torch.Tensor,
             is_prefill: bool,
             mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
         ) -> torch.Tensor:
             """
-            Apply MOME convolution using ColumnParallelMOME with KV cache update.
+            Apply MOME convolution using ColumnParallelMOMERL with KV cache update.
 
             This is a helper method for model layers to apply MOME convolution
             with proper cache management. The cache is updated in-place during

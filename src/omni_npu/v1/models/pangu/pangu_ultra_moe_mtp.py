@@ -23,7 +23,7 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 from .pangu_ultra_moe import OpenPanguDecoderLayer
-from omni_npu.layers.mhc.npu_mhc import NPUmHC
+from omni_npu.layers.mhc.mhc_rl import NPUmHCRL
 from omni_npu.model_config.config_loader.loader import model_extra_config
 
 class SharedHead(nn.Module):

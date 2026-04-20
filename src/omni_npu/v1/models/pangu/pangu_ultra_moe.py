@@ -49,7 +49,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from omni_npu.model_config.config_loader.loader import model_extra_config
-from omni_npu.layers.mhc.npu_mhc import NPUmHC
+from omni_npu.layers.mhc.mhc_rl import NPUmHCRL
 from omni_npu.plugin_decorators import post_model_forward_decorator
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
@@ -344,12 +344,12 @@ class OpenPanguDecoderLayer(nn.Module):
         is_mtp_layer = layer_idx >= getattr(config, "num_hidden_layers", float('inf'))
         self.use_mhc = getattr(config, "use_mhc", False) and not is_mtp_layer
         if self.use_mhc:
-            self.attn_mhc_module = NPUmHC(
+            self.attn_mhc_module = NPUmHCRL(
                 config=config,
                 pre_only=False,
                 prefix=f"{prefix}.attn_mhc_module",
             )
-            self.mlp_mhc_module = NPUmHC(
+            self.mlp_mhc_module = NPUmHCRL(
                 config=config,
                 pre_only=False,
                 prefix=f"{prefix}.mlp_mhc_module",
@@ -478,7 +478,7 @@ class OpenPanguModel(nn.Module):
         self.use_mhc = getattr(config, "use_mhc", False)
         if self.use_mhc:
             self.num_stream = getattr(config, "mhc_num_stream", 4)
-            self.merge_mhc_module = NPUmHC(
+            self.merge_mhc_module = NPUmHCRL(
                 config=config,
                 pre_only=True,
                 prefix=f"{prefix}.merge_mhc_module",
