@@ -440,13 +440,14 @@ class PrefillConnectorWorker:
                 return all_done_sending, all_done_recving
 
             with self._transfer_lock:
-                for req_id in self.receive_req_list:
+                for req_idx in range(len(self.receive_req_list) - 1, -1, -1):
+                    req_id = self.receive_req_list[req_idx]
                     logger.debug(f"Get_finished: request {req_id}")
-                    all_done_sending.add(req_id)
-                    # if the request's kv has been received, remove it from requests_finish_time
                     if req_id in self.requests_finish_time:
+                        all_done_sending.add(req_id)
+                        # if the request's kv has been received, remove it from requests_finish_time
                         del self.requests_finish_time[req_id]
-                self.receive_req_list.clear()
+                        self.receive_req_list.remove(req_id)
 
         return all_done_sending, all_done_recving
 
