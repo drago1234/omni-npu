@@ -875,7 +875,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         assert model_extra_config.operator_opt_config.use_noncontiguous_kv, "use_noncontiguous_kv is required when prefill cp is enabled"
 
         merged_x = sp_manager.mome_suffix_exchange(x)
-        merged_x = sp_manager.broadcast_mome_req_tails_from_rank0(merged_x)
+        merged_x = sp_manager.append_mome_req_global_tails(merged_x)
 
         forward_context = get_forward_context()
         metadata = forward_context.attn_metadata

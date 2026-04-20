@@ -524,16 +524,19 @@ class SPManager:
         rank0: | r0 c0 | r0 c7 | r1 c0 | r1 c7 |
         rank1: | r0 c1 | r0 c6 | r1 c1 | r1 c6 | 
         """
-
-        cp_query_split_lens = cdiv(np.diff(cumlens), self.sp_size * 2)
+        seq_lens = np.diff(cumlens)
+        frag_num = self.sp_size * 2
+        cp_query_split_lens = cdiv(seq_lens, frag_num)
         self.cp_mome_phase_split_sizes = tuple(int(req_len) for req_len in cp_query_split_lens.tolist())
         num_reqs = len(self.cp_mome_phase_split_sizes)
 
         factor = 1 if self.sp_rank == 0 else 2
         core_merged_query_lens = 2 * cp_query_split_lens + factor * self.mome_prefix_size
-        # Non-rank0 appends rank0's per-request 4 tail tokens after suffix exchange.
-        tail_append_len = 0 if self.sp_rank == 0 else 2 * self.mome_prefix_size
-        merged_query_lens = core_merged_query_lens + tail_append_len
+        max_tail_append_len = 2 * self.mome_prefix_size
+        # Every rank appends each request's real global tail (up to max_tail_append_len)
+        # to the end of phase1, so MOME cache update observes identical tail context.
+        req_tail_append_lens = np.minimum(seq_lens, max_tail_append_len)
+        merged_query_lens = core_merged_query_lens + req_tail_append_lens
         mome_query_start_loc = np.zeros(num_reqs + 1, dtype=cp_query_split_lens.dtype)
         mome_query_start_loc[1:] = np.cumsum(merged_query_lens)
         self.cp_mome_query_start_loc = torch.tensor(
@@ -549,6 +552,12 @@ class SPManager:
             int(merged_len) for merged_len in core_merged_query_lens.tolist()
         )
         self.cp_mome_merged_split_sizes = tuple(int(merged_len) for merged_len in merged_query_lens.tolist())
+        self.cp_mome_req_tail_append_lens = tuple(
+            int(append_len) for append_len in req_tail_append_lens.tolist()
+        )
+        self.cp_mome_seq_lens = tuple(
+            int(seq_len) for seq_len in seq_lens.tolist()
+        )
         self.cp_mome_suffix_block_len = num_reqs * self.mome_prefix_size
         self.cp_mome_local_suffix_len = self.cp_mome_suffix_block_len * 2
 
@@ -596,37 +605,70 @@ class SPManager:
             merged_pieces.extend([phase0_chunk, phase1_suffix_chunk, phase1_chunk])
         return torch.cat(merged_pieces, dim=0)
 
-    def broadcast_mome_req_tails_from_rank0(
+    def append_mome_req_global_tails(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
         tail_len = self.mome_prefix_size + self.mome_prefix_size
         req_core_sizes = self.cp_mome_merged_core_split_sizes
+        req_tail_append_lens = self.cp_mome_req_tail_append_lens
+        req_split_sizes = self.cp_mome_phase_split_sizes
+        req_seq_lens = self.cp_mome_seq_lens
+        frag_num = self.sp_size * 2
         num_reqs = len(req_core_sizes)
         tail_shape = (num_reqs, tail_len, *x.shape[1:])
-        tail_scratch = torch.empty(
+        merged_tail_scratch = torch.zeros(
             tail_shape,
             dtype=x.dtype,
             device=x.device,
         )
+        local_tail_contrib = torch.zeros_like(merged_tail_scratch)
+        phase0_base = 0 if self.sp_rank == 0 else self.mome_prefix_size
+        phase1_base = self.mome_prefix_size if self.sp_rank == 0 else 2 * self.mome_prefix_size
+        for req_idx, (req_chunk, req_split_size) in enumerate(zip(x.split(req_core_sizes, dim=0), req_split_sizes)):
+            req_tail_len = req_tail_append_lens[req_idx]
+            if req_tail_len == 0:
+                continue
+            phase0_start = phase0_base
+            phase0_end = phase0_start + req_split_size
+            phase1_start = phase1_base + req_split_size
+            phase1_end = phase1_start + req_split_size
+            phase0_chunk = req_chunk[phase0_start:phase0_end]
+            phase1_chunk = req_chunk[phase1_start:phase1_end]
 
-        if self.sp_rank == 0:
-            for req_idx, (req_chunk, req_len) in enumerate(zip(x.split(req_core_sizes, dim=0), req_core_sizes)):
-                assert req_len >= tail_len, f"Expected req_len >= tail_len, got req_len={req_len}, tail_len={tail_len}"
-                tail_scratch[req_idx].copy_(req_chunk[-tail_len:])
+            req_seq_len = req_seq_lens[req_idx]
+            start_pos = req_seq_len - req_tail_len
+            for tail_pos in range(req_tail_len):
+                token_pos = start_pos + tail_pos
+                chunk_idx = token_pos // req_split_size
+                token_off = token_pos - chunk_idx * req_split_size
+                if chunk_idx < self.sp_size:
+                    owner_rank = chunk_idx
+                    if owner_rank == self.sp_rank:
+                        local_tail_contrib[req_idx, tail_pos].copy_(phase0_chunk[token_off])
+                elif chunk_idx < frag_num:
+                    owner_rank = frag_num - 1 - chunk_idx
+                    if owner_rank == self.sp_rank:
+                        local_tail_contrib[req_idx, tail_pos].copy_(phase1_chunk[token_off])
+                else:
+                    raise RuntimeError(
+                        f"Invalid chunk_idx={chunk_idx} for req_seq_len={req_seq_len}, req_split_size={req_split_size}, frag_num={frag_num}"
+                    )
 
-        torch.distributed.broadcast(
-            tail_scratch,
-            src=0,
+        torch.distributed.all_reduce(
+            local_tail_contrib,
+            op=torch.distributed.ReduceOp.SUM,
             group=self.sp_comm,
         )
-        if self.sp_rank == 0:
-            return x
+        merged_tail_scratch.copy_(local_tail_contrib)
 
         req_chunks = x.split(req_core_sizes, dim=0)
         merged_pieces = []
         for idx, req_chunk in enumerate(req_chunks):
-            merged_pieces.extend([req_chunk, tail_scratch[idx]])
+            req_tail_len = req_tail_append_lens[idx]
+            merged_pieces.append(req_chunk)
+            if req_tail_len > 0:
+                merged_pieces.append(merged_tail_scratch[idx, :req_tail_len])
         return torch.cat(merged_pieces, dim=0)
 
     def mome_split_and_cat(self, merged_output: torch.Tensor) -> torch.Tensor:
@@ -685,7 +727,7 @@ class DummySPManager:
     def mome_suffix_exchange(self, x: torch.Tensor):
         return x
 
-    def broadcast_mome_req_tails_from_rank0(self, x: torch.Tensor):
+    def append_mome_req_global_tails(self, x: torch.Tensor):
         return x
 
     def mome_split_and_cat(self, x: torch.Tensor):

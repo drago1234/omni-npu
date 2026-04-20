@@ -9,7 +9,7 @@ import torch_npu
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.distributed import get_tp_group
+from vllm.distributed import get_tp_group, split_tensor_along_last_dim
 from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.forward_context import get_forward_context
@@ -447,6 +447,7 @@ class NPUPanguIndexer(torch.nn.Module):
         cp_cos: torch.Tensor,
         cp_sin: torch.Tensor,
         sp_manager: Optional[SPManager] = None,
+        attn_metadata: Optional[MLACommonMetadata] = None,
         kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         q = self.wq_b(q_lora)
@@ -481,7 +482,7 @@ class NPUPanguIndexer(torch.nn.Module):
         weights = self.weights_proj(cp_x)
         self._update_indexer_cache(
             k,
-            sp_manager.cp_slot_mapping,
+            attn_metadata.slot_mapping,
             kv_cache,
         )
 
@@ -725,7 +726,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if self.use_mome:
             assert self.num_heads % self.tp_size == 0, \
                 "For MoME attention, num_heads should be divisible by tp_size."
-            if self.is_cp_layer:
+            if model_extra_config.parall_config.ena_context_parallel:
                 o_mome_cache_shape = (self.num_heads * self.v_head_dim,)
             else:
                 o_mome_cache_shape = (self.num_heads * self.v_head_dim // self.tp_size,)
@@ -835,7 +836,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             dim=self.num_heads * self.v_head_dim,
             kernel_width=self.mome_kernel_width,
             prefix=f"{self.layer_name}.o_conv",
-            disable_tp=self.is_cp_layer,
+            disable_tp=model_extra_config.parall_config.ena_context_parallel,
         )
 
     def _calculate_page_size_padded(
@@ -1200,10 +1201,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
 
         q = torch.cat([q_nope, q_pe], dim=-1)
 
-        sink_k_nope = self.kv_a_layernorm(self.param_sink_compressed_kv).unsqueeze(1)
-        sink_k_pe = self.param_sink_k_pe.unsqueeze(1)
-        sink_kv = torch.cat([sink_k_nope, sink_k_pe], dim=-1)
-
         if self.cache_config.cache_dtype in ["int8_ds_mla"]:
             attn_output = torch.ops.custom.npu_ai_infra_kv_quant_sparse_flash_attention(
                 query=q,
@@ -1216,8 +1213,8 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 sparse_block_size=1,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
-                key_sink=sink_kv,
-                value_sink=sink_k_nope,
+                key_sink=self.sink_kv,
+                value_sink=self.sink_k_nope,
                 layout_query="TND",
                 layout_kv="PA_BSND",
                 sparse_mode=3,
@@ -1244,15 +1241,13 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 layout_query="TND",
                 layout_kv="PA_BSND",
                 sparse_mode=3,
-                key_sink=sink_kv,
-                value_sink=sink_k_nope,
+                key_sink=self.sink_kv,
+                value_sink=self.sink_k_nope,
             )[0]
 
-        attn_output = attn_output.transpose(0, 1)
-        attn_output = attn_output.view(self.num_local_heads, -1, self.kv_lora_rank)
+        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         attn_output = (
-            torch.matmul(attn_output, self.attn.impl.W_UV)
-                .transpose(1, 0)
+            torch_npu.npu_transpose_batchmatmul(attn_output, self.W_UV, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
                 .reshape(-1, self.num_local_heads * self.v_head_dim)
         )
 
@@ -1267,7 +1262,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         sp_manager: Optional[SPManager] = None,
     ) -> torch.Tensor:
         merged_x = sp_manager.mome_suffix_exchange(x)
-        merged_x = sp_manager.broadcast_mome_req_tails_from_rank0(merged_x)
+        merged_x = sp_manager.append_mome_req_global_tails(merged_x)
         kv_cache = self.mome_attn.kv_cache[get_forward_context().virtual_engine]
         bsz = mome_metadata.cache_indices.size(0)
         if not self.on_ascend950:
@@ -1333,11 +1328,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
             dim=-1,
         )
 
-        q_nope = q_nope.transpose(0, 1) \
-                    .reshape(self.num_local_heads, -1, self.qk_nope_head_dim)
+        q_nope = q_nope.view(-1, self.num_local_heads, self.qk_nope_head_dim)
         q_nope = (
-            torch.matmul(q_nope, self.attn.impl.W_UK_T)
-                .transpose(1, 0)
+            torch_npu.npu_transpose_batchmatmul(q_nope, self.W_UK_T, perm_x1=(1, 0, 2), perm_y=(1, 0, 2))
                 .reshape(-1, self.num_local_heads, self.kv_lora_rank)
         )
 
@@ -1363,6 +1356,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             cp_cos,
             cp_sin,
             sp_manager,
+            attn_metadata,
             kv_cache,
         )
         ### Indexer stream ends ###
@@ -1393,7 +1387,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             "gamma": self.kv_a_layernorm.weight,
             "cos": cos.view(-1, 1, 1, self.qk_rope_head_dim),
             "sin": sin.view(-1, 1, 1, self.qk_rope_head_dim),
-            "index": sp_manager.cp_slot_mapping,
+            "index": attn_metadata.slot_mapping,
             "epsilon": self.kv_a_layernorm.variance_epsilon,
             "cache_mode": "PA",
             "rotary_mode": "half" if not self.rope_interleaved else "interleave-half",
@@ -2169,6 +2163,8 @@ class NPUPanguSparseAttention(torch.nn.Module):
     ) -> torch.Tensor:
 
         if self.use_mome:
+            if model_extra_config.parall_config.ena_context_parallel and not self.is_dsa_layer:
+                attn_output = get_tp_group().all_gather(attn_output, dim=1)
             attn_output = self._apply_MOME(
                 attn_output,
                 self.o_conv,
@@ -2176,6 +2172,9 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 attn_metadata,
                 mome_metadata,
             )
+            if model_extra_config.parall_config.ena_context_parallel and not self.is_dsa_layer and self.o_proj.tp_size > 1:
+                attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
+                attn_output = attn_output[self.o_proj.tp_rank].contiguous()
 
         if self.enable_flashcomm2 and not self.is_dsa_layer:
             # Decode / mixed batch path: o_proj has disable_tp=True (full weight
