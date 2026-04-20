@@ -554,8 +554,10 @@ class NPUPanguSparseAttention(torch.nn.Module):
         self.num_heads = num_heads
         self.tp_size = get_tp_group().world_size
         assert num_heads % self.tp_size == 0
+        self.is_cp_layer = self.is_dsa_layer and \
+            model_extra_config.parall_config.ena_context_parallel
         self.num_local_heads = (
-            num_heads if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else num_heads // self.tp_size
+            num_heads if self.is_cp_layer else num_heads // self.tp_size
         )
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -584,6 +586,16 @@ class NPUPanguSparseAttention(torch.nn.Module):
             device='npu',
             dtype=torch.uint8,
         )
+
+        if self.is_cp_layer:
+            max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+            self.num_computed_for_cp = torch.zeros(
+                (max_num_reqs*2, ), 
+                device="npu", 
+                dtype=torch.int32, 
+            )
+        else:
+            self.num_computed_for_cp = None
 
         self.quant_cache_dtype = ["hif8_ds_mla", "fp8_ds_mla", "int8_ds_mla"]
         self.block_size = self.cache_config.block_size
@@ -629,7 +641,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             quant_config=self.quant_config,
             prefix=f"{self.layer_name}.q_b_proj",
             return_bias=False,
-            disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
+            disable_tp=self.is_cp_layer,
         )
         self.kv_a_layernorm = RMSNorm(
             self.kv_lora_rank,
@@ -642,7 +654,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             quant_config=self.quant_config,
             prefix=f"{self.layer_name}.kv_b_proj",
             return_bias=False,
-            disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
+            disable_tp=self.is_cp_layer,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -652,7 +664,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             reduce_results=False,
             prefix=f"{self.layer_name}.o_proj",
             return_bias=False,
-            disable_tp=True if (self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel) or (self.enable_flashcomm2 and not self.is_dsa_layer) else False,
+            disable_tp=True if (self.is_cp_layer) or (self.enable_flashcomm2 and not self.is_dsa_layer) else False,
         )
 
     def _init_rotary_emb(self):
@@ -713,7 +725,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if self.use_mome:
             assert self.num_heads % self.tp_size == 0, \
                 "For MoME attention, num_heads should be divisible by tp_size."
-            if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel:
+            if self.is_cp_layer:
                 o_mome_cache_shape = (self.num_heads * self.v_head_dim,)
             else:
                 o_mome_cache_shape = (self.num_heads * self.v_head_dim // self.tp_size,)
@@ -823,7 +835,7 @@ class NPUPanguSparseAttention(torch.nn.Module):
             dim=self.num_heads * self.v_head_dim,
             kernel_width=self.mome_kernel_width,
             prefix=f"{self.layer_name}.o_conv",
-            disable_tp=True if self.is_dsa_layer and model_extra_config.parall_config.ena_context_parallel else False,
+            disable_tp=self.is_cp_layer,
         )
 
     def _calculate_page_size_padded(
@@ -1257,14 +1269,30 @@ class NPUPanguSparseAttention(torch.nn.Module):
         merged_x = sp_manager.mome_suffix_exchange(x)
         merged_x = sp_manager.broadcast_mome_req_tails_from_rank0(merged_x)
         kv_cache = self.mome_attn.kv_cache[get_forward_context().virtual_engine]
-        cache = kv_cache[kv_index][:, :self.mome_kernel_width - 1]
-        cache_indices = mome_metadata.cache_indices
-        merged_x = layer.forward_prefill(
-            merged_x,
-            cache,
-            cache_indices,
-            sp_manager.cp_mome_query_start_loc,
-        )
+        bsz = mome_metadata.cache_indices.size(0)
+        if not self.on_ascend950:
+            merged_x = torch.ops.custom.npu_ai_infra_fused_causal_conv1d(
+                merged_x, 
+                layer.weight, 
+                kv_cache[kv_index], 
+                query_start_loc=sp_manager.cp_mome_query_start_loc, 
+                cache_indices=mome_metadata.cache_indices, 
+                num_computed_tokens=self.num_computed_for_cp[:bsz], 
+                pad_slot_id=mome_metadata.pad_slot_id, 
+                max_query_len=-1, 
+                residual_connection=1, 
+                conv_mode=1, 
+                inplace=False, 
+            )
+        else:
+            cache = kv_cache[kv_index][:, -(self.mome_kernel_width - 1):]
+            merged_x = layer.forward_prefill(
+                merged_x,
+                cache,
+                mome_metadata.cache_indices,
+                query_start_loc=sp_manager.cp_mome_query_start_loc,
+                has_initial_state=None, 
+            )
         return sp_manager.mome_split_and_cat(merged_x)
 
     def _forward_prefill_cp(
@@ -2194,7 +2222,7 @@ def npu_pangu_forward(
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
 
-        enable_cp = model_extra_config.parall_config.ena_context_parallel and self.is_dsa_layer \
+        enable_cp = self.is_cp_layer \
                     and not has_decode and num_actual_tokens > attn_metadata.num_prefills * self.tp_size * 2
         enable_flashcomm2 = self.enable_flashcomm2 and not self.is_dsa_layer
 
