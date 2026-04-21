@@ -253,6 +253,9 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         else:
             cache_indices = common_attn_metadata.block_table_tensor[:, 0]
 
+        seq_lens = torch.diff(common_attn_metadata.query_start_loc, dim=-1)
+        cache_indices.masked_fill_(seq_lens == 0, PAD_SLOT_ID)
+
         # For cudagraph: copy to persistent buffer if applicable
         if (
             num_prefills == 0
