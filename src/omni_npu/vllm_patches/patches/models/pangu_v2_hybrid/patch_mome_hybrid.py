@@ -325,7 +325,16 @@ class NPUMoMEPatch(VLLMPatch):
 
             if self.is_prefill_node:
                 cache_indices = metadata.cache_indices
-                cache[cache_indices, 1:] = cache[cache_indices, :-1]
+
+                if cache_indices.dim() > 1:
+                    cache_indices = cache_indices.reshape(-1)
+                cache_indices = cache_indices.to(device=cache.device, dtype=torch.long)
+                if cache_indices.numel() == 0:
+                    return x
+                selected_cache = cache.index_select(0, cache_indices)
+                selected_cache[:, 1:].copy_(selected_cache[:, :-1].clone())
+                cache.index_copy_(0, cache_indices, selected_cache)
+                
             return x
 
     layers.npumome.MomeAttention = MomeAttention
