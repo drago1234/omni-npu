@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from omni_npu.layers.utils import named_stream
 from omni_npu.layers.fused_moe.fused_moe import fused_experts_tp
@@ -303,28 +304,18 @@ class NPUFusedMoE(FusedMoE):
         return None
 
     def forward(self, hidden_states: torch.Tensor, router_logits: Optional[torch.Tensor]):
-        return self.quant_method.apply(
-            layer=self, 
-            hidden_states=hidden_states, 
+        if self.shared_experts is None:
+            return torch.ops.vllm.npu_moe_forward(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                layer_name=self.layer_name,
+            )
+        shared_out, fused_out = torch.ops.vllm.npu_moe_forward_shared(
+            hidden_states=hidden_states,
             router_logits=router_logits,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            enable_eplb=self.enable_eplb,
-            expert_load_view=getattr(self, "expert_load_view", None),
-            logical_to_physical_map=getattr(self, "logical_to_physical_map", None),
-            logical_replica_count=getattr(self, "logical_replica_count", None),
+            layer_name=self.layer_name,
         )
+        return shared_out, fused_out
 
     @staticmethod
     def select_experts(
@@ -390,4 +381,88 @@ class NPUFusedMoE(FusedMoE):
 
 @SharedFusedMoE.register_oot
 class NPUSharedFusedMoE(SharedFusedMoE, NPUFusedMoE):
-    pass
+    @property
+    def gate(self):
+        return self._gate
+
+
+def _npu_moe_apply(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    return self.quant_method.apply(
+        layer=self,
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        top_k=self.top_k,
+        renormalize=self.renormalize,
+        use_grouped_topk=self.use_grouped_topk,
+        global_num_experts=self.global_num_experts,
+        expert_map=self.expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask,
+        topk_group=self.topk_group,
+        num_expert_group=self.num_expert_group,
+        custom_routing_function=self.custom_routing_function,
+        scoring_func=self.scoring_func,
+        routed_scaling_factor=self.routed_scaling_factor,
+        e_score_correction_bias=self.e_score_correction_bias,
+        activation=self.activation,
+        apply_router_weight_on_input=self.apply_router_weight_on_input,
+        enable_eplb=self.enable_eplb,
+        expert_load_view=getattr(self, "expert_load_view", None),
+        logical_to_physical_map=getattr(self, "logical_to_physical_map", None),
+        logical_replica_count=getattr(self, "logical_replica_count", None),
+    )
+
+
+def npu_moe_forward(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    assert self.shared_experts is None
+    return _npu_moe_apply(self, hidden_states, router_logits)
+
+
+def npu_moe_forward_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+def npu_moe_forward_shared(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    assert self.shared_experts is not None
+    return _npu_moe_apply(self, hidden_states, router_logits)
+
+
+def npu_moe_forward_shared_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shared_out = torch.empty_like(hidden_states)
+    fused_out = torch.empty_like(hidden_states)
+    return shared_out, fused_out
+
+
+direct_register_custom_op(
+    op_name="npu_moe_forward",
+    op_func=npu_moe_forward,
+    mutates_args=["hidden_states"],
+    fake_impl=npu_moe_forward_fake,
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="npu_moe_forward_shared",
+    op_func=npu_moe_forward_shared,
+    mutates_args=["hidden_states"],
+    fake_impl=npu_moe_forward_shared_fake,
+    dispatch_key="PrivateUse1",
+)
