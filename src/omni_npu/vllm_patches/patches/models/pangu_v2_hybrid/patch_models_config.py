@@ -25,8 +25,6 @@ class PanguV2HybridForCausalLMConfig(MambaModelConfig):
         from vllm.utils.torch_utils import get_dtype_size
         from math import prod
 
-        MambaModelConfig.verify_and_update_config(vllm_config)
-
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
 
@@ -44,6 +42,8 @@ class PanguV2HybridForCausalLMConfig(MambaModelConfig):
             cache_config.block_size = 128
         block_size = cache_config.block_size
         assert block_size % 16 == 0, f"block size {block_size} must be divisible by 16."
+
+        MambaModelConfig.verify_and_update_config(vllm_config)
 
         bf16_size = 2
 
