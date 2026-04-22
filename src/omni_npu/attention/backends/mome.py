@@ -418,6 +418,9 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         cache_indices = blk_table if prefix_caching else blk_table[:, 0]
         num_accepted_tokens = metadata.num_accepted_tokens
         num_computed_tokens = metadata.num_computed_tokens
+        block_idx_last_computed_token = metadata.block_idx_last_computed_token
+        block_idx_first_scheduled_token = metadata.block_idx_first_scheduled_token
+        block_idx_last_scheduled_token = metadata.block_idx_last_scheduled_token
         num_reqs = blk_table.shape[0]
 
         # For CUDA graphs, copy to persistent buffer
@@ -440,9 +443,25 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 persistent_num_accepted_tokens.copy_(num_accepted_tokens, non_blocking=True)
                 num_accepted_tokens = persistent_num_accepted_tokens
 
+            if prefix_caching:
+                persistent_blcct = self.block_idx_last_computed_token[:num_reqs]
+                persistent_blcct.copy_(block_idx_last_computed_token, non_blocking=True)
+                block_idx_last_computed_token = persistent_blcct
+
+                persistent_bfst = self.block_idx_first_scheduled_token[:num_reqs]
+                persistent_bfst.copy_(block_idx_first_scheduled_token, non_blocking=True)
+                block_idx_first_scheduled_token = persistent_bfst
+
+                persistent_blst = self.block_idx_last_scheduled_token[:num_reqs]
+                persistent_blst.copy_(block_idx_last_scheduled_token, non_blocking=True)
+                block_idx_last_scheduled_token = persistent_blst
+
         new_metadata.cache_indices = cache_indices
         new_metadata.num_accepted_tokens = num_accepted_tokens
         new_metadata.num_computed_tokens = num_computed_tokens
+        new_metadata.block_idx_last_computed_token = block_idx_last_computed_token
+        new_metadata.block_idx_first_scheduled_token = block_idx_first_scheduled_token
+        new_metadata.block_idx_last_scheduled_token = block_idx_last_scheduled_token
 
         if new_metadata.prefill is not None:
             new_metadata.prefill = copy.copy(metadata.prefill)
@@ -451,6 +470,13 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 new_metadata.prefill.num_computed_tokens = num_computed_tokens[metadata.num_decodes:]
             if num_accepted_tokens is not None:
                 new_metadata.prefill.num_accepted_tokens = num_accepted_tokens[metadata.num_decodes:]
+            if prefix_caching:
+                new_metadata.prefill.block_idx_last_computed_token = \
+                    block_idx_last_computed_token[metadata.num_decodes:]
+                new_metadata.prefill.block_idx_first_scheduled_token = \
+                    block_idx_first_scheduled_token[metadata.num_decodes:]
+                new_metadata.prefill.block_idx_last_scheduled_token = \
+                    block_idx_last_scheduled_token[metadata.num_decodes:]
         if new_metadata.decode is not None:
             new_metadata.decode = copy.copy(metadata.decode)
             new_metadata.decode.cache_indices = cache_indices[:metadata.num_decodes]
@@ -458,5 +484,12 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 new_metadata.decode.num_computed_tokens = num_computed_tokens[:metadata.num_decodes]
             if num_accepted_tokens is not None:
                 new_metadata.decode.num_accepted_tokens = num_accepted_tokens[:metadata.num_decodes]
+            if prefix_caching:
+                new_metadata.decode.block_idx_last_computed_token = \
+                    block_idx_last_computed_token[:metadata.num_decodes]
+                new_metadata.decode.block_idx_first_scheduled_token = \
+                    block_idx_first_scheduled_token[:metadata.num_decodes]
+                new_metadata.decode.block_idx_last_scheduled_token = \
+                    block_idx_last_scheduled_token[:metadata.num_decodes]
 
         return new_metadata
