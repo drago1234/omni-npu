@@ -432,12 +432,13 @@ def _get_request_slot_mapping(self: Scheduler, request: Request) -> np.ndarray |
     if not block_ids:
         return None
 
+    block_size = self.kv_cache_manager.coordinator.single_type_managers[0].block_size
     block_ids_array = np.array(block_ids, dtype=np.int32)
     num_blocks = len(block_ids)
-    block_offsets = np.arange(self.block_size, dtype=np.int32)
+    block_offsets = np.arange(block_size, dtype=np.int32)
     slot_mapping = (
-        block_offsets.reshape((1, self.block_size))
-        + block_ids_array.reshape((num_blocks, 1)) * self.block_size
+        block_offsets.reshape((1, block_size))
+        + block_ids_array.reshape((num_blocks, 1)) * block_size
     ).flatten()
     return slot_mapping
 
