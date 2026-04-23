@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from vllm.reasoning.deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from vllm.entrypoints.openai.protocol import DeltaMessage
 from vllm.tokenizers import TokenizerLike
-
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest
 
 class PanguReasoningParser(DeepSeekR1ReasoningParser):
     """
@@ -21,8 +21,12 @@ class PanguReasoningParser(DeepSeekR1ReasoningParser):
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
-        self.delta_token_ids = None
+        self.delta_token_ids = []
         self.is_reasoning_end_count = 0
+        chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
+        # Pangu defaults to thinking enabled; only treat output as
+        # pure content when the user explicitly disables it.
+        self.thinking_enabled = chat_kwargs.get("think", True)
 
     @property
     def start_token(self) -> str:
@@ -37,10 +41,10 @@ class PanguReasoningParser(DeepSeekR1ReasoningParser):
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
         if self.end_token_id in input_ids and self.end_token_id in self.delta_token_ids:
             self.is_reasoning_end_count += 1
-        if self.is_reasoning_end_count == 1:
+            return self.is_reasoning_end_count == 1
+    
+        if input_ids[-1] == self.end_token_id:
             return True
-        else:
-            return False
 
     def extract_reasoning_streaming(
             self,
@@ -72,3 +76,33 @@ class PanguReasoningParser(DeepSeekR1ReasoningParser):
             delta_text = delta_text[start_index + len(self.start_token):]
             ret = DeltaMessage(reasoning=delta_text)
         return ret
+
+    def extract_reasoning(
+        self, model_output: str, request: ChatCompletionRequest
+    ) -> tuple[str | None, str | None]:
+        """
+        Returns:
+            tuple[Optional[str], Optional[str]]: reasoning content and content
+        """
+
+        # Check if the <think> is present in the model output, remove it
+        # if it is present.
+        model_output_parts = model_output.partition(self.start_token)
+        model_output = (
+            model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
+        )
+
+        # Check if the model output contains the </think> tokens.
+        # If the end token is not found, return the model output as is.
+        if not self.thinking_enabled:
+            # Thinking explicitly disabled — treat everything as content.
+            return None, model_output
+        
+        if self.end_token not in model_output:
+            return model_output, None
+        else:
+            # Extract reasoning content from the model output.
+            reasoning, _, content = model_output.partition(self.end_token)
+
+            final_content = content or None
+            return reasoning, final_content
