@@ -64,6 +64,9 @@ class NPUmHC(torch.nn.Module):
             torch.empty(self.hidden_size * self.num_stream, dtype=torch.float32)
         )
 
+    def process_weights_after_loading(self) -> None:
+        self.phi_weight = (self.phi.weight * self.norm_gamma).contiguous()
+
     def _mhc_pre_naive(self, hidden_states: torch.Tensor):
         shape, dtype = hidden_states.size(), hidden_states.dtype
         hidden_states = hidden_states.flatten(-2).float()
@@ -160,10 +163,10 @@ class NPUmHC(torch.nn.Module):
                 hidden_states, h_post, h_res, _, _, _ = \
                     torch.ops.custom.npu_manifold_constrained_hyper_connection_pre(
                         hidden_states,
-                        self.phi.weight,
+                        self.phi_weight,
                         self.branch_alpha,
                         self.branch_beta,
-                        gamma=self.norm_gamma.view(self.num_stream, -1),
+                        gamma=None,
                         norm_eps=self.hc_eps,
                         hc_eps=self.hc_eps,
                 )

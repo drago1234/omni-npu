@@ -132,6 +132,8 @@ class ModelOperatorOptConfig:
     use_noncontiguous_kv: bool = False
     merge_q_kv_conv: bool = False # 是否合并qa_conv和compresskv_conv
 
+    gmm_fr_token_threshold: int = 0 # 开启gmm_fr的token数阈值，小于等于阈值时开启，默认不开启
+    use_rope_fusion_op: bool = True # 是否使用npu_apply_rotary_pos_emb融合算子，默认开启
 
     def __post_init__(self):
 

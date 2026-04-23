@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from omni_npu.attention.backends.utils import register_attention_backend, _maybe_padded_raw_tensor_to_strided_caches, SPManager
 from omni_npu.model_config.config_loader.loader import model_extra_config
 
+from omni_npu.v1.utils import on_ascend950
 
 logger = init_logger(__name__)
 NPUDSA = "NPUDSA"
@@ -236,15 +237,21 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
                 )
 
         if metadata is not None:
+            cache_dtype_str = self.vllm_config.cache_config.cache_dtype
+            if (on_ascend950() and cache_dtype_str == "hif8_ds_mla") or cache_dtype_str == "int8_ds_mla":
+                block_size = 2 * self.kv_cache_spec.block_size
+            else:
+                block_size = self.kv_cache_spec.block_size
+            
             slot_mapping_2d = torch.stack([
-                metadata.slot_mapping // self.kv_cache_spec.block_size,
-                metadata.slot_mapping % self.kv_cache_spec.block_size,
+                metadata.slot_mapping // block_size,
+                metadata.slot_mapping % block_size,
             ], dim=-1)
 
             # For cudagraph: copy to persistent buffer if applicable
             if (
                 metadata.num_prefills == 0
-                and metadata.num_decodes <= self.decode_cudagraph_max_bs
+                and metadata.num_decode_tokens <= self.decode_cudagraph_max_bs
                 and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
             ):
                 self.slot_mapping_2d[:metadata.num_decode_tokens].copy_(

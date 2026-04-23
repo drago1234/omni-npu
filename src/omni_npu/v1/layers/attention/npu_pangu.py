@@ -50,6 +50,7 @@ try:
 except ImportError as e:
     logger.warning(f"Failed to import omni_custom_ops: {e}")
 
+import os
 
 class NPUPanguIndexer(torch.nn.Module):
     def __init__(
@@ -77,6 +78,7 @@ class NPUPanguIndexer(torch.nn.Module):
         self.on_ascend950 = on_ascend950()
         self._init_indexer_weights()
         self.quant_cache_dtype = ["hif8_ds_mla", "fp8_ds_mla", "int8_ds_mla", "li_int8_ds_mla"]
+        self.use_rope_fusion_op = model_extra_config.operator_opt_config.use_rope_fusion_op
 
     def _init_indexer_weights(self):
         self.wq_b = ReplicatedLinear(
@@ -272,20 +274,14 @@ class NPUPanguIndexer(torch.nn.Module):
     def _update_indexer_cache_unquant(
         self,
         k: torch.Tensor,
-        slot_mapping: torch.Tensor,
+        slot_mapping_2d: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
     ) -> bool:
-
-        slot_indices = torch.stack([
-            slot_mapping // self.block_size,
-            slot_mapping % self.block_size,
-            ], dim=1,
-        )
 
         # TODO: need fix
         torch.ops.custom.npu_ai_infra_scatter_block_update_(
             kv_cache[1],
-            slot_indices,
+            slot_mapping_2d,
             k.view(-1, k.shape[-1]),
         )
         return True
@@ -293,15 +289,9 @@ class NPUPanguIndexer(torch.nn.Module):
     def _update_indexer_cache_quant(
         self,
         k: torch.Tensor,
-        slot_mapping: torch.Tensor,
+        slot_mapping_2d: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
     ) -> bool:
-
-        slot_indices_c8 = torch.stack([
-            slot_mapping // self.block_size_c8,
-            slot_mapping % self.block_size_c8,
-            ], dim=1,
-        )
 
         if self.on_ascend950 and self.cache_config.cache_dtype in ["hif8_ds_mla"]:
             k_scale = torch.ones(
@@ -311,12 +301,12 @@ class NPUPanguIndexer(torch.nn.Module):
 
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[1].view(torch.int8),
-                slot_indices_c8,
+                slot_mapping_2d,
                 k_hif8.view(torch.int8),
             )
             torch_npu.npu_scatter_nd_update_(
                 kv_cache[2],
-                slot_indices_c8,
+                slot_mapping_2d,
                 k_scale,
             )
             return True
@@ -328,20 +318,15 @@ class NPUPanguIndexer(torch.nn.Module):
             k_packed = torch.cat([k_int8, k_scale_bytes], dim=-1)
 
             if self.cache_config.cache_dtype == "li_int8_ds_mla":
-                slot_indices = torch.stack([
-                    slot_mapping // self.block_size,
-                    slot_mapping % self.block_size,
-                    ], dim=1,
-                )
                 torch.ops.custom.npu_ai_infra_scatter_block_update_(
                     kv_cache[1],
-                    slot_indices,
+                    slot_mapping_2d,
                     k_packed.view(-1, k_packed.shape[-1]),
                 )
             else:
                 torch.ops.custom.npu_ai_infra_scatter_block_update_(
                     kv_cache[1],
-                    slot_indices_c8,
+                    slot_mapping_2d,
                     k_packed.view(-1, k_packed.shape[-1]),
                 )
             return True
@@ -355,22 +340,19 @@ class NPUPanguIndexer(torch.nn.Module):
         qr: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        positions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         q = self.wq_b(qr)
         k = self.wk(hidden_states)
         k = self.k_norm(k)
 
-        if positions is not None:
-            cos_sin_cache = torch.cat([cos[:, :self.qk_rope_head_dim // 2], sin[:, :self.qk_rope_head_dim // 2]], dim = -1)
-            q, k = torch_npu.npu_mrope(
-                positions,
-                q.view(-1, self.index_n_heads * self.index_head_dim),
-                k,
-                cos_sin_cache,
-                head_size=self.index_head_dim,
-                mrope_section=[0, 0, 0],
+        if self.use_rope_fusion_op:
+            torch_npu.npu_apply_rotary_pos_emb(
+                q.view(-1, 1, self.index_n_heads, self.index_head_dim),
+                k.view(-1, 1, 1, self.index_head_dim),
+                cos.view(-1, 1, 1, self.qk_rope_head_dim),
+                sin.view(-1, 1, 1, self.qk_rope_head_dim),
+                layout="BSND",
                 rotary_mode="half",
             )
             q = q.view(-1, self.index_n_heads, self.index_head_dim)
@@ -411,7 +393,6 @@ class NPUPanguIndexer(torch.nn.Module):
         qr: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        positions: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
         kv_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
@@ -421,12 +402,11 @@ class NPUPanguIndexer(torch.nn.Module):
             qr,
             cos,
             sin,
-            positions,
         )
 
         self._update_indexer_cache(
             k,
-            attn_metadata.slot_mapping,
+            attn_metadata.slot_mapping_2d,
             kv_cache,
         )
 
@@ -482,7 +462,7 @@ class NPUPanguIndexer(torch.nn.Module):
         weights = self.weights_proj(cp_x)
         self._update_indexer_cache(
             k,
-            attn_metadata.slot_mapping,
+            attn_metadata.slot_mapping_2d,
             kv_cache,
         )
 
@@ -931,14 +911,12 @@ class NPUPanguSparseAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        positions: torch.Tensor,
     ) -> torch.Tensor:
         return torch.ops.vllm.npu_pangu_forward(
             hidden_states=hidden_states,
             cos=cos,
             sin=sin,
             layer_name=self.prefix,
-            positions=positions,
         )
 
     def _prepare_phase_inputs(
@@ -946,7 +924,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        positions: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         phase: str,
     ):
@@ -955,15 +932,19 @@ class NPUPanguSparseAttention(torch.nn.Module):
         if phase == "prefill":
             # first phase: backup originals
             attn_metadata.origin_slot_mapping = attn_metadata.slot_mapping.clone()
+            if self.is_dsa_layer:
+                attn_metadata.origin_slot_mapping_2d = attn_metadata.slot_mapping_2d.clone()
             attn_metadata.orig_num_actual_tokens = attn_metadata.num_actual_tokens
             num_actual_tokens = attn_metadata.num_actual_tokens
 
             sliced_hidden = hidden_states[num_decode_tokens:num_actual_tokens, ...]
             sliced_cos = cos[num_decode_tokens:num_actual_tokens, ...]
             sliced_sin = sin[num_decode_tokens:num_actual_tokens, ...]
-            sliced_positions = positions[num_decode_tokens:num_actual_tokens]
             attn_metadata.prefill.slot_mapping = attn_metadata.origin_slot_mapping[num_decode_tokens:num_actual_tokens]
             attn_metadata.slot_mapping = attn_metadata.prefill.slot_mapping
+            if self.is_dsa_layer:
+                attn_metadata.prefill.slot_mapping_2d = attn_metadata.origin_slot_mapping_2d[num_decode_tokens:num_actual_tokens]
+                attn_metadata.slot_mapping_2d = attn_metadata.prefill.slot_mapping_2d
             attn_metadata.saved_decode = attn_metadata.decode
             attn_metadata.decode = None
             attn_metadata.num_actual_tokens = num_actual_tokens - num_decode_tokens
@@ -972,23 +953,29 @@ class NPUPanguSparseAttention(torch.nn.Module):
             if saved_decode is not None:
                 attn_metadata.decode = attn_metadata.saved_decode
             origin_slot_mapping = attn_metadata.origin_slot_mapping
+            if self.is_dsa_layer:
+                origin_slot_mapping_2d = attn_metadata.origin_slot_mapping_2d
 
             sliced_hidden = hidden_states[:num_decode_tokens, ...]
             sliced_cos = cos[:num_decode_tokens, ...]
             sliced_sin = sin[:num_decode_tokens, ...]
-            sliced_positions = positions[:num_decode_tokens]
             attn_metadata.decode.slot_mapping = origin_slot_mapping[:num_decode_tokens]
             attn_metadata.slot_mapping = attn_metadata.decode.slot_mapping
+            if self.is_dsa_layer:
+                attn_metadata.decode.slot_mapping_2d = origin_slot_mapping_2d[:num_decode_tokens]
+                attn_metadata.slot_mapping_2d = attn_metadata.decode.slot_mapping_2d
             attn_metadata.saved_prefill = attn_metadata.prefill
             attn_metadata.prefill = None
             attn_metadata.num_actual_tokens = num_decode_tokens
-        return sliced_hidden, sliced_cos, sliced_sin, sliced_positions
+        return sliced_hidden, sliced_cos, sliced_sin
 
     def _restore_phase_metadata(self, attn_metadata: MLACommonMetadata):
         saved_prefill = getattr(attn_metadata, 'saved_prefill', None)
         if saved_prefill is not None:
             attn_metadata.prefill = saved_prefill
         attn_metadata.slot_mapping = attn_metadata.origin_slot_mapping
+        if self.is_dsa_layer:
+            attn_metadata.slot_mapping_2d = attn_metadata.origin_slot_mapping_2d
         attn_metadata.num_actual_tokens = attn_metadata.orig_num_actual_tokens
 
     def _forward_dummy(
@@ -1031,7 +1018,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        positions: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
@@ -1040,7 +1026,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
             hidden_states,
             cos,
             sin,
-            positions,
             attn_metadata,
             mome_metadata,
         )
@@ -1428,7 +1413,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        positions: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> torch.Tensor:
@@ -1438,7 +1422,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 hidden_states,
                 cos,
                 sin,
-                positions,
                 attn_metadata,
                 mome_metadata, 
             )
@@ -1457,7 +1440,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 hidden_states,
                 cos,
                 sin,
-                positions,
                 attn_metadata,
                 mome_metadata,
             )
@@ -1850,7 +1832,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        positions: torch.Tensor,
         attn_metadata: Optional[MLACommonMetadata] = None,
         mome_metadata: Optional[NPUMomeAttentionMetadata] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor], # DSA/MLA/SWA absorb
@@ -1907,7 +1888,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 q_lora,
                 cos,
                 sin,
-                positions,
                 attn_metadata,
                 kv_cache,
             )
@@ -2200,7 +2180,6 @@ def npu_pangu_forward(
     cos: torch.Tensor,
     sin: torch.Tensor,
     layer_name: str,
-    positions: torch.Tensor,
 ) -> torch.Tensor:
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]    
@@ -2232,28 +2211,26 @@ def npu_pangu_forward(
                 hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
 
         if has_decode and has_prefill:
-            prefill_hidden_states, prefill_cos, prefill_sin, prefill_positions = self._prepare_phase_inputs(
-                hidden_states, cos, sin, positions, attn_metadata, 
+            prefill_hidden_states, prefill_cos, prefill_sin = self._prepare_phase_inputs(
+                hidden_states, cos, sin, attn_metadata, 
                 phase="prefill",
             )
             hidden_states[num_decode_tokens:num_actual_tokens] = self._forward_prefill(
                 prefill_hidden_states,
                 prefill_cos,
                 prefill_sin,
-                prefill_positions,
                 attn_metadata,
                 mome_metadata.prefill,
             )
 
-            decode_hidden_states, decode_cos, decode_sin, decode_positions = self._prepare_phase_inputs(
-                hidden_states, cos, sin, positions, attn_metadata, 
+            decode_hidden_states, decode_cos, decode_sin = self._prepare_phase_inputs(
+                hidden_states, cos, sin, attn_metadata, 
                 phase="decode",
             )
             hidden_states[:num_decode_tokens] = self._forward_decode(
                 decode_hidden_states,
                 decode_cos,
                 decode_sin,
-                decode_positions,
                 attn_metadata,
                 mome_metadata.decode,
             )
@@ -2283,7 +2260,6 @@ def npu_pangu_forward(
                     hidden_states[num_decode_tokens:num_actual_tokens],
                     cos[num_decode_tokens:num_actual_tokens],
                     sin[num_decode_tokens:num_actual_tokens],
-                    positions[num_decode_tokens:num_actual_tokens],
                     attn_metadata,
                     mome_metadata,
                 )
@@ -2292,7 +2268,6 @@ def npu_pangu_forward(
                 hidden_states[:num_decode_tokens],
                 cos[:num_decode_tokens],
                 sin[:num_decode_tokens],
-                positions[:num_decode_tokens],
                 attn_metadata,
                 mome_metadata,
             )
@@ -2309,7 +2284,6 @@ def npu_pangu_forward_fake(
     cos: torch.Tensor,
     sin: torch.Tensor,
     layer_name: str,
-    positions: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
