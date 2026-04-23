@@ -33,7 +33,7 @@ class TestNpuGraphExAdaptor:
                     graph, example_inputs, compiler_config = mock_inputs
 
                     mock_config = MagicMock()
-                    mock_config.npugraph_ex_config = {"enable": True, "enable_static_kernel": False}
+                    mock_config.npugraph_ex_config = {"enable": True, "static_kernel_compile": False}
                     mock_get_aclgraph_config.return_value = mock_config
 
                     mock_npugraph_ex = MagicMock()
@@ -73,7 +73,7 @@ class TestNpuGraphExAdaptor:
                     graph.graph = mock_fx_graph
 
                     mock_config = MagicMock()
-                    mock_config.npugraph_ex_config = {"enable": True, "enable_static_kernel": False}
+                    mock_config.npugraph_ex_config = {"enable": True, "static_kernel_compile": False}
                     mock_get_aclgraph_config.return_value = mock_config
 
                     mock_npugraph_ex = MagicMock()

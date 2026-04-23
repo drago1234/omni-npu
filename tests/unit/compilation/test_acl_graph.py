@@ -19,6 +19,8 @@ from omni_npu.compilation.acl_graph import (
     set_graph_params,
     get_graph_params,
     ensure_weak_ref_graph_params,
+    set_aclgraph_recapture,
+    get_aclgraph_recapture,
     ACLGraphWrapper,
 )
 
@@ -29,10 +31,12 @@ from omni_npu.compilation.acl_graph import (
 
 @pytest.fixture(autouse=True)
 def reset_graph_params():
-    """Reset the module-level _graph_params before each test."""
+    """Reset the module-level _graph_params and global_recapture before each test."""
     acl_graph_module._graph_params = None
+    acl_graph_module.global_recapture = False
     yield
     acl_graph_module._graph_params = None
+    acl_graph_module.global_recapture = False
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +84,22 @@ class TestWeakRef:
     def test_weak_ref_tensors_invalid_type(self):
         with pytest.raises(ValueError, match="Invalid type"):
             weak_ref_tensors({"key": torch.tensor([1.0])})
+
+
+# ---------------------------------------------------------------------------
+# set_aclgraph_recapture / get_aclgraph_recapture
+# ---------------------------------------------------------------------------
+
+class TestRecapture:
+
+    def test_default_is_false(self):
+        assert get_aclgraph_recapture() is False
+
+    def test_set_and_get(self):
+        set_aclgraph_recapture(True)
+        assert get_aclgraph_recapture() is True
+        set_aclgraph_recapture(False)
+        assert get_aclgraph_recapture() is False
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +178,31 @@ class TestEnsureWeakRefGraphParams:
         # a pass-through without _C_ascend)
         assert isinstance(params.workspaces[4][mock_fn], torch.Tensor)
 
+    def test_none_kwargs_value_skipped(self):
+        """If a weak_ref_key's value is None, it stays None (not weak-reffed)."""
+        op_desc = OpDescriptor(
+            op_out_fn=MagicMock(),
+            workspace_fn=MagicMock(),
+            weak_ref_keys=("query",),
+        )
+        entry = GraphTaskEntry(
+            op_desc=op_desc,
+            captured_kwargs={"query": None, "scale": 1.0},
+            out_tensors=[torch.randn(2)],
+            handle=MagicMock(),
+            event=MagicMock(),
+        )
+        params = GraphParams(
+            task_entries={4: {"layer0": entry}},
+            workspaces={4: {}},
+        )
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=params):
+            ensure_weak_ref_graph_params()
+
+        assert entry.captured_kwargs["query"] is None
+
 
 # ---------------------------------------------------------------------------
 # ACLGraphWrapper
@@ -200,6 +245,33 @@ class TestACLGraphWrapperInit:
 
         mock_cls.assert_called_once()
         assert isinstance(wrapper.aclgraph_options, CUDAGraphOptions)
+
+    def test_npugraph_ex_config_defaults(self):
+        cfg = MagicMock(spec=VllmConfig)
+        cfg.additional_config = None
+        wrapper = ACLGraphWrapper(
+            MagicMock(), cfg, CUDAGraphMode.PIECEWISE, MagicMock())
+        assert wrapper.npugraph_ex_config == {}
+        assert wrapper.need_static_compile is False
+
+    def test_need_static_compile_true(self):
+        cfg = MagicMock(spec=VllmConfig)
+        cfg.additional_config = {
+            "npugraph_ex_config": {"enable": True, "static_kernel_compile": True}
+        }
+        wrapper = ACLGraphWrapper(
+            MagicMock(), cfg, CUDAGraphMode.PIECEWISE, MagicMock())
+        assert wrapper.need_static_compile is True
+
+    def test_need_static_compile_partial_config(self):
+        """Only enable=True but static_kernel_compile missing => False."""
+        cfg = MagicMock(spec=VllmConfig)
+        cfg.additional_config = {
+            "npugraph_ex_config": {"enable": True}
+        }
+        wrapper = ACLGraphWrapper(
+            MagicMock(), cfg, CUDAGraphMode.PIECEWISE, MagicMock())
+        assert wrapper.need_static_compile is False
 
 
 class TestACLGraphWrapperAttr:
@@ -283,8 +355,6 @@ class TestACLGraphWrapperCall:
         wrapper, ctx, mock_graph = wrapper_and_context
 
         with patch("omni_npu.compilation.acl_graph."
-                    "validate_cudagraph_capturing_enabled"), \
-             patch("omni_npu.compilation.acl_graph."
                     "ensure_weak_ref_graph_params"):
             result = wrapper(torch.tensor([1.0]))
 
@@ -339,6 +409,84 @@ class TestACLGraphWrapperCall:
 
         with pytest.raises(AssertionError, match="Input addresses"):
             wrapper(test_tensor)
+
+    def test_static_compile_first_run(self, wrapper_and_context):
+        """When need_static_compile=True, runnable is called once before capture."""
+        wrapper, ctx, mock_graph = wrapper_and_context
+        wrapper.need_static_compile = True
+        wrapper.first_run_finished = False
+
+        with patch("omni_npu.compilation.acl_graph."
+                    "ensure_weak_ref_graph_params"):
+            wrapper(torch.tensor([1.0]))
+
+        # runnable called twice: once for static compile, once inside graph capture
+        assert wrapper.runnable.call_count == 2
+        assert wrapper.first_run_finished is True
+
+    def test_static_compile_skipped_after_first(self, wrapper_and_context):
+        """After first_run_finished, no extra runnable call for static compile."""
+        wrapper, ctx, mock_graph = wrapper_and_context
+        wrapper.need_static_compile = True
+        wrapper.first_run_finished = True
+
+        with patch("omni_npu.compilation.acl_graph."
+                    "ensure_weak_ref_graph_params"):
+            wrapper(torch.tensor([1.0]))
+
+        # only the capture-time call, no extra static compile call
+        assert wrapper.runnable.call_count == 1
+
+    def test_recapture_flag_triggers_recapture(self, wrapper_and_context):
+        """When entry.recapture=True, the graph is re-captured and old one reset."""
+        wrapper, ctx, mock_graph = wrapper_and_context
+        bd = ctx.batch_descriptor
+
+        old_graph = MagicMock()
+        entry = ACLGraphEntry(batch_descriptor=bd)
+        entry.aclgraph = old_graph
+        entry.recapture = True
+        wrapper.concrete_aclgraph_entries[bd] = entry
+
+        with patch("omni_npu.compilation.acl_graph."
+                    "ensure_weak_ref_graph_params"):
+            wrapper(torch.tensor([1.0]))
+
+        old_graph.reset.assert_called_once()
+        assert entry.recapture is False
+
+    def test_update_graph_recapture_sets_entries(self):
+        """update_graph_recapture marks all entries for recapture."""
+        cfg = MagicMock(spec=VllmConfig)
+        cfg.additional_config = None
+        wrapper = ACLGraphWrapper(
+            MagicMock(), cfg, CUDAGraphMode.PIECEWISE, MagicMock())
+
+        bd = MagicMock()
+        entry = ACLGraphEntry(batch_descriptor=bd)
+        wrapper.concrete_aclgraph_entries[bd] = entry
+
+        set_aclgraph_recapture(True)
+        wrapper.update_graph_recapture()
+
+        assert entry.recapture is True
+        assert get_aclgraph_recapture() is False
+
+    def test_update_graph_recapture_noop_when_flag_false(self):
+        """update_graph_recapture is a no-op when global flag is False."""
+        cfg = MagicMock(spec=VllmConfig)
+        cfg.additional_config = None
+        wrapper = ACLGraphWrapper(
+            MagicMock(), cfg, CUDAGraphMode.PIECEWISE, MagicMock())
+
+        bd = MagicMock()
+        entry = ACLGraphEntry(batch_descriptor=bd)
+        wrapper.concrete_aclgraph_entries[bd] = entry
+
+        assert get_aclgraph_recapture() is False
+        wrapper.update_graph_recapture()
+
+        assert entry.recapture is False
 
 
 # ---------------------------------------------------------------------------

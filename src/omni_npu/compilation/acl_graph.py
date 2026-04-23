@@ -135,7 +135,13 @@ class ACLGraphWrapper:
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
-
+        self.npugraph_ex_config = (self.vllm_config.additional_config or {}).get(
+            "npugraph_ex_config", {}
+        )
+        self.need_static_compile = (
+            self.npugraph_ex_config.get("enable", False)
+            and self.npugraph_ex_config.get("static_kernel_compile", False)
+        )
         # assert runtime_mode is not NONE(no aclgraph), otherwise, we don't
         # need to initialize a ACLGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
@@ -202,7 +208,11 @@ class ACLGraphWrapper:
                 # piecewise mode.
                 logger.debug("Capturing a aclgraph on (%s,%s)",
                              self.runtime_mode.name, entry.batch_descriptor)
-
+            if self.need_static_compile and not self.first_run_finished:
+                # Compile once before the first capture so static kernels are ready.
+                logger.debug("<<< Running first compile for static kernel compilation")
+                self.runnable(*args, **kwargs)
+                self.first_run_finished = True
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]

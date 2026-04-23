@@ -18,12 +18,12 @@ class TestAclGraphConfig:
     def test_init_with_additional_config_containing_npugraph_ex_config(self):
         """Test AclGraphConfig initialization when additional_config contains npugraph_ex_config."""
         mock_vllm_config = MagicMock()
-        mock_vllm_config.additional_config = {"npugraph_ex_config": {"enable": True, "enable_static_kernel": False}}
+        mock_vllm_config.additional_config = {"npugraph_ex_config": {"enable": True, "static_kernel_compile": False}}
 
         config = AclGraphConfig(mock_vllm_config)
 
-        assert config.additional_config == {"npugraph_ex_config": {"enable": True, "enable_static_kernel": False}}
-        assert config.npugraph_ex_config == {"enable": True, "enable_static_kernel": False}
+        assert config.additional_config == {"npugraph_ex_config": {"enable": True, "static_kernel_compile": False}}
+        assert config.npugraph_ex_config == {"enable": True, "static_kernel_compile": False}
 
     def test_init_with_additional_config_without_npugraph_ex_config(self):
         """Test AclGraphConfig initialization when additional_config exists but doesn't contain npugraph_ex_config."""

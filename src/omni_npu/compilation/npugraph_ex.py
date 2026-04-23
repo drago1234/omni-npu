@@ -40,7 +40,7 @@ class NpuGraphExAdaptor(CompilerInterface):
         # execute FX graph in eager mode before graph mode to optimize FX graph.
         config.debug.run_eagerly = True
         # static kernel switch, suitable for static shapes or scenes with less shape changes.
-        if npugraph_ex_config.get("enable_static_kernel", False):
+        if npugraph_ex_config.get("static_kernel_compile", False):
             config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
         # insert the GraphPassManager into the torchair config
         if "post_grad_custom_post_pass" in compiler_config:

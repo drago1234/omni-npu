@@ -726,14 +726,10 @@ class NPUModelRunner(GPUModelRunner):
                 force_has_lora=activate_lora,
             )
         )
-        # For dummy run，in execute_model , If cudagraph_runtime_mode is None, 
-        # dummy run is in execute_model and no compilation is needed. 
-        # If it is not None, dummy run is during model capture and compilation is required.
-        need_compile = False
+
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode
         else:
-            need_compile = True
             assert cudagraph_runtime_mode == _cudagraph_mode, (
                 f"Cudagraph runtime mode mismatch in dummy_run. "
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
@@ -860,7 +856,6 @@ class NPUModelRunner(GPUModelRunner):
                     self._build_conv_context(dummy=True)
                 forward_context = get_forward_context()
                 forward_context.capturing = False
-                forward_context.need_compile = need_compile
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
