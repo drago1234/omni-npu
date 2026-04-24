@@ -232,6 +232,10 @@ class StaticSinkAttentionPatch(VLLMPatch):
                         self.populate_sink_kv(self_kv_cache[0], self_kv_cache[1])
             return super().forward(*args, **kwargs)
 
+        def maybe_populate_sink_kv_after_wakeup(self, self_k_cache, self_v_cache):
+            if not model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                self.populate_sink_kv(self_k_cache, self_v_cache)
+
         def populate_sink_kv(self, k_nope_cache: torch.Tensor, k_pe_cache: torch.Tensor):
             sink_kv_slot_mapping = torch.arange(
                 self.block_size,

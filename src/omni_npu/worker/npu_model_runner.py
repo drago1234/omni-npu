@@ -978,8 +978,12 @@ class NPUModelRunner(GPUModelRunner):
         # Since `virtual_engine` is defaulted to 0 and will be deprecated, we directly set it to 0 here.
         self_kv_cache = sink_kv_cache[0]
         if self_kv_cache is not None and len(self_kv_cache) > 0:
-            populate_sink_kv_method = getattr(module, "populate_sink_kv")
-            populate_sink_kv_method(self_kv_cache[0], self_kv_cache[1])
+            if hasattr(module, "maybe_populate_sink_kv_after_wakeup"):
+                populate_sink_kv_method = getattr(module, "maybe_populate_sink_kv_after_wakeup")
+                populate_sink_kv_method(self_kv_cache[0], self_kv_cache[1])
+            else:
+                populate_sink_kv_method = getattr(module, "populate_sink_kv")
+                populate_sink_kv_method(self_kv_cache[0], self_kv_cache[1])
 
         for kv_cache_group_id in range(len(self.kv_cache_config.kv_cache_groups)):
             for attn_group in self.attn_groups[kv_cache_group_id]:

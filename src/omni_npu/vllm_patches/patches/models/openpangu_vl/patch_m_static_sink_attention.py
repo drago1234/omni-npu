@@ -195,8 +195,6 @@ class StaticSinkAttentionPatch(VLLMPatch):
 
             return super().forward(query, key, value, output_shape)
 
-
-
         def populate_sink_kv(self, self_k_cache, self_v_cache):
             sink_kv_slot_mapping = torch.arange(
                 self.block_size,
