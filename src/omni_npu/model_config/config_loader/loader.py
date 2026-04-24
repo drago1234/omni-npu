@@ -109,6 +109,7 @@ class ModelOperatorOptConfig:
     kv_nz: bool = True
     gmm_nz: bool = True
     moe_multi_stream_tune: bool = False
+    shared_expert_multi_stream: bool = True
     unquant_bmm_nz: bool = True
     decode_moe_dispatch_combine: bool = False
     enable_super_kernel: bool = False
@@ -123,6 +124,7 @@ class ModelOperatorOptConfig:
     shared_expert_gate_up_prefetch: int = 28
     shared_expert_down_prefetch: int = 14
 
+    enable_moe_agrs: bool = False
     enable_round_pipeline_comm: bool = False
     enable_pipeline_comm: bool = False
     use_omni_cache: bool = False

@@ -451,7 +451,7 @@ class CommunicationStrategySelector:
             # tokens per rank
             local_num_tokens = cdiv(num_tokens, self.tp_size)
 
-        if self.is_a2_device:
+        if self.is_a2_device or model_extra_config.operator_opt_config.enable_moe_agrs:
             # TP or DP only
             if self.tp_size == 1 or self.dp_size == 1:
                 strategy = "agrs"

@@ -44,7 +44,8 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         super().__init__(moe)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
-        self.shared_experts_stream = named_stream("shared_experts_stream")
+        if model_extra_config.operator_opt_config.shared_expert_multi_stream:
+            self.shared_experts_stream = named_stream("shared_experts_stream")
 
     def apply(
         self,
@@ -142,9 +143,17 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
 
         shared_output = None
         if layer.shared_experts is not None:
-            cur_stream = torch.npu.current_stream()
-            self.shared_experts_stream.wait_stream(cur_stream)
-            with torch.npu.stream(self.shared_experts_stream):
+            if model_extra_config.operator_opt_config.shared_expert_multi_stream:
+                cur_stream = torch.npu.current_stream()
+                self.shared_experts_stream.wait_stream(cur_stream)
+                with torch.npu.stream(self.shared_experts_stream):
+                    if layer.shared_experts.gate_up_proj.tp_size > 1:
+                        # Shared experts with TP>1 require full hidden_states;
+                        # output is all-reduced later.
+                        shared_output = layer.shared_experts(hidden_states)
+                    else:
+                        shared_output = layer.shared_experts(x_slice)
+            else:
                 if layer.shared_experts.gate_up_proj.tp_size > 1:
                     # Shared experts with TP>1 require full hidden_states;
                     # output is all-reduced later.
@@ -162,7 +171,8 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         )
 
         if layer.shared_experts is not None:
-            cur_stream.wait_stream(self.shared_experts_stream)
+            if model_extra_config.operator_opt_config.shared_expert_multi_stream:
+                cur_stream.wait_stream(self.shared_experts_stream)
             if layer.shared_experts.gate_up_proj.tp_size > 1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
             if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
