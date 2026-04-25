@@ -593,7 +593,7 @@ class TestNPUModelRunner:
         runner = NPUModelRunner(self.vllm_cfg, self.npu_device)
 
         # Mock the necessary components
-        mock_module = MagicMock()
+        mock_module = MagicMock(spec=["populate_sink_kv", "kv_cache"])
         # sink_kv_cache is a list where each element is [k_cache, v_cache] for each engine
         # The implementation uses sink_kv_cache[0], which should be a list/tuple with at least 2 elements
         mock_k_cache = MagicMock()
@@ -602,6 +602,37 @@ class TestNPUModelRunner:
         mock_module.kv_cache = mock_sink_kv_cache
         mock_populate_sink_kv = MagicMock()
         mock_module.populate_sink_kv = mock_populate_sink_kv
+
+         # Setup mock KV cache config
+        mock_kv_cache_config = MagicMock()
+        mock_kv_cache_config.kv_cache_groups = []
+
+        # Setup runner attributes
+        setattr(runner, "kv_cache_config", mock_kv_cache_config)
+
+        # Call _kv_cache_sink_attn_after_wake_up
+        runner._kv_cache_sink_attn_after_wake_up(mock_module)
+
+        # Verify populate_sink_kv was called with correct parameters
+        # The implementation calls: populate_sink_kv_method(sink_kv_cache[0][0], sink_kv_cache[0][1])
+        mock_populate_sink_kv.assert_called_once_with(mock_k_cache,
+                                                      mock_v_cache)
+
+    def test_kv_cache_sink_attn_after_wake_up_maybe_populate(self, monkeypatch):
+        """Test _kv_cache_sink_attn_after_wake_up method."""
+        # Create runner
+        runner = NPUModelRunner(self.vllm_cfg, self.npu_device)
+
+        # Mock the necessary components
+        mock_module = MagicMock()
+        # sink_kv_cache is a list where each element is [k_cache, v_cache] for each engine
+        # The implementation uses sink_kv_cache[0], which should be a list/tuple with at least 2 elements
+        mock_k_cache = MagicMock()
+        mock_v_cache = MagicMock()
+        mock_sink_kv_cache = [[mock_k_cache, mock_v_cache]]
+        mock_module.kv_cache = mock_sink_kv_cache
+        mock_populate_sink_kv = MagicMock()
+        mock_module.maybe_populate_sink_kv_after_wakeup = mock_populate_sink_kv
 
          # Setup mock KV cache config
         mock_kv_cache_config = MagicMock()
