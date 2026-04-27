@@ -1054,7 +1054,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             # Prefill output dimension is v_head_dim
             # Note: num_tokens should equal q_cumlens[-1], using q_nope.shape[0] is safer
             attn_output_shape = (q_nope.shape[0], self.num_local_heads, self.v_head_dim)
-            attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             attn_output[:q_cumlens[-1]] = torch.ops.custom.npu_fused_infer_attention_sink(**kwargs)[0]
             # Prefill stage keeps TND format
         else:
@@ -1092,7 +1092,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
 
             # Decode output dim kv_lora_rank
             attn_output_shape = (num_tokens, query_heads, self.kv_lora_rank)
-            attn_output = torch.empty(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
+            attn_output = torch.zeros(attn_output_shape, dtype=q_nope.dtype, device=q_nope.device)
             softmax_lse = torch.empty(num_tokens, dtype=q_nope.dtype, device=q_nope.device)
 
             if forward_context.capturing:

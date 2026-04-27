@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler as V1TopKTopPSampler
 from omni_npu.v1.utils import on_ascend950
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
 
@@ -71,6 +72,18 @@ class NPUTopKTopPSampler(V1TopKTopPSampler):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        from omni_npu.sample.sampler import apply_top_k_top_p, random_sample
+        if model_extra_config.operator_opt_config.disable_npu_top_k_top_p_sample:
+            logits, idx = apply_top_k_top_p(logits, k, p)
+            probs = logits.softmax(dim=-1, dtype=torch.float32)
+            token_ids = random_sample(probs, idx, generators, self.dsa_stream)
+
+            logits_to_return = None
+            if self.logprobs_mode == "processed_logits":
+                logits_to_return = logits
+            elif self.logprobs_mode == "processed_logprobs":
+                logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+            return token_ids, logits_to_return
         logits = logits.type(torch.bfloat16)
         if p is not None:
             p = p.type(torch.bfloat16)

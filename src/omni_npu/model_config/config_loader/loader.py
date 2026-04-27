@@ -131,6 +131,7 @@ class ModelOperatorOptConfig:
     enable_dsa: bool=True
 
     omni_disable_npu_add_rms_norm: bool = False
+    disable_npu_top_k_top_p_sample: bool = False
     use_noncontiguous_kv: bool = False
     merge_q_kv_conv: bool = False # 是否合并qa_conv和compresskv_conv
 
