@@ -51,16 +51,20 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
+    from vllm.v1.kv_cache_interface import AttentionSpec
 
 
 logger = init_logger(__name__)
 
 _ORIGINAL_SCHEDULER_INIT = Scheduler.__init__
+_ORIGINAL_GPU_MODEL_RUNNER_INIT = GPUModelRunner.__init__
+_ORIGINAL_INIT_ROUTED_EXPERTS_CAPTURER = GPUModelRunner.init_routed_experts_capturer
 _ORIGINAL_SAVE_CAPTURED_EXPERTS = VLLMRoutedExpertsCapturer.save_captured_experts
 _ORIGINAL_CHAT_STREAM = OpenAIServingChat.chat_completion_stream_generator
 _ORIGINAL_COMPLETION_STREAM = OpenAIServingCompletion.completion_stream_generator
@@ -404,12 +408,75 @@ class SchedulerInitPatch(VLLMPatch):
             and hasattr(self, "vllm_config")
             and hasattr(self, "max_num_kv_tokens")
         ):
-            self.routed_experts_reader.attach_buffer(
+            kv_cache_config = getattr(self, "kv_cache_config", None)
+            self.routed_experts_attn_gid = _get_attention_kv_cache_gid(kv_cache_config) if kv_cache_config is not None else 0
+            if kv_cache_config is not None:
+                # Recalculate max_num_kv_tokens using attention group's block_size.
+                # The original calculation used cache_config.block_size which may be
+                # different from the attention group's block_size in hybrid models.
+                attn_group = kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
+                attn_block_size = attn_group.kv_cache_spec.block_size
+                self.max_num_kv_tokens = kv_cache_config.num_blocks * attn_block_size
+
+            # Reset the reader's shm so that attach_buffer can re-initialize with the new max_num_kv_tokens.
+            # The original Scheduler.__init__ already called attach_buffer with incorrect values.
+            reader = self.routed_experts_reader
+            if getattr(reader, "_shm", None) is not None:
+                reader._shm = None
+                reader._host_buffer_view = None
+
+            reader.attach_buffer(
                 max_num_kv_tokens=self.max_num_kv_tokens,
                 model_config=self.vllm_config.model_config,
                 instance_id=self.vllm_config.instance_id,
                 vllm_config=self.vllm_config,
             )
+
+
+@register_patch("GPUModelRunnerInitRoutedExpertsPatch", GPUModelRunner)
+class GPUModelRunnerInitRoutedExpertsPatch(VLLMPatch):
+    _attr_names_to_apply = ["__init__", "init_routed_experts_capturer"]
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        _ORIGINAL_GPU_MODEL_RUNNER_INIT(self, *args, **kwargs)
+        # Initialize routed_experts_attn_gid to 0 by default.
+        # It will be properly set in init_routed_experts_capturer().
+        self.routed_experts_attn_gid = 0
+
+    def init_routed_experts_capturer(self) -> None:
+        logger.info(
+            "Initializing routed experts capturer, enable_return_routed_experts: %s",
+            self.model_config.enable_return_routed_experts,
+        )
+        routed_experts_capturer = VLLMRoutedExpertsCapturer.create()
+
+        self.routed_experts_attn_gid = _get_attention_kv_cache_gid(self.kv_cache_config)
+
+        # Recalculate max_num_kv_tokens using attention group's block_size.
+        attn_group = self.kv_cache_config.kv_cache_groups[self.routed_experts_attn_gid]
+        attn_block_size = attn_group.kv_cache_spec.block_size
+        self.max_num_kv_tokens = self.kv_cache_config.num_blocks * attn_block_size
+
+        routed_experts_capturer.init_buffer(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_kv_tokens=self.max_num_kv_tokens,
+            model_config=self.model_config,
+            instance_id=self.vllm_config.instance_id,
+        )
+
+
+def _get_attention_kv_cache_gid(kv_cache_config) -> int:
+    """Find the first attention group index for routed experts indexing.
+
+    This fixes hybrid models (e.g., Mamba + Attention like Jamba, Qwen3.5)
+    where group 0 might be Mamba (block_size=262144) instead of Attention.
+    """
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+        if isinstance(group.kv_cache_spec, AttentionSpec):
+            return gid
+    return 0
 
 
 def _concatenate_index_ranges(
@@ -428,11 +495,19 @@ def _get_request_slot_mapping(self: Scheduler, request: Request) -> np.ndarray |
     if kv_blocks is None:
         return None
 
-    block_ids = kv_blocks.get_block_ids()[0]
+    # Use the attention group index instead of hardcoded 0.
+    # This fixes hybrid models (Mamba + Attention) where group 0 might be Mamba.
+    attn_gid = getattr(self, "routed_experts_attn_gid", 0)
+    block_ids = kv_blocks.get_block_ids()[attn_gid]
     if not block_ids:
         return None
 
-    block_size = self.kv_cache_manager.coordinator.single_type_managers[0].block_size
+    # Get block_size from the attention group's kv_cache_spec.
+    kv_cache_config = getattr(self, "kv_cache_config", None)
+    if kv_cache_config is not None and attn_gid < len(kv_cache_config.kv_cache_groups):
+        block_size = kv_cache_config.kv_cache_groups[attn_gid].kv_cache_spec.block_size
+    else:
+        block_size = self.kv_cache_manager.coordinator.single_type_managers[0].block_size
     block_ids_array = np.array(block_ids, dtype=np.int32)
     num_blocks = len(block_ids)
     block_offsets = np.arange(block_size, dtype=np.int32)
@@ -624,13 +699,21 @@ class SchedulerRoutedExpertsPatch(VLLMPatch):
 
             routed_experts = None
             if stopped:
-                if self.vllm_config.model_config.enable_return_routed_experts:
+                if getattr(self.vllm_config.model_config, "enable_return_routed_experts", False):
+                    # Use the attention group index instead of hardcoded 0.
+                    # This fixes hybrid models (Mamba + Attention) where group 0 might be Mamba.
+                    attn_gid = getattr(self, "routed_experts_attn_gid", 0)
                     kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
-                    block_ids = kv_blocks.get_block_ids()[0]
+                    block_ids = kv_blocks.get_block_ids()[attn_gid]
                     num_tokens = request.num_tokens - 1
                     block_ids_array = np.array(block_ids, dtype=np.int32)
                     num_blocks = len(block_ids)
-                    block_size = self.block_size
+                    # Get block_size from the attention group's kv_cache_spec.
+                    kv_cache_config = getattr(self, "kv_cache_config", None)
+                    if kv_cache_config is not None and attn_gid < len(kv_cache_config.kv_cache_groups):
+                        block_size = kv_cache_config.kv_cache_groups[attn_gid].kv_cache_spec.block_size
+                    else:
+                        block_size = self.block_size
                     block_offsets = np.arange(0, block_size)
                     slot_mapping = (
                         block_offsets.reshape((1, block_size))

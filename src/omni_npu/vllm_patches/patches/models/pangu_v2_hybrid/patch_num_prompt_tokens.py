@@ -100,7 +100,11 @@ class PanguV2HybridGPUModelRunnerPatch(VLLMPatch):
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         if self.model_config.enable_return_routed_experts:
-            self.slot_mapping = slot_mapping_gid_0[:num_tokens].cpu().numpy()
+            # Use attention group's slot_mapping instead of hardcoded group 0.
+            # This fixes hybrid models (Mamba + Attention) where group 0 might be Mamba.
+            attn_gid = getattr(self, "routed_experts_attn_gid", 0)
+            _, slot_mapping_attn = _get_block_table_and_slot_mapping(attn_gid)
+            self.slot_mapping = slot_mapping_attn[:num_tokens].cpu().numpy()
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
