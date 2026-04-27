@@ -983,7 +983,7 @@ class TestNPUModelRunner:
         )
         monkeypatch.setattr(self.runner, "get_model", lambda: model)
 
-        self.runner._hook_model_load_weights()
+        self.runner._hook_model_load_weights(model)
 
         assert model.load_weights is original_load_weights
         assert model._omni_npu_load_weights_hooked is True
@@ -1000,7 +1000,7 @@ class TestNPUModelRunner:
         monkeypatch.setattr("omni_npu.worker.npu_model_runner.logger.error",
                             log_error)
 
-        self.runner._hook_model_load_weights()
+        self.runner._hook_model_load_weights(model)
 
         log_error.assert_called_once_with("model.load_weights is not callable.")
         assert model._omni_npu_load_weights_hooked is False
@@ -1014,9 +1014,9 @@ class TestNPUModelRunner:
         )
         monkeypatch.setattr(self.runner, "get_model", lambda: model)
 
-        log_info = MagicMock()
-        monkeypatch.setattr("omni_npu.worker.npu_model_runner.logger.info",
-                            log_info)
+        log_info_once = MagicMock()
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.logger.info_once",
+                            log_info_once)
 
         class DummyContextManager:
             def __enter__(self):
@@ -1042,7 +1042,7 @@ class TestNPUModelRunner:
         self.runner.model_config = SimpleNamespace(enable_sleep_mode=False,
                                                    enforce_eager=False)
 
-        self.runner._hook_model_load_weights()
+        self.runner._hook_model_load_weights(model)
 
         assert model._omni_npu_load_weights_hooked is True
         wrapped = model.load_weights
@@ -1051,11 +1051,11 @@ class TestNPUModelRunner:
         wrapped("arg0", kw="val")
 
         original_load_weights.assert_called_once_with("arg0", kw="val")
-        get_instance.assert_called_once_with()
-        allocator.use_memory_pool.assert_called_once_with(tag="weights")
+        get_instance.assert_not_called()
+        allocator.use_memory_pool.assert_not_called()
         set_cfg_context.assert_called_once_with(self.runner.vllm_config)
-        capture_model.assert_called_once_with()
-        assert log_info.call_count == 2
+        capture_model.assert_not_called()
+        assert log_info_once.call_count == 2
 
     def test_hook_model_load_weights_skip_capture_when_sleep_mode_enabled(
             self, monkeypatch):
@@ -1076,9 +1076,10 @@ class TestNPUModelRunner:
 
         allocator = MagicMock()
         allocator.use_memory_pool.return_value = DummyContextManager()
+        get_instance = MagicMock(return_value=allocator)
         monkeypatch.setattr(
             "omni_npu.worker.npu_model_runner.NpuMemAllocator.get_instance",
-            MagicMock(return_value=allocator),
+            get_instance,
         )
         monkeypatch.setattr(
             "omni_npu.worker.npu_model_runner.set_current_vllm_config",
@@ -1090,10 +1091,143 @@ class TestNPUModelRunner:
         self.runner.model_config = SimpleNamespace(enable_sleep_mode=True,
                                                    enforce_eager=False)
 
-        self.runner._hook_model_load_weights()
+        self.runner._hook_model_load_weights(model)
         model.load_weights()
 
         original_load_weights.assert_called_once_with()
+        get_instance.assert_called_once_with()
+        allocator.use_memory_pool.assert_called_once_with(tag="weights")
+        capture_model.assert_not_called()
+
+    def test_hook_model_load_weights_suppresses_post_weight_load(self,
+                                                                 monkeypatch):
+        """Test wrapped load_weights skips internal post_weight_load call."""
+        post_weight_load = MagicMock()
+        model = SimpleNamespace(
+            _omni_npu_load_weights_hooked=False,
+            post_weight_load=post_weight_load,
+        )
+
+        def _load_weights_impl(*args, **kwargs):
+            model.post_weight_load()
+
+        original_load_weights = MagicMock(side_effect=_load_weights_impl)
+        model.load_weights = original_load_weights
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+
+        class DummyContextManager:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        allocator = MagicMock()
+        allocator.use_memory_pool.return_value = DummyContextManager()
+        get_instance = MagicMock(return_value=allocator)
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.NpuMemAllocator.get_instance",
+            get_instance,
+        )
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.set_current_vllm_config",
+            MagicMock(return_value=DummyContextManager()),
+        )
+        monkeypatch.setattr(self.runner, "capture_model", MagicMock())
+        self.runner.model_config = SimpleNamespace(enable_sleep_mode=True,
+                                                   enforce_eager=False)
+
+        self.runner._hook_model_load_weights(model)
+        self.runner.get_model().load_weights("arg0")
+
+        original_load_weights.assert_called_once_with("arg0")
+        get_instance.assert_called_once_with()
+        allocator.use_memory_pool.assert_called_once_with(tag="weights")
+        post_weight_load.assert_not_called()
+        assert self.runner.get_model().post_weight_load is post_weight_load
+        self.runner.get_model().post_weight_load()
+        post_weight_load.assert_called_once_with()
+
+    def test_post_weight_load_calls_model_hook(self, monkeypatch):
+        post_weight_load = MagicMock()
+        model = SimpleNamespace(post_weight_load=post_weight_load)
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+        monkeypatch.setattr(self.runner, "get_drafter_model", lambda: None)
+        capture_model = MagicMock()
+        monkeypatch.setattr(self.runner, "capture_model", capture_model)
+        self.runner.model_config = SimpleNamespace(enable_sleep_mode=False,
+                                                   enforce_eager=False)
+
+        self.runner.model_post_weight_load()
+
+        post_weight_load.assert_called_once_with()
+        capture_model.assert_called_once_with()
+
+    def test_post_weight_load_skips_capture_when_enforce_eager(self, monkeypatch):
+        post_weight_load = MagicMock()
+        model = SimpleNamespace(post_weight_load=post_weight_load)
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+        monkeypatch.setattr(self.runner, "get_drafter_model", lambda: None)
+        capture_model = MagicMock()
+        monkeypatch.setattr(self.runner, "capture_model", capture_model)
+        self.runner.model_config = SimpleNamespace(enable_sleep_mode=False,
+                                                   enforce_eager=True)
+
+        self.runner.model_post_weight_load()
+
+        post_weight_load.assert_called_once_with()
+        capture_model.assert_not_called()
+
+    def test_post_weight_load_calls_drafter_hook_with_sleep_mode(self, monkeypatch):
+        class DummyContextManager:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        model_post_weight_load = MagicMock()
+        drafter_post_weight_load = MagicMock()
+        model = SimpleNamespace(post_weight_load=model_post_weight_load)
+        drafter_model = SimpleNamespace(post_weight_load=drafter_post_weight_load)
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+        monkeypatch.setattr(self.runner, "get_drafter_model", lambda: drafter_model)
+
+        allocator = MagicMock()
+        allocator.use_memory_pool.return_value = DummyContextManager()
+        get_instance = MagicMock(return_value=allocator)
+        monkeypatch.setattr(
+            "omni_npu.worker.npu_model_runner.NpuMemAllocator.get_instance",
+            get_instance,
+        )
+        set_cfg_context = MagicMock(return_value=DummyContextManager())
+        monkeypatch.setattr("omni_npu.worker.npu_model_runner.set_current_vllm_config",
+                            set_cfg_context)
+        capture_model = MagicMock()
+        monkeypatch.setattr(self.runner, "capture_model", capture_model)
+        self.runner.model_config = SimpleNamespace(enable_sleep_mode=True,
+                                                   enforce_eager=False)
+
+        self.runner.model_post_weight_load()
+
+        get_instance.assert_called_once_with()
+        allocator.use_memory_pool.assert_called_once_with(tag="weights")
+        set_cfg_context.assert_called_once_with(self.runner.vllm_config)
+        model_post_weight_load.assert_called_once_with()
+        drafter_post_weight_load.assert_called_once_with()
+        capture_model.assert_not_called()
+
+    def test_post_weight_load_skips_when_missing_hook(self, monkeypatch):
+        model = SimpleNamespace()
+        monkeypatch.setattr(self.runner, "get_model", lambda: model)
+        monkeypatch.setattr(self.runner, "get_drafter_model", lambda: None)
+        capture_model = MagicMock()
+        monkeypatch.setattr(self.runner, "capture_model", capture_model)
+        self.runner.model_config = SimpleNamespace(enable_sleep_mode=False,
+                                                   enforce_eager=True)
+
+        self.runner.model_post_weight_load()
+
         capture_model.assert_not_called()
 
     def test_execute_model_uses_switch(self, monkeypatch):

@@ -473,8 +473,10 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
         )
 
-    def _hook_model_load_weights(self) -> None:
-        model = self.get_model()
+    def _hook_model_load_weights(self, model: nn.Module | None) -> None:
+        if model is None:
+            return
+
         if getattr(model, "_omni_npu_load_weights_hooked", False):
             return
 
@@ -485,22 +487,48 @@ class NPUModelRunner(GPUModelRunner):
 
         @wraps(original_load_weights)
         def wrapped_load_weights(*args, **kwargs):
-            logger.info("Before calling self.model.load_weights")
+            logger.info_once("Before calling self.model.load_weights")
+            original_post_weight_load = getattr(model, "post_weight_load", None)
+            suppress_post_weight_load = callable(original_post_weight_load)
+            if suppress_post_weight_load:
+                setattr(model, "post_weight_load", lambda *_, **__: None)
             try:
-                allocator = NpuMemAllocator.get_instance()
-                context = allocator.use_memory_pool(tag="weights")
+                if self.model_config.enable_sleep_mode:
+                    allocator = NpuMemAllocator.get_instance()
+                    context = allocator.use_memory_pool(tag="weights")
+                else:
+                    context = nullcontext()
                 with context, set_current_vllm_config(self.vllm_config):
                     original_load_weights(*args, **kwargs)
 
-                # this is for RL pause/resume scene, recapture the model after loading weights.
-                if not self.model_config.enable_sleep_mode:
-                    if not self.model_config.enforce_eager:
-                        self.capture_model()
             finally:
-                logger.info("After calling self.model.load_weights")
+                if suppress_post_weight_load:
+                    setattr(model, "post_weight_load", original_post_weight_load)
+                logger.info_once("After calling self.model.load_weights")
 
         model.load_weights = wrapped_load_weights
         model._omni_npu_load_weights_hooked = True
+
+    def _model_post_weight_load(self, model: nn.Module | None) -> None:
+        if model is None:
+            return
+        post_weight_load = getattr(model, "post_weight_load", None)
+        if callable(post_weight_load):
+            post_weight_load()
+
+    def model_post_weight_load(self) -> None:
+        if self.model_config.enable_sleep_mode:
+            allocator = NpuMemAllocator.get_instance()
+            context = allocator.use_memory_pool(tag="weights")
+        else:
+            context = nullcontext()
+        with context, set_current_vllm_config(self.vllm_config):
+            self._model_post_weight_load(self.get_model())
+            self._model_post_weight_load(self.get_drafter_model())
+        # this is for RL pause/resume scene, recapture the model after loading weights.
+        if not self.model_config.enable_sleep_mode:
+            if not self.model_config.enforce_eager:
+                self.capture_model()
 
     def load_model(self, eep_scale_up: bool = False) -> None:
         """
@@ -573,7 +601,8 @@ class NPUModelRunner(GPUModelRunner):
                     self.drafter.model.model.wrapped_layers = wrapped_layers
                     logger.debug("<<< Wrapped multi mtp layers of drafter model with ACLGraphWrapper")
         self._is_mm_encoder_only = supports_mm_encoder_only(self.model)
-        self._hook_model_load_weights()
+        self._hook_model_load_weights(self.get_model())
+        self._hook_model_load_weights(self.get_drafter_model())
 
     def capture_model(self) -> int:
         logger.debug("<<< Capturing model in npu_model_runner")
@@ -605,6 +634,13 @@ class NPUModelRunner(GPUModelRunner):
         if isinstance(self.model, ACLGraphWrapper):
             return self.model.unwrap()
         return self.model
+
+    def get_drafter_model(self) -> nn.Module | None:
+        if hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer):
+            if isinstance(self.drafter.model, ACLGraphWrapper):
+                return self.drafter.model.unwrap()
+            return self.drafter.model
+        return None
 
     @torch.inference_mode()
     def _dummy_run(
