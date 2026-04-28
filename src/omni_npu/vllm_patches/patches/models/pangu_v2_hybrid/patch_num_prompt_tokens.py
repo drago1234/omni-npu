@@ -63,7 +63,9 @@ class PanguV2HybridGPUModelRunnerPatch(VLLMPatch):
             self.num_accepted_tokens.copy_to_gpu()
 
         ### patch code
-        
+        # For prefill requests, use_spec_decode can still be False,
+        # but MoME metadata still needs num_prompt_tokens.
+
         self.num_prompt_tokens.np[:num_reqs] = (
             self.input_batch.num_prompt_tokens[:num_reqs]
         )
@@ -178,7 +180,7 @@ class PanguV2HybridGPUModelRunnerPatch(VLLMPatch):
 
             ### patched code
 
-            if use_spec_decode and isinstance(builder, NPUMomeAttentionMetadataBuilder):
+            if isinstance(builder, NPUMomeAttentionMetadataBuilder):
                 extra_attn_metadata_args["num_prompt_tokens"] = \
                     self.num_prompt_tokens.gpu[:num_reqs_padded]
 

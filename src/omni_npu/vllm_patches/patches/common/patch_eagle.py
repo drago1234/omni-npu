@@ -583,10 +583,11 @@ class EagleProposerPatch(VLLMPatch):
 
             extra_attn_metadata_args = {}
             if isinstance(builder, NPUMomeAttentionMetadataBuilder):
+                num_reqs = common_attn_metadata.num_reqs
                 extra_attn_metadata_args['num_accepted_tokens'] = \
-                    self.runner.num_accepted_tokens.gpu[
-                        :common_attn_metadata.num_reqs
-                    ]
+                    self.runner.num_accepted_tokens.gpu[:num_reqs]
+                extra_attn_metadata_args['num_prompt_tokens'] = \
+                    self.runner.num_prompt_tokens.gpu[:num_reqs]
 
             attn_metadata = builder.build_for_drafting(
                 common_attn_metadata=group_cm,

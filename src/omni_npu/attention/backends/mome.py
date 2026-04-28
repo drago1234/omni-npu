@@ -102,6 +102,10 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.mome_block_size = kv_cache_spec.block_size
         self.speculative_config = vllm_config.speculative_config
         self.kv_cache_spec = kv_cache_spec
+        
+        self.is_pd_disagg = vllm_config.kv_transfer_config is not None
+        self.is_decode_node = (self.is_pd_disagg and \
+            vllm_config.kv_transfer_config.kv_role == "kv_consumer")
 
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
@@ -110,6 +114,8 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             self.num_spec = 0
         self.use_spec_decode = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
+
+        self.fake_num_spec = max(self.num_spec, 1) if self.is_pd_disagg else self.num_spec
 
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -174,14 +180,24 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self,
         common_attn_metadata: CommonAttentionMetadata,
         mome_block_size: int,
+        num_accepted_tokens: torch.Tensor,
+        num_prompt_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Borrowed from `BaseMambaAttentionMetadataBuilder`. Completely same.
-        """
+        
         num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
         # Block index of the last computed token
-        # TODO: fix block_idx_last_computed_token when APC enabled
-        block_idx_last_computed_token = cdiv(num_computed_tokens, mome_block_size) - 1
+        if self.num_spec > 0 and num_prompt_tokens is not None:
+            # With speculative decoding and num_computed_tokens > num_prompt_tokens, 
+            # the last scheduling must be MTP and num_accepted_tokens is meaningful, 
+            # and we need to get the correct block index for the running cache
+            block_idx_last_computed_token = torch.where(
+                num_computed_tokens > num_prompt_tokens, 
+                cdiv(num_computed_tokens - num_accepted_tokens + self.num_spec, mome_block_size) - 1,
+                cdiv(num_computed_tokens, mome_block_size) - 1
+            )
+        else:
+            block_idx_last_computed_token = cdiv(num_computed_tokens, mome_block_size) - 1
+        
         # which is <= block index for the first scheduled token
         block_idx_first_scheduled_token = (
             cdiv(num_computed_tokens + 1, mome_block_size) - 1
@@ -231,12 +247,18 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         block_idx_first_scheduled_token = None
         block_idx_last_scheduled_token = None
 
-        # For graph capture, num_prompt_tokens is None
-        if num_accepted_tokens is not None and num_prompt_tokens is not None:
+        if num_accepted_tokens is None:
+            num_accepted_tokens = torch.full_like(num_computed_tokens, self.fake_num_spec + 1)
+        elif num_prompt_tokens is not None: # For graph capture, num_prompt_tokens is None
             num_accepted_tokens = num_accepted_tokens.clone()
             # if the previous schedule is prefill (computed <= prompt), we reset num_accepted_tokens = num_spec + 1
-            # so the MoME kernel reads the last few tokens from the cache
-            num_accepted_tokens.masked_fill_(num_computed_tokens <= num_prompt_tokens, self.num_spec + 1)
+            # so the MoME kernel reads the [-2:] tokens from the cache
+            num_accepted_tokens.masked_fill_(num_computed_tokens <= num_prompt_tokens, self.fake_num_spec + 1)
+
+        # if the current schedule is the recompute of the last prompt, 
+        # we reset num_accepted_tokens = fake_num_spec to let the kernel read the [-3:-1] tokens from the cache
+        if self.is_decode_node and num_prompt_tokens is not None:
+            num_accepted_tokens.masked_fill_(num_computed_tokens < num_prompt_tokens, self.fake_num_spec)
 
         # Get cache indices
         apc_enabled = self.vllm_config.cache_config.enable_prefix_caching
@@ -248,7 +270,10 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 block_idx_first_scheduled_token,
                 block_idx_last_scheduled_token,
             ) = self._compute_prefix_caching_block_indices(
-                common_attn_metadata, self.mome_block_size
+                common_attn_metadata, 
+                self.mome_block_size, 
+                num_accepted_tokens, 
+                num_prompt_tokens, 
             )
         else:
             cache_indices = common_attn_metadata.block_table_tensor[:, 0]
@@ -404,7 +429,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             f"cudagraph capture sizes ({self.decode_cudagraph_max_bs})."
         )
 
-        num_accepted_tokens = None if self.num_spec == 0 else torch.diff(m.query_start_loc)
+        num_accepted_tokens = torch.diff(m.query_start_loc) # always use not-None num_accepted_tokens for graph capturing
         return self.build(0, m, num_accepted_tokens=num_accepted_tokens)
 
     def update_block_table(

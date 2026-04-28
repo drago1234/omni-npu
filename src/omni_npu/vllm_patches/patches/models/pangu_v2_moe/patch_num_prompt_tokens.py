@@ -62,15 +62,17 @@ class PanguV2MoeGPUModelRunnerPatch(VLLMPatch):
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
 
-            ### patch code
-            
-            self.num_prompt_tokens.np[:num_reqs] = (
-                self.input_batch.num_prompt_tokens[:num_reqs]
-            )
-            self.num_prompt_tokens.np[num_reqs:].fill(0)
-            self.num_prompt_tokens.copy_to_gpu()
+        ### patch code
+        # for prefill requests, we have use_spec_decode == False,  
+        # but we still need num_prompt_tokens
+        
+        self.num_prompt_tokens.np[:num_reqs] = (
+            self.input_batch.num_prompt_tokens[:num_reqs]
+        )
+        self.num_prompt_tokens.np[num_reqs:].fill(0)
+        self.num_prompt_tokens.copy_to_gpu()
 
-            ### patch code
+        ### patch code
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -174,7 +176,7 @@ class PanguV2MoeGPUModelRunnerPatch(VLLMPatch):
 
             ### patched code
 
-            if use_spec_decode and isinstance(builder, NPUMomeAttentionMetadataBuilder):
+            if isinstance(builder, NPUMomeAttentionMetadataBuilder):
                 extra_attn_metadata_args["num_prompt_tokens"] = \
                     self.num_prompt_tokens.gpu[:num_reqs_padded]
 

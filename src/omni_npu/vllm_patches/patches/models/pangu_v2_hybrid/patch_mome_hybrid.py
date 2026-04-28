@@ -102,8 +102,6 @@ class NPUMoMEPatch(VLLMPatch):
             self.state_dtypes = state_dtypes
 
             self.on_ascend950 = on_ascend950()
-            self.is_prefill_node = vllm_config.kv_transfer_config is not None and \
-                vllm_config.kv_transfer_config.kv_role == "kv_producer"
 
             # KV cache will be set by model runner during initialization
             # Shape: tuple of (q_cache, kv_cache, o_cache)
@@ -322,18 +320,6 @@ class NPUMoMEPatch(VLLMPatch):
                     num_accepted_tokens=metadata.num_accepted_tokens,
                     pad_slot_id=metadata.pad_slot_id,
                 )
-
-            if self.is_prefill_node:
-                cache_indices = metadata.cache_indices
-
-                if cache_indices.dim() > 1:
-                    cache_indices = cache_indices.reshape(-1)
-                cache_indices = cache_indices.to(device=cache.device, dtype=torch.long)
-                if cache_indices.numel() == 0:
-                    return x
-                selected_cache = cache.index_select(0, cache_indices)
-                selected_cache[:, 1:].copy_(selected_cache[:, :-1].clone())
-                cache.index_copy_(0, cache_indices, selected_cache)
                 
             return x
 

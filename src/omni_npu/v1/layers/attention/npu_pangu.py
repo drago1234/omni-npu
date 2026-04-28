@@ -1085,13 +1085,6 @@ class NPUPanguSparseAttention(torch.nn.Module):
                 num_accepted_tokens=mome_metadata.num_accepted_tokens, 
                 pad_slot_id=mome_metadata.pad_slot_id, 
             )
-        
-        if self.is_prefill_node:
-            # In PD disaggregation, the decode node recomputes the last token of the prompt. 
-            # In the prefill node, we roll back the cache by one token so that
-            # the decode node gets the right cache to read.
-            cache_indices = mome_metadata.cache_indices
-            kv_cache[kv_index][cache_indices, 1:] = kv_cache[kv_index][cache_indices, :-1]
 
         x = torch.cat([x, x_padded], dim=0)
         return x
