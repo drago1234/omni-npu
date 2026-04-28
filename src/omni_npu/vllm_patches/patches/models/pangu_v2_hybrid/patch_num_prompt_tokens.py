@@ -62,15 +62,15 @@ class PanguV2HybridGPUModelRunnerPatch(VLLMPatch):
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
 
-            ### patch code
-            
-            self.num_prompt_tokens.np[:num_reqs] = (
-                self.input_batch.num_prompt_tokens[:num_reqs]
-            )
-            self.num_prompt_tokens.np[num_reqs:].fill(0)
-            self.num_prompt_tokens.copy_to_gpu()
+        ### patch code
+        
+        self.num_prompt_tokens.np[:num_reqs] = (
+            self.input_batch.num_prompt_tokens[:num_reqs]
+        )
+        self.num_prompt_tokens.np[num_reqs:].fill(0)
+        self.num_prompt_tokens.copy_to_gpu()
 
-            ### patch code
+        ### patch code
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 

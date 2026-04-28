@@ -675,7 +675,7 @@ def generate_random_sequence(
     req_arange = list(range(batchsize + 1))
     if spec_metadata is not None:
         for i in range(batchsize):
-            req_arange[i + 1] = req_arange[i] + spec_metadata.num_draft_tokens[i] + 1
+            req_arange[i + 1] = req_arange[i] + spec_metadata.num_draft_tokens[i]
     q = torch.empty_like(probs)
     # NOTE(woosuk): To batch-process the requests without their own seeds,
     # which is the common case, we first assume that every request does
@@ -687,5 +687,6 @@ def generate_random_sequence(
         # TODO(woosuk): This can be slow because we handle each request
         # one by one. Optimize this.
         for i, generator in generators.items():
-            q[req_arange[i]:req_arange[i + 1]].exponential_(generator=generator)
+            if req_arange[i + 1] > req_arange[i]:
+                q[req_arange[i]:req_arange[i + 1]].exponential_(generator=generator)
     return q

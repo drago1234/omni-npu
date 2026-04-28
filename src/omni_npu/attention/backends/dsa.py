@@ -221,7 +221,6 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         if metadata.decode is not None and self.vllm_config.kv_transfer_config is not None:
             # for pd-mixed, TP is used, no need to use mc2_mask
             metadata.decode.mc2_mask = self._generate_activate_mask(metadata.num_actual_tokens)
-            metadata.slot_mapping = self._align_slot_mapping(metadata.slot_mapping, metadata.num_reqs)
 
         if metadata.prefill is not None:
             metadata.prefill.query_cumlens = torch.cumsum(metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1], dim=0, dtype=torch.int32)
@@ -267,13 +266,6 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         self.mc2_mask.fill_(False)
         self.mc2_mask[:actual_seqs_num].fill_(True)
         return self.mc2_mask
-
-    def _align_slot_mapping(self, slot_mapping: torch.Tensor, num_reqs) -> torch.Tensor:
-        num_tokens_padded = num_reqs * self.uniform_decode_query_len
-        slot_mapping_numel = slot_mapping.numel()
-        if slot_mapping_numel < num_tokens_padded:
-            slot_mapping = torch.nn.functional.pad(slot_mapping, (0, num_tokens_padded - slot_mapping_numel), value=PAD_SLOT_ID)
-        return slot_mapping
 
 
 class NPUDSAImpl(MLACommonBaseImpl[NPUDSAMetadata]):
