@@ -127,7 +127,7 @@ class TestNpuMemAllocator:
         # 2. memcpy called (Device -> Host, flag 2)
         npu_mem_pool.memcpy.assert_called_with(
             0x200,  # dest (cpu)
-            0x200 + size * 2,  # dest_max
+            size,  # dest_max (destination buffer size)
             ptr_addr,  # src (npu)
             size,  # size
             2  # ACL_MEMCPY_DEVICE_TO_HOST
@@ -165,7 +165,7 @@ class TestNpuMemAllocator:
         # 2. memcpy (Host -> Device, flag 1)
         npu_mem_pool.memcpy.assert_called_with(
             ptr_addr,  # dest (npu)
-            ptr_addr + size * 2,
+            size,  # dest_max (destination buffer size)
             0x200,  # src (cpu)
             size,
             1  # ACL_MEMCPY_HOST_TO_DEVICE

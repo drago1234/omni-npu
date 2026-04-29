@@ -202,8 +202,7 @@ class NpuMemAllocator:
                     pin_memory=NPUPlatform.is_pin_memory_available())
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 ACL_MEMCPY_DEVICE_TO_HOST = 2
-                dest_max = cpu_ptr + size_in_bytes * 2
-                memcpy(cpu_ptr, dest_max, ptr, size_in_bytes,
+                memcpy(cpu_ptr, size_in_bytes, ptr, size_in_bytes,
                        ACL_MEMCPY_DEVICE_TO_HOST)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
@@ -231,8 +230,7 @@ class NpuMemAllocator:
                         ) * cpu_backup_tensor.element_size()
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         ACL_MEMCPY_HOST_TO_DEVICE = 1
-                        dest_max = ptr + size_in_bytes * 2
-                        memcpy(ptr, dest_max, cpu_ptr, size_in_bytes,
+                        memcpy(ptr, size_in_bytes, cpu_ptr, size_in_bytes,
                                ACL_MEMCPY_HOST_TO_DEVICE)
                         data.cpu_backup_tensor = None
 
