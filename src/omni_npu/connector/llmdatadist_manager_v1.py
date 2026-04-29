@@ -90,7 +90,9 @@ class LLMDataDistConfig:
         else:
             self.rank = get_world_group().rank_in_group
             self.local_rank = get_world_group().local_rank
-            self.cluster_id = ip_port_to_int(f"{self.local_host_ip}:{int(self.host_port)+self.local_rank}", self.tp_size)
+            # Prefill uses local_rank, Decode uses rank for cluster_id
+            port_offset = self.local_rank if self.kv_role_tmp == "kv_producer" else self.rank
+            self.cluster_id = ip_port_to_int(f"{self.local_host_ip}:{int(self.host_port)+port_offset}", self.tp_size)
 
         # will be used in d side to checkout which P rank is selected to build kv link
         self.kv_parallel_size = self.kv_transfer_config.kv_parallel_size
@@ -190,7 +192,9 @@ class LLMDataDistManager:
         self.dp_size = self.data_dist_config.dp_size
         self.dp_rank = self.data_dist_config.dp_rank
         self.prefill_dp_size = self.data_dist_config.kv_producer_dp_size
-        if not self.data_dist_config.is_prefill:
+        if self.data_dist_config.is_prefill:
+            self.decode_id = 0
+        else:
             self.decode_id = self.dp_rank // NUM_DIE_PER_MACH
 
         self.data_dist_option = None
