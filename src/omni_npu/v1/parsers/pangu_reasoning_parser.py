@@ -55,6 +55,9 @@ class PanguReasoningParser(DeepSeekR1ReasoningParser):
             current_token_ids: Sequence[int],
             delta_token_ids: Sequence[int],
     ) -> DeltaMessage | None:
+        if not self.thinking_enabled:
+            return  DeltaMessage(content=delta_text)
+            
         self.delta_token_ids = delta_token_ids
 
         ret = super().extract_reasoning_streaming(
