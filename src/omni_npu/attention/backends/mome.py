@@ -192,7 +192,7 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # and we need to get the correct block index for the running cache
             block_idx_last_computed_token = torch.where(
                 num_computed_tokens > num_prompt_tokens, 
-                cdiv(num_computed_tokens - num_accepted_tokens + self.num_spec, mome_block_size) - 1,
+                cdiv(num_computed_tokens - num_accepted_tokens + self.num_spec + 1, mome_block_size) - 1,
                 cdiv(num_computed_tokens, mome_block_size) - 1
             )
         else:
