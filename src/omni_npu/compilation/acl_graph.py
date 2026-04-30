@@ -3,6 +3,7 @@
 
 import copy
 import dataclasses
+import gc
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
@@ -165,6 +166,32 @@ class ACLGraphWrapper:
     def unwrap(self) -> Callable:
         # in case we need to access the original runnable.
         return self.runnable
+    
+    def _reset_recaptured_graph(self, entry: ACLGraphEntry) -> None:
+        """Release per-shape graph state before recapturing to reduce peak memory."""
+        free_before_cleanup, _ = torch.npu.mem_get_info()
+        aclgraph = entry.aclgraph
+        entry.aclgraph = None
+        entry.output = None
+        entry.recapture = False
+
+        runtime_shape = entry.batch_descriptor.num_tokens
+        graph_params = get_graph_params()
+        if graph_params is not None:
+            graph_params.task_entries.get(runtime_shape, {}).clear()
+            graph_params.workspaces.get(runtime_shape, {}).clear()
+
+        if aclgraph is not None:
+            aclgraph.reset()
+            gc.collect()
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        free_after_reset, _ = torch.npu.mem_get_info()
+        gib = 1 << 30
+        logger.info(
+            f"ACLGraph recapture memory cleanup for shape={runtime_shape}: "
+            f"freed {(free_after_reset - free_before_cleanup) / gib:.2f} GiB"
+        )
 
     def update_graph_recapture(self):
         if get_aclgraph_recapture():
@@ -201,6 +228,10 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None or entry.recapture:
+            # reset the aclgraph if recapture is true
+            if entry.recapture and entry.aclgraph is not None:
+                self._reset_recaptured_graph(entry)
+
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -253,12 +284,6 @@ class ACLGraphWrapper:
             # here we always use weak ref for the output
             # to save memory
             entry.output = weak_ref_tensors(output)
-
-            # reset the aclgraph if recapture is true
-            if entry.recapture:
-                entry.recapture = False
-                if entry.aclgraph is not None:
-                    entry.aclgraph.reset()
 
             entry.aclgraph = aclgraph
 
