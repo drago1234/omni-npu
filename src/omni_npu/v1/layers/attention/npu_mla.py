@@ -346,6 +346,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     device=current_platform.device_type,
                     dtype=config.torch_dtype,
                 )
+            self.normed_sink_compressed_kv = None
         # To enable dummy run with out weight
         self.post_weight_load()
 
@@ -680,7 +681,11 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                         attn_metadata.query_start_loc,
                     )
             else:
-                sink_kv = self.kv_b_proj.forward(self.attn.sink_compressed_kv)[0]
+                if self.normed_sink_compressed_kv is None:
+                    normed_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
+                else:
+                    normed_sink_compressed_kv = self.normed_sink_compressed_kv
+                sink_kv = self.kv_b_proj.forward(normed_sink_compressed_kv)[0]
             kv = self.kv_b_proj.forward(prefill_kv_a)[0]
 
         cur_stream.wait_stream(sub_stream)
@@ -691,7 +696,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
 
         # calculate kv_cumlens and sink tensors
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-            sink_k_pe = self.attn.sink_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
+            sink_k_pe = self.param_sink_k_pe.view(-1, 1, self.qk_rope_head_dim).repeat(1, self.num_local_heads, 1)
             sink_k_nope, sink_v = torch.split(
                 sink_kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim),
                 [self.qk_nope_head_dim, self.v_head_dim],
@@ -745,25 +750,26 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         return output
 
     def post_weight_load(self) -> None:
-        if self._init_wuk_t_uv and getattr(self.attn.impl, "W_UK_T", None) is not None:
-            is_weight_nz = getattr(self.kv_b_proj.weight, "is_weight_nz", False)
-            if is_weight_nz:
-                self.kv_b_proj.weight.data = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, torch_npu.Format.ND)
-            self.attn.impl.process_weights_after_loading(self.kv_b_proj.weight.dtype)
-            if is_weight_nz:
-                self.kv_b_proj.weight.data = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, torch_npu.Format.FRACTAL_NZ)
-        else:
-            self._init_wuk_t_uv = True
         if getattr(self, 'param_sink_number', 0) > 0:
-            if getattr(self, "kv_a_layernorm", None) is not None:
-                param_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
-            else:
-                param_sink_compressed_kv = self.param_sink_compressed_kv
-            self.attn.update_sink_kv(self.param_sink_k_pe, param_sink_compressed_kv)
+            normed_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
+
+            if not model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                self.attn.update_sink_kv(self.param_sink_k_pe, normed_sink_compressed_kv)
+
         if not model_extra_config.operator_opt_config.use_noncontiguous_kv:
             if self.merge_q_kv_conv and self.merge_conv is not None:
                 self.merge_conv.merge_conv.weight.data = torch.cat([self.qa_conv.merge_conv.weight.data, self.compresskv_conv.merge_conv.weight.data], dim=0).contiguous()
                 self.merge_conv.conv_weight = self.merge_conv.merge_conv.weight.data.squeeze(1).transpose(0, 1).contiguous()
+
+        if self._init_wuk_t_uv:
+            if getattr(self.attn.impl, "W_UK_T", None) is not None:
+                self.attn.impl.process_weights_after_loading(self.kv_b_proj.weight.dtype)
+
+            if getattr(self, 'param_sink_number', 0) > 0:
+                if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                    self.normed_sink_compressed_kv = torch.nn.Parameter(normed_sink_compressed_kv, requires_grad=False)
+        else:
+            self._init_wuk_t_uv = True
 
     def sink_kv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
@@ -872,11 +878,15 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         }
 
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+            if self.normed_sink_compressed_kv is None:
+                normed_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
+            else:
+                normed_sink_compressed_kv = self.normed_sink_compressed_kv
             kwargs.update(
                 {
-                    "key_sink": self.attn.sink_compressed_kv.unsqueeze(1),
-                    "value_sink": self.attn.sink_compressed_kv.unsqueeze(1),
-                    "key_rope_sink": self.attn.sink_k_pe.unsqueeze(1),
+                    "key_sink": normed_sink_compressed_kv.unsqueeze(1),
+                    "value_sink": normed_sink_compressed_kv.unsqueeze(1),
+                    "key_rope_sink": self.param_sink_k_pe.unsqueeze(1),
                 }
             )
         else:
@@ -1080,10 +1090,14 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             }
 
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
+                if self.normed_sink_compressed_kv is None:
+                    normed_sink_compressed_kv = self.kv_a_layernorm(self.param_sink_compressed_kv)
+                else:
+                    normed_sink_compressed_kv = self.normed_sink_compressed_kv
                 kwargs.update({
-                    "key_sink": self.attn.sink_compressed_kv.unsqueeze(1),
-                    "value_sink": self.attn.sink_compressed_kv.unsqueeze(1),
-                    "key_rope_sink": self.attn.sink_k_pe.unsqueeze(1),
+                    "key_sink": normed_sink_compressed_kv.unsqueeze(1),
+                    "value_sink": normed_sink_compressed_kv.unsqueeze(1),
+                    "key_rope_sink": self.param_sink_k_pe.unsqueeze(1),
                 })
             else:
                 kwargs.update({
@@ -1236,7 +1250,7 @@ def npu_mla_forward(
 
     if not model_extra_config.operator_opt_config.use_noncontiguous_kv:
         if self.param_sink_number > 0:
-            assert self.attn.sink_k_pe is not None and self.attn.sink_compressed_kv is not None, (
+            assert self.param_sink_k_pe is not None and self.param_sink_compressed_kv is not None, (
                 "sink_k_pe and sink_compressed_kv have not been prepared"
             )
             if not self.attn.sink_populated:

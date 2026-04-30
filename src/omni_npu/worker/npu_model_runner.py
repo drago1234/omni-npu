@@ -526,9 +526,9 @@ class NPUModelRunner(GPUModelRunner):
             self._model_post_weight_load(self.get_model())
             self._model_post_weight_load(self.get_drafter_model())
         # this is for RL pause/resume scene, recapture the model after loading weights.
-        if not self.model_config.enable_sleep_mode:
-            if not self.model_config.enforce_eager:
-                self.capture_model()
+        # if not self.model_config.enable_sleep_mode:
+        #     if not self.model_config.enforce_eager:
+        #         self.capture_model()
 
     def load_model(self, eep_scale_up: bool = False) -> None:
         """

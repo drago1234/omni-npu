@@ -2,7 +2,8 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import os
-from typing import Optional, Union
+import gc
+from typing import Optional, Union, List
 
 import torch
 import torch_npu
@@ -318,37 +319,76 @@ class NPUWorker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     def sleep(self, level: int = 1) -> None:
-
         def GiB(b):
             return b / (1 << 30)
+
+        gc.collect()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
+
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
 
         self.model_runner.unregister_kv_caches()
-        allocator = NpuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights", ) if level == 1 else tuple())
+
+        self.model_runner.get_model().to("cpu")
+        if hasattr(self.model_runner, "drafter") and self.model_runner.drafter:
+            self.model_runner.get_drafter_model().to("cpu")
+
+        self.kv_nbytes:List[List[int]] = [
+            [t.untyped_storage().nbytes() for t in row]
+            for row in self.model_runner.kv_caches
+        ]
+
+        for i, kv_caches_i in enumerate(self.model_runner.kv_caches):
+            for j, kv_caches_i_j in enumerate(kv_caches_i):
+                kv_caches_i_j.untyped_storage().resize_(0)
+
+        gc.collect()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
 
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
-        assert freed_bytes >= 0, "Memory increase after sleep."
-
+        assert freed_bytes >= 0, "Memory usage increased after sleeping."
         logger.info(
             "Sleep mode freed %.2f GiB memory, "
-            "%.2f GiB memory is still in use", GiB(freed_bytes), GiB(used_bytes)
+            "%.2f GiB memory is still in use.", GiB(freed_bytes), GiB(used_bytes)
         )
 
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
-        allocator = NpuMemAllocator.get_instance()
-        allocator.wake_up(tags=tags)
-        if ("kv_cache" in tags and hasattr(self.model_runner, "kv_cache_after_wake_up")):
-            self.model_runner.kv_cache_after_wake_up()
+        def GiB(b):
+            return b / (1 << 30)
 
-        if tags is not None and "kv_cache" in tags:
+        gc.collect()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
+        
+        free_bytes_before = torch.npu.mem_get_info()[0]
+
+        if (tags == ["weights"]):
+            self.model_runner.get_model().to("npu")
+            if hasattr(self.model_runner, "drafter") and self.model_runner.drafter:
+                self.model_runner.get_drafter_model().to("npu")
+
+        if (tags == ["kv_cache"]):
+            for i, kv_caches_i in enumerate(self.model_runner.kv_caches):
+                for j, kv_caches_i_j in enumerate(kv_caches_i):
+                    kv_caches_i_j.untyped_storage().resize_(self.kv_nbytes[i][j])
+
             logger.info(f"re-register kv caches now")
             self.model_runner.reregister_kv_caches()
             if not self.model_config.enforce_eager:
                 set_aclgraph_recapture(True)
                 self.model_runner.capture_model()
+
+        gc.collect()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
+
+        free_bytes_after = torch.npu.mem_get_info()[0]
+        use_bytes = free_bytes_before - free_bytes_after
+        logger.info(f"wake_up {tags=} use %.2f GiB memory.", GiB(use_bytes))
 
 def init_worker_distributed_environment(
     vllm_config,
