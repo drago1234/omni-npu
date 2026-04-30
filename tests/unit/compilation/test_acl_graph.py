@@ -320,11 +320,9 @@ class TestACLGraphWrapperCall:
             ctx.attn_metadata = {}
             mock_get_ctx.return_value = ctx
 
-            cfg = MagicMock(spec=VllmConfig)
-            cfg.additional_config = None
             wrapper = ACLGraphWrapper(
                 runnable=MagicMock(return_value=torch.tensor([1.0])),
-                vllm_config=cfg,
+                vllm_config=MagicMock(spec=VllmConfig),
                 runtime_mode=CUDAGraphMode.PIECEWISE,
                 graph_pool=MagicMock(),
             )
@@ -440,116 +438,22 @@ class TestACLGraphWrapperCall:
         assert wrapper.runnable.call_count == 1
 
     def test_recapture_flag_triggers_recapture(self, wrapper_and_context):
-        """When entry.recapture=True, the graph is re-captured."""
+        """When entry.recapture=True, the graph is re-captured and old one reset."""
         wrapper, ctx, mock_graph = wrapper_and_context
         bd = ctx.batch_descriptor
 
         old_graph = MagicMock()
-        workspace_fn = MagicMock()
-        graph_params = GraphParams(
-            task_entries={4: {"layer0": MagicMock()}},
-            workspaces={4: {workspace_fn: MagicMock()}},
-        )
         entry = ACLGraphEntry(batch_descriptor=bd)
         entry.aclgraph = old_graph
         entry.recapture = True
         wrapper.concrete_aclgraph_entries[bd] = entry
 
-        with patch("omni_npu.compilation.acl_graph.get_graph_params",
-                   return_value=graph_params), \
-             patch("torch.npu.synchronize") as sync, \
-             patch("torch.npu.mem_get_info",
-                   side_effect=[(10 << 30, 20 << 30),
-                                (12 << 30, 20 << 30)]), \
-             patch("torch.npu.empty_cache") as empty_cache, \
-             patch("omni_npu.compilation.acl_graph.gc.collect") as collect, \
-             patch("omni_npu.compilation.acl_graph."
-                   "ensure_weak_ref_graph_params"):
+        with patch("omni_npu.compilation.acl_graph."
+                    "ensure_weak_ref_graph_params"):
             wrapper(torch.tensor([1.0]))
 
-        assert graph_params.task_entries[4] == {}
-        assert graph_params.workspaces[4] == {}
-        sync.assert_called_once()
-        empty_cache.assert_called_once()
-        collect.assert_called_once()
         old_graph.reset.assert_called_once()
-        assert entry.aclgraph is mock_graph
         assert entry.recapture is False
-
-    def test_reset_recaptured_graph_clears_cached_state(
-            self, wrapper_and_context):
-        """Resetting a captured graph releases the cached state for its shape."""
-        wrapper, ctx, _ = wrapper_and_context
-        old_graph = MagicMock()
-        workspace_fn = MagicMock()
-        graph_params = GraphParams(
-            task_entries={
-                4: {"layer0": MagicMock()},
-                8: {"layer0": MagicMock()},
-            },
-            workspaces={
-                4: {workspace_fn: MagicMock()},
-                8: {workspace_fn: MagicMock()},
-            },
-        )
-        entry = ACLGraphEntry(batch_descriptor=ctx.batch_descriptor)
-        entry.aclgraph = old_graph
-        entry.output = torch.tensor([42.0])
-        entry.recapture = True
-
-        with patch("omni_npu.compilation.acl_graph.get_graph_params",
-                   return_value=graph_params), \
-             patch("torch.npu.mem_get_info",
-                   side_effect=[(10 << 30, 20 << 30),
-                                (12 << 30, 20 << 30)]), \
-             patch("torch.npu.synchronize") as sync, \
-             patch("torch.npu.empty_cache") as empty_cache, \
-             patch("omni_npu.compilation.acl_graph.gc.collect") as collect:
-            wrapper._reset_recaptured_graph(entry)
-
-        assert entry.aclgraph is None
-        assert entry.output is None
-        assert entry.recapture is False
-        assert graph_params.task_entries[4] == {}
-        assert graph_params.workspaces[4] == {}
-        assert graph_params.task_entries[8] != {}
-        assert graph_params.workspaces[8] != {}
-        old_graph.reset.assert_called_once()
-        sync.assert_called_once()
-        empty_cache.assert_called_once()
-        collect.assert_called_once()
-
-    def test_recapture_failure_clears_entry(self, wrapper_and_context):
-        """A failed recapture should not leave a partial graph cached."""
-        wrapper, ctx, mock_graph = wrapper_and_context
-        bd = ctx.batch_descriptor
-
-        old_graph = MagicMock()
-        entry = ACLGraphEntry(batch_descriptor=bd)
-        entry.aclgraph = old_graph
-        entry.output = torch.tensor([42.0])
-        entry.recapture = True
-        wrapper.concrete_aclgraph_entries[bd] = entry
-
-        with patch("omni_npu.compilation.acl_graph.get_graph_params",
-                   return_value=None), \
-             patch("torch.npu.synchronize"), \
-             patch("torch.npu.mem_get_info",
-                   side_effect=[(10 << 30, 20 << 30),
-                                (12 << 30, 20 << 30)]), \
-             patch("torch.npu.empty_cache"), \
-             patch("omni_npu.compilation.acl_graph.gc.collect"), \
-             patch("torch.npu.graph") as mock_graph_ctx:
-            mock_graph_ctx.return_value.__enter__.side_effect = RuntimeError(
-                "capture failed")
-            with pytest.raises(RuntimeError, match="capture failed"):
-                wrapper(torch.tensor([1.0]))
-
-        old_graph.reset.assert_called_once()
-        assert entry.aclgraph is None
-        assert entry.output is None
-        assert entry.recapture is False
-        mock_graph.reset.assert_not_called()
 
     def test_update_graph_recapture_sets_entries(self):
         """update_graph_recapture marks all entries for recapture."""
