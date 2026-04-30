@@ -54,6 +54,30 @@ CLUSTER_HEARTBEAT_TIMEOUT = 60
 HEARTBEAT_IPC_PATH = "ipc:///tmp/prefill_llmdatadist_connector_ipc"
 
 
+def _summarize_block_ids(block_ids: Any, limit: int = 16) -> Any:
+    if block_ids is None:
+        return None
+    if isinstance(block_ids, tuple):
+        return [_summarize_block_ids(group, limit) for group in block_ids]
+    if isinstance(block_ids, list):
+        if block_ids and isinstance(block_ids[0], list):
+            return [_summarize_block_ids(group, limit) for group in block_ids]
+        return {
+            "len": len(block_ids),
+            "head": block_ids[:limit],
+            "tail": block_ids[-limit:] if len(block_ids) > limit else block_ids[:],
+        }
+    return block_ids
+
+
+def _is_grouped_block_ids(block_ids: Any) -> bool:
+    return (
+        isinstance(block_ids, (list, tuple))
+        and len(block_ids) > 0
+        and isinstance(block_ids[0], (list, tuple))
+    )
+
+
 @dataclass
 class ReqMeta:
     local_block_ids: list[int]
@@ -243,7 +267,7 @@ class LLMDataDistConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        return self.request_finished(request, list(itertools.chain(*block_ids)))
+        return self.request_finished(request, [list(group) for group in block_ids])
 
 class PrefillConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -536,9 +560,13 @@ class DecodeConnectorScheduler:
     def _round_up(self, x: int, y: int) -> int:
         return ((x + y - 1) // y) * y
 
-    def get_unhashed_block_ids(self, blocks) -> list[int]:
-        """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
-        return [block.block_id for group in blocks.blocks for block in group if block.block_hash is None]
+    def get_unhashed_block_ids(self, blocks):
+        """Get unhashed block ids, preserving KV cache group boundaries."""
+        group_block_ids = [
+            [block.block_id for block in group if block.block_hash is None]
+            for group in blocks.blocks
+        ]
+        return group_block_ids
 
     def update_state_after_alloc(self, request: "Request",
                                  blocks: "KVCacheBlocks",
@@ -565,7 +593,7 @@ class DecodeConnectorScheduler:
     ) -> KVConnectorMetadata:
         metadata = DatadistConnectorMetadata()
         for req_id, (req, block_ids) in self._reqs_need_recv.items():
-            if isinstance(block_ids, tuple):
+            if isinstance(block_ids, tuple) and not _is_grouped_block_ids(block_ids):
                 block_ids = list(itertools.chain(*block_ids))
             if req.kv_transfer_params is None:
                 logger.warning(f"For reuqest {req_id}: kv_transfer_params now is None")
@@ -771,29 +799,49 @@ class DecodeConnectorWorker:
             # local_block_ids[0] is a list of local block ids for uncompressed layers
             # local_block_ids[1] is a list of local block ids for compressed layers
             elif isinstance(meta.local_block_ids[0], list):
-                # If local_block_ids[0] is a list of lists, we need to ensure that remote_block_ids
-                # is a list of lists as well, where each sublist corresponds to the local_block
-                meta.remote_block_ids = [meta.remote_block_ids] * len(meta.local_block_ids)
-                # If local_block_ids[0] is empty, skip pulling kv for the request
-                if len(meta.local_block_ids[0]) == 0:
+                if not _is_grouped_block_ids(meta.remote_block_ids):
+                    raise RuntimeError(
+                        "Grouped local block ids require grouped remote block ids "
+                        f"for request {req_id}, got {type(meta.remote_block_ids[0])}."
+                    )
+                if len(meta.remote_block_ids) != len(meta.local_block_ids):
+                    raise RuntimeError(
+                        "Grouped local/remote block ids must have the same number "
+                        f"of groups for request {req_id}: "
+                        f"{len(meta.local_block_ids)} vs {len(meta.remote_block_ids)}."
+                    )
+
+                aligned_local_block_ids = []
+                aligned_remote_block_ids = []
+                for local_group, remote_group in zip(meta.local_block_ids, meta.remote_block_ids):
+                    if len(local_group) == 0:
+                        aligned_local_group = []
+                        aligned_remote_group = []
+                    elif len(remote_group) < len(local_group):
+                        aligned_local_group = local_group[:len(remote_group)]
+                        aligned_remote_group = remote_group
+                    else:
+                        aligned_local_group = local_group
+                        # Extra remote blocks are lookahead/speculative blocks appended
+                        # after the prompt blocks. Keep the prefix-aligned blocks.
+                        aligned_remote_group = remote_group[:len(local_group)]
+                    aligned_local_block_ids.append(aligned_local_group)
+                    aligned_remote_block_ids.append(aligned_remote_group)
+
+                if all(len(group) == 0 for group in aligned_local_block_ids):
                     if self.tp_rank == 0:
                         logger.info(f" ***** Request {req_id} has 0 local blocks, skip load kv.")
                     continue
-                # remote_block_ids in P is less than local_block_ids[0] in D,
-                # leaded by lookahead num, which is used by eagle and multi step
-                elif len(meta.remote_block_ids[0]) < len(meta.local_block_ids[0]):
-                    meta.local_block_ids[0] = meta.local_block_ids[0][:len(meta.remote_block_ids[0])]
-                    logger.debug("look ahead token num is greater than 0")
-                # If remote_block_ids in P is more than local_block_ids[0] in D, we only need the last N remote blocks
-                elif len(meta.remote_block_ids[0]) > len(meta.local_block_ids[0]):
-                    meta.remote_block_ids[0] = meta.remote_block_ids[0][-len(meta.local_block_ids[0]):]
+
+                meta.local_block_ids = list(itertools.chain.from_iterable(aligned_local_block_ids))
+                meta.remote_block_ids = list(itertools.chain.from_iterable(aligned_remote_block_ids))
                 if self.tp_rank == 0:
                     logger.info(
                         " ***** start_load_kv for request %s "
                         "Num local_block_ids: %s. Num remote_block_ids: %s.",
                         req_id,
-                        len(meta.local_block_ids[0]),
-                        len(meta.remote_block_ids[0])
+                        len(meta.local_block_ids),
+                        len(meta.remote_block_ids)
                     )
             # handle the unexpected case where local_block_ids is not a list of int or list of lists
             else:
