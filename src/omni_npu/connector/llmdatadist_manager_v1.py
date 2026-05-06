@@ -170,6 +170,12 @@ class LLMDataDistConfig:
         else:
             worker_ips = ips
 
+        # Ensure local_host_ip is the first element in the list
+        if worker_ips and worker_ips[0] != self.local_host_ip:
+            if self.local_host_ip in worker_ips:
+                worker_ips.remove(self.local_host_ip)
+                worker_ips.insert(0, self.local_host_ip)
+
         return worker_ips
 
     @cached_property

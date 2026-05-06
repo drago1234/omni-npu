@@ -617,24 +617,24 @@ class TestLLMDataDistConfig:
 
 
     @pytest.mark.parametrize(
-        "ray_nodes, expected_ips",
+        "ray_nodes, local_host_ip, expected_ips",
         [
-            ([], ["127.0.0.1"]),  # No nodes
+            ([], "127.0.0.1", ["127.0.0.1"]),  # No nodes, fallback to local_host_ip
             ([{"Alive": True, "NodeManagerAddress": "192.168.1.1", "GcsAddress": "192.168.1.1:12345"},
               {"Alive": True, "NodeManagerAddress": "192.168.1.2", "GcsAddress": "192.168.1.2:12345"}],
-             ["192.168.1.2", "192.168.1.1"]),
+             "192.168.1.2", ["192.168.1.2", "192.168.1.1"]),
             ([{"Alive": False, "NodeManagerAddress": "192.168.1.1"},
               {"Alive": True, "NodeManagerAddress": "192.168.1.2", "GcsAddress": "192.168.1.2:12345"}],
-             ["192.168.1.2"]),
+             "192.168.1.2", ["192.168.1.2"]),
             ([{"Alive": False, "NodeManagerAddress": "192.168.1.1"},
               {"Alive": True, "NodeManagerAddress": "192.168.1.2"}],
-             ["192.168.1.2"]),
+             "192.168.1.2", ["192.168.1.2"]),
         ]
     )
-    def test_get_worker_ips(self, ray_nodes, expected_ips, vllm_config, mock_ray):
+    def test_get_worker_ips(self, ray_nodes, local_host_ip, expected_ips, vllm_config, mock_ray):
         """Test _get_worker_ips with different Ray cluster states."""
         mock_ray.nodes.return_value = ray_nodes
-        config = LLMDataDistConfig(vllm_config, "127.0.0.1", 8080, ignore_load_rank=True)
+        config = LLMDataDistConfig(vllm_config, local_host_ip, 8080, ignore_load_rank=True)
 
         assert config._get_worker_ips() == expected_ips
 
