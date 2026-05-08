@@ -20,17 +20,14 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
-global_recapture_generation = 0
+global_recapture = False
 
 def set_aclgraph_recapture(enable: bool):
-    global global_recapture_generation
-    if not enable:
-        return
-
-    global_recapture_generation += 1
+    global global_recapture
+    global_recapture = enable
 
 def get_aclgraph_recapture():
-    return global_recapture_generation
+    return global_recapture
 
 def weak_ref_tensor(tensor: Any) -> Any:
     """
@@ -157,7 +154,6 @@ class ACLGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
-        self._recapture_generation_seen = get_aclgraph_recapture()
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -171,11 +167,10 @@ class ACLGraphWrapper:
         return self.runnable
 
     def update_graph_recapture(self):
-        recapture_generation = get_aclgraph_recapture()
-        if recapture_generation != self._recapture_generation_seen:
+        if get_aclgraph_recapture():
             for _, entry in self.concrete_aclgraph_entries.items():
                 entry.recapture = True
-            self._recapture_generation_seen = recapture_generation
+            set_aclgraph_recapture(False)
 
     def __call__(self, *args, **kwargs):
         logger.debug("<<< ACLGraphWrapper is being called.")
