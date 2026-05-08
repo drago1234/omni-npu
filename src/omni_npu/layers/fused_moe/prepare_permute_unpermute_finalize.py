@@ -466,7 +466,7 @@ class CommunicationStrategySelector:
         else:
             # TP or DP only
             if self.dp_size == 1 or self.tp_size == 1:
-                if local_num_tokens > self.max_dispatch_combine_threshold:
+                if not model_extra_config.operator_opt_config.decode_moe_dispatch_combine or local_num_tokens > self.max_dispatch_combine_threshold:
                     strategy = "all2all"
                 else:
                     strategy = "dispatch_combine"
