@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-
 import json
 import unittest
 from unittest.mock import MagicMock
@@ -43,6 +42,31 @@ class TestPanguToolParserExtractToolCalls(unittest.TestCase):
         self.assertEqual(len(res.tool_calls), 1)
         self.assertEqual(res.tool_calls[0].function.name, "get_weather")
         self.assertEqual(json.loads(res.tool_calls[0].function.arguments), {"city": "Beijing"})
+
+    def test_extract_tool_calls_with_single_object_tool_call(self):
+        """测试非流式单对象 JSON 工具调用降级处理"""
+        model_output = (
+            "Thought: I need to check weather."
+            "<|tool_call_start|>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Beijing\"}}<|tool_call_end|>"
+        )
+        res = self.parser.extract_tool_calls(model_output, self.request)
+
+        self.assertFalse(res.tools_called)
+        self.assertEqual(res.tool_calls, [])
+        self.assertEqual(model_output, res.content)
+
+    def test_extract_tool_calls_with_missing_closing_brace(self):
+        """测试非流式工具调用 JSON 尾部少右花括号时降级处理"""
+        model_output = (
+            "<|tool_call_start|>"
+            "[{\"name\": \"send_email\", \"arguments\": {\"userInput\": \"ALAN，你好！\"}]"
+            "<|tool_call_end|>"
+        )
+        res = self.parser.extract_tool_calls(model_output, self.request)
+
+        self.assertFalse(res.tools_called)
+        self.assertEqual(res.tool_calls, [])
+        self.assertEqual(model_output, res.content)
 
     def test_extract_tool_calls_whit_exception(self):
         """测试 JSON 格式错误时的降级处理"""
@@ -196,6 +220,63 @@ class TestPanguToolParserExtractToolCallsStreaming(unittest.TestCase):
         self.assertIsNotNone(res_next)
         self.assertEqual(res_next.tool_calls[0].function.name, "t2")
         self.assertTrue(self.parser.current_tool_name_sent)
+
+    def test_extract_tool_calls_streaming_does_not_emit_empty_arguments(self):
+        """case: partial JSON 补出的空 arguments 不应提前发送"""
+        self.parser.current_tool_id = -1
+        self.parser.current_tool_name_sent = False
+        self.parser.streamed_args_for_tool = []
+
+        partial = '<|tool_call_start|>[{"name": "get_nums", "arguments": {}'
+
+        res = self.parser.extract_tool_calls_streaming(
+            previous_text="<|tool_call_start|>",
+            current_text=partial,
+            delta_text='[{"name": "get_nums", "arguments": {}',
+            previous_token_ids=[104],
+            current_token_ids=[104, 1],
+            delta_token_ids=[1],
+            request=self.request
+        )
+
+        self.assertIsNone(res)
+        self.assertEqual(self.parser.current_tool_id, 0)
+        self.assertEqual(self.parser.streamed_args_for_tool, [""])
+
+        res_name = self.parser.extract_tool_calls_streaming(
+            previous_text=partial,
+            current_text=partial,
+            delta_text="",
+            previous_token_ids=[104, 1],
+            current_token_ids=[104, 1],
+            delta_token_ids=[],
+            request=self.request
+        )
+
+        self.assertIsNotNone(res_name)
+        self.assertEqual(res_name.tool_calls[0].function.name, "get_nums")
+        self.assertIsNone(res_name.tool_calls[0].function.arguments)
+        self.assertEqual(self.parser.streamed_args_for_tool[0], "")
+
+        full = (
+            '<|tool_call_start|>'
+            '[{"name": "get_nums", "arguments": {"grade": ["一年级", "二年级"]}}]'
+        )
+        res_args = self.parser.extract_tool_calls_streaming(
+            previous_text=partial,
+            current_text=full,
+            delta_text='{"grade": ["一年级", "二年级"]}}]',
+            previous_token_ids=[104, 1],
+            current_token_ids=[104, 1, 2],
+            delta_token_ids=[2],
+            request=self.request
+        )
+
+        self.assertIsNotNone(res_args)
+        args = res_args.tool_calls[0].function.arguments
+        self.assertNotIn("{}", args)
+        self.assertEqual(json.loads(args), {"grade": ["一年级", "二年级"]})
+        self.assertEqual(self.parser.streamed_args_for_tool[0], args)
 
 
 if __name__ == '__main__':

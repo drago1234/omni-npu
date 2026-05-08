@@ -239,24 +239,34 @@ class PanguToolParser(ToolParser):
             elif not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
                 if function_name:
+                    cur_arguments = current_tool_call.get("arguments")
+                    cur_args_json = None
+                    if cur_arguments and self.is_complete[
+                            self.current_tool_id]:
+                        # If args are already present in this chunk, emit them
+                        # together with tool name to avoid empty-argument tool call.
+                        cur_args_json = json.dumps(cur_arguments,
+                                                   ensure_ascii=False)
                     delta = DeltaMessage(tool_calls=[
                         DeltaToolCall(index=self.current_tool_id,
                                       type="function",
                                       id=make_tool_call_id(),
                                       function=DeltaFunctionCall(
-                                          name=function_name).model_dump(
+                                          name=function_name,
+                                          arguments=cur_args_json).model_dump(
                                           exclude_none=True))
                     ])
+                    if cur_args_json is not None:
+                        self.streamed_args_for_tool[
+                            self.current_tool_id] = cur_args_json
                     self.current_tool_name_sent = True
-                else:
-                    delta = None
 
             # now we know we're on the same tool call and we're streaming
             # arguments
             else:
                 cur_arguments = current_tool_call.get("arguments")
                 delta = None
-                if cur_arguments is not None:
+                if cur_arguments:
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = json.dumps(cur_arguments,
@@ -268,8 +278,9 @@ class PanguToolParser(ToolParser):
                     if self.is_complete[self.current_tool_id]:
                         argument_diff = cur_args_json[sent:]
                     elif prev_arguments:
-                        prev_args_json = json.dumps(prev_arguments,
-                                                    ensure_ascii=False)
+                        prev_args_json = json.dumps(
+                            prev_arguments,
+                            ensure_ascii=False)
                         if cur_args_json != prev_args_json:
                             prefix = find_common_prefix(
                                 prev_args_json, cur_args_json)
