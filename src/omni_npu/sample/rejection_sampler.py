@@ -22,6 +22,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from omni_npu.sample.ops.topk_topp_sampler import apply_top_k_top_p_npu
 from omni_npu.v1.utils import on_ascend950
+from omni_npu.model_config.config_loader.loader import model_extra_config
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 logger = init_logger(__name__)
@@ -612,11 +613,16 @@ def compute_probs_and_sample(
     logits.div_(temperature.unsqueeze(-1))
 
     logits = logits.type(torch.bfloat16)
-    with torch_npu.npu.stream(stream):
+    if model_extra_config.operator_opt_config.sampler_multi_stream:
+        with torch_npu.npu.stream(stream):
+            q = generate_random_sequence(
+                logits, sampling_metadata, metadata,
+            ).type(torch.float32)
+        torch.npu.default_stream().wait_stream(stream)
+    else:
         q = generate_random_sequence(
             logits, sampling_metadata, metadata,
         ).type(torch.float32)
-    torch.npu.default_stream().wait_stream(stream)
     if on_ascend950():
         logits = apply_top_k_top_p(logits, top_k, top_p)
         probs = logits.softmax(dim=-1, dtype=torch.float32)

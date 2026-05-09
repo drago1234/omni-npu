@@ -110,6 +110,7 @@ class ModelOperatorOptConfig:
     gmm_nz: bool = True
     moe_multi_stream_tune: bool = False
     shared_expert_multi_stream: bool = True
+    sampler_multi_stream: bool = True
     unquant_bmm_nz: bool = True
     decode_moe_dispatch_combine: bool = False
     enable_super_kernel: bool = False

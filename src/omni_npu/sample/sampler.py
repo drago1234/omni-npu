@@ -13,6 +13,7 @@ from vllm.v1.sample.sampler import Sampler as SamplerV1
 from vllm.v1.outputs import SamplerOutput as SamplerOutputV1
 
 from omni_npu.sample.ops.topk_topp_sampler import NPUTopKTopPSampler
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 FP32_EPS = 2 ** -24
 USE_SORT_OP_MIN_BS = 2
@@ -99,7 +100,22 @@ def random_sample(
     We use this function instead of torch.multinomial because torch.multinomial
     causes CPU-GPU synchronization.
     """
-    with torch_npu.npu.stream(stream) :
+    if model_extra_config.operator_opt_config.sampler_multi_stream:
+        with torch_npu.npu.stream(stream) :
+            q = torch.empty_like(probs)
+            # NOTE(woosuk): To batch-process the requests without their own seeds,
+            # which is the common case, we first assume that every request does
+            # not have its own seed. Then, we overwrite the values for the requests
+            # that have their own seeds.
+            if len(generators) != probs.shape[0]:
+                q.exponential_()
+            if generators:
+                # TODO(woosuk): This can be slow because we handle each request
+                # one by one. Optimize this.
+                for i, generator in generators.items():
+                    q[i].exponential_(generator=generator)
+        torch.npu.default_stream().wait_stream(stream)
+    else:
         q = torch.empty_like(probs)
         # NOTE(woosuk): To batch-process the requests without their own seeds,
         # which is the common case, we first assume that every request does
@@ -112,7 +128,7 @@ def random_sample(
             # one by one. Optimize this.
             for i, generator in generators.items():
                 q[i].exponential_(generator=generator)
-    torch.npu.default_stream().wait_stream(stream)
+
     res = probs.div_(q).argmax(dim=-1).view(-1)
     if idx == None:
         return res
