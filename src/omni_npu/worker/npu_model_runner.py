@@ -54,7 +54,11 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
-from omni_npu.compilation.acl_graph import ACLGraphWrapper, set_graph_params
+from omni_npu.compilation.acl_graph import (
+    ACLGraphWrapper,
+    consume_aclgraph_recapture,
+    set_graph_params,
+)
 from omni_npu.plugin_decorators import (
     init_config_decorator,
     prepare_inputs_decorator,
@@ -610,8 +614,32 @@ class NPUModelRunner(GPUModelRunner):
             logger.info(f"<<< capture_model use gegraph, dummy_run max_num_reqs={self.max_num_reqs}")
             self._dummy_run(self.max_num_reqs, force_attention=True, uniform_decode=True)
             return
+        if consume_aclgraph_recapture():
+            self._mark_aclgraph_wrappers_for_recapture()
         with switch_torch_device():
             super().capture_model()
+
+    def _iter_aclgraph_wrappers(self):
+        if isinstance(self.model, ACLGraphWrapper):
+            yield self.model
+
+        if not (hasattr(self, "drafter") and isinstance(self.drafter, EagleProposer)):
+            return
+
+        drafter_model = getattr(self.drafter, "model", None)
+        if isinstance(drafter_model, ACLGraphWrapper):
+            yield drafter_model
+
+        wrapped_layers = getattr(getattr(drafter_model, "model", None),
+                                 "wrapped_layers", None)
+        if isinstance(wrapped_layers, dict):
+            for layer in wrapped_layers.values():
+                if isinstance(layer, ACLGraphWrapper):
+                    yield layer
+
+    def _mark_aclgraph_wrappers_for_recapture(self) -> None:
+        for wrapper in self._iter_aclgraph_wrappers():
+            wrapper.recapture = True
 
     @torch.inference_mode()
     def execute_model(

@@ -24,10 +24,17 @@ global_recapture = False
 
 def set_aclgraph_recapture(enable: bool):
     global global_recapture
-    global_recapture = enable
+    if not enable or global_recapture:
+        return
 
-def get_aclgraph_recapture():
-    return global_recapture
+    global_recapture = True
+
+def consume_aclgraph_recapture() -> bool:
+    global global_recapture
+    if not global_recapture:
+        return False
+    global_recapture = False
+    return True
 
 def weak_ref_tensor(tensor: Any) -> Any:
     """
@@ -154,6 +161,7 @@ class ACLGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        self.recapture = False
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -167,10 +175,10 @@ class ACLGraphWrapper:
         return self.runnable
 
     def update_graph_recapture(self):
-        if get_aclgraph_recapture():
+        if self.recapture:
             for _, entry in self.concrete_aclgraph_entries.items():
                 entry.recapture = True
-            set_aclgraph_recapture(False)
+            self.recapture = False
 
     def __call__(self, *args, **kwargs):
         logger.debug("<<< ACLGraphWrapper is being called.")

@@ -6,6 +6,7 @@ from unittest.mock import create_autospec
 import numpy as np
 import torch
 import pytest
+import omni_npu.worker.npu_model_runner as runner_module
 from types import SimpleNamespace
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
@@ -73,6 +74,34 @@ class TestNPUModelRunner:
         with switch_torch_device():
             assert torch.cuda is torch.npu
         assert torch.cuda is not torch.npu
+
+    def test_mark_aclgraph_wrappers_for_recapture(self, monkeypatch):
+        class FakeEagleProposer:
+            pass
+
+        def make_aclgraph_wrapper():
+            wrapper = object.__new__(runner_module.ACLGraphWrapper)
+            wrapper.recapture = False
+            return wrapper
+
+        monkeypatch.setattr(runner_module, "EagleProposer", FakeEagleProposer)
+
+        runner = object.__new__(NPUModelRunner)
+        runner.model = make_aclgraph_wrapper()
+
+        drafter_wrapper = make_aclgraph_wrapper()
+        wrapped_layer = make_aclgraph_wrapper()
+        drafter_wrapper.runnable = SimpleNamespace(
+            model=SimpleNamespace(wrapped_layers={"0": wrapped_layer})
+        )
+        runner.drafter = FakeEagleProposer()
+        runner.drafter.model = drafter_wrapper
+
+        runner._mark_aclgraph_wrappers_for_recapture()
+
+        assert runner.model.recapture is True
+        assert drafter_wrapper.recapture is True
+        assert wrapped_layer.recapture is True
 
     def test_npu_runner_init(self, monkeypatch):
         """Test NPUModelRunner initialization.

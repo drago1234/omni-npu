@@ -20,7 +20,7 @@ from omni_npu.compilation.acl_graph import (
     get_graph_params,
     ensure_weak_ref_graph_params,
     set_aclgraph_recapture,
-    get_aclgraph_recapture,
+    consume_aclgraph_recapture,
     ACLGraphWrapper,
 )
 
@@ -31,7 +31,7 @@ from omni_npu.compilation.acl_graph import (
 
 @pytest.fixture(autouse=True)
 def reset_graph_params():
-    """Reset the module-level _graph_params and global_recapture before each test."""
+    """Reset module-level ACL graph state before each test."""
     acl_graph_module._graph_params = None
     acl_graph_module.global_recapture = False
     yield
@@ -87,19 +87,21 @@ class TestWeakRef:
 
 
 # ---------------------------------------------------------------------------
-# set_aclgraph_recapture / get_aclgraph_recapture
+# set_aclgraph_recapture
 # ---------------------------------------------------------------------------
 
 class TestRecapture:
 
-    def test_default_is_false(self):
-        assert get_aclgraph_recapture() is False
-
-    def test_set_and_get(self):
+    def test_set_and_consume_recapture_request(self):
         set_aclgraph_recapture(True)
-        assert get_aclgraph_recapture() is True
-        set_aclgraph_recapture(False)
-        assert get_aclgraph_recapture() is False
+        assert consume_aclgraph_recapture() is True
+        assert consume_aclgraph_recapture() is False
+
+    def test_repeated_enable_sets_request_once(self):
+        set_aclgraph_recapture(True)
+        set_aclgraph_recapture(True)
+        assert consume_aclgraph_recapture() is True
+        assert consume_aclgraph_recapture() is False
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +227,7 @@ class TestACLGraphWrapperInit:
         assert wrapper.runtime_mode == CUDAGraphMode.PIECEWISE
         assert wrapper.aclgraph_options is opts
         assert wrapper.concrete_aclgraph_entries == {}
+        assert wrapper.recapture is False
 
     def test_none_pool_uses_global(self):
         mock_pool = MagicMock()
@@ -320,9 +323,12 @@ class TestACLGraphWrapperCall:
             ctx.attn_metadata = {}
             mock_get_ctx.return_value = ctx
 
+            vllm_config = MagicMock(spec=VllmConfig)
+            vllm_config.additional_config = None
+
             wrapper = ACLGraphWrapper(
                 runnable=MagicMock(return_value=torch.tensor([1.0])),
-                vllm_config=MagicMock(spec=VllmConfig),
+                vllm_config=vllm_config,
                 runtime_mode=CUDAGraphMode.PIECEWISE,
                 graph_pool=MagicMock(),
             )
@@ -466,11 +472,13 @@ class TestACLGraphWrapperCall:
         entry = ACLGraphEntry(batch_descriptor=bd)
         wrapper.concrete_aclgraph_entries[bd] = entry
 
-        set_aclgraph_recapture(True)
+        wrapper.recapture = True
+        assert wrapper.recapture is True
+
         wrapper.update_graph_recapture()
 
         assert entry.recapture is True
-        assert get_aclgraph_recapture() is False
+        assert wrapper.recapture is False
 
     def test_update_graph_recapture_noop_when_flag_false(self):
         """update_graph_recapture is a no-op when global flag is False."""
@@ -483,7 +491,6 @@ class TestACLGraphWrapperCall:
         entry = ACLGraphEntry(batch_descriptor=bd)
         wrapper.concrete_aclgraph_entries[bd] = entry
 
-        assert get_aclgraph_recapture() is False
         wrapper.update_graph_recapture()
 
         assert entry.recapture is False
