@@ -647,7 +647,6 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             self.param_sink_number > 0
             and (self.enable_chunked_prefill or self.enable_prefix_caching)
             and getattr(attn_metadata, "block_table", None) is not None
-            and attn_metadata.chunked_context is not None
         )
 
         if use_sink_chunked_prefill:
