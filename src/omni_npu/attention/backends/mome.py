@@ -185,8 +185,10 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
         num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
-        # Block index of the last computed token
-        if self.num_spec > 0 and num_prompt_tokens is not None:
+        # compute the block index of the running cache
+        if num_prompt_tokens is None or self.num_spec == 0:
+            block_idx_last_computed_token = cdiv(num_computed_tokens, mome_block_size) - 1
+        else:
             # With speculative decoding and num_computed_tokens > num_prompt_tokens, 
             # the last scheduling must be MTP and num_accepted_tokens is meaningful, 
             # and we need to get the correct block index for the running cache
@@ -195,9 +197,17 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 cdiv(num_computed_tokens - num_accepted_tokens + self.num_spec + 1, mome_block_size) - 1,
                 cdiv(num_computed_tokens, mome_block_size) - 1
             )
-        else:
-            block_idx_last_computed_token = cdiv(num_computed_tokens, mome_block_size) - 1
-        
+        if self.is_decode_node and num_prompt_tokens is not None:
+            # Since there is no chunked prefill or prefix cache hit on the decode node, 
+            # the only case where num_computed_tokens < num_prompt_tokens is decode recompute, 
+            # and we need to locate the block of running cache (instead of prefix cache)
+            # and read the [-3:-1] tokens from the cache (see below)
+            block_idx_last_computed_token = torch.where(
+                num_computed_tokens < num_prompt_tokens, 
+                cdiv(num_computed_tokens + 1, mome_block_size) - 1, 
+                block_idx_last_computed_token
+            )
+
         # which is <= block index for the first scheduled token
         block_idx_first_scheduled_token = (
             cdiv(num_computed_tokens + 1, mome_block_size) - 1
