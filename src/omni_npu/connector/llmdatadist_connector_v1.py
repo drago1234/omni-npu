@@ -80,18 +80,22 @@ def _is_grouped_block_ids(block_ids: Any) -> bool:
 
 @dataclass
 class ReqMeta:
-    local_block_ids: list[int]
-    remote_block_ids: list[int]
+    local_block_ids: list[list[int]]
+    remote_block_ids: list[list[int]]
     remote_host: str
     remote_cluster_id: str
     spec_token_ids: Optional[list[int]]
     remote_dp_rank: Optional[int]
     remote_request_id: Optional[str]
     token_num: int
+    num_external_tokens: Optional[int]
+    full_local_block_ids: Optional[list[list[int]]]
+
 
 @dataclass
 class ReqMetaPrefill:
     finish_time: float
+
 
 class DatadistConnectorMetadata(KVConnectorMetadata):
     """Metadata for datadist connector."""
@@ -105,6 +109,8 @@ class DatadistConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
         token_num: int = None, # for DCP
+        num_external_tokens: Optional[int] = None,
+        full_local_block_ids: Optional[list[list[int]]] = None,
     ):
         self.requests[request_id] = ReqMeta(
             local_block_ids=local_block_ids,
@@ -115,7 +121,10 @@ class DatadistConnectorMetadata(KVConnectorMetadata):
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
             remote_request_id=kv_transfer_params.get("remote_request_id", None),
             token_num=token_num,
+            num_external_tokens=num_external_tokens,
+            full_local_block_ids=full_local_block_ids,
         )
+
 
 class DatadistConnectorMetadataPrefill(KVConnectorMetadata):
     """Metadata for datadist connector."""
@@ -505,7 +514,7 @@ class DecodeConnectorScheduler:
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
-        self._reqs_need_recv: dict[str, tuple[Request, list[int]]] = {}
+        self._reqs_need_recv: dict[str, tuple[Request, list[list[int]], list[list[int]], int]] = {}
         self.processed_request: set[str] = set()
         self.ctx = zmq.Context()
         self.zmq_socket_map = {}
@@ -560,7 +569,7 @@ class DecodeConnectorScheduler:
     def _round_up(self, x: int, y: int) -> int:
         return ((x + y - 1) // y) * y
 
-    def get_unhashed_block_ids(self, blocks):
+    def get_unhashed_block_ids(self, blocks: KVCacheBlocks) -> list[list[int]]:
         """Get unhashed block ids, preserving KV cache group boundaries."""
         group_block_ids = [
             [block.block_id for block in group if block.block_hash is None]
@@ -582,8 +591,13 @@ class DecodeConnectorScheduler:
         if params is not None:
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_cluster_id", "remote_host_ip")):
+                    full_block_ids = [
+                        [block.block_id for block in group]
+                        for group in blocks.blocks
+                    ]
                     self._reqs_need_recv[request.request_id] = (
-                        request, self.get_unhashed_block_ids(blocks))
+                        request, self.get_unhashed_block_ids(blocks), full_block_ids, num_external_tokens
+                    )
                 else:
                     logger.warning("Got invalid KVTransferParams: %s.", params)
 
@@ -592,9 +606,8 @@ class DecodeConnectorScheduler:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         metadata = DatadistConnectorMetadata()
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
-            if isinstance(block_ids, tuple) and not _is_grouped_block_ids(block_ids):
-                block_ids = list(itertools.chain(*block_ids))
+        for req_id, (req, block_ids, full_block_ids, num_external_tokens) in self._reqs_need_recv.items():
+            assert _is_grouped_block_ids(block_ids) or len(block_ids) == 0, f"{block_ids}="
             if req.kv_transfer_params is None:
                 logger.warning(f"For reuqest {req_id}: kv_transfer_params now is None")
             else:
@@ -603,6 +616,8 @@ class DecodeConnectorScheduler:
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
                     token_num=req.num_prompt_tokens,
+                    num_external_tokens=num_external_tokens,
+                    full_local_block_ids=full_block_ids,
                 )
             req.kv_transfer_params = None
         self._reqs_need_recv.clear()
@@ -775,78 +790,75 @@ class DecodeConnectorWorker:
                     remote_block_ids=meta.remote_block_ids,
                 )
 
-            # If local_block_ids is a flat list of int, omni-attention is not used
-            # and we can directly use the local_block_ids and remote_block_ids
             if isinstance(meta.local_block_ids[0], int):
-                # local_block_ids (kv blocks in D) is more than remote_block_ids (kv blocks in P)
-                # leaded by lookahead num, which is used by eagle and multi step
-                if len(meta.remote_block_ids) < len(meta.local_block_ids):
-                    meta.local_block_ids = meta.local_block_ids[:len(meta.remote_block_ids)]
-                    logger.debug("look ahead token num is greater than 0")
-                # If remote_block_ids is more than local_block_ids, we only need the last N remote blocks
-                # where N is the number of local blocks
-                elif len(meta.remote_block_ids) > len(meta.local_block_ids):
-                    meta.remote_block_ids = meta.remote_block_ids[-len(meta.local_block_ids):]
+                # legacy list[int] block ids is deprecated
+                raise RuntimeError(
+                    "Flattened block ids for KV transfer is deprecated. Block ids must be "
+                    "doubly nested lists of ints, i.e., list[list[int]]."
+                    f"{meta.local_block_ids=}, {meta.remote_block_ids=}."
+                )
+
+            if not _is_grouped_block_ids(meta.local_block_ids):
+                raise RuntimeError(
+                    "Grouped local block ids is required "
+                    f"for request {req_id}, got {meta.local_block_ids}."
+                )
+
+            if not _is_grouped_block_ids(meta.remote_block_ids):
+                raise RuntimeError(
+                    "Grouped local block ids require grouped remote block ids "
+                    f"for request {req_id}, got {meta.remote_block_ids}."
+                )
+
+            if len(meta.remote_block_ids) != len(meta.local_block_ids):
+                raise RuntimeError(
+                    "Grouped local/remote block ids must have the same number "
+                    f"of groups for request {req_id}: "
+                    f"{len(meta.local_block_ids)} vs {len(meta.remote_block_ids)}."
+            )
+
+            aligned_local_block_ids = []
+            aligned_remote_block_ids = []
+            for group_id, (local_group, remote_group) in enumerate(zip(meta.local_block_ids, meta.remote_block_ids)):
+                if len(local_group) == 0:
+                    aligned_local_group = []
+                    aligned_remote_group = []
+                elif len(remote_group) < len(local_group):
+                    # NOTE(runze): corner case, reconsider it later
+                    aligned_local_group = local_group[:len(remote_group)]
+                    aligned_remote_group = remote_group
+                    logger.error(f"More local blocks than remote blocks: {local_group=}, {remote_group=}")
+                elif len(remote_group) > len(local_group):
+                    aligned_local_group = local_group
+                    full_local_group = meta.full_local_block_ids[group_id]
+                    if len(remote_group) == len(full_local_group) + 1:
+                        remote_group = remote_group[:-1]  # trim the lookahead block
+                    elif len(remote_group) < len(full_local_group) or len(remote_group) > len(full_local_group) + 1:
+                        raise RuntimeError("Length of remote should either match full local or exceed by 1, but got "
+                                           f"{len(remote_group)=}, {len(full_local_group)=}, {len(local_group)=}")
+                    aligned_remote_group = remote_group[-len(local_group):]
+                else:
+                    aligned_local_group = local_group
+                    aligned_remote_group = remote_group
+                aligned_local_block_ids.append(aligned_local_group)
+                aligned_remote_block_ids.append(aligned_remote_group)
+
+            if all(len(group) == 0 for group in aligned_local_block_ids):
                 if self.tp_rank == 0:
-                    logger.info(
-                        " ***** start_load_kv for request %s "
-                        "Num local_block_ids: %s. Num remote_block_ids: %s.",
-                        req_id,
-                        len(meta.local_block_ids),
-                        len(meta.remote_block_ids)
-                    )
-            # If local_block_ids is a list of lists (e.g., [[], []]), omni-attention is used
-            # local_block_ids[0] is a list of local block ids for uncompressed layers
-            # local_block_ids[1] is a list of local block ids for compressed layers
-            elif isinstance(meta.local_block_ids[0], list):
-                if not _is_grouped_block_ids(meta.remote_block_ids):
-                    raise RuntimeError(
-                        "Grouped local block ids require grouped remote block ids "
-                        f"for request {req_id}, got {type(meta.remote_block_ids[0])}."
-                    )
-                if len(meta.remote_block_ids) != len(meta.local_block_ids):
-                    raise RuntimeError(
-                        "Grouped local/remote block ids must have the same number "
-                        f"of groups for request {req_id}: "
-                        f"{len(meta.local_block_ids)} vs {len(meta.remote_block_ids)}."
-                    )
+                    logger.info(f" ***** Request {req_id} has 0 local blocks, skip load kv.")
+                continue
 
-                aligned_local_block_ids = []
-                aligned_remote_block_ids = []
-                for local_group, remote_group in zip(meta.local_block_ids, meta.remote_block_ids):
-                    if len(local_group) == 0:
-                        aligned_local_group = []
-                        aligned_remote_group = []
-                    elif len(remote_group) < len(local_group):
-                        aligned_local_group = local_group[:len(remote_group)]
-                        aligned_remote_group = remote_group
-                    else:
-                        aligned_local_group = local_group
-                        # Extra remote blocks are lookahead/speculative blocks appended
-                        # after the prompt blocks. Keep the prefix-aligned blocks.
-                        aligned_remote_group = remote_group[:len(local_group)]
-                    aligned_local_block_ids.append(aligned_local_group)
-                    aligned_remote_block_ids.append(aligned_remote_group)
+            meta.local_block_ids = list(itertools.chain.from_iterable(aligned_local_block_ids))
+            meta.remote_block_ids = list(itertools.chain.from_iterable(aligned_remote_block_ids))
+            if self.tp_rank == 0:
+                logger.info(
+                    " ***** start_load_kv for request %s "
+                    "Num local_block_ids: %s. Num remote_block_ids: %s.",
+                    req_id,
+                    len(meta.local_block_ids),
+                    len(meta.remote_block_ids)
+                )
 
-                if all(len(group) == 0 for group in aligned_local_block_ids):
-                    if self.tp_rank == 0:
-                        logger.info(f" ***** Request {req_id} has 0 local blocks, skip load kv.")
-                    continue
-
-                meta.local_block_ids = list(itertools.chain.from_iterable(aligned_local_block_ids))
-                meta.remote_block_ids = list(itertools.chain.from_iterable(aligned_remote_block_ids))
-                if self.tp_rank == 0:
-                    logger.info(
-                        " ***** start_load_kv for request %s "
-                        "Num local_block_ids: %s. Num remote_block_ids: %s.",
-                        req_id,
-                        len(meta.local_block_ids),
-                        len(meta.remote_block_ids)
-                    )
-            # handle the unexpected case where local_block_ids is not a list of int or list of lists
-            else:
-                logger.error(f"Unexpected type for meta.local_block_ids[0]: {type(meta.local_block_ids[0])}")
-                raise RuntimeError(f"Unexpected type for meta.local_block_ids[0]: {type(meta.local_block_ids[0])}")
             # TODO: multi_thread_pull_kv and multi_rank_pull_kv are not supported yet
             # Use ThreadPoolExecutor to handle the task
             future = self.executor.submit(
