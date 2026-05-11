@@ -302,6 +302,9 @@ class OpenPanguMTP(nn.Module, SupportsPP):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        
+        self.post_weight_load()
+        
         return loaded_params
 
     def post_weight_load(self) -> None:

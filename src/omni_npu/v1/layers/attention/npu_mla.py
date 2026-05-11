@@ -310,7 +310,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     ),
                     device=current_platform.device_type,
                     dtype=config.torch_dtype,
-                )
+                ),
+                requires_grad=False
             )
             set_weight_attrs(
                 self.param_sink_k_pe,
@@ -328,7 +329,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                         ),
                         device=current_platform.device_type,
                         dtype=config.torch_dtype,
-                    )
+                    ),
+                    requires_grad=False
                 )
                 set_weight_attrs(
                     self.param_sink_compressed_kv,
