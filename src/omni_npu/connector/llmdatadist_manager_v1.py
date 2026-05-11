@@ -398,14 +398,20 @@ class LLMDataDistManager:
     def _refresh_link(self, prompt_cluster_id, prefill_dp_rank, d_rank):
         """ refresh the kv link: unlink + link """
         logger.warning(f"======= refresh_link with {prompt_cluster_id=} ========")
-        (host_cluster_id, prefill_dp_rank, d_rank) = \
-            self._get_host_cluster_id(prompt_cluster_id, prefill_dp_rank, d_rank)
+        result = self._get_host_cluster_id(prompt_cluster_id, prefill_dp_rank, d_rank)
+        if result is None:
+            logger.warning(
+                f"No prompt_cluster_id={prompt_cluster_id}, prefill_dp_rank={prefill_dp_rank}, d_rank={d_rank}. "
+                f"Available registered_link_infos keys: {list(self.registered_link_infos.keys())}"
+            )
+            return
+        (host_cluster_id, prefill_dp_rank, d_rank) = result
         if host_cluster_id is not None:
             self.close_link(host_cluster_id, prefill_dp_rank, d_rank)
             logger.warning(f"======= rebuild_link with {prompt_cluster_id=} ========")
             self.register_link(host_cluster_id, prefill_dp_rank, d_rank)
         else:
-            raise RuntimeError(f"Unregistered host cluster id!!!")
+            logger.error(f"Unregistered host cluster id!!!")
 
     # search for the host_cluster_id in key using the prompt_cluster_id in value
     def _get_host_cluster_id(self, prompt_cluster_id, prefill_dp_rank, d_rank):
