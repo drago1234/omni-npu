@@ -892,3 +892,42 @@ class TestUnregisterMemoryEdgeCases:
 
         # Should not raise and no calls made
         manager.data_dist_engine.cache_manager.unregister_cache.assert_not_called()
+
+
+class TestRefreshLink:
+    """Tests for LLMDataDistManager._refresh_link method."""
+
+    def test_refresh_link_returns_early_when_get_host_returns_none(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that _refresh_link returns early when _get_host_cluster_id returns None."""
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+        manager.registered_link_infos = {
+            (('cluster1',), 0, 0): [12345],
+        }
+
+        with patch.object(manager, '_get_host_cluster_id', return_value=None) as mock_get_host, \
+             patch.object(manager, 'close_link') as mock_close_link, \
+             patch.object(manager, 'register_link') as mock_register_link:
+            # Query with non-existent prompt_cluster_id
+            manager._refresh_link(99999, 0, 0)
+
+            mock_get_host.assert_called_once_with(99999, 0, 0)
+            mock_close_link.assert_not_called()
+            mock_register_link.assert_not_called()
+
+    def test_refresh_link_calls_close_and_register_on_success(self, mock_vllm_config, mock_llm_datadist, mock_world_group):
+        """Test that _refresh_link calls close_link and register_link when host found."""
+        mock_vllm_config.kv_transfer_config.kv_role = 'kv_consumer'
+        manager = LLMDataDistManager(mock_vllm_config, "127.0.0.1", 8000)
+        manager.registered_link_infos = {
+            (('cluster1',), 0, 0): [12345],
+        }
+
+        with patch.object(manager, '_get_host_cluster_id', return_value=(('cluster1',), 0, 0)) as mock_get_host, \
+             patch.object(manager, 'close_link') as mock_close_link, \
+             patch.object(manager, 'register_link') as mock_register_link:
+            manager._refresh_link(12345, 0, 0)
+
+            mock_get_host.assert_called_once_with(12345, 0, 0)
+            mock_close_link.assert_called_once_with(('cluster1',), 0, 0)
+            mock_register_link.assert_called_once_with(('cluster1',), 0, 0)

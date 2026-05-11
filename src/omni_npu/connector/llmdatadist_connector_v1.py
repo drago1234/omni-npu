@@ -443,6 +443,9 @@ class PrefillConnectorWorker:
     def unregister_kv_caches(self):
         self.datadist_manager.unregister_link()
         self.datadist_manager.unregister_memory()
+        with self.remote_hb_info_lock:
+            self.remote_hb_info.clear()
+        logger.info("PrefillConnectorWorker unregister_kv_caches done, cleared remote_hb_info")
 
     def start_load_kv(self, metadata: DatadistConnectorMetadataPrefill):
         pass
@@ -767,6 +770,8 @@ class DecodeConnectorWorker:
     def unregister_kv_caches(self):
         self.datadist_manager.unregister_link()
         self.datadist_manager.unregister_memory()
+        self.hb_server_info.clear()
+        logger.info("DecodeConnectorWorker unregister_kv_caches done, cleared hb_server_info")
 
     # Now go asynchronous pull_kv
     def start_load_kv(self, metadata: DatadistConnectorMetadata):

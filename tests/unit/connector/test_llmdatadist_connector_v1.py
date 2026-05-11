@@ -1191,6 +1191,24 @@ class TestPrefillConnectorWorkerUnregisterKVCaches:
         worker.datadist_manager.unregister_link.assert_called_once()
         worker.datadist_manager.unregister_memory.assert_called_once()
 
+    def test_prefill_worker_unregister_kv_caches_clears_remote_hb_info(self):
+        """Test that unregister_kv_caches clears remote_hb_info for PrefillConnectorWorker."""
+        worker = MagicMock(spec=PrefillConnectorWorker)
+        worker.datadist_manager = MagicMock()
+        worker.datadist_manager.unregister_link = MagicMock()
+        worker.datadist_manager.unregister_memory = MagicMock()
+        worker.remote_hb_info = {'cluster_123': 1234567890, 'cluster_456': 1234567891}
+        worker.remote_hb_info_lock = threading.Lock()
+
+        # Bind the actual method
+        worker.unregister_kv_caches = PrefillConnectorWorker.unregister_kv_caches.__get__(worker, PrefillConnectorWorker)
+
+        worker.unregister_kv_caches()
+
+        worker.datadist_manager.unregister_link.assert_called_once()
+        worker.datadist_manager.unregister_memory.assert_called_once()
+        assert worker.remote_hb_info == {}
+
 
 class TestDecodeConnectorWorkerUnregisterKVCaches:
     """Tests for DecodeConnectorWorker.unregister_kv_caches method."""
@@ -1208,3 +1226,75 @@ class TestDecodeConnectorWorkerUnregisterKVCaches:
 
         worker.datadist_manager.unregister_link.assert_called_once()
         worker.datadist_manager.unregister_memory.assert_called_once()
+
+    def test_decode_worker_unregister_kv_caches_clears_hb_server_info(self):
+        """Test that unregister_kv_caches clears hb_server_info for DecodeConnectorWorker."""
+        worker = MagicMock(spec=DecodeConnectorWorker)
+        worker.datadist_manager = MagicMock()
+        worker.datadist_manager.unregister_link = MagicMock()
+        worker.datadist_manager.unregister_memory = MagicMock()
+        worker.hb_server_info = {'tcp://127.0.0.1:5000': (MagicMock(), 1234567890)}
+
+        # Bind the actual method
+        worker.unregister_kv_caches = DecodeConnectorWorker.unregister_kv_caches.__get__(worker, DecodeConnectorWorker)
+
+        worker.unregister_kv_caches()
+
+        worker.datadist_manager.unregister_link.assert_called_once()
+        worker.datadist_manager.unregister_memory.assert_called_once()
+        assert worker.hb_server_info == {}
+
+
+class TestPrefillHeartbeatTimerAfterSleep:
+    """Tests for PrefillConnectorWorker.heartbeat_timer_func behavior after sleep/clear."""
+
+    def test_heartbeat_timer_no_timeout_when_remote_hb_info_cleared(self, mock_vllm_config, mock_datadist_manager, mock_get_tp_rank, mock_zmq_context, mock_threading_thread):
+        """Test that heartbeat_timer_func does not trigger timeout when remote_hb_info is cleared after sleep."""
+        mock_get_tp_rank.return_value = 0
+        worker = PrefillConnectorWorker(mock_vllm_config, "127.0.0.1", "5568")
+
+        with patch(f"{PATH_PREFIX}.time") as mock_time_util, \
+             patch.object(worker, 'datadist_manager') as mock_manager, \
+             patch.object(worker, 'hb_socket') as mock_hb_socket:
+            # remote_hb_info is empty after sleep/unregister
+            worker.remote_hb_info = {}
+            worker.remote_hb_info_lock = threading.Lock()
+
+            # Set time such that any entry would timeout if it existed
+            mock_time_util.time.return_value = 1234567890 + CLUSTER_HEARTBEAT_TIMEOUT + 100
+            mock_time_util.sleep.side_effect = StopIteration
+
+            try:
+                worker.heartbeat_timer_func()
+            except StopIteration:
+                pass
+
+            # force_unlink should not be called since remote_hb_info is empty
+            mock_manager.force_unlink.assert_not_called()
+
+
+class TestDecodeHeartbeatTimerAfterSleep:
+    """Tests for DecodeConnectorWorker.heartbeat_timer_func behavior after sleep/clear."""
+
+    def test_heartbeat_timer_no_timeout_when_hb_server_info_cleared(self, mock_vllm_config, mock_datadist_manager, mock_get_tp_rank, mock_threading_thread):
+        """Test that heartbeat_timer_func does not trigger close_link when hb_server_info is cleared after sleep."""
+        worker = DecodeConnectorWorker(mock_vllm_config, "127.0.0.1", 123)
+
+        with patch.object(worker, "datadist_manager") as mock_manager, \
+             patch.object(worker, "ctx") as mock_ctx, \
+             patch(f"{PATH_PREFIX}.time") as mock_time_util:
+
+            # hb_server_info is empty after sleep/unregister
+            worker.hb_server_info = {}
+            mock_manager.registered_link_infos = [((0, 0), 0, 0), ((0, 0), 0, 0), ((0, 0), 0, 0)]
+            mock_manager.cluster_id_to_ip_port.side_effect = [("127.0.0.1:123", 2, 0), ("127.0.0.1:123", 2, 0), ("127.0.0.1:123", 2, 0)]
+            mock_time_util.time.side_effect = [0, 0, int(1e9)]
+            mock_time_util.sleep.side_effect = StopIteration
+
+            try:
+                worker.heartbeat_timer_func()
+            except StopIteration:
+                pass
+
+            # close_link should not be called since hb_server_info is empty
+            mock_manager.close_link.assert_not_called()
