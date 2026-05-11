@@ -111,24 +111,14 @@ class LLMDataDistConfig:
         # (timestamp_ms, ip1_int, ip2_int, ip3_int, ...)
         self.host_cluster_id = (timestamp_ms, *ip_integers)
 
-    # get all node ips in a TP group
-    def _get_worker_ips(self):
-        """Return worker IPs. Only query Ray when Ray is actually available/running.
-
-        Behavior:
-        - If has config "p_node_list" and self.is_prefill, return p_node_list
-        - If self.is_prefill is False: return [self.local_host_ip].
-        - If Ray is not installed: log and return [self.local_host_ip].
-        - If Ray is installed but no cluster is reachable: log and return [self.local_host_ip].
-        - If a Ray cluster is reachable: return all Alive nodes' NodeManagerAddress,
-          with head node (if detected) placed first.
-        """
+    def _ips_from_config(self) -> list:
         worker_ips = self.kv_transfer_config.kv_connector_extra_config.get("p_node_list")
         if self.is_prefill and worker_ips and isinstance(worker_ips, list) and len(worker_ips) > 0:
             return worker_ips
-        
-        # default fallback
-        worker_ips = [self.local_host_ip]
+        return []
+
+    def _ips_from_ray(self) -> list:
+        worker_ips = []
 
         if not self.is_prefill:
             return worker_ips
@@ -169,7 +159,25 @@ class LLMDataDistConfig:
             worker_ips = [head_ip] + ips
         else:
             worker_ips = ips
+        return worker_ips
 
+    # get all node ips in a TP group
+    def _get_worker_ips(self):
+        # priority: config -> ray -> default
+        worker_ips = (
+            self._ips_from_config() or
+            self._ips_from_ray() or
+            [self.local_host_ip] # default
+        )
+
+        # NOTE:
+        # In fact, "worker_ips" are only used for "remote_cluster_id"
+        # maintained by prefill-scheduler, who shares the same ip
+        # with prefill-heartbeat-receiver (worker at rank0).
+        # 
+        # Thus, we only care about the local_host of prefill-scheduler,
+        # where local_host_ip is exactly the ip of heartbeat-receiver.
+        # 
         # Ensure local_host_ip is the first element in the list
         if worker_ips and worker_ips[0] != self.local_host_ip:
             if self.local_host_ip in worker_ips:

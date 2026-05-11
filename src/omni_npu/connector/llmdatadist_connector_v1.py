@@ -382,6 +382,13 @@ class PrefillConnectorWorker:
         # initialize the dict to save requests finish time
         self.requests_finish_time = dict()
 
+    def _unlink(self, cluster_id: int):
+            try:
+                self.datadist_manager.force_unlink(cluster_id)
+                logger.info(f"force unlink: {cluster_id}")
+            except Exception as e:
+                logger.error(f"force_unlink failed: {cluster_id} {e}")
+
     def heartbeat_timer_func(self):
         logger.info(f"start heart beat thread {threading.current_thread().name}")
         while True:
@@ -401,7 +408,7 @@ class PrefillConnectorWorker:
                 logger.warning(f"remote heartbeat timeout: {ip_port=}, {remote_cluster_id=}")
                 port = int(ip_port.split(":")[1])
                 if port == 0:
-                    self.datadist_manager.force_unlink(int(remote_cluster_id))
+                    self._unlink(int(remote_cluster_id))
                 else:
                     rank = port
                     remote_ipc = HEARTBEAT_IPC_PATH + f"_{rank}"
@@ -428,8 +435,7 @@ class PrefillConnectorWorker:
             data = self.ipc_socket.recv_string()
             logger.info(f"hb server receive ipc data: {data}")
             if data and isinstance(data, int):
-                self.datadist_manager.force_unlink(int(data))
-                logger.info(f"force unlink: {data}")
+                self._unlink(int(data))
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.datadist_manager.register_memory(kv_caches, self.kv_cache_config)
