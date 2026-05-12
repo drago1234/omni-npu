@@ -260,6 +260,8 @@ class PanguToolParser(ToolParser):
                         self.streamed_args_for_tool[
                             self.current_tool_id] = cur_args_json
                     self.current_tool_name_sent = True
+                else:
+                    delta = None
 
             # now we know we're on the same tool call and we're streaming
             # arguments
