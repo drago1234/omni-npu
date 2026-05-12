@@ -608,6 +608,9 @@ class NPUModelRunner(GPUModelRunner):
         self._hook_model_load_weights(self.get_model())
         self._hook_model_load_weights(self.get_drafter_model())
 
+    def reset_input_batch(self) -> None:
+        self.input_batch.block_table.clear()
+
     def capture_model(self) -> int:
         logger.debug("<<< Capturing model in npu_model_runner")
         if self.vllm_config.npu_compilation_config.use_gegraph:
@@ -615,6 +618,7 @@ class NPUModelRunner(GPUModelRunner):
             self._dummy_run(self.max_num_reqs, force_attention=True, uniform_decode=True)
             return
         if consume_aclgraph_recapture():
+            self.reset_input_batch()
             self._mark_aclgraph_wrappers_for_recapture()
         with switch_torch_device():
             super().capture_model()
