@@ -760,7 +760,9 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
             num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+            for i in range(num_tokens % num_reqs):
+                num_scheduled_tokens_list[i] += 1
+            max_query_len = num_scheduled_tokens_list[0]
 
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs

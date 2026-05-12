@@ -150,7 +150,7 @@ class NPUDSAMetadata(MLACommonMetadata[NPUDSADecodeMetadata]):
 
 
 class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
     def __init__(
