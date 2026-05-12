@@ -432,6 +432,9 @@ class EagleProposerPatch(VLLMPatch):
             if hasattr(self.model, "lm_head"):
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
+        
+        if hasattr(self.model, "set_shared_weight"):
+            self.model.set_shared_weight(target_language_model)
 
     def validate_same_kv_cache_group(self, kv_cache_config) -> None:
         """Build per-group draft layer structure from runner's attn_groups.
