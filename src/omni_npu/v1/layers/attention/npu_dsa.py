@@ -682,6 +682,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 sparse_mode=3,
                 key_sink=self.attn.impl.sink_kv,
                 value_sink=self.attn.impl.sink_k_nope,
+                batch_invariant=True,
             )[0]
 
         return torch.ops.custom.npu_sparse_flash_attention_enhance(

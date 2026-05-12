@@ -878,6 +878,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     "key_sink": self.attn.sink_compressed_kv.unsqueeze(1),
                     "value_sink": self.attn.sink_compressed_kv.unsqueeze(1),
                     "key_rope_sink": self.attn.sink_k_pe.unsqueeze(1),
+                    "batch_invariant": True,
                 }
             )
         else:
