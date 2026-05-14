@@ -52,6 +52,7 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.compilation.cuda_graph import CUDAGraphStat
 
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
+from omni_npu.worker.npu_graph_dispatcher import NPUGraphDispatcher
 from omni_npu.sample.sampler import NPUSamplerV1
 from omni_npu.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import (
@@ -162,6 +163,9 @@ class NPUModelRunner(GPUModelRunner):
         ] | None = None
 
         self._is_mm_encoder_only = False
+
+        # use npugraph dispatcher
+        self.cudagraph_dispatcher = NPUGraphDispatcher(self.vllm_config)
 
 
     def _build_conv_context(self, dummy:bool = False):
