@@ -169,7 +169,7 @@ class OpenPanguMoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                disable_tp=True,
+                disable_tp=False,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )

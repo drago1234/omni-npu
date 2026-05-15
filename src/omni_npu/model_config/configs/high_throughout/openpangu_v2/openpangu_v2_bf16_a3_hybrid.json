@@ -23,6 +23,23 @@
                     "type": "AllReduce",
                     "tp_size_or_ranks": 1
                 }
+            },
+            "shared_experts.gate_up_proj": {
+                "tp_size_or_ranks": 1,
+                "x_transform": {
+                    "type": "AllGather",
+                    "tp_size_or_ranks": 1
+                }
+            },
+            "shared_experts.down_proj": {
+                "tp_size_or_ranks": 1,
+                "x_transform": {
+                    "type": "None"
+                },
+                "y_transform": {
+                    "type": "ReduceScatter",
+                    "tp_size_or_ranks": 1
+                }
             }
         }
     },
