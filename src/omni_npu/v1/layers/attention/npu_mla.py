@@ -70,6 +70,7 @@ from omni_npu.compilation.utils import (
     OP_FIA_SINK,
 )
 from omni_npu.plugin_decorators import mla_attn_decorator
+from omni_npu.v1.distributed.communication_op_ext import layer_parallel_all_gather
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -106,9 +107,9 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         self.kv_lora_rank = kv_lora_rank
 
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
+        self.tp_size = get_tensor_model_parallel_world_size()
+        assert num_heads % self.tp_size == 0
+        self.num_local_heads = num_heads // self.tp_size
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -495,7 +496,9 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             if self.conv is not None:
                 attn_output = get_tp_group().all_gather(attn_output, dim=1)
                 attn_output = self.conv(attn_output, state_indice=2)
-                if self.o_proj.tp_size > 1:
+                if self.o_proj.tp_size > 1 and self.o_proj.x_transform == "NoOp":
+                    if self.o_proj.tp_size > self.tp_size:
+                        attn_output = layer_parallel_all_gather(attn_output, self.o_proj.layer_name_inside_block, "x", dim=0)
                     attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
                     attn_output = attn_output[self.o_proj.tp_rank].contiguous()
         else:
@@ -535,7 +538,9 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 if self.conv is not None:
                     attn_output = get_tp_group().all_gather(attn_output, dim=1)
                     attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
-                    if self.o_proj.tp_size > 1:
+                    if self.o_proj.tp_size > 1 and self.o_proj.x_transform == "NoOp":
+                        if self.o_proj.tp_size > self.tp_size:
+                            attn_output = layer_parallel_all_gather(attn_output, self.o_proj.layer_name_inside_block, "x", dim=0)
                         attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
                         attn_output = attn_output[self.o_proj.tp_rank].contiguous()
             else:
@@ -735,7 +740,9 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             if self.conv is not None:
                 attn_output = get_tp_group().all_gather(attn_output, dim=1)
                 attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
-                if self.o_proj.tp_size > 1:
+                if self.o_proj.tp_size > 1 and self.o_proj.x_transform == "NoOp":
+                    if self.o_proj.tp_size > self.tp_size:
+                        attn_output = layer_parallel_all_gather(attn_output, self.o_proj.layer_name_inside_block, "x", dim=0)
                     attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
                     attn_output = attn_output[self.o_proj.tp_rank].contiguous()
         else:
@@ -900,7 +907,9 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             if self.conv is not None:
                 attn_output = get_tp_group().all_gather(attn_output, dim=1)
                 attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
-                if self.o_proj.tp_size > 1:
+                if self.o_proj.tp_size > 1 and self.o_proj.x_transform == "NoOp":
+                    if self.o_proj.tp_size > self.tp_size:
+                        attn_output = layer_parallel_all_gather(attn_output, self.o_proj.layer_name_inside_block, "x", dim=0)
                     attn_output = split_tensor_along_last_dim(attn_output, num_partitions=self.o_proj.tp_size)
                     attn_output = attn_output[self.o_proj.tp_rank].contiguous()
         else:

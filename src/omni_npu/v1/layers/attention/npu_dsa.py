@@ -54,9 +54,10 @@ from omni_npu.v1.layers.linear import (
     ColumnParallelFlashCommLinear,
     ReplicatedFlashCommLinear
 )
-from omni_npu.model_config.config_loader.loader import  model_extra_config
+from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.v1.utils import current_stream
 from omni_npu.plugin_decorators import dsa_attn_decorator
+from omni_npu.v1.distributed.communication_op_ext import layer_parallel_all_gather
 
 class Indexer(torch.nn.Module):
     def __init__(
@@ -277,6 +278,9 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         self.quant_symbol = quant_config is not None
         self._init_wuk_t_uv = False
         self.is_pd_disagg = vllm_config.kv_transfer_config is not None
+
+        self.is_prefill_node = (self.is_pd_disagg and \
+            vllm_config.kv_transfer_config.kv_role == "kv_producer")
 
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedFlashCommLinear(
@@ -860,7 +864,9 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             if self.conv is not None:
                 out = get_tp_group().all_gather(out, dim=1)
                 out = self.conv(out, state_indice=2, is_prefill=True)
-                if self.o_proj.tp_size > 1:
+                if self.o_proj.tp_size > 1 and self.o_proj.x_transform == "NoOp":
+                    if not self.is_prefill_node:
+                        out = layer_parallel_all_gather(out, self.o_proj.layer_name_inside_block, "x", dim=0)
                     out = split_tensor_along_last_dim(out, num_partitions=self.o_proj.tp_size)
                     out = out[self.o_proj.tp_rank].contiguous()
         else:
@@ -1100,7 +1106,9 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             if self.conv is not None:
                 out = get_tp_group().all_gather(out, dim=1)
                 out = self.conv(out, state_indice=2)
-                if self.o_proj.tp_size > 1:
+                if self.o_proj.tp_size > 1 and self.o_proj.x_transform == "NoOp":
+                    if self.o_proj.tp_size > self.tp_size:
+                        out = layer_parallel_all_gather(out, self.o_proj.layer_name_inside_block, "x", dim=0)
                     out = split_tensor_along_last_dim(out, num_partitions=self.o_proj.tp_size)
                     out = out[self.o_proj.tp_rank].contiguous()
         else:
