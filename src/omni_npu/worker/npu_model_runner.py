@@ -614,6 +614,9 @@ class NPUModelRunner(GPUModelRunner):
 
     def reset_input_batch(self) -> None:
         self.input_batch.block_table.clear()
+        for block_table in self.input_batch.block_table.block_tables:
+            block_table.slot_mapping.gpu.fill_(0)
+            block_table.slot_mapping.cpu.fill_(0)
 
     def capture_model(self) -> int:
         logger.debug("<<< Capturing model in npu_model_runner")
