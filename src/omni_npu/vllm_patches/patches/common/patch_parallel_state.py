@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import os
 import torch
+import torch_npu
 from torch.distributed import Backend, ProcessGroup
 
 from vllm.distributed import (
@@ -210,6 +212,18 @@ class GroupCoordinatorPatch(VLLMPatch):
         self_device_group = None
         self_cpu_group = None
         logger.info(f"{self.use_local_synchronization=}")
+
+        options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+        if group_name == "ep":
+            hccl_buffer_size = os.getenv('HCCL_EP_BUFFSIZE', os.getenv('HCCL_BUFFSIZE', 200))
+            options.hccl_config = {
+                "group_name": self.unique_name,
+                "hccl_buffer_size": int(hccl_buffer_size)
+            }
+        else:
+            options.hccl_config = {
+                "group_name": self.unique_name,
+            }
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
