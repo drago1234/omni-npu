@@ -1107,7 +1107,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
                 out = get_tp_group().all_gather(out, dim=1)
                 out = self.conv(out, state_indice=2)
                 if self.o_proj.tp_size > 1 and self.o_proj.x_transform == "NoOp":
-                    if self.o_proj.tp_size > self.tp_size:
+                    if self.o_proj.tp_size > self.tp_size and not self.is_prefill_node:
                         out = layer_parallel_all_gather(out, self.o_proj.layer_name_inside_block, "x", dim=0)
                     out = split_tensor_along_last_dim(out, num_partitions=self.o_proj.tp_size)
                     out = out[self.o_proj.tp_rank].contiguous()
