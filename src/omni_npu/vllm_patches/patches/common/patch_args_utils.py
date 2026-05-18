@@ -2,16 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
-import json
 from typing import Callable
-
-from omni_npu.v1.config import ReasoningConfig
-from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 from vllm import EngineArgs
 from vllm.config import VllmConfig
-from vllm.logger import logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+from omni_npu.vllm_patches.core import VLLMPatch, register_patch
 
 ROUTED_EXPERTS_SERIALIZATION_MODES = ("zip_base64", "base64")
 DEFAULT_ROUTED_EXPERTS_SERIALIZATION_MODE = "zip_base64"
@@ -25,11 +22,6 @@ def _apply_engine_config_extensions(
     engine_args: EngineArgs,
     vllm_config: VllmConfig,
 ) -> VllmConfig:
-    reasoning_config = getattr(engine_args, "reasoning_config", None)
-    if reasoning_config is not None and vllm_config.model_config is not None:
-        reasoning_config.initialize_token_ids(vllm_config.model_config)
-        vllm_config.reasoning_config = reasoning_config
-
     vllm_config.routed_experts_serialization_mode = getattr(
         engine_args,
         "routed_experts_serialization_mode",
@@ -43,11 +35,9 @@ class VllmConfigPatch(VLLMPatch):
     """Patch to VllmConfig with extra engine-bridge fields."""
 
     _attr_names_to_apply = [
-        "reasoning_config",
         "routed_experts_serialization_mode",
     ]
 
-    reasoning_config: ReasoningConfig | None = None
     routed_experts_serialization_mode: str = (
         DEFAULT_ROUTED_EXPERTS_SERIALIZATION_MODE
     )
@@ -58,7 +48,6 @@ class EngineArgsPatch(VLLMPatch):
     """Patch to EngineArgs for bridgeable CLI/config extensions."""
 
     _attr_names_to_apply = [
-        "reasoning_config",
         "routed_experts_serialization_mode",
         "add_cli_args",
         "from_cli_args",
@@ -66,7 +55,6 @@ class EngineArgsPatch(VLLMPatch):
         "create_engine_config",
     ]
 
-    reasoning_config: ReasoningConfig | None = None
     routed_experts_serialization_mode: str = (
         DEFAULT_ROUTED_EXPERTS_SERIALIZATION_MODE
     )
@@ -81,10 +69,6 @@ class EngineArgsPatch(VLLMPatch):
             description=VllmConfig.__doc__,
         )
         vllm_group.add_argument(
-            "--reasoning-config",
-            **ReasoningConfig.as_argparse_dict(),
-        )
-        vllm_group.add_argument(
             "--routed-experts-serialization-mode",
             choices=ROUTED_EXPERTS_SERIALIZATION_MODES,
             default=DEFAULT_ROUTED_EXPERTS_SERIALIZATION_MODE,
@@ -95,19 +79,6 @@ class EngineArgsPatch(VLLMPatch):
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         instance = _original_from_cli_args(cls, args)
-
-        reasoning_config_var = "reasoning_config"
-        raw_reasoning = getattr(args, reasoning_config_var, None)
-        if raw_reasoning:
-            try:
-                if isinstance(raw_reasoning, str):
-                    config_dict = json.loads(raw_reasoning)
-                    instance.reasoning_config = ReasoningConfig(**config_dict)
-                else:
-                    instance.reasoning_config = raw_reasoning
-            except Exception as exception:
-                logger.error(f"Error parsing {reasoning_config_var}: {exception}")
-                instance.reasoning_config = None
 
         instance.routed_experts_serialization_mode = getattr(
             args,
