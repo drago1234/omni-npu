@@ -227,7 +227,10 @@ class GroupCoordinatorPatch(VLLMPatch):
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend, use_local_synchronization=self.use_local_synchronization
+                ranks,
+                backend=torch_distributed_backend,
+                use_local_synchronization=self.use_local_synchronization,
+                pg_options=options,
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
