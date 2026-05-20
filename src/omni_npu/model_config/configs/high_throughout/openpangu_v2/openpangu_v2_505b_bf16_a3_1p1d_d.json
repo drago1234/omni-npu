@@ -12,37 +12,37 @@
                 }
             },
             "mlp.gate_up_proj": {
-                "tp_size_or_ranks": 4,
+                "tp_size_or_ranks": 16,
                 "x_transform": {
                     "type": "AllGather",
-                    "tp_size_or_ranks": 4
+                    "tp_size_or_ranks": 16
                 }
             },
             "mlp.down_proj": {
-                "tp_size_or_ranks": 4,
+                "tp_size_or_ranks": 16,
                 "x_transform": {
                     "type": "None"
                 },
                 "y_transform": {
                     "type": "ReduceScatter",
-                    "tp_size_or_ranks": 4
+                    "tp_size_or_ranks": 16
                 }
             },
             "shared_experts.gate_up_proj": {
-                "tp_size_or_ranks": 1,
+                "tp_size_or_ranks": 16,
                 "x_transform": {
                     "type": "AllGather",
-                    "tp_size_or_ranks": 1
+                    "tp_size_or_ranks": 16
                 }
             },
             "shared_experts.down_proj": {
-                "tp_size_or_ranks": 1,
+                "tp_size_or_ranks": 16,
                 "x_transform": {
                     "type": "None"
                 },
                 "y_transform": {
                     "type": "ReduceScatter",
-                    "tp_size_or_ranks": 1
+                    "tp_size_or_ranks": 16
                 }
             }
         }
@@ -54,7 +54,8 @@
         "kv_nz": false,
         "merge_q_kv_conv": false,
         "shared_expert_multi_stream": false,
-        "enable_moe_agrs": true,
-        "disable_npu_top_k_top_p_sample": true
+        "enable_moe_agrs": false,
+        "disable_npu_top_k_top_p_sample": true,
+        "sampler_multi_stream": false
     }
 }
