@@ -106,6 +106,7 @@ class OpenPanguMultiTokenPredictor(nn.Module):
                 )
             }
         )
+        self.wrapped_layers = None
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -127,7 +128,12 @@ class OpenPanguMultiTokenPredictor(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
 
-        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
+        if self.wrapped_layers is None:
+            layers = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        else:
+            layers = self.wrapped_layers[str(self.mtp_start_layer_idx + current_step_idx)]
+
+        return layers(
             input_ids,
             positions,
             previous_hidden_states,
@@ -148,7 +154,6 @@ class OpenPanguMultiTokenPredictor(nn.Module):
         return logits
 
 
-@support_torch_compile
 class OpenPanguMTP(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

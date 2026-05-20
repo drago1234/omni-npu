@@ -49,6 +49,7 @@ from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.compilation.cuda_graph import CUDAGraphStat
 
 from omni_npu.worker.npu_mem_pool import NpuMemAllocator
@@ -162,6 +163,14 @@ class NPUModelRunner(GPUModelRunner):
             torch.Tensor | None,
         ] | None = None
 
+        # make buffer for speculative decode
+        if self.speculative_config:
+            self.cu_num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+            self.cu_num_sampled_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+            self.logits_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+            self.target_logits_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+            self.bonus_logits_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+
         self._is_mm_encoder_only = False
 
         # use npugraph dispatcher
@@ -183,6 +192,93 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_cache_map[req_id] = idx + 1
             self.cache_slot_id[self.input_batch.num_reqs:] = 0
         forward_context.cache_slot_id = self.cache_slot_id
+
+    def _calc_spec_decode_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+    ) -> SpecDecodeMetadata:
+        # Inputs:
+        # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
+        # num_draft_tokens:         [  3,   0,   2,   0,   1]
+        # Outputs:
+        # cu_num_draft_tokens:      [  3,   3,   5,   5,   6]
+        # logits_indices:           [  0,   1,   2,   3, 103, 104, 105, 106,
+        #                            206, 207, 208]
+        # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
+        # bonus_logits_indices:     [  3,   4,   7,   8,  10]
+
+        # Compute the logits indices.
+        # [4, 1, 3, 1, 2]
+        num_sampled_tokens = num_draft_tokens + 1
+
+        # Step 1. cu_num_sampled_tokens: [4, 5, 8, 9, 11]
+        # arange: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]
+        cu_num_sampled_tokens, arange = self._get_cumsum_and_arange(
+            num_sampled_tokens, cumsum_dtype=np.int32
+        )
+        # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
+        logits_indices = np.repeat(
+            cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
+        )
+        # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
+        logits_indices += arange
+
+        # Compute the bonus logits indices.
+        bonus_logits_indices = cu_num_sampled_tokens - 1
+
+        # Compute the draft logits indices.
+        # cu_num_draft_tokens: [3, 3, 5, 5, 6]
+        # arange: [0, 1, 2, 0, 1, 0]
+        cu_num_draft_tokens, arange = self._get_cumsum_and_arange(
+            num_draft_tokens, cumsum_dtype=np.int32
+        )
+        # [0, 0, 0, 5, 5, 9]
+        target_logits_indices = np.repeat(
+            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+        )
+        # [0, 1, 2, 5, 6, 9]
+        target_logits_indices += arange
+
+        # TODO: Optimize the CPU -> GPU copy.
+        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens)
+        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens)
+        logits_indices = torch.from_numpy(logits_indices)
+        target_logits_indices = torch.from_numpy(target_logits_indices)
+        bonus_logits_indices = torch.from_numpy(bonus_logits_indices)
+
+        self.cu_num_draft_tokens.cpu[:cu_num_draft_tokens.numel()] = cu_num_draft_tokens
+        self.cu_num_sampled_tokens.cpu[:cu_num_sampled_tokens.numel()] = cu_num_sampled_tokens
+        self.logits_indices.cpu[:logits_indices.numel()] = logits_indices
+        self.target_logits_indices.cpu[:target_logits_indices.numel()] = target_logits_indices
+        self.bonus_logits_indices.cpu[:bonus_logits_indices.numel()] = bonus_logits_indices
+
+        self.cu_num_draft_tokens.copy_to_gpu(cu_num_draft_tokens.numel())
+        self.cu_num_sampled_tokens.copy_to_gpu(cu_num_sampled_tokens.numel())
+        self.logits_indices.copy_to_gpu(logits_indices.numel())
+        self.target_logits_indices.copy_to_gpu(target_logits_indices.numel())
+        self.bonus_logits_indices.copy_to_gpu(bonus_logits_indices.numel())
+
+        cu_num_draft_tokens = self.cu_num_draft_tokens.gpu[:cu_num_draft_tokens.numel()]
+        cu_num_sampled_tokens = self.cu_num_sampled_tokens.gpu[:cu_num_sampled_tokens.numel()]
+        logits_indices = self.logits_indices.gpu[:logits_indices.numel()]
+        target_logits_indices = self.target_logits_indices.gpu[:target_logits_indices.numel()]
+        bonus_logits_indices = self.bonus_logits_indices.gpu[:bonus_logits_indices.numel()]
+
+        # Compute the draft token ids.
+        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
+        draft_token_ids = self.input_ids.gpu[logits_indices]
+        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+
+        return SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens.tolist(),
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            cu_num_sampled_tokens=cu_num_sampled_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            logits_indices=logits_indices,
+        )
 
     def _model_forward(
         self,
@@ -667,6 +763,34 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(self, grammar_output):
         with switch_torch_device():
             return super().sample_tokens(grammar_output)
+
+    # When async scheduling, valid_sampled_token_count_cpu already carries
+    # the same information via its own async copy stream. num_accepted_tokens
+    # is derived in _get_valid_sampled_token_count instead.
+    def _update_states_after_model_execute(
+        self, output_token_ids: torch.Tensor
+    ) -> None:
+        if self.use_async_scheduling:
+            return
+        return super()._update_states_after_model_execute(output_token_ids)
+
+    # Override to also propagate num_accepted_tokens_cpu from the async-copied
+    # valid_sampled_token_count. This runs during execute_model -> _update_requests,
+    # before _build_attention_metadata, so self.runner.num_accepted_tokens.gpu will
+    # see correct values.
+    def _get_valid_sampled_token_count(self) -> list[int]:
+        prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+        sampled_count_event = self.valid_sampled_token_count_event
+        if sampled_count_event is None or prev_sampled_token_ids is None:
+            return []
+
+        counts_cpu = self.valid_sampled_token_count_cpu
+        assert counts_cpu is not None
+        sampled_count_event.synchronize()
+
+        num_reqs = prev_sampled_token_ids.shape[0]
+        self.input_batch.num_accepted_tokens_cpu[: num_reqs] = counts_cpu[: num_reqs]
+        return counts_cpu[: num_reqs].tolist()
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph wrapper.

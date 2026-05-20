@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
+from vllm.config import CUDAGraphMode
 from vllm.distributed import (
     get_ep_group,
     get_dp_group,
@@ -440,10 +441,8 @@ class CommunicationStrategySelector:
     def select_communication_strategy(self, num_tokens: int):
         forward_ctx = get_forward_context()
         attn_metadata = forward_ctx.attn_metadata
-        decode_threshold = 0
         if attn_metadata is not None:
             attn_metadata = next(iter(attn_metadata.values()), None)
-            decode_threshold = getattr(attn_metadata, "decode_threshold", 0)
 
         if model_extra_config.parall_config.ena_seq_parallel:
             local_num_tokens = num_tokens
@@ -457,7 +456,7 @@ class CommunicationStrategySelector:
                 strategy = "agrs"
             else:
                 # TP + DP
-                if decode_threshold == 0 or num_tokens <= decode_threshold:
+                if forward_ctx.cudagraph_runtime_mode == CUDAGraphMode.FULL:
                     strategy = "agrs"
                 else:
                     strategy = "all2all"
@@ -472,7 +471,7 @@ class CommunicationStrategySelector:
                     strategy = "dispatch_combine"
             else:
                 # TP + DP
-                if num_tokens <= decode_threshold:
+                if forward_ctx.cudagraph_runtime_mode == CUDAGraphMode.FULL:
                     strategy = "agrs"
                 else:
                     strategy = "all2all"

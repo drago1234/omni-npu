@@ -272,9 +272,12 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         # Get cache indices
         apc_enabled = self.vllm_config.cache_config.enable_prefix_caching
+        padded_reqs_mask = (common_attn_metadata.seq_lens == 0)
         if apc_enabled:
             cache_indices = common_attn_metadata.block_table_tensor
-
+            cache_indices = torch.where(
+                padded_reqs_mask[:, None], PAD_SLOT_ID, cache_indices,
+            )
             (
                 block_idx_last_computed_token,
                 block_idx_first_scheduled_token,
@@ -287,10 +290,9 @@ class NPUMomeAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         else:
             cache_indices = common_attn_metadata.block_table_tensor[:, 0]
-
-        seq_lens = torch.diff(common_attn_metadata.query_start_loc, dim=-1)
-        idx = torch.nonzero(seq_lens == 0)
-        cache_indices[idx] = PAD_SLOT_ID
+            cache_indices = torch.where(
+                padded_reqs_mask, PAD_SLOT_ID, cache_indices,
+            )
 
         # For cudagraph: copy to persistent buffer if applicable
         if (

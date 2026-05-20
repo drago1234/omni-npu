@@ -2605,3 +2605,59 @@ class TestUnregisterAndReregisterKVCaches:
 
         # Should not raise and should return early
         runner.reregister_kv_caches()
+
+    def test_update_states_after_model_execute_is_noop(self):
+        """Test that _update_states_after_model_execute is a no-op (returns None).
+
+        When async scheduling is enabled, num_accepted_tokens is derived in
+        _get_valid_sampled_token_count instead, so this override must be a
+        pure no-op to avoid double-updating state.
+        """
+        runner = self.runner
+        output_token_ids = torch.zeros(4, dtype=torch.int32,
+                                       device=self.npu_device)
+        result = runner._update_states_after_model_execute(output_token_ids)
+        assert result is None
+
+    def test_get_valid_sampled_token_count_returns_empty_when_no_event(self):
+        """Test _get_valid_sampled_token_count returns [] when event or
+        prev_sampled_token_ids is None (early-exit path)."""
+        runner = self.runner
+        runner.input_batch = SimpleNamespace(
+            prev_sampled_token_ids=None,
+            num_accepted_tokens_cpu=torch.zeros(runner.max_num_reqs,
+                                                dtype=torch.int32),
+        )
+        runner.valid_sampled_token_count_event = None
+        runner.valid_sampled_token_count_cpu = None
+        assert runner._get_valid_sampled_token_count() == []
+
+    def test_get_valid_sampled_token_count_propagates_counts(self):
+        """Test _get_valid_sampled_token_count synchronizes the async copy and
+        propagates counts into input_batch.num_accepted_tokens_cpu."""
+        runner = self.runner
+        num_reqs = 3
+
+        # Simulate counts that would have been async-copied from device
+        counts_cpu = torch.tensor([1, 2, 3, 0, 0], dtype=torch.int32)
+        prev_sampled_token_ids = torch.zeros(num_reqs, 1, dtype=torch.int32,
+                                             device=self.npu_device)
+        num_accepted_tokens_cpu = torch.zeros(runner.max_num_reqs,
+                                              dtype=torch.int32)
+
+        mock_event = MagicMock()
+        runner.input_batch = SimpleNamespace(
+            prev_sampled_token_ids=prev_sampled_token_ids,
+            num_accepted_tokens_cpu=num_accepted_tokens_cpu,
+        )
+        runner.valid_sampled_token_count_event = mock_event
+        runner.valid_sampled_token_count_cpu = counts_cpu
+
+        result = runner._get_valid_sampled_token_count()
+
+        # Event must be synchronized before reading counts
+        mock_event.synchronize.assert_called_once()
+        # Return value should be the first num_reqs counts as a Python list
+        assert result == [1, 2, 3]
+        # num_accepted_tokens_cpu must be updated in-place
+        assert num_accepted_tokens_cpu[:num_reqs].tolist() == [1, 2, 3]
