@@ -26,8 +26,13 @@ class PanguReasoningParser(DeepSeekR1ReasoningParser):
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
         # Pangu defaults to thinking enabled; only treat output as
         # pure content when the user explicitly disables it.
-        self.thinking_enabled = chat_kwargs.get("think", True)
-
+        think = chat_kwargs.get("think", True)
+        thinking = chat_kwargs.get("thinking", True)
+        
+        self.thinking_enabled = True
+        if not think or not thinking:
+            self.thinking_enabled = False
+    
     @property
     def start_token(self) -> str:
         """The token that starts reasoning content."""
