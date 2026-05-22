@@ -623,7 +623,7 @@ def compute_probs_and_sample(
         q = generate_random_sequence(
             logits, sampling_metadata, metadata,
         ).type(torch.float32)
-    if on_ascend950():
+    if on_ascend950() or model_extra_config.operator_opt_config.disable_npu_top_k_top_p_sample:
         logits = apply_top_k_top_p(logits, top_k, top_p)
         probs = logits.softmax(dim=-1, dtype=torch.float32)
         token_ids = probs.div_(q).argmax(dim=-1).view(-1)
