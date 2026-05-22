@@ -310,6 +310,14 @@ class ThinkingBudgetStateHolder:
             state["prev_output_length"] = len(state.get("output_tok_ids", []))
             return
         output = state.get("output_tok_ids", [])
+
+        all_tokens = (state.get("prompt_tok_ids") or []) + (state.get("output_tok_ids") or [])
+        last_start = self._find_last_sequence_index(all_tokens, self.think_start_token_ids)
+        last_end = self._find_last_sequence_index(all_tokens, self.think_end_token_ids)
+        
+        state["semantic_in_think"] = (last_start > last_end)
+        state["semantic_has_ended"] = (last_end > last_start)
+
         if not output:
             # When in_end was set at init (budget=0, prompt already in think),
             # we must force the first generated token to be the end token;
@@ -494,6 +502,21 @@ class ThinkingBudgetStateHolder:
             if seq_idx not in self.cu_num_tokens:
                 continue
             state = self._state[seq_idx]
+
+            start_pos = self.cu_num_tokens[seq_idx]
+            end_pos = (self.cu_num_tokens.get(seq_idx + 1, logits.shape[0]) 
+                    if seq_idx + 1 in self.cu_num_tokens else logits.shape[0])
+            
+            # 1. 在思考中 → 抑制 tool_call_start_token
+            if state.get("semantic_in_think", False) and self.tool_call_start_token_ids:
+                tool_start_token_id = self.tool_call_start_token_ids[0]
+                logits[start_pos:end_pos, tool_start_token_id] = -float('inf')
+
+            # 2. 思考已结束 → 抑制 think_end_token（避免重复生成）
+            if state.get("semantic_has_ended", False) and self.think_end_token_ids:
+                think_end_token_id = self.think_end_token_ids[0]
+                logits[start_pos:end_pos, think_end_token_id] = -float('inf')
+
             if state.get("in_end", False):
                 # logits processor in spec mode are called twice
                 # once for bonus token logits and
@@ -540,14 +563,5 @@ class ThinkingBudgetStateHolder:
             if len(active_indices) > 0:
                 force_tokens = self.force_token_ids[active_indices]
                 logits[active_indices, force_tokens] = 1e9
-        
-        tool_start_token_id = self.tool_call_start_token_ids[0]
-        output_tok_ids = state["output_tok_ids"]
-        
-        if tool_start_token_id:
-            if self.think_end_token_ids[0] not in output_tok_ids:
-                logits[:, tool_start_token_id] = -float('inf')
-            else:
-                logits[:, self.think_end_token_ids[0]] = -float('inf')
 
         return logits
