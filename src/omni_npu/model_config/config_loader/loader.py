@@ -100,6 +100,7 @@ class ModelParallelConfig:
     ena_seq_parallel: bool = False
     ena_context_parallel: bool = False
     enable_flashcomm2: bool = False
+    shared_experts_disable_tp: bool = False
 
  
 @dataclass

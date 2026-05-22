@@ -141,20 +141,21 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             activation=activation,
         )
 
+        use_custom = "omni_custom_models" in os.environ.get("VLLM_PLUGINS", "")
         shared_output = None
         if layer.shared_experts is not None:
             if model_extra_config.operator_opt_config.shared_expert_multi_stream:
                 cur_stream = torch.npu.current_stream()
                 self.shared_experts_stream.wait_stream(cur_stream)
                 with torch.npu.stream(self.shared_experts_stream):
-                    if layer.shared_experts.gate_up_proj.tp_size == self.tp_size:
+                    if layer.shared_experts.gate_up_proj.tp_size > 1 and not use_custom:
                         # Shared experts with TP>1 require full hidden_states;
                         # output is all-reduced later.
                         shared_output = layer.shared_experts(hidden_states)
                     else:
                         shared_output = layer.shared_experts(x_slice)
             else:
-                if layer.shared_experts.gate_up_proj.tp_size == self.tp_size:
+                if layer.shared_experts.gate_up_proj.tp_size > 1 and not use_custom:
                     # Shared experts with TP>1 require full hidden_states;
                     # output is all-reduced later.
                     shared_output = layer.shared_experts(hidden_states)
@@ -173,9 +174,9 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
         if layer.shared_experts is not None:
             if model_extra_config.operator_opt_config.shared_expert_multi_stream:
                 cur_stream.wait_stream(self.shared_experts_stream)
-            if layer.shared_experts.gate_up_proj.tp_size == self.tp_size:
+            if layer.shared_experts.gate_up_proj.tp_size > 1 and not use_custom:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
-            if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
+            if use_custom:
                 routed_output = routed_output + shared_output
 
         if is_need_slice:
