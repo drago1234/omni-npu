@@ -241,8 +241,7 @@ class PanguToolParser(ToolParser):
                 if function_name:
                     cur_arguments = current_tool_call.get("arguments")
                     cur_args_json = None
-                    if cur_arguments and self.is_complete[
-                            self.current_tool_id]:
+                    if cur_arguments is not None and self.is_complete[self.current_tool_id]:
                         # If args are already present in this chunk, emit them
                         # together with tool name to avoid empty-argument tool call.
                         cur_args_json = json.dumps(cur_arguments,
@@ -268,7 +267,7 @@ class PanguToolParser(ToolParser):
             else:
                 cur_arguments = current_tool_call.get("arguments")
                 delta = None
-                if cur_arguments:
+                if cur_arguments is not None:
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = json.dumps(cur_arguments,

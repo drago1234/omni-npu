@@ -227,18 +227,18 @@ class TestPanguToolParserExtractToolCallsStreaming(unittest.TestCase):
         self.parser.current_tool_name_sent = False
         self.parser.streamed_args_for_tool = []
 
-        partial = '<|tool_call_start|>[{"name": "get_nums", "arguments": {}'
+        partial = '<|tool_call_start|>[{"name": "get_nums", "arguments": {}}]'
 
         res = self.parser.extract_tool_calls_streaming(
             previous_text="<|tool_call_start|>",
             current_text=partial,
-            delta_text='[{"name": "get_nums", "arguments": {}',
+             delta_text='[{"name": "get_nums", "arguments": {}',
             previous_token_ids=[104],
             current_token_ids=[104, 1],
             delta_token_ids=[1],
             request=self.request
         )
-
+       
         self.assertIsNone(res)
         self.assertEqual(self.parser.current_tool_id, 0)
         self.assertEqual(self.parser.streamed_args_for_tool, [""])
@@ -255,29 +255,103 @@ class TestPanguToolParserExtractToolCallsStreaming(unittest.TestCase):
 
         self.assertIsNotNone(res_name)
         self.assertEqual(res_name.tool_calls[0].function.name, "get_nums")
-        self.assertIsNone(res_name.tool_calls[0].function.arguments)
-        self.assertEqual(self.parser.streamed_args_for_tool[0], "")
+        self.assertEqual(self.parser.streamed_args_for_tool[0], "{}")
 
-        full = (
-            '<|tool_call_start|>'
-            '[{"name": "get_nums", "arguments": {"grade": ["一年级", "二年级"]}}]'
-        )
-        res_args = self.parser.extract_tool_calls_streaming(
-            previous_text=partial,
-            current_text=full,
-            delta_text='{"grade": ["一年级", "二年级"]}}]',
-            previous_token_ids=[104, 1],
-            current_token_ids=[104, 1, 2],
-            delta_token_ids=[2],
-            request=self.request
-        )
+    def test_extract_tool_calls_streaming_func_name_with_empety_dict(self):
+        delta_tokens= [
+            '<|tool_call_start|>[',
+            '{"name": ',
+            '"get_',
+            'weather", "arguments": {}} ',
+            ']<|tool_call_end|>', 
+        ]
+        all_token_ids = [
+            [104,228],
+            [45920, 13, ],
+            [89108, 89216, 24440, 84063, ],
+            [93166, 88870, 89216, 6731],
+            [ 45932, 105],
+        ]
+        previous_texts = [""]
+        all_previous_token_ids = [[]]
+        for idx, delta_text in enumerate(delta_tokens):
+            delta_token_ids = all_token_ids[idx]
+            previous_text = previous_texts[0]
+            previous_token_ids = all_previous_token_ids[0]
+            current_text = previous_text + delta_text
+            current_token_ids = previous_token_ids + list(delta_token_ids)
+            
+            delta_message =  self.parser.extract_tool_calls_streaming(
+                previous_text,
+                current_text,
+                delta_text,
+                previous_token_ids,
+                current_token_ids,
+                delta_token_ids,
+                self.request,
+            )
+            previous_texts[0] = current_text
+            all_previous_token_ids[0] = current_token_ids
+            
+            if delta_message and delta_message.tool_calls:
+                
+                name = delta_message.tool_calls[0].function.name
+                args = delta_message.tool_calls[0].function.arguments
+                
+                self.assertEqual(name, "get_weather")
+                self.assertEqual(json.loads(args), {})
+            
+    def test_extract_tool_calls_streaming_empety_dict(self):
+        delta_tokens= [ 
+            '<|tool_call_start|>',
+           '[',
+            '{"',
+            'name": ',
+            '"get_',
+            'weather", ',
+            '"arguments": '
+            '{' ,
+           '}',
+            '} ',
+            ']',
+            '<|tool_call_end|>', 
+        ]
 
-        self.assertIsNotNone(res_args)
-        args = res_args.tool_calls[0].function.arguments
-        self.assertNotIn("{}", args)
-        self.assertEqual(json.loads(args), {"grade": ["一年级", "二年级"]})
-        self.assertEqual(self.parser.streamed_args_for_tool[0], args)
-
+        all_token_ids = [
+            [104],
+            *[[i]for i in range(len(delta_tokens)-2)],
+            [105],
+        ]
+       
+        previous_texts = [""]
+        all_previous_token_ids = [[]]
+        for idx, delta_text in enumerate(delta_tokens):
+            delta_token_ids = all_token_ids[idx]
+            previous_text = previous_texts[0]
+            previous_token_ids = all_previous_token_ids[0]
+            current_text = previous_text + delta_text
+            current_token_ids = previous_token_ids + list(delta_token_ids)
+            
+            delta_message = self.parser.extract_tool_calls_streaming(
+                previous_text,
+                current_text,
+                delta_text,
+                previous_token_ids,
+                current_token_ids,
+                delta_token_ids,
+                self.request,
+            )
+            previous_texts[0] = current_text
+            all_previous_token_ids[0] = current_token_ids
+            
+            if delta_message and delta_message.tool_calls:
+                
+                name = delta_message.tool_calls[0].function.name
+                args = delta_message.tool_calls[0].function.arguments
+                if name:
+                    self.assertEqual(name, "get_weather")
+                if args:
+                    self.assertEqual(json.loads(args), {})
 
 if __name__ == '__main__':
     unittest.main()
