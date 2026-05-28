@@ -840,6 +840,42 @@ class TestNPUModelRunner:
 
         assert super_called.get("called") is True
 
+    def test_capture_model_recapture_resets_resources(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(runner_module, "consume_aclgraph_recapture",
+                            lambda: True)
+        monkeypatch.setattr(runner_module, "switch_torch_device",
+                            lambda: nullcontext())
+        monkeypatch.setattr(
+            runner_module,
+            "reset_aclgraph_recapture_resources",
+            MagicMock(side_effect=lambda: calls.append("reset_resources")),
+        )
+        monkeypatch.setattr(
+            GPUModelRunner,
+            "capture_model",
+            lambda self: calls.append("super_capture"),
+        )
+        monkeypatch.setattr(
+            self.runner,
+            "reset_input_batch",
+            MagicMock(side_effect=lambda: calls.append("reset_input_batch")),
+        )
+        monkeypatch.setattr(
+            self.runner,
+            "_mark_aclgraph_wrappers_for_recapture",
+            MagicMock(side_effect=lambda: calls.append("mark_wrappers")),
+        )
+
+        self.runner.capture_model()
+
+        assert calls == [
+            "reset_input_batch",
+            "reset_resources",
+            "mark_wrappers",
+            "super_capture",
+        ]
+
     def test_load_model(self, monkeypatch):
         """Test load_model method calls super().load_model and possible ACLGraphWrapper wrapping.
 

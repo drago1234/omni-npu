@@ -59,6 +59,7 @@ from omni_npu.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import (
     ACLGraphWrapper,
     consume_aclgraph_recapture,
+    reset_aclgraph_recapture_resources,
     set_graph_params,
 )
 from omni_npu.plugin_decorators import (
@@ -722,6 +723,7 @@ class NPUModelRunner(GPUModelRunner):
             return
         if consume_aclgraph_recapture():
             self.reset_input_batch()
+            reset_aclgraph_recapture_resources()
             self._mark_aclgraph_wrappers_for_recapture()
         with switch_torch_device():
             super().capture_model()

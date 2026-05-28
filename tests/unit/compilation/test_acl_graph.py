@@ -21,6 +21,7 @@ from omni_npu.compilation.acl_graph import (
     ensure_weak_ref_graph_params,
     set_aclgraph_recapture,
     consume_aclgraph_recapture,
+    reset_aclgraph_recapture_resources,
     ACLGraphWrapper,
 )
 
@@ -102,6 +103,35 @@ class TestRecapture:
         set_aclgraph_recapture(True)
         assert consume_aclgraph_recapture() is True
         assert consume_aclgraph_recapture() is False
+
+    def test_reset_resources_noops_without_graph_params(self):
+        with patch("torch.npu.mem_get_info") as mem_get_info:
+            reset_aclgraph_recapture_resources()
+
+        mem_get_info.assert_not_called()
+
+    def test_reset_resources_clears_cached_graph_params(self):
+        set_graph_params({4, 8})
+        params = get_graph_params()
+        params.task_entries[4]["layer0"] = MagicMock()
+        params.task_entries[8]["layer0"] = MagicMock()
+        params.workspaces[4][MagicMock()] = torch.tensor([1.0])
+        params.workspaces[8][MagicMock()] = torch.tensor([2.0])
+
+        with patch("torch.npu.mem_get_info",
+                   side_effect=[(10 << 30, 20 << 30),
+                                (12 << 30, 20 << 30)]) as mem_get_info, \
+             patch("omni_npu.compilation.acl_graph.gc.collect") as collect, \
+             patch("torch.npu.empty_cache") as empty_cache, \
+             patch("torch.npu.synchronize") as synchronize:
+            reset_aclgraph_recapture_resources()
+
+        assert params.task_entries == {4: {}, 8: {}}
+        assert params.workspaces == {4: {}, 8: {}}
+        assert mem_get_info.call_count == 2
+        collect.assert_called_once()
+        empty_cache.assert_called_once()
+        synchronize.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -455,11 +485,22 @@ class TestACLGraphWrapperCall:
         wrapper.concrete_aclgraph_entries[bd] = entry
 
         with patch("omni_npu.compilation.acl_graph."
-                    "ensure_weak_ref_graph_params"):
+                    "ensure_weak_ref_graph_params"), \
+             patch("torch.npu.mem_get_info",
+                   side_effect=[(10 << 30, 20 << 30),
+                                (11 << 30, 20 << 30)]) as mem_get_info, \
+             patch("omni_npu.compilation.acl_graph.gc.collect") as collect, \
+             patch("torch.npu.empty_cache") as empty_cache, \
+             patch("torch.npu.synchronize") as synchronize:
             wrapper(torch.tensor([1.0]))
 
         old_graph.reset.assert_called_once()
         assert entry.recapture is False
+        assert entry.aclgraph is mock_graph
+        assert mem_get_info.call_count == 2
+        collect.assert_called_once()
+        empty_cache.assert_called_once()
+        synchronize.assert_called_once()
 
     def test_update_graph_recapture_sets_entries(self):
         """update_graph_recapture marks all entries for recapture."""
