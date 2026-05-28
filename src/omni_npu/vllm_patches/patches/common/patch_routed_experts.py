@@ -83,6 +83,9 @@ _ROUTED_EXPERT_KEYS = (
     "routed_experts_str_len",
     "routed_experts_str",
 )
+_UNSUPPORTED_OUTPUTS_TEXT = (
+    "outputs_text and output_token_ids are not supported for /completion"
+)
 _CURRENT_ROUTED_EXPERTS_PAYLOAD: ContextVar[dict[str, Any] | None] = ContextVar(
     "current_routed_experts_payload",
     default=None,
@@ -1244,11 +1247,21 @@ class ExpertIdServingCompletionStream(VLLMPatch):
         request_metadata: Any,
     ):
         _ensure_choice_patches_applied()
+        last_finish_reason: str | None = None
+
+        async def _track_finish_reason():
+            nonlocal last_finish_reason
+            async for prompt_idx, result in result_generator:
+                outputs = getattr(result, "outputs", ()) or ()
+                if outputs:
+                    last_finish_reason = getattr(outputs[-1], "finish_reason", None)
+                yield prompt_idx, result
+
         async for chunk in _ORIGINAL_COMPLETION_STREAM(
             self,
             request,
             engine_prompts,
-            _wrap_indexed_request_output_stream(self, request, result_generator),
+            _wrap_indexed_request_output_stream(self, request, _track_finish_reason()),
             request_id,
             created_time,
             model_name,
@@ -1257,6 +1270,20 @@ class ExpertIdServingCompletionStream(VLLMPatch):
             request_metadata,
         ):
             yield chunk
+
+        if (
+            request_id is not None
+            and getattr(self, "request_logger", None) is not None
+            and getattr(self, "enable_log_outputs", False)
+        ):
+            self.request_logger.log_outputs(
+                request_id=request_id,
+                outputs=_UNSUPPORTED_OUTPUTS_TEXT,
+                output_token_ids=None,
+                finish_reason=last_finish_reason,
+                is_streaming=True,
+                delta=False,
+            )
 
 
 @register_patch("ExpertIdServingCompletionFinal", OpenAIServingCompletion)
@@ -1298,4 +1325,21 @@ class ExpertIdServingCompletionFinal(VLLMPatch):
         for choice, payload in zip(response.choices, payloads):
             if payload is not None:
                 choice.routed_experts = payload
+        if (
+            request_id is not None
+            and getattr(self, "request_logger", None) is not None
+            and getattr(self, "enable_log_outputs", False)
+        ):
+            choices = getattr(response, "choices", None)
+            finish_reason = None
+            if choices:
+                finish_reason = getattr(choices[-1], "finish_reason", None)
+            self.request_logger.log_outputs(
+                request_id=request_id,
+                outputs=_UNSUPPORTED_OUTPUTS_TEXT,
+                output_token_ids=None,
+                finish_reason=finish_reason,
+                is_streaming=False,
+                delta=False,
+            )
         return response
