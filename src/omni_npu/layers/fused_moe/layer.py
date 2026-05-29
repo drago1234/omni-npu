@@ -99,7 +99,8 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             x_slice = x_slice[start:end]
 
         if layer.gate is not None:
-            router_logits, _ = layer.gate(x_slice)
+            # router_logits, _ = layer.gate(x_slice)
+            router_logits = torch.nn.functional.linear(x_slice.type(torch.float32), layer.gate.weight.data.type(torch.float32))
         else:
             assert router_logits is not None, "Expected gate or router_logits must be provided."
             if is_need_slice:

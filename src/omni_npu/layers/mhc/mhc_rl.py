@@ -168,7 +168,8 @@ class NPUmHCRL(torch.nn.Module):
                         gamma=None,
                         norm_eps=self.hc_eps,
                         hc_eps=self.hc_eps,
-                )
+                        out_flag=1
+                    )
             else:
                 hidden_states, h_post, h_res, _, _, _ = torch_npu.npu_mhc_pre(
                     hidden_states,
