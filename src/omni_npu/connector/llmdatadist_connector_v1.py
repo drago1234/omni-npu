@@ -649,7 +649,9 @@ class DecodeConnectorScheduler:
         if request.request_id in self.processed_request:
             self.processed_request.remove(request.request_id)
         if request.status == RequestStatus.FINISHED_ABORTED and request.kv_transfer_params is not None:
-            self._send_pulled_kv_req_list(request.kv_transfer_params.get("remote_host_ip"), [request.request_id])
+            remote_host_ip = request.kv_transfer_params.get("remote_host_ip")
+            if remote_host_ip is not None:
+                self._send_pulled_kv_req_list(remote_host_ip, [request.request_id])
         return False, None
 
 
