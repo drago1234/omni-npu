@@ -5,7 +5,7 @@ import time
 from typing import Any
 
 from vllm.v1.request import Request
-from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from omni_npu.vllm_patches.core import VLLMPatch, register_patch
@@ -78,12 +78,12 @@ class SchedulerResetPrefixCachePatch(VLLMPatch):
         )
 
 
-@register_patch("EngineCoreResetPrefixCachePatch", EngineCore)
+@register_patch("EngineCoreResetPrefixCachePatch", EngineCoreProc)
 class EngineCoreResetPrefixCachePatch(VLLMPatch):
     _attr_names_to_apply = ["_process_engine_step"]
 
     # modified method
-    def _process_engine_step(self: EngineCore) -> bool:
+    def _process_engine_step(self: EngineCoreProc) -> bool:
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
