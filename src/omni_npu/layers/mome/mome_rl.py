@@ -127,11 +127,11 @@ class ColumnParallelMOMERL(torch.nn.Module):
             initial_state_idx=mome_metadata.block_idx_last_computed_token,
             pad_slot_id=mome_metadata.pad_slot_id,
             max_query_len=mome_metadata.max_query_len,
-            residual_connection=1,
+            residual_connection=0,
             block_size=mome_metadata.B_size,
             conv_mode=1, 
             inplace=inplace, 
-        )
+        ) + x
 
     def forward_prefill(
         self,
