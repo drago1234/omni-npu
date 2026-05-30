@@ -65,13 +65,16 @@ class ThinkingBudgetStateHolder:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
             self.tool_call_start_token_ids = []
+            self.tool_call_end_token_ids = []
         else:
             rs = reasoning_config.reasoning_start_token_ids
             re = reasoning_config.reasoning_end_token_ids
             ts = reasoning_config.tool_call_start_token_ids
+            te = reasoning_config.tool_call_end_token_ids
             self.think_start_token_ids = rs if rs else []
             self.think_end_token_ids = re if re else []
             self.tool_call_start_token_ids = ts if ts else []
+            self.tool_call_end_token_ids = te if te else []
 
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
@@ -311,13 +314,6 @@ class ThinkingBudgetStateHolder:
             return
         output = state.get("output_tok_ids", [])
 
-        all_tokens = (state.get("prompt_tok_ids") or []) + (state.get("output_tok_ids") or [])
-        last_start = self._find_last_sequence_index(all_tokens, self.think_start_token_ids)
-        last_end = self._find_last_sequence_index(all_tokens, self.think_end_token_ids)
-        
-        state["semantic_in_think"] = (last_start > last_end)
-        state["semantic_has_ended"] = (last_end > last_start)
-
         if not output:
             # When in_end was set at init (budget=0, prompt already in think),
             # we must force the first generated token to be the end token;
@@ -506,14 +502,26 @@ class ThinkingBudgetStateHolder:
             start_pos = self.cu_num_tokens[seq_idx]
             end_pos = (self.cu_num_tokens.get(seq_idx + 1, logits.shape[0]) 
                     if seq_idx + 1 in self.cu_num_tokens else logits.shape[0])
+
+            all_tokens = (state.get("prompt_tok_ids") or []) + (state.get("output_tok_ids") or [])
+            last_start = self._find_last_sequence_index(all_tokens, self.think_start_token_ids)
+            last_end = self._find_last_sequence_index(all_tokens, self.think_end_token_ids)
+            
+            in_think = (last_start > last_end)
+            think_has_ended = (last_end > last_start)
             
             # 1. 在思考中 → 抑制 tool_call_start_token
-            if state.get("semantic_in_think", False) and self.tool_call_start_token_ids:
+            if in_think and self.tool_call_start_token_ids:
                 tool_start_token_id = self.tool_call_start_token_ids[0]
                 logits[start_pos:end_pos, tool_start_token_id] = -float('inf')
 
+            #  在思考中 → 抑制 tool_call_end_token
+            if in_think and self.tool_call_end_token_ids:
+                tool_end_token_id = self.tool_call_end_token_ids[0]
+                logits[start_pos:end_pos, tool_end_token_id] = -float('inf')
+
             # 2. 思考已结束 → 抑制 think_end_token（避免重复生成）
-            if state.get("semantic_has_ended", False) and self.think_end_token_ids:
+            if think_has_ended and self.think_end_token_ids:
                 think_end_token_id = self.think_end_token_ids[0]
                 logits[start_pos:end_pos, think_end_token_id] = -float('inf')
 

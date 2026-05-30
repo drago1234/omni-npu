@@ -30,6 +30,8 @@ class ReasoningConfig:
     """Deprecated alias for `reasoning_end_str`."""
     tool_call_start_token: str = ""
     """String that indicates the start of tool call."""
+    tool_call_end_token: str = ""
+    """String that indicates the end of tool call."""
 
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=True
@@ -38,6 +40,9 @@ class ReasoningConfig:
         default=None, init=False, repr=True
     )
     _tool_call_start_token_ids: list[int] | None = field(
+        default=None, init=False, repr=True
+    )
+    _tool_call_end_token_ids: list[int] | None = field(
         default=None, init=False, repr=True
     )
     _enabled: bool = field(default=False, init=False, repr=False)
@@ -57,6 +62,10 @@ class ReasoningConfig:
     @property
     def tool_call_start_token_ids(self) -> list[int] | None:
         return self._tool_call_start_token_ids
+
+    @property
+    def tool_call_end_token_ids(self) -> list[int] | None:
+        return self._tool_call_end_token_ids
 
     @classmethod
     def as_argparse_dict(cls):
@@ -82,6 +91,7 @@ class ReasoningConfig:
         reasoning_start_str = self.reasoning_start_str or self.think_start_str
         reasoning_end_str = self.reasoning_end_str or self.think_end_str
         tool_call_start_token = self.tool_call_start_token
+        tool_call_end_token = self.tool_call_end_token
         if not reasoning_start_str or not reasoning_end_str:
             return
 
@@ -95,6 +105,10 @@ class ReasoningConfig:
         
         self._tool_call_start_token_ids = tokenizer.encode(
             tool_call_start_token, add_special_tokens=False
+        )
+
+        self._tool_call_end_token_ids = tokenizer.encode(
+            tool_call_end_token, add_special_tokens=False
         )
 
         if not self._reasoning_start_token_ids or not self._reasoning_end_token_ids:
