@@ -164,34 +164,22 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         expanded_x = all2all_prepare_permute_result.expanded_x
         input_splits = all2all_prepare_permute_result.input_splits
         output_splits = all2all_prepare_permute_result.output_splits
+        expanded_row_idx = all2all_prepare_permute_result.expanded_row_idx
         new_x = torch.index_select(
             hidden_states, 0, gathered_idxs_unsort.to(torch.float32).argsort().to(torch.int32)
         )
         gathered_tokens = new_x.new_empty(*expanded_x.shape)
         dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=get_ep_group().device_group)
-        expanded_row_idx = all2all_prepare_permute_result.expanded_row_idx
-        input_dtype = gathered_tokens.dtype
-        topk = topk_weights.shape[-1]
-        flatten_indices = topk_ids.reshape(-1)
-        sorted_indices = torch.sort(flatten_indices.float(), stable=True)[1]
-        if sorted_indices.numel() != gathered_tokens.size(0):
-            raise ValueError("sorted_indices.numel() must be == gathered_tokens.size(0)")
-
-        permuted_probs = topk_weights.float().reshape(-1).index_select(0, sorted_indices)
-        gathered_tokens = gathered_tokens * permuted_probs.unsqueeze(-1)
-        unpermuted_tokens = torch.zeros(
-            topk_weights.shape[0],
-            gathered_tokens.size(-1),
-            dtype=gathered_tokens.dtype,
-            device=gathered_tokens.device,
-        )
-        sorted_indices = sorted_indices // topk
-        unpermuted_tokens = unpermuted_tokens.scatter_add_(
-            0,
-            sorted_indices.unsqueeze(1).expand(-1, gathered_tokens.shape[1]),
+        return torch_npu.npu_moe_finalize_routing(
             gathered_tokens,
+            skip1=None,
+            skip2=None,
+            bias=None,
+            scales=topk_weights.to(gathered_tokens.dtype),
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=None,
+            drop_pad_mode=2,
         )
-        return unpermuted_tokens.to(input_dtype)
 
 
 class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):

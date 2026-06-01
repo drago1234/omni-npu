@@ -80,8 +80,6 @@ class Indexer(torch.nn.Module):
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
-        self.softmax_scale = self.head_dim ** -0.5
-        self.weights_scale = self.n_head ** -0.5
         # no tensor parallel, just replicated
         self.wq_b = ReplicatedFlashCommLinear(
             self.q_lora_rank,
@@ -138,7 +136,6 @@ class Indexer(torch.nn.Module):
         assert kx.size(0) == k_cos_sin[0].size(0)
         N, D = self.n_head, self.head_dim
         wi = self.weights_proj(wx)[0]         # TN
-        wi = wi * self.weights_scale * self.softmax_scale
         qi = self.wq_b(qr)[0].view(-1, N, D)  # TND
         qi = self._apply_rope(qi, *q_cos_sin) # TND
         ki = self.wk(kx)[0]                   # TD
