@@ -207,7 +207,7 @@ class PanguToolParser(ToolParser):
                 # streamed to the client yet.
                 if self.current_tool_id >= 0:
                     cur_arguments = current_tool_call.get("arguments")
-                    if cur_arguments:
+                    if cur_arguments is not None:
                         cur_args_json = json.dumps(cur_arguments,
                                                    ensure_ascii=False)
                         sent = len(
