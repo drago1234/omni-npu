@@ -91,7 +91,7 @@ def _stream_ctx(_stream):
 def test_select_experts_profile_mode(layer_module):
     module, _, context_holder = layer_module
     context_holder.attn_metadata = None
-    module.get_ep_group = MagicMock(return_value=SimpleNamespace(rank=1))
+    module.get_ep_group = MagicMock(return_value=SimpleNamespace(rank_in_group=1))
 
     topk_weights, topk_ids = module.NPUFusedMoE.select_experts(
         router_logits=torch.zeros(2, 4),

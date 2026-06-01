@@ -345,7 +345,7 @@ class NPUFusedMoE(FusedMoE):
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
             # profile run, force load balance
-            ep_rank = get_ep_group().rank
+            ep_rank = get_ep_group().rank_in_group
             global_num_experts = router_logits.shape[1]
             num_tokens = router_logits.shape[0]
             topk_ids = torch.arange(
