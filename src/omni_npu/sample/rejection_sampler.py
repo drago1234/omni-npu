@@ -149,7 +149,7 @@ class NPURejectionSampler(RejectionSampler):
             )
 
         logprobs_tensors = None
-        if sampling_metadata.max_num_logprobs:
+        if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(
                 sampling_metadata.max_num_logprobs,
                 metadata,

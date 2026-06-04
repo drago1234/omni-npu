@@ -2,6 +2,7 @@ import importlib
 import importlib.machinery
 import sys
 import types
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -51,7 +52,11 @@ def rejection_mod(monkeypatch):
         "_C",
         types.SimpleNamespace(_NPUTaskGroupHandle=object),
     )
-    setattr(fake_aiter_ops, "rocm_aiter_ops", None)
+    setattr(
+        fake_aiter_ops,
+        "rocm_aiter_ops",
+        types.SimpleNamespace(is_enabled=lambda: False),
+    )
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
     monkeypatch.setitem(sys.modules, "vllm._aiter_ops", fake_aiter_ops)
     monkeypatch.setattr(
@@ -60,8 +65,11 @@ def rejection_mod(monkeypatch):
         types.SimpleNamespace(
             default_stream=lambda: fake_default_stream,
             Stream=object,
+            Event=object,
             NPUGraph=object,
             ExternalEvent=object,
+            is_available=lambda: False,
+            config=types.SimpleNamespace(),
         ),
         raising=False,
     )
@@ -398,4 +406,108 @@ def test_rejection_sample_random_path_invokes_helpers(rejection_mod, monkeypatch
     assert called["random_called"] is True
     assert called["no_draft_probs"] is True
     assert torch.equal(out, torch.tensor([[4, 5, 6]], dtype=torch.int32))
+
+
+@dataclass
+class _ForwardSamplingMetadata:
+    max_num_logprobs: int | None
+
+
+def _build_npu_rejection_sampler(mod):
+    base_sampler = SimpleNamespace(
+        logprobs_mode="raw_logits",
+        dsa_stream=object(),
+    )
+    return mod.NPURejectionSampler(base_sampler)
+
+
+def _build_spec_decode_metadata():
+    return SimpleNamespace(
+        max_spec_len=1,
+        bonus_logits_indices=torch.tensor([0], dtype=torch.int64),
+        target_logits_indices=torch.tensor([1], dtype=torch.int64),
+        draft_token_ids=torch.tensor([1], dtype=torch.int32),
+        num_draft_tokens=[1],
+        cu_num_draft_tokens=torch.tensor([1], dtype=torch.int64),
+    )
+
+
+def _patch_npu_rejection_forward_deps(mod, rejection, monkeypatch, output_ids):
+    bonus_output = SimpleNamespace(
+        sampled_token_ids=torch.tensor([[9]], dtype=torch.int32),
+        logprobs_tensors=SimpleNamespace(logprobs=torch.zeros(1, 4)),
+    )
+    rejection.sampler = lambda *args, **kwargs: bonus_output
+    monkeypatch.setattr(
+        rejection, "apply_logits_processors", lambda target_logits, sm, md: target_logits
+    )
+    monkeypatch.setattr(
+        mod,
+        "compute_probs_and_sample",
+        lambda target_logits, cu, sm, md, stream: (
+            torch.tensor([1], dtype=torch.int32),
+            target_logits,
+        ),
+    )
+    monkeypatch.setattr(mod, "simple_verify", lambda *args, **kwargs: output_ids)
+
+
+def test_npu_rejection_sampler_forward_collects_logprobs_when_max_num_logprobs_zero(
+    rejection_mod, monkeypatch
+):
+    """top_logprobs=0 still requires sampled-token logprobs."""
+    mod, _, _ = rejection_mod
+    rejection = _build_npu_rejection_sampler(mod)
+    metadata = _build_spec_decode_metadata()
+    output_ids = torch.tensor([[1, mod.PLACEHOLDER_TOKEN_ID]], dtype=torch.int32)
+    _patch_npu_rejection_forward_deps(mod, rejection, monkeypatch, output_ids)
+
+    fake_logprobs = SimpleNamespace(dummy=True)
+    get_logprobs_calls = []
+    monkeypatch.setattr(
+        rejection,
+        "_get_logprobs_tensors",
+        lambda max_num_logprobs, *args, **kwargs: (
+            get_logprobs_calls.append(max_num_logprobs) or fake_logprobs
+        ),
+    )
+
+    out = rejection.forward(
+        metadata=metadata,
+        draft_probs=None,
+        logits=torch.randn(2, 4),
+        sampling_metadata=_ForwardSamplingMetadata(max_num_logprobs=0),
+    )
+
+    assert get_logprobs_calls == [0]
+    assert out.logprobs_tensors is fake_logprobs
+    assert torch.equal(out.sampled_token_ids, output_ids)
+
+
+def test_npu_rejection_sampler_forward_skips_logprobs_when_max_num_logprobs_none(
+    rejection_mod, monkeypatch
+):
+    mod, _, _ = rejection_mod
+    rejection = _build_npu_rejection_sampler(mod)
+    metadata = _build_spec_decode_metadata()
+    output_ids = torch.tensor([[1, mod.PLACEHOLDER_TOKEN_ID]], dtype=torch.int32)
+    _patch_npu_rejection_forward_deps(mod, rejection, monkeypatch, output_ids)
+
+    get_logprobs_called = []
+    monkeypatch.setattr(
+        rejection,
+        "_get_logprobs_tensors",
+        lambda *args, **kwargs: get_logprobs_called.append(True),
+    )
+
+    out = rejection.forward(
+        metadata=metadata,
+        draft_probs=None,
+        logits=torch.randn(2, 4),
+        sampling_metadata=_ForwardSamplingMetadata(max_num_logprobs=None),
+    )
+
+    assert get_logprobs_called == []
+    assert out.logprobs_tensors is None
+    assert torch.equal(out.sampled_token_ids, output_ids)
 
