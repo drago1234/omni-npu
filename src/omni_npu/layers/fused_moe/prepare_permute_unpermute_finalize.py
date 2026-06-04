@@ -171,15 +171,15 @@ class All2AllPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):
         gathered_tokens = new_x.new_empty(*expanded_x.shape)
         dist.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=get_ep_group().device_group)
         return torch_npu.npu_moe_finalize_routing(
-            gathered_tokens,
+            gathered_tokens.to(topk_weights.dtype),
             skip1=None,
             skip2=None,
             bias=None,
-            scales=topk_weights.to(gathered_tokens.dtype),
+            scales=topk_weights,
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=None,
             drop_pad_mode=2,
-        )
+        ).to(gathered_tokens.dtype)
 
 
 class AGRSPrepPmtAndUnpmtFinal(FusedMoEPreparePermuteAndUnpermuteFinalize):

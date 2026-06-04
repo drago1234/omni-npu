@@ -99,7 +99,7 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             x_slice = x_slice[start:end]
 
         if layer.gate is not None:
-            router_logits, _ = layer.gate(x_slice)
+            router_logits, _ = layer.gate(x_slice.float())
         else:
             assert router_logits is not None, "Expected gate or router_logits must be provided."
             if is_need_slice:
@@ -121,6 +121,10 @@ class NPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod, NPUFusedMoEMethodB
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
         )
+        # Sort each row of topk_ids in ascending order, and reorder topk_weights accordingly.
+        sorted_indices = topk_ids.argsort(dim=-1)
+        topk_ids = topk_ids.gather(dim=-1, index=sorted_indices).contiguous()
+        topk_weights = topk_weights.gather(dim=-1, index=sorted_indices).contiguous()
 
         if (
             getattr(layer, "vllm_config", None) is not None
