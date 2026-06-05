@@ -175,10 +175,7 @@ class RoutedExpertsReaderPDSupportPatch(VLLMPatch):
             return
 
         hf_config = model_config.hf_text_config
-        if hf_config.num_experts_per_tok > torch.iinfo(torch.uint8).max:
-            host_dtype = np.uint16
-        else:
-            host_dtype = np.uint8
+        host_dtype = np.int16
         shape = (
             max_num_kv_tokens,
             hf_config.num_hidden_layers,
@@ -222,13 +219,8 @@ class RoutedExpertsCapturerTPAggregatePatch(VLLMPatch):
         hf_config = model_config.hf_text_config
         num_layers = hf_config.num_hidden_layers
         num_experts_per_tok = hf_config.num_experts_per_tok
-
-        if num_experts_per_tok > torch.iinfo(torch.uint8).max:
-            device_dtype = torch.uint16
-            host_dtype = np.uint16
-        else:
-            device_dtype = torch.uint8
-            host_dtype = np.uint8
+        device_dtype = torch.int16
+        host_dtype = np.int16
 
         self._device_buffer = torch.zeros(
             (max_num_batched_tokens, num_layers, num_experts_per_tok),

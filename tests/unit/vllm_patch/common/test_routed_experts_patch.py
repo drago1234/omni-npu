@@ -194,20 +194,11 @@ def test_is_prefill_node_falls_back_to_role(monkeypatch, role, expected):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    ("num_experts_per_tok", "expected_torch_dtype", "expected_numpy_dtype"),
-    [
-        (255, torch.uint8, np.uint8),
-        (256, torch.uint16, np.uint16),
-    ],
-)
-def test_init_buffer_uses_npu_and_dtype_derived_from_num_experts_per_tok(
+def test_init_buffer_uses_npu_and_int16_dtype(
     monkeypatch,
-    num_experts_per_tok,
-    expected_torch_dtype,
-    expected_numpy_dtype,
 ):
     captured = {}
+    num_experts_per_tok = 8
 
     class _FakeSharedMemory:
         def __init__(self, size: int):
@@ -261,38 +252,30 @@ def test_init_buffer_uses_npu_and_dtype_derived_from_num_experts_per_tok(
     )
 
     assert captured["zeros_shape"] == (8, 3, num_experts_per_tok)
-    assert captured["zeros_dtype"] is expected_torch_dtype
+    assert captured["zeros_dtype"] is torch.int16
     assert captured["zeros_device"] == "npu"
     assert captured["shm_size"] == (
-        16 * 3 * num_experts_per_tok * np.dtype(expected_numpy_dtype).itemsize
+        16 * 3 * num_experts_per_tok * np.dtype(np.int16).itemsize
     )
-    assert capturer._host_buffer_view.dtype == np.dtype(expected_numpy_dtype)
+    assert capturer._host_buffer_view.dtype == np.dtype(np.int16)
     assert capturer._host_buffer_view.shape == (16, 3, num_experts_per_tok)
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    ("num_experts_per_tok", "expected_numpy_dtype"),
-    [
-        (255, np.uint8),
-        (256, np.uint16),
-    ],
-)
-def test_attach_buffer_uses_dtype_derived_from_num_experts_per_tok(
+def test_attach_buffer_uses_int16_dtype(
     monkeypatch,
-    num_experts_per_tok,
-    expected_numpy_dtype,
 ):
     class _FakeSharedMemory:
         def __init__(self, size: int):
             self.buf = bytearray(size)
 
+    num_experts_per_tok = 8
     monkeypatch.setattr(patch_routed_experts, "_file_lock", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
         patch_routed_experts.shared_memory,
         "SharedMemory",
         lambda name: _FakeSharedMemory(
-            16 * 3 * num_experts_per_tok * np.dtype(expected_numpy_dtype).itemsize
+            16 * 3 * num_experts_per_tok * np.dtype(np.int16).itemsize
         ),
     )
 
@@ -315,7 +298,7 @@ def test_attach_buffer_uses_dtype_derived_from_num_experts_per_tok(
         vllm_config=vllm_config,
     )
 
-    assert reader._host_buffer_view.dtype == np.dtype(expected_numpy_dtype)
+    assert reader._host_buffer_view.dtype == np.dtype(np.int16)
     assert reader._host_buffer_view.shape == (16, 3, num_experts_per_tok)
     assert reader.is_pd_disaggregation is True
     assert reader.is_pd_prefill is True
