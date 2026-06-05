@@ -494,6 +494,10 @@ class ThinkingBudgetStateHolder:
             else:
                 cumulative_total += 1
 
+        tool_start_id = self.tool_call_start_token_ids[0] if self.tool_call_start_token_ids else None
+        tool_end_id = self.tool_call_end_token_ids[0] if self.tool_call_end_token_ids else None
+        think_end_id = self.think_end_token_ids[0] if self.think_end_token_ids else None
+
         for seq_idx in sorted(self._state.keys()):
             if seq_idx not in self.cu_num_tokens:
                 continue
@@ -502,28 +506,44 @@ class ThinkingBudgetStateHolder:
             start_pos = self.cu_num_tokens[seq_idx]
             end_pos = (self.cu_num_tokens.get(seq_idx + 1, logits.shape[0]) 
                     if seq_idx + 1 in self.cu_num_tokens else logits.shape[0])
-
+            
+            spec_tokens = spec_token_ids_for_layout[seq_idx] if seq_idx < len(spec_token_ids_for_layout) else []
             all_tokens = (state.get("prompt_tok_ids") or []) + (state.get("output_tok_ids") or [])
-            last_start = self._find_last_sequence_index(all_tokens, self.think_start_token_ids)
-            last_end = self._find_last_sequence_index(all_tokens, self.think_end_token_ids)
             
-            in_think = (last_start > last_end)
-            think_has_ended = (last_end > last_start)
-            
-            # 1. 在思考中 → 抑制 tool_call_start_token
-            if in_think and self.tool_call_start_token_ids:
-                tool_start_token_id = self.tool_call_start_token_ids[0]
-                logits[start_pos:end_pos, tool_start_token_id] = -float('inf')
-
-            #  在思考中 → 抑制 tool_call_end_token
-            if in_think and self.tool_call_end_token_ids:
-                tool_end_token_id = self.tool_call_end_token_ids[0]
-                logits[start_pos:end_pos, tool_end_token_id] = -float('inf')
-
-            # 2. 思考已结束 → 抑制 think_end_token（避免重复生成）
-            if think_has_ended and self.think_end_token_ids:
-                think_end_token_id = self.think_end_token_ids[0]
-                logits[start_pos:end_pos, think_end_token_id] = -float('inf')
+            if self.in_spec_mode and not predict_bonus_token and think_end_id in spec_tokens:
+                # sliced logits `seq_logits` shares memory with original logits `logits`
+                # so changing the value of `seq_logits`` will also change the value of `logits``
+                seq_logits = logits[start_pos:end_pos]
+                num_tokens = seq_logits.shape[0]
+                constrain_mask = torch.arange(num_tokens, device=logits.device)
+                
+                think_end_id_index = spec_tokens.index(think_end_id)
+                tool_constrain_mask = constrain_mask <= think_end_id_index
+                think_constrain_mask = constrain_mask > think_end_id_index
+                
+                if tool_start_id is not None:
+                    seq_logits[tool_constrain_mask, tool_start_id] = -float('inf')
+                if tool_end_id is not None:
+                    seq_logits[tool_constrain_mask, tool_end_id] = -float('inf')
+                if think_end_id is not None:
+                    seq_logits[think_constrain_mask, think_end_id] = -float('inf')
+            else:
+                all_tokens_final = all_tokens + spec_tokens if self.in_spec_mode else all_tokens
+                
+                last_start = self._find_last_sequence_index(all_tokens_final, self.think_start_token_ids)
+                last_end = self._find_last_sequence_index(all_tokens_final, self.think_end_token_ids)
+                
+                in_think = (last_start > last_end)
+                think_has_ended = (last_end > last_start)
+                
+                if in_think:
+                    if tool_start_id is not None:
+                        logits[start_pos:end_pos, tool_start_id] = -float('inf')
+                    if tool_end_id is not None:
+                        logits[start_pos:end_pos, tool_end_id] = -float('inf')
+                        
+                if think_has_ended and think_end_id is not None:
+                    logits[start_pos:end_pos, think_end_id] = -float('inf')
 
             if state.get("in_end", False):
                 # logits processor in spec mode are called twice
