@@ -55,7 +55,9 @@ def load_model_extra_config(model_config, vllm_config, scheduler_config):
         hardware_platform = "A5"
     else:
         raise ValueError(f"Unsupported device: {device_name}. Only Ascend910/Ascend910B/Ascend950 are supported.")
-    
+    global model_extra_config
+    model_extra_config.dtype = vllm_config.model_config.dtype
+
     update_task_config(
         model_name = model_name,
         hardware_platform = hardware_platform,
@@ -170,8 +172,9 @@ class ModelOperatorOptConfig:
             torch.npu.config.allow_internal_format = True
 
 
-@dataclass 
+@dataclass
 class ModelExtraConfig:
+    dtype: torch.dtype = torch.bfloat16
     parall_config: ModelParallelConfig = field(default_factory = ModelParallelConfig)
     operator_opt_config: ModelOperatorOptConfig = field(default_factory = ModelOperatorOptConfig)
     task_config: TaskConfig = field(default_factory = TaskConfig)
@@ -262,7 +265,10 @@ def parse_hf_config(hf_config):
     elif quantization_config is not None and quantization_config.get('quant_method', '').strip() == 'hifloat8':
         quant_type = "hif8"
     else:
-        quant_type = "bf16"
+        if hasattr(hf_config, "dtype") and hf_config.dtype in ["float16", "fp16", torch.float16]:
+            quant_type = "fp16"
+        else:
+            quant_type = "bf16"
 
     return model_name, quant_type
 

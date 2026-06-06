@@ -27,11 +27,11 @@ def apply_top_k_top_p_npu(
 ) -> torch.Tensor:
     if k is None and p is None:
         return logits
-    logits = logits.type(torch.bfloat16)
+    logits = logits.type(model_extra_config.dtype)
     if p is not None:
-        p = p.type(torch.bfloat16)
+        p = p.type(model_extra_config.dtype)
     else:
-        p = torch.ones(logits.shape[0], dtype=torch.bfloat16, device=logits.device)
+        p = torch.ones(logits.shape[0], dtype=model_extra_config.dtype, device=logits.device)
     if k is not None:
         k = k.type(torch.int32)
     else:
@@ -84,11 +84,11 @@ class NPUTopKTopPSampler(V1TopKTopPSampler):
             elif self.logprobs_mode == "processed_logprobs":
                 logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
             return token_ids, logits_to_return
-        logits = logits.type(torch.bfloat16)
+        logits = logits.type(model_extra_config.dtype)
         if p is not None:
-            p = p.type(torch.bfloat16)
+            p = p.type(model_extra_config.dtype)
         else:
-            p = torch.ones(logits.shape[0], dtype=torch.bfloat16, device=logits.device)
+            p = torch.ones(logits.shape[0], dtype=model_extra_config.dtype, device=logits.device)
         if k is not None:
             k = k.type(torch.int32)
         else:

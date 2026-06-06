@@ -611,7 +611,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
             )
             output = merged_output
 
-        return output.to(torch.bfloat16).flatten(start_dim=-2)
+        return output.to(model_extra_config.dtype).flatten(start_dim=-2)
 
     def _forward_decode_dcp(
         self,
@@ -688,7 +688,7 @@ class NPUMLAImpl(MLACommonBaseImpl[NPUMLAMetadata]):
                 outs=[it.view(-1, D) for it in tp_out.float().split(sect, dim=0)],
                 lses=[it.flatten() for it in tp_lse.split(sect, dim=0)],
             )
-        return merged.to(torch.bfloat16).view(self.num_heads, -1, D) # NTD
+        return merged.to(model_extra_config.dtype).view(self.num_heads, -1, D) # NTD
 
     def _forward_decode(
         self,

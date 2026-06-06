@@ -271,7 +271,7 @@ class StaticSinkAttentionPatch(VLLMPatch):
                         block_size=block_size,
                         num_kv_heads=1,
                         head_size=self.head_size,
-                        dtype=torch.bfloat16,
+                        dtype=model_extra_config.dtype,
                         sliding_window=2048,
                         page_size_padded=vllm_config.cache_config.mamba_page_size_padded,
                     )

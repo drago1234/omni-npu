@@ -191,5 +191,41 @@
                 "decode_config_file": "openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_d.json"
             }
         }
+    },
+    {
+        "model": "openpangu_v2_92B",
+        "hardware": "A3",
+        "precision": "fp16",
+        "configs":{
+            "hybrid":{
+                "config_file":"openpangu_v2/openpangu_v2_bf16_a3_hybrid.json"
+            },
+            "1P1D": {
+                "prefill_config_file": "openpangu_v2/openpangu_v2_92b_bf16_a3_1p1d_p.json",
+                "decode_config_file": "openpangu_v2/openpangu_v2_92b_bf16_a3_1p1d_d.json"
+            },
+            "2P2D": {
+                "prefill_config_file": "openpangu_v2/openpangu_v2_92b_bf16_a3_1p1d_p.json",
+                "decode_config_file": "openpangu_v2/openpangu_v2_92b_bf16_a3_1p1d_d.json"
+            }
+        }
+    },
+    {
+        "model": "openpangu_v2_505B",
+        "hardware": "A3",
+        "precision": "fp16",
+        "configs":{
+            "hybrid":{
+                "config_file":"openpangu_v2/openpangu_v2_bf16_a3_hybrid.json"
+            },
+            "1P1D": {
+                "prefill_config_file": "openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_p.json",
+                "decode_config_file": "openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_d.json"
+            },
+            "2P2D": {
+                "prefill_config_file": "openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_p.json",
+                "decode_config_file": "openpangu_v2/openpangu_v2_505b_bf16_a3_1p1d_d.json"
+            }
+        }
     }
 ]

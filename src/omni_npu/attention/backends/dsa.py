@@ -81,7 +81,7 @@ class NPUDSABackend(MLACommonBackend):
             dtypes = (torch.bfloat16, torch.int8)
         else:
             shapes = ( (576,), (128,) )
-            dtypes = (torch.bfloat16, torch.bfloat16)
+            dtypes = (model_extra_config.dtype, model_extra_config.dtype)
 
         return _maybe_padded_raw_tensor_to_strided_caches(
             raw_tensor,

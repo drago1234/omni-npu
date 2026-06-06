@@ -7,6 +7,7 @@ import torch
 import torch_npu
 
 from vllm.platforms import current_platform
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
 def _apply_experts(layer: torch.nn.Module, h: torch.Tensor, expert_tokens: torch.Tensor, pertoken_scale=None):
@@ -105,4 +106,4 @@ def fused_experts_tp(
     out = _apply_experts(layer, sorted_tokens, expert_tokens, pertoken_scale)
     
     return torch_npu.npu_moe_finalize_routing(out, None, None, None, topk_weights,
-                                              expanded_src_to_dst_row, topk_ids).to(torch.bfloat16)
+                                              expanded_src_to_dst_row, topk_ids).to(model_extra_config.dtype)

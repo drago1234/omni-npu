@@ -605,14 +605,14 @@ def compute_probs_and_sample(
             sampling_metadata.top_p,
             cu_num_draft_tokens,
             num_tokens,
-        ).type(torch.bfloat16)
+        ).type(model_extra_config.dtype)
     else:
-        top_p = torch.ones(logits.shape[0], dtype=torch.bfloat16, device=logits.device)
+        top_p = torch.ones(logits.shape[0], dtype=model_extra_config.dtype, device=logits.device)
 
     # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
     logits.div_(temperature.unsqueeze(-1))
 
-    logits = logits.type(torch.bfloat16)
+    logits = logits.type(model_extra_config.dtype)
     if model_extra_config.operator_opt_config.sampler_multi_stream:
         with torch_npu.npu.stream(stream):
             q = generate_random_sequence(

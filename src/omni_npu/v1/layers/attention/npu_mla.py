@@ -233,9 +233,9 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     (self.num_heads * self.v_head_dim,),
                 )
                 self.mome_state_dtypes = (
-                    torch.bfloat16,
-                    torch.bfloat16,
-                    torch.bfloat16,
+                    model_extra_config.dtype,
+                    model_extra_config.dtype,
+                    model_extra_config.dtype,
                 )
                 self.kernel_size = getattr(config, 'router_sliding_window', 0)
                 self.cache_dtype_str = None
@@ -438,7 +438,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 k_rope_scale=None,
                 k_rope_offset=None,
                 epsilon=self.kv_a_layernorm.variance_epsilon,
-                cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
+                cache_mode="PA_NZ" if (model_extra_config.operator_opt_config.kv_nz and model_extra_config.dtype != torch.float16) else "PA",
                 rotary_mode="half" if not self.rope_interleaved else "interleave",
                 quant_mode="none",
                 is_output_kv=True
@@ -453,7 +453,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 kv_cache[1].unsqueeze(2),
                 kv_cache[0].unsqueeze(2),
                 epsilon=self.kv_a_layernorm.variance_epsilon,
-                cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
+                cache_mode="PA_NZ" if (model_extra_config.operator_opt_config.kv_nz and model_extra_config.dtype != torch.float16) else "PA",
             )
 
             if model_extra_config.operator_opt_config.kv_nz:
@@ -618,7 +618,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     k_rope_scale=None,
                     k_rope_offset=None,
                     epsilon=self.kv_a_layernorm.variance_epsilon,
-                    cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
+                    cache_mode="PA_NZ" if (model_extra_config.operator_opt_config.kv_nz and model_extra_config.dtype != torch.float16) else "PA",
                     rotary_mode="half" if not self.rope_interleaved else "interleave",
                     quant_mode="none",
                     is_output_kv=True
@@ -635,7 +635,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                     k_rope_scale=None,
                     k_rope_offset=None,
                     epsilon=self.kv_a_layernorm.variance_epsilon,
-                    cache_mode="PA_NZ" if model_extra_config.operator_opt_config.kv_nz else "PA",
+                    cache_mode="PA_NZ" if (model_extra_config.operator_opt_config.kv_nz and model_extra_config.dtype != torch.float16) else "PA",
                     is_output_kv=True
                 )
 

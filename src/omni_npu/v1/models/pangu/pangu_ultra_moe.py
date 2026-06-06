@@ -591,7 +591,7 @@ class OpenPanguModelBase(nn.Module, SupportsPP, SupportsLoRA):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states.float())
+        logits = self.logits_processor(self.lm_head, hidden_states.float() if model_extra_config.dtype != torch.float16 else hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
