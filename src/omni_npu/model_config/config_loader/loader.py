@@ -111,6 +111,7 @@ class ModelOperatorOptConfig:
     enable_prefill_mla_absorb_pa: bool = False
     kv_nz: bool = True
     gmm_nz: bool = True
+    lmhead_nz: bool = True
     moe_multi_stream_tune: bool = False
     shared_expert_multi_stream: bool = True
     sampler_multi_stream: bool = True

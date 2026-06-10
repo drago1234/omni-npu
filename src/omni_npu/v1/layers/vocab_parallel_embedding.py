@@ -32,6 +32,7 @@ from omni_npu.v1.distributed.parallel_state_ext import (
     get_world_group,
 )
 from omni_npu.v1.distributed.communication_op_ext import reduce_scatter_local
+from omni_npu.model_config.config_loader.loader import model_extra_config
 
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
@@ -248,4 +249,5 @@ class NPUParallelLMHead(NPUVocabParallelEmbedding):
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         super().weight_loader(param, loaded_weight)
-        param.data = torch_npu.npu_format_cast(param.data, 29)
+        if model_extra_config.operator_opt_config.lmhead_nz:
+            param.data = torch_npu.npu_format_cast(param.data, 29)

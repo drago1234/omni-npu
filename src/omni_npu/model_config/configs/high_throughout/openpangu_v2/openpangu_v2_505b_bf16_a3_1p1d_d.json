@@ -52,6 +52,7 @@
         "enable_kv_rmsnorm_rope_cache": true,
         "decode_moe_dispatch_combine": true,
         "kv_nz": false,
+        "lmhead_nz": false,
         "merge_q_kv_conv": false,
         "shared_expert_multi_stream": false,
         "enable_moe_agrs": false,
