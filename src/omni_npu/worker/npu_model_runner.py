@@ -59,6 +59,7 @@ from omni_npu.sample.rejection_sampler import NPURejectionSampler
 from omni_npu.compilation.acl_graph import (
     ACLGraphWrapper,
     consume_aclgraph_recapture,
+    reset_stale_aclgraph_resources,
     set_graph_params,
 )
 from omni_npu.plugin_decorators import (
@@ -722,11 +723,20 @@ class NPUModelRunner(GPUModelRunner):
             return
         if consume_aclgraph_recapture():
             self.reset_input_batch()
-            self._mark_aclgraph_wrappers_for_recapture()
+            # Release old graphs, clear cached graph-task resources, fully
+            # destruct the old shared pool, then rotate current_platform's
+            # shared graph pool to a fresh handle and re-point every wrapper at
+            # it. This frees memory before recapture while keeping the single
+            # shared-pool design and avoiding the allocator's `use_count > 0`
+            # assert on the retired pool.
+            reset_stale_aclgraph_resources(self._iter_aclgraph_wrappers())
         with switch_torch_device():
             super().capture_model()
 
     def _iter_aclgraph_wrappers(self):
+        # Keep this iterator in sync with every path that owns an
+        # ACLGraphWrapper. Recapture uses it to release stale ACLGraphs and
+        # repoint wrappers to the refreshed shared graph pool.
         if isinstance(self.model, ACLGraphWrapper):
             yield self.model
 
@@ -743,10 +753,6 @@ class NPUModelRunner(GPUModelRunner):
             for layer in wrapped_layers.values():
                 if isinstance(layer, ACLGraphWrapper):
                     yield layer
-
-    def _mark_aclgraph_wrappers_for_recapture(self) -> None:
-        for wrapper in self._iter_aclgraph_wrappers():
-            wrapper.recapture = True
 
     @torch.inference_mode()
     def execute_model(

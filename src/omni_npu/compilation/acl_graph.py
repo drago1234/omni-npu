@@ -3,6 +3,7 @@
 
 import copy
 import dataclasses
+import gc
 
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -36,6 +37,41 @@ def consume_aclgraph_recapture() -> bool:
         return False
     global_recapture = False
     return True
+
+def reset_stale_aclgraph_resources(wrappers=None) -> None:
+    free_before, _ = torch.npu.mem_get_info()
+    graph_params = get_graph_params()
+    # Drop cached graph-task metadata so recapture rebuilds it.
+    if graph_params is not None:
+        for task_entries in graph_params.task_entries.values():
+            task_entries.clear()
+        for workspaces in graph_params.workspaces.values():
+            workspaces.clear()
+
+    wrappers = list(wrappers) if wrappers is not None else []
+    if wrappers:
+        # Release every captured NPUGraph (shared pool use_count -> 0).
+        for wrapper in wrappers:
+            wrapper.reset_captured_graphs()
+
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.synchronize()
+
+    # Rotate current_platform's shared pool
+    if wrappers:
+        type(current_platform)._global_graph_pool = None
+        new_pool = current_platform.get_global_graph_pool()
+        for wrapper in wrappers:
+            wrapper.graph_pool = new_pool
+
+    free_after, _ = torch.npu.mem_get_info()
+    logger.info(
+        "Stale ACLGraph resource reset: released graphs, cleared graph_params, "
+        "destructed the old shared pool and rotated to a fresh global pool, "
+        "freed %.2f GiB",
+        (free_after - free_before) / (1 << 30),
+    )
 
 def weak_ref_tensor(tensor: Any) -> Any:
     """
@@ -96,7 +132,6 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: Optional[list[int]] = None
-    recapture: bool = False # whether to recapture the aclgraph
 
 
 class ACLGraphWrapper:
@@ -154,6 +189,9 @@ class ACLGraphWrapper:
         # need to initialize a ACLGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
         if self.graph_pool is None:
+            # get_global_graph_pool() must stay ACLGraph-only. If other code
+            # keeps references to this shared pool, recapture may not fully
+            # release the stale pool when rotating to a fresh one.
             self.graph_pool = current_platform.get_global_graph_pool()
 
         if cudagraph_options is None:
@@ -162,7 +200,6 @@ class ACLGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
-        self.recapture = False
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -175,11 +212,21 @@ class ACLGraphWrapper:
         # in case we need to access the original runnable.
         return self.runnable
 
-    def update_graph_recapture(self):
-        if self.recapture:
-            for _, entry in self.concrete_aclgraph_entries.items():
-                entry.recapture = True
-            self.recapture = False
+    def reset_captured_graphs(self) -> None:
+        """Eagerly release all captured graphs before a recapture.
+
+        The reset happens against the pool the graphs were captured into,
+        which decrements that pool's ``use_count`` in the allocator. Rotating
+        ``self.graph_pool`` to a fresh shared handle is handled by the caller
+        (``reset_stale_aclgraph_resources``) after the old pool has been
+        destructed.
+        """
+        for entry in self.concrete_aclgraph_entries.values():
+            aclgraph = entry.aclgraph
+            entry.aclgraph = None
+            entry.output = None
+            if aclgraph is not None:
+                aclgraph.reset()
 
     def __call__(self, *args, **kwargs):
         logger.debug("<<< ACLGraphWrapper is being called.")
@@ -200,8 +247,6 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        self.update_graph_recapture()
-
         if batch_descriptor not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
             self.concrete_aclgraph_entries[batch_descriptor] = \
@@ -209,7 +254,7 @@ class ACLGraphWrapper:
 
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
-        if entry.aclgraph is None or entry.recapture:
+        if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -262,11 +307,6 @@ class ACLGraphWrapper:
             # here we always use weak ref for the output
             # to save memory
             entry.output = weak_ref_tensors(output)
-            # reset the aclgraph if recapture is true
-            if entry.recapture:
-                entry.recapture = False
-                if entry.aclgraph is not None:
-                    entry.aclgraph.reset()
 
             entry.aclgraph = aclgraph
 

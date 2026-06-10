@@ -21,7 +21,7 @@ from omni_npu.compilation.acl_graph import (
     ensure_weak_ref_graph_params,
     set_aclgraph_recapture,
     consume_aclgraph_recapture,
-    reset_aclgraph_recapture_resources,
+    reset_stale_aclgraph_resources,
     ACLGraphWrapper,
 )
 
@@ -103,6 +103,41 @@ class TestRecapture:
         set_aclgraph_recapture(True)
         assert consume_aclgraph_recapture() is True
         assert consume_aclgraph_recapture() is False
+
+    def test_reset_stale_resources_noop_when_empty(self):
+        """No graph_params and no wrappers => early return, no cleanup pass."""
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=None), \
+             patch("torch.npu.empty_cache", create=True) as mock_empty:
+            reset_stale_aclgraph_resources([])
+
+        mock_empty.assert_not_called()
+
+    def test_reset_stale_resources_releases_and_rotates(self):
+        """Releases graphs, clears graph_params, and re-points the wrapper at
+        the freshly rotated shared pool."""
+        params = GraphParams(
+            task_entries={4: {"layer0": MagicMock()}},
+            workspaces={4: {MagicMock(): MagicMock()}},
+        )
+        mock_pool = MagicMock()
+        wrapper = MagicMock()
+
+        with patch("omni_npu.compilation.acl_graph.get_graph_params",
+                    return_value=params), \
+             patch("omni_npu.compilation.acl_graph.current_platform"
+                    ".get_global_graph_pool", return_value=mock_pool), \
+             patch("torch.npu.mem_get_info", create=True,
+                    return_value=(0, 0)), \
+             patch("torch.npu.empty_cache", create=True) as mock_empty, \
+             patch("torch.npu.synchronize", create=True):
+            reset_stale_aclgraph_resources([wrapper])
+
+        wrapper.reset_captured_graphs.assert_called_once()
+        assert params.task_entries[4] == {}
+        assert params.workspaces[4] == {}
+        mock_empty.assert_called_once()
+        assert wrapper.graph_pool is mock_pool
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +263,6 @@ class TestACLGraphWrapperInit:
         assert wrapper.runtime_mode == CUDAGraphMode.PIECEWISE
         assert wrapper.aclgraph_options is opts
         assert wrapper.concrete_aclgraph_entries == {}
-        assert wrapper.recapture is False
 
     def test_none_pool_uses_global(self):
         mock_pool = MagicMock()
@@ -444,57 +478,32 @@ class TestACLGraphWrapperCall:
         # only the capture-time call, no extra static compile call
         assert wrapper.runnable.call_count == 1
 
-    def test_recapture_flag_triggers_recapture(self, wrapper_and_context):
-        """When entry.recapture=True, the graph is re-captured and old one reset."""
-        wrapper, ctx, mock_graph = wrapper_and_context
+    def test_reset_captured_graphs_releases_entries(self, wrapper_and_context):
+        """reset_captured_graphs resets each graph and nulls aclgraph/output."""
+        wrapper, ctx, _ = wrapper_and_context
         bd = ctx.batch_descriptor
-
-        old_graph = MagicMock()
+        mock_graph = MagicMock()
         entry = ACLGraphEntry(batch_descriptor=bd)
-        entry.aclgraph = old_graph
-        entry.recapture = True
+        entry.aclgraph = mock_graph
+        entry.output = torch.tensor([1.0])
         wrapper.concrete_aclgraph_entries[bd] = entry
 
-        with patch("omni_npu.compilation.acl_graph."
-                    "ensure_weak_ref_graph_params")
-            wrapper(torch.tensor([1.0]))
+        wrapper.reset_captured_graphs()
 
-        old_graph.reset.assert_called_once()
-        assert entry.recapture is False
+        mock_graph.reset.assert_called_once()
+        assert entry.aclgraph is None
+        assert entry.output is None
 
-    def test_update_graph_recapture_sets_entries(self):
-        """update_graph_recapture marks all entries for recapture."""
-        cfg = MagicMock(spec=VllmConfig)
-        cfg.additional_config = None
-        wrapper = ACLGraphWrapper(
-            MagicMock(), cfg, CUDAGraphMode.PIECEWISE, MagicMock())
-
-        bd = MagicMock()
+    def test_reset_captured_graphs_skips_missing_graph(self, wrapper_and_context):
+        """An entry without a captured graph is left untouched, no error."""
+        wrapper, ctx, _ = wrapper_and_context
+        bd = ctx.batch_descriptor
         entry = ACLGraphEntry(batch_descriptor=bd)
         wrapper.concrete_aclgraph_entries[bd] = entry
 
-        wrapper.recapture = True
-        assert wrapper.recapture is True
+        wrapper.reset_captured_graphs()
 
-        wrapper.update_graph_recapture()
-
-        assert entry.recapture is True
-        assert wrapper.recapture is False
-
-    def test_update_graph_recapture_noop_when_flag_false(self):
-        """update_graph_recapture is a no-op when global flag is False."""
-        cfg = MagicMock(spec=VllmConfig)
-        cfg.additional_config = None
-        wrapper = ACLGraphWrapper(
-            MagicMock(), cfg, CUDAGraphMode.PIECEWISE, MagicMock())
-
-        bd = MagicMock()
-        entry = ACLGraphEntry(batch_descriptor=bd)
-        wrapper.concrete_aclgraph_entries[bd] = entry
-
-        wrapper.update_graph_recapture()
-
-        assert entry.recapture is False
+        assert entry.aclgraph is None
 
 
 # ---------------------------------------------------------------------------

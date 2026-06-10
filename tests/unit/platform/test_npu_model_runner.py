@@ -75,14 +75,12 @@ class TestNPUModelRunner:
             assert torch.cuda is torch.npu
         assert torch.cuda is not torch.npu
 
-    def test_mark_aclgraph_wrappers_for_recapture(self, monkeypatch):
+    def test_iter_aclgraph_wrappers(self, monkeypatch):
         class FakeEagleProposer:
             pass
 
         def make_aclgraph_wrapper():
-            wrapper = object.__new__(runner_module.ACLGraphWrapper)
-            wrapper.recapture = False
-            return wrapper
+            return object.__new__(runner_module.ACLGraphWrapper)
 
         monkeypatch.setattr(runner_module, "EagleProposer", FakeEagleProposer)
 
@@ -97,11 +95,9 @@ class TestNPUModelRunner:
         runner.drafter = FakeEagleProposer()
         runner.drafter.model = drafter_wrapper
 
-        runner._mark_aclgraph_wrappers_for_recapture()
+        wrappers = list(runner._iter_aclgraph_wrappers())
 
-        assert runner.model.recapture is True
-        assert drafter_wrapper.recapture is True
-        assert wrapped_layer.recapture is True
+        assert wrappers == [runner.model, drafter_wrapper, wrapped_layer]
 
     def test_npu_runner_init(self, monkeypatch):
         """Test NPUModelRunner initialization.
