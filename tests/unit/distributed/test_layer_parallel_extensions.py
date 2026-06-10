@@ -211,12 +211,16 @@ class TestParallelStateExtensions(unittest.TestCase):
     def setUp(self):
         self._orig_layer_comm_dict = parallel_state_ext._LAYER_COMM_DICT
         self._orig_local_world = parallel_state_ext._LOCAL_WORLD
+        self._orig_group_cache = dict(parallel_state_ext._TP_SIZE_OR_RANKS_GROUP_CACHE)
         parallel_state_ext._LAYER_COMM_DICT = None
         parallel_state_ext._LOCAL_WORLD = None
+        parallel_state_ext._clear_tp_size_or_ranks_group_cache()
 
     def tearDown(self):
         parallel_state_ext._LAYER_COMM_DICT = self._orig_layer_comm_dict
         parallel_state_ext._LOCAL_WORLD = self._orig_local_world
+        parallel_state_ext._TP_SIZE_OR_RANKS_GROUP_CACHE.clear()
+        parallel_state_ext._TP_SIZE_OR_RANKS_GROUP_CACHE.update(self._orig_group_cache)
 
     def test_normalize_comm_op_type_aliases_and_canonical(self):
         mapping = {
@@ -497,6 +501,30 @@ class TestParallelStateExtensions(unittest.TestCase):
                 group_name="g",
             )
             self.assertEqual(result, "created_group")
+            mock_init.assert_called_once()
+
+    def test_create_group_from_tp_size_or_ranks_reuses_same_group_ranks(self):
+        group_ranks = [[0, 1], [2, 3]]
+        with patch(
+            "omni_npu.v1.distributed.parallel_state_ext._tp_size_or_ranks_to_group_ranks",
+            return_value=group_ranks,
+        ), patch(
+            "omni_npu.v1.distributed.parallel_state_ext.init_model_parallel_group",
+            return_value="created_group",
+        ) as mock_init:
+            first = parallel_state_ext._create_group_from_tp_size_or_ranks(
+                tp_size_or_ranks=4,
+                local_rank=0,
+                backend="hccl",
+                group_name="layer_mlp.gate_up_proj",
+            )
+            second = parallel_state_ext._create_group_from_tp_size_or_ranks(
+                tp_size_or_ranks=4,
+                local_rank=0,
+                backend="hccl",
+                group_name="layer_mlp.down_proj",
+            )
+            self.assertIs(first, second)
             mock_init.assert_called_once()
 
     @patch("omni_npu.v1.distributed.parallel_state_ext.dist.is_initialized", return_value=False)

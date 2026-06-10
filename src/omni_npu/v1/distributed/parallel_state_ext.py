@@ -57,6 +57,10 @@ _LOCAL_WORLD = None
 #   }
 _LAYER_COMM_DICT: dict[str, dict[str, Any]] | None = None
 
+# Cache process groups by normalized group_ranks so layers sharing the same
+# tp_size_or_ranks reuse a single communication domain.
+_TP_SIZE_OR_RANKS_GROUP_CACHE: dict[tuple[tuple[int, ...], ...], GroupCoordinator] = {}
+
 # Supported tensor transform keys.
 _TENSOR_TRANSFORM_KEYS = ("x_transform", "y_transform")
 
@@ -131,6 +135,8 @@ def ensure_layer_parallel_initialized(
     global _LAYER_COMM_DICT
     if _LAYER_COMM_DICT is not None:
         return
+
+    _clear_tp_size_or_ranks_group_cache()
 
     if not dist.is_initialized():
         logger.warning(
@@ -436,22 +442,44 @@ def _parse_tensor_transform_cfg(
     }
 
 
+def _group_ranks_cache_key(group_ranks: list[list[int]]) -> tuple[tuple[int, ...], ...]:
+    """Build a hashable cache key from group_ranks."""
+    return tuple(tuple(ranks) for ranks in group_ranks)
+
+
+def _clear_tp_size_or_ranks_group_cache() -> None:
+    """Clear the tp_size_or_ranks group cache."""
+    _TP_SIZE_OR_RANKS_GROUP_CACHE.clear()
+
+
 def _create_group_from_tp_size_or_ranks(
     tp_size_or_ranks: Any,
     local_rank: int,
     backend: str,
     group_name: str,
 ) -> GroupCoordinator | None:
-    """Parse tp_size_or_ranks and create a GroupCoordinator."""
+    """Parse tp_size_or_ranks and create or reuse a GroupCoordinator."""
     group_ranks = _tp_size_or_ranks_to_group_ranks(tp_size_or_ranks, group_name)
     if group_ranks is None:
         return None
-    return init_model_parallel_group(
+
+    cache_key = _group_ranks_cache_key(group_ranks)
+    cached_group = _TP_SIZE_OR_RANKS_GROUP_CACHE.get(cache_key)
+    if cached_group is not None:
+        logger.debug(
+            "Reusing communication group for %s (same tp_size_or_ranks as an existing group)",
+            group_name,
+        )
+        return cached_group
+
+    group = init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         backend=backend,
         group_name=group_name,
     )
+    _TP_SIZE_OR_RANKS_GROUP_CACHE[cache_key] = group
+    return group
 
 
 def _tp_size_or_ranks_to_group_ranks(
