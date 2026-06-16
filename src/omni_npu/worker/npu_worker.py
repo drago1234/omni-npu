@@ -109,6 +109,19 @@ class NPUWorker(WorkerBase):
             # Initialize the model best practice configs.
             load_model_extra_config(self.model_config, self.vllm_config, self.scheduler_config)
 
+            # OMNI-CONF worker-scope snapshot (solution doc §3.3): full dump
+            # on local_rank 0, hash-only elsewhere (cross-rank drift signal).
+            # Exception-isolated + once-guarded + OMNI_CONFIG_SUMMARY=0 gated inside.
+            from omni_npu.diagnostics.config_summary import emit_config_summary
+            emit_config_summary(
+                vllm_config=self.vllm_config,
+                scope="worker",
+                rank=self.rank,
+                local_rank=self.local_rank,
+                include_omni=True,
+                hash_only=(self.local_rank != 0),
+            )
+
             # Only initialize the custom layer-parallel communication domain when
             # explicitly enabled by the high-performance launcher script.
             if "omni_custom_models" in os.environ.get("VLLM_PLUGINS", ""):
