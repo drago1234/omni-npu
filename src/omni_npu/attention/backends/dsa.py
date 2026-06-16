@@ -225,14 +225,21 @@ class NPUDSAMetadataBuilder(MLACommonMetadataBuilder[NPUDSAMetadata]):
         if metadata.prefill is not None:
             metadata.prefill.query_cumlens = torch.cumsum(metadata.prefill.query_start_loc[1:] - metadata.prefill.query_start_loc[:-1], dim=0, dtype=torch.int32)
             metadata.prefill.seq_lens = common_attn_metadata.seq_lens[-metadata.prefill.query_cumlens.shape[0]:]
-            if model_extra_config.parall_config.ena_context_parallel:
-                slot_mapping = metadata.slot_mapping[:metadata.num_actual_tokens]
-                metadata.prefill.sp_manager = SPManager(
-                    get_tp_group(),
-                    slot_mapping_ref=slot_mapping,
-                    blk_table_ref=metadata.prefill.block_table,
-                    cumlens=metadata.prefill.query_start_loc,
-                    init_zigzag=True,
+            if model_extra_config.parall_config.ena_seq_parallel:
+                prefill = metadata.prefill
+                mome_kernel_width = getattr(self.vllm_config.model_config.hf_config, "router_sliding_window", 0)
+                computed_lens = prefill.seq_lens - (prefill.query_start_loc[1:] - prefill.query_start_loc[:-1])
+                has_chunked_context = (
+                    self.vllm_config.cache_config.enable_prefix_caching
+                    or self.vllm_config.scheduler_config.enable_chunked_prefill
+                )
+                prefill.sp_manager = SPManager.init_cp(
+                    cumlens=prefill.query_start_loc,  # [B + 1]
+                    computed_lens=computed_lens,
+                    block_table_ref=prefill.block_table,
+                    table_size=prefill.block_table.size(1),
+                    mome_kernel_width=mome_kernel_width,
+                    has_chunked_context=has_chunked_context,
                 )
 
         if metadata is not None:

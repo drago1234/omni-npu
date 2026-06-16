@@ -4,10 +4,12 @@
 import os
 import torch
 import numpy as np
+from functools import wraps
 from importlib.metadata import entry_points
+from contextlib import contextmanager
 
 from vllm.utils.math_utils import cdiv
-from vllm.distributed import GroupCoordinator
+from vllm.distributed import GroupCoordinator, get_tp_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -243,6 +245,48 @@ def get_available_backends() -> list[str]:
     return list(NPU_ATTENTION_BACKEND.keys())
 
 
+def lazy_init(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if not hasattr(self, "_registered_lazy_init"):
+            self._registered_lazy_init = {}
+
+        def initializer():
+            func(self, *args, **kwargs)
+        self._registered_lazy_init[func.__name__] = initializer
+    return wrapper
+
+
+def depends_on(init_method):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if hasattr(self, "_registered_lazy_init"):
+                initializer = self._registered_lazy_init.pop(
+                    init_method.__name__, lambda: None)
+                initializer()
+            return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def support_cache(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        name: str = kwargs.pop("cached", None)
+        if name:
+            cache_name = f"{func.__name__}.{name}"
+            if not hasattr(self, "_cached_list"):
+                self._cached_list = {}
+            if cache_name in self._cached_list: # no checking input
+                return self._cached_list[cache_name]
+        y = func(self, *args, **kwargs)
+        if name:
+            self._cached_list[cache_name] = y
+        return y
+    return wrapper
+
+
 class SPManager:
     """
     This module handles sequence parallelism (SP).
@@ -252,56 +296,84 @@ class SPManager:
 
     CP refers to zigzag-form SP splitting, aimed at adjusting query distribution to
     balance attention computation across ranks.
-
-    Module initialization defaults to standard SP operations; CP-related operations
-    require explicit init_zigzag flag.
     """
 
-    def __init__(
-        self,
-        sp_group: GroupCoordinator,
-        blk_table_ref: torch.Tensor,   # ref only
-        slot_mapping_ref: torch.Tensor,
-        cumlens: torch.Tensor,         # [B + 1]
-        cumlens_np: np.ndarray = None, # [B + 1]
-        init_zigzag: bool = False,
-        pg: int = 128,                 # page size
-        mome_kernel_width: int = 3,
-    ):
+    def __init__(self, sp_group: GroupCoordinator):
         self.sp_group = sp_group
         self.sp_size = sp_group.world_size
         self.sp_rank = sp_group.rank_in_group
         self.sp_comm = sp_group.device_group
         assert self.sp_size > 0
 
+        self.tok = 0
+        self.sp_len = 0
+        self.sp_align = 0
+        self.slice_domain = (0, 0)
+        self.cp_reorg_metadata = None
+        self.cp_slice_metadata = None
+        self.cp_attn_metadata_half = None
+        self.cp_attn_metadata = None
+        self.blk_align_metadata = None
+        self.mome_prefix_size = 0
+        self.cp_mome_phase_split_sizes = ()
+        self.cp_mome_query_start_loc = None
+        self.cp_mome_req_split_sizes = ()
+        self.cp_mome_merged_core_split_sizes = ()
+        self.cp_mome_merged_split_sizes = ()
+        self.cp_mome_req_tail_append_lens = ()
+        self.cp_mome_seq_lens = ()
+        self.cp_mome_suffix_block_len = 0
+        self.cp_mome_local_suffix_len = 0
+
+    @staticmethod
+    def init_sp(tok: int, sp_group: GroupCoordinator = None):
+        sp_group = sp_group or get_tp_group()
+        sp_manager = SPManager(sp_group)
+        sp_manager._scheme_sp_ctrl(tok)
+        return sp_manager
+
+    @staticmethod
+    def init_cp(
+        cumlens: torch.Tensor,         # [B + 1]
+        computed_lens: torch.Tensor,   # [B]
+        cumlens_np: np.ndarray = None, # [B + 1]
+        sp_group: GroupCoordinator = None,
+        page_size: int = 128,
+        table_size: int = 128,
+        block_table_ref: torch.Tensor = None,
+        mome_kernel_width: int = 3,
+        has_chunked_context: bool = False,
+    ):
+        sp_group = sp_group or get_tp_group()
         if cumlens_np is None:
             cumlens_np = np.array(cumlens.tolist(), dtype=np.int32)
         assert cumlens.dim() == 1 and cumlens_np.ndim == 1
         assert cumlens_np.size == cumlens.size(0)
         assert cumlens.size(0) > 1 # at least 2 elements in a valid batch, [B + 1]
 
-        assert blk_table_ref.dim() == 2
-        self.table_size = blk_table_ref.size(1)
-        self.pg = pg
-        self.init_zigzag = init_zigzag
-        self.mome_prefix_size = mome_kernel_width - 1
+        sp_manager = SPManager(sp_group)
+        sp_manager._scheme_sp_ctrl(cumlens_np[-1])
+        sp_manager._scheme_cp_attn(cumlens, computed_lens, block_table_ref, page_size, table_size)
+        sp_manager._scheme_cp_slice(cumlens_np)
+        sp_manager._scheme_cp_reorg(cumlens_np)
+        if mome_kernel_width > 1:
+            seq_lens = np.diff(cumlens_np)
+            if all(seq_len >= 4 * sp_manager.sp_size for seq_len in seq_lens) and not has_chunked_context:
+                sp_manager._scheme_cp_mome(seq_lens, mome_kernel_width)
+        return sp_manager
 
-        self._scheme_sp_ctrl(cumlens_np)
-        if init_zigzag:
-            self._scheme_cp_attn(cumlens, blk_table_ref, slot_mapping_ref)
-            self._scheme_cp_slice(cumlens_np)
-            self._scheme_cp_reorg(cumlens_np)
-            if self.mome_prefix_size > 0:
-                self._scheme_cp_mome(cumlens_np)
+    # ===================== sp_ctrl =====================
 
-    def _scheme_sp_ctrl(self, cumlens: np.ndarray):
-        self.tok = int(cumlens[-1])
+    @lazy_init
+    def _scheme_sp_ctrl(self, tok: int):
+        self.tok = int(tok)
         self.sp_len = cdiv(self.tok, self.sp_size)
         self.sp_align = self.sp_len * self.sp_size
         a = min(self.tok, self.sp_rank * self.sp_len)
         b = min(self.tok, a + self.sp_len)
         self.slice_domain = (a, b)
 
+    @depends_on(_scheme_sp_ctrl)
     def align_tokens(self, x: torch.Tensor) -> torch.Tensor:
         assert x.size(0) == self.tok
         if self.tok == self.sp_align:
@@ -310,6 +382,8 @@ class SPManager:
         y[:self.tok] = x
         return y
 
+    @depends_on(_scheme_sp_ctrl)
+    @support_cache
     def slice_tokens(self, x: torch.Tensor) -> torch.Tensor:
         assert x.size(0) >= self.tok
         a, b = self.slice_domain
@@ -320,11 +394,14 @@ class SPManager:
             y[:b - a] = x[a:b]
         return y
 
+    @depends_on(_scheme_sp_ctrl)
     def ag_tokens(self, x: torch.Tensor) -> torch.Tensor:
         assert x.size(0) == self.sp_len
         return self.sp_group.all_gather(x, dim=0)[:self.tok]
 
+    # ===================== cp_reorg =====================
 
+    @lazy_init
     def _scheme_cp_reorg(self, cumlens: np.ndarray): # [B + 1]
         frag_num = self.sp_size * 2
         frag_lens = cdiv(np.diff(cumlens), frag_num)
@@ -332,7 +409,8 @@ class SPManager:
         ends = cumlens[1:].repeat(2)
         frags = frag_lens.repeat(2)
         frags_base = frags.cumsum() - frags
-        sp_len, cp_len = self.sp_len, int(frags.sum())
+        sp_len = int(cdiv(cumlens[-1], self.sp_size))
+        cp_len = int(frags.sum())
 
         class slicer:
             def __init__(self, src, dst, cp, raw):
@@ -382,8 +460,9 @@ class SPManager:
 
         self.cp_reorg_metadata = (sends, sp_split, cp_split, sp_len, cp_len)
 
+    @depends_on(_scheme_cp_reorg)
+    @support_cache
     def sp_to_cp(self, sp: torch.Tensor) -> torch.Tensor:
-        assert self.init_zigzag
         sends, sp_split, cp_split, sp_len, cp_len = self.cp_reorg_metadata
         assert sp.size(0) == sp_len
         tmp = sp.new_zeros(sum(sp_split), *sp.shape[1:])
@@ -396,8 +475,9 @@ class SPManager:
             group=self.sp_comm)
         return cp # output zigzag
 
+    @depends_on(_scheme_cp_reorg)
+    @support_cache
     def cp_to_sp(self, cp: torch.Tensor) -> torch.Tensor:
-        assert self.init_zigzag
         sends, sp_split, cp_split, sp_len, cp_len = self.cp_reorg_metadata
         assert cp.size(0) == cp_len
         tmp = cp.new_empty(sum(sp_split), *cp.shape[1:])
@@ -410,7 +490,22 @@ class SPManager:
             it.slice_src(sp).copy_(it.slice_dst(tmp))
         return sp
 
+    def sp_to_tp(self, sp_x: torch.Tensor): # reorg SP/CP to TP
+        assert sp_x.dim() == 2 # [T, nD]
+        n = self.sp_size
+        D = sp_x.size(1) // n
+        sp_x = sp_x.view(-1, n, D)               # [T, n, D]          
+        sp_x = sp_x.transpose(0, 1).contiguous() # [n, T, D]
+        tp_x = torch.empty_like(sp_x)
+        torch.distributed.all_to_all_single(
+            tp_x.view(n, -1), sp_x.view(n, -1),
+            [1] * n, [1] * n, group=self.sp_comm,
+        )
+        return tp_x.view(-1, D) # [nT, D]
 
+    # ===================== cp_slice =====================
+
+    @lazy_init
     def _scheme_cp_slice(self, cumlens: np.ndarray):
         frag_num = self.sp_size * 2
         frag_lens = cdiv(np.diff(cumlens), frag_num)
@@ -427,27 +522,38 @@ class SPManager:
 
         sects = [(dst, src, end - src) for dst, src, end
             in zip(frags_base, left, right) if src < end]
-        cp_len = int(frags.sum())
-        self.cp_slice_metadata = (sects, cp_len)
+        cp_len, tok = int(frags.sum()), int(cumlens[-1])
+        self.cp_slice_metadata = (sects, cp_len, tok)
 
+    @depends_on(_scheme_cp_slice)
+    @support_cache
     def cp_slice(self, x: torch.Tensor) -> torch.Tensor:
-        assert self.init_zigzag
-        assert x.size(0) >= self.tok
-        sects, cp_len = self.cp_slice_metadata
+        sects, cp_len, tok = self.cp_slice_metadata
+        assert x.size(0) >= tok
         y = x.new_zeros(cp_len, *x.shape[1:])
         for dst, src, n in sects:
             y[dst : dst + n] = x[src : src + n]
         return y
 
-    def _scheme_cp_attn(self, cumlens: torch.Tensor, blk_table_ref: torch.Tensor, slot_mapping_ref: torch.Tensor):
+    # ===================== cp_attn =====================
+
+    @lazy_init
+    def _scheme_cp_attn(
+        self,
+        cumlens: torch.Tensor,
+        computed_lens: torch.Tensor,
+        blk_table_ref: torch.Tensor,
+        pg: int,
+        tab: int,
+    ):
         frag_num = self.sp_size * 2
         cumlens = cumlens.to(torch.int32)    # [B + 1]
         seq_lens = cumlens.diff()            # [B]
         frag_lens = cdiv(seq_lens, frag_num) # [B]
-        seq_blks = cdiv(seq_lens, self.pg)   # [B]
+        seq_blks = cdiv(seq_lens, pg)   # [B]
 
-        kv_lens_1 = frag_lens * (self.sp_rank + 1)                # [B]
-        kv_lens_2 = frag_lens * (frag_num - self.sp_rank)         # [B]
+        kv_lens_1 = computed_lens + frag_lens * (self.sp_rank + 1)                # [B]
+        kv_lens_2 = computed_lens + frag_lens * (frag_num - self.sp_rank)         # [B]
         frag_cumlens = frag_lens.cumsum(dim=0, dtype=torch.int32) # [B]
         self.cp_attn_metadata_half = (frag_cumlens, frag_cumlens, kv_lens_1, kv_lens_2)
 
@@ -457,49 +563,37 @@ class SPManager:
         kv_lens = kv_lens.transpose(0, 1).flatten()         # [2B]
 
         blk_base = seq_blks.cumsum(dim=0, dtype=torch.int32) - seq_blks
-        table0 = torch.arange(self.table_size, dtype=torch.int32, device=cumlens.device)
+        table0 = torch.arange(tab, dtype=torch.int32, device=cumlens.device)
         blk_table = (table0.view(1, -1) + blk_base.repeat_interleave(2, dim=0).view(-1, 1))
         cp_block_table = blk_table_ref.repeat_interleave(2, dim=0)
         self.cp_attn_metadata = (q_cumlens, kv_lens, blk_table, cp_block_table)
-        self.cp_slot_mapping = slot_mapping_ref.clone()
 
+        tok = int(cumlens[-1])
         seq_lens = seq_lens.tolist()
-        align_lens = (seq_blks * self.pg).tolist()
-        self.blk_align_metadata = (seq_lens, align_lens)
+        align_lens = (seq_blks * pg).tolist()
+        self.blk_align_metadata = (seq_lens, align_lens, pg, tok)
 
-    def cp_attn_meta(self) -> tuple:
-        # FA once:
-        #
-        assert self.init_zigzag
+    @depends_on(_scheme_cp_attn)
+    def cp_attn_meta(self) -> tuple: # FA once:
         return self.cp_attn_metadata # q_cumlens, kv_lens, blk_table
 
+    @depends_on(_scheme_cp_attn)
     def cp_attn_meta_2(self) -> tuple:
-        assert self.init_zigzag
-        # return q_cumlens_1, q_cumlens_2, kv_lens_1, kv_lens_2
         return self.cp_attn_metadata_half
 
+    @depends_on(_scheme_cp_attn)
     def page_align(self, x: torch.Tensor) -> torch.Tensor:
-        assert self.init_zigzag
-        seq_lens, align_lens = self.blk_align_metadata
-        assert x.size(0) == self.tok
+        seq_lens, align_lens, pg, tok = self.blk_align_metadata
+        assert x.size(0) == tok
         y = x.new_empty(sum(align_lens), *x.shape[1:])
         torch.split_with_sizes_copy(x, seq_lens,
             out=[it[:n] for it, n in
                 zip(y.split(align_lens), seq_lens)])
-        return y.view(-1, self.pg, 1, x.size(-1))
+        return y.view(-1, pg, 1, x.size(-1))
 
-    def _scheme_cp_mome(self, cumlens: np.ndarray):
-        cp_query_start_loc = cdiv(cumlens, self.sp_size)
-        if self.sp_rank == 0:
-            offset = self.mome_kernel_width - 1
-        else:
-            offset = (self.mome_kernel_width - 1) * 2
-        mome_query_start_loc = cp_query_start_loc + offset
-        mome_query_start_loc[0] = cp_query_start_loc[0]
-        mome_query_start_loc_tensor = torch.tensor(mome_query_start_loc, dtype=torch.int32, device=current_platform.device_type)
-        self.cp_mome_metadata = (mome_query_start_loc_tensor, )
+    # ===================== cp_mome =====================
 
-    def _scheme_cp_mome(self, cumlens: np.ndarray):
+    def _scheme_cp_mome(self, seq_lens: np.ndarray, mome_kernel_width: int):
         """
         TP4, req_num = 2 for example, 8 chunks per request in total
         r0 means req0, c0 means chunk0
@@ -522,9 +616,10 @@ class SPManager:
         rank 1 start_query_loc = [0, (2 * (r0_chunk_len + 2) + 4), (2 * (r0_chunk_len + 2) + 4) + (2 * (r1_chunk_len + 2) + 4)]
         after mome restore layout:
         rank0: | r0 c0 | r0 c7 | r1 c0 | r1 c7 |
-        rank1: | r0 c1 | r0 c6 | r1 c1 | r1 c6 | 
+        rank1: | r0 c1 | r0 c6 | r1 c1 | r1 c6 |
         """
-        seq_lens = np.diff(cumlens)
+
+        self.mome_prefix_size = mome_kernel_width - 1
         frag_num = self.sp_size * 2
         cp_query_split_lens = cdiv(seq_lens, frag_num)
         self.cp_mome_phase_split_sizes = tuple(int(req_len) for req_len in cp_query_split_lens.tolist())
@@ -616,6 +711,7 @@ class SPManager:
         req_seq_lens = self.cp_mome_seq_lens
         frag_num = self.sp_size * 2
         num_reqs = len(req_core_sizes)
+
         tail_shape = (num_reqs, tail_len, *x.shape[1:])
         merged_tail_scratch = torch.zeros(
             tail_shape,
@@ -623,6 +719,7 @@ class SPManager:
             device=x.device,
         )
         local_tail_contrib = torch.zeros_like(merged_tail_scratch)
+
         phase0_base = 0 if self.sp_rank == 0 else self.mome_prefix_size
         phase1_base = self.mome_prefix_size if self.sp_rank == 0 else 2 * self.mome_prefix_size
         for req_idx, (req_chunk, req_split_size) in enumerate(zip(x.split(req_core_sizes, dim=0), req_split_sizes)):
@@ -684,26 +781,18 @@ class SPManager:
             restored_chunks.extend([phase0_chunk, phase1_chunk])
         return torch.cat(restored_chunks, dim=0)
 
-    def __repr__(self):
-        return f"""SPManager(
-            sp_size={self.sp_size}, 
-            sp_rank={self.sp_rank}, 
-            init_zigzag={self.init_zigzag},
-            cp_mome_query_start_loc={self.cp_mome_query_start_loc},
-            cp_mome_req_split_sizes={self.cp_mome_req_split_sizes},
-        )"""
-
 
 class DummySPManager:
 
-    def __init__(self, sp_group: GroupCoordinator):
+    def __init__(self, sp_group: GroupCoordinator = None):
+        sp_group = sp_group or get_tp_group()
         self.sp_size = sp_group.world_size
         # in dummy_run, we assert token_num divisible by sp_size
 
-    def sp_to_cp(self, x: torch.Tensor):
+    def sp_to_cp(self, x: torch.Tensor, cached=None):
         return x
 
-    def cp_to_sp(self, x: torch.Tensor):
+    def cp_to_sp(self, x: torch.Tensor, cached=None):
         return x
 
     def align_tokens(self, x: torch.Tensor):
@@ -712,14 +801,17 @@ class DummySPManager:
     def page_align(self, x: torch.Tensor):
         return x
 
-    def slice_tokens(self, x: torch.Tensor):
+    def slice_tokens(self, x: torch.Tensor, cached=None):
         return x[: x.size(0) // self.sp_size].clone()
 
-    def cp_slice(self, x: torch.Tensor):
+    def cp_slice(self, x: torch.Tensor, cached=None):
         return x[: x.size(0) // self.sp_size].clone()
 
     def ag_tokens(self, x: torch.Tensor):
         return torch.cat([x] * self.sp_size)
+
+    def sp_to_tp(self, x: torch.Tensor):
+        return x.view(x.size(0) * self.sp_size, -1)
 
     def cp_attn_meta(self) -> tuple:
         return None, None, None, None
@@ -734,16 +826,133 @@ class DummySPManager:
         return x
 
 
-def lazy_init_cos_sin(
-    sp_manager: SPManager | DummySPManager,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    init_zigzag: bool = False,
+def lazy_zero_like(like: torch.Tensor):
+    class Tensor:
+        def __init__(self, like: torch.Tensor):
+            self.val = None
+            self.shape = like.shape
+            self.cfg = {"device": like.device, "dtype": like.dtype}
+
+        def tensor(self):
+            if self.val is None:
+                self.val = torch.zeros(self.shape, **self.cfg)
+            return self.val
+
+        def __setitem__(self, key, value):
+            if self.val is None and self.shape == value.shape:
+                self.val = value # directly ref
+            else:
+                self.tensor()[key] = value
+    return Tensor(like)
+
+
+@contextmanager
+def sp_disabled(
+    self: "Attention",
+    hidden_states: torch.Tensor,
+    sp_group: GroupCoordinator = None,
 ):
-    if hasattr(sp_manager, "sp_cos"):
-        return
-    if init_zigzag:
-        sp_manager.cp_cos = sp_manager.cp_slice(cos)
-        sp_manager.cp_sin = sp_manager.cp_slice(sin)
-    sp_manager.sp_cos = sp_manager.slice_tokens(cos)
-    sp_manager.sp_sin = sp_manager.slice_tokens(sin)
+    assert hasattr(self, "ena_sp")
+    assert hasattr(self, "o_proj")
+    out = lazy_zero_like(hidden_states)
+    if self.ena_sp:
+        self.ena_sp = False
+        if hasattr(self.o_proj, "y_transform"):
+            y_transform = self.o_proj.y_transform
+            if y_transform == "ReduceScatter":
+                self.o_proj.y_transform = "AllReduce"
+
+        sp_group = sp_group or get_tp_group()
+        x = sp_group.all_gather(hidden_states, dim=0)
+        y = lazy_zero_like(x)
+        yield x, y, out
+        y = y.tensor().split(hidden_states.size(0))
+        out[:] = y[sp_group.rank_in_group]
+
+        self.ena_sp = True
+        if hasattr(self.o_proj, "y_transform"):
+            self.o_proj.y_transform = y_transform
+    else:
+        yield hidden_states, out, out
+
+
+def paged_scatter(
+    slot_mapping: torch.Tensor,  # [T]
+    cumlens: np.ndarray,         # [B + 1]
+    computed: np.ndarray = None, # [B]
+    pg: int = 128,
+):
+    if isinstance(cumlens, torch.Tensor):
+        cumlens = np.array(cumlens.tolist(), dtype=np.int32)
+    assert cumlens.ndim == 1 and cumlens.size > 1
+    assert slot_mapping.dim() == 1
+    assert slot_mapping.size(0) == cumlens[-1]
+
+    seq_lens = np.diff(cumlens, axis=0)
+
+    if computed is not None:
+        assert computed.ndim == 1
+        assert seq_lens.size() == computed.size()
+        pre_lens = computed % pg
+    else:
+        pre_lens = seq_lens * 0
+
+    pre_odds = (pg - pre_lens) % pg
+    pre_odds = np.clip(pre_odds, a_min=0, a_max=seq_lens)
+    full_base = cumlens[:-1] + pre_odds
+    full_lens = (seq_lens - pre_odds) // pg * pg
+    full_ends = full_base + full_lens
+    odd_base = np.concatenate(([0], full_ends))
+    odd_lens = np.concatenate((full_base, [cumlens[-1]])) - odd_base
+
+    def extraction(base: np.ndarray, lens: np.ndarray):
+        result = []
+        for src, num in zip(base, lens):
+            if num > 0:
+                result.append((int(src), int(src + num)))
+        return result
+
+    def extract(x: torch.Tensor, frags: list):
+        if len(frags) == 0:
+            return x.new_empty(0)
+        return torch.cat([x[a:b] for a, b in frags])
+
+    ori_len = int(cumlens[-1])
+    odd_frags = extraction(odd_base, odd_lens)
+    full_frags = extraction(full_base, full_lens)
+
+    odds_slots = extract(slot_mapping, odd_frags)
+    full_slots = extract(slot_mapping, full_frags)
+    page_idx = full_slots[::pg].contiguous() // pg
+
+    def full_pages(x: torch.Tensor): # [T, ...]
+        assert x.dim() >= 2 and x.size(0) == ori_len
+        x = extract(x, full_frags).view(-1, pg, *x.shape[1:])
+        return x, page_idx # [*, pg, ...], [*]
+
+    def odd_tokens(x: torch.Tensor): # [T, ...]
+        assert x.dim() >= 2 and x.size(0) == ori_len
+        return extract(x, odd_frags), odds_slots # [T, ...], [T]
+
+    return full_pages, odd_tokens
+
+
+def paged_cache(
+    slot_mapping: torch.Tensor,  # [T]
+    cumlens: np.ndarray,         # [B + 1]
+    computed: np.ndarray = None, # [B]
+    pg: int = 128,
+):
+    full_pages, odd_tokens = paged_scatter(
+        slot_mapping, cumlens, computed, pg)
+
+    def cache_fn(x: torch.Tensor, cache: torch.Tensor):
+        assert x.dim() == 2 and cache.dim() >= 3
+        assert cache.size(-1) == x.size(-1)
+        D = x.size(-1)
+        odd_x, odd_slots = odd_tokens(x) # [T, D],     [D]
+        full_x, page_idx = full_pages(x) # [*, pg, D], [D]
+        cache.view(-1, D)[odd_slots] = odd_x
+        cache.view(-1, pg * D)[page_idx] = full_x.view(-1, pg * D)
+
+    return cache_fn

@@ -25,6 +25,8 @@ from vllm.sequence import IntermediateTensors
 from .pangu_ultra_moe import OpenPanguDecoderLayer
 from omni_npu.layers.mhc.mhc_rl import NPUmHCRL
 from omni_npu.model_config.config_loader.loader import model_extra_config
+from omni_npu.attention.backends.utils import SPManager
+
 
 class SharedHead(nn.Module):
     def __init__(
@@ -74,6 +76,10 @@ class OpenPanguMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
+        if model_extra_config.parall_config.ena_seq_parallel:
+            sp_manager = SPManager.init_sp(previous_hidden_states.size(0))
+            previous_hidden_states = sp_manager.slice_tokens(previous_hidden_states)
+
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -125,7 +131,17 @@ class OpenPanguMultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(
+                input_ids,
+                enable_scatter=model_extra_config.parall_config.ena_seq_parallel,
+            )
+        else:
+            # inputs_embeds bypasses NPUVocabParallelEmbedding which does RS internally.
+            # In SP mode, we need to split tokens across ranks manually.
+            if model_extra_config.parall_config.ena_seq_parallel:
+                sp_manager = SPManager.init_sp(inputs_embeds.size(0))
+                inputs_embeds = sp_manager.slice_tokens(inputs_embeds)
+
         current_step_idx = spec_step_idx % self.num_mtp_layers
 
         if self.wrapped_layers is None:

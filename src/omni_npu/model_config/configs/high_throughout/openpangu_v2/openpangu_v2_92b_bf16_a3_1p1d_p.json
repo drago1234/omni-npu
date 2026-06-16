@@ -1,5 +1,7 @@
 {
     "model_parallel_config": {
+        "ena_seq_parallel": true,
+        "ena_context_parallel": true,
         "layer_parallel_config": {
             "self_attn.o_proj": {
                 "tp_size_or_ranks": 1

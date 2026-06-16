@@ -55,6 +55,10 @@ from omni_npu.v1.layers.linear import (
 )
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.attention import ops
+from omni_npu.attention.backends.utils import (
+    SPManager,
+    DummySPManager,
+)
 try:
     import omni_training_custom_ops
 except:
@@ -515,11 +519,21 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         attn_metadata: Optional[Union['NPUMLAPrefillMetadata', 'NPUMLAMetadata']] = None,
         pd_mixed_flag: bool = False,
     ) -> torch.Tensor:
+        seq_parallel = model_extra_config.parall_config.ena_seq_parallel
+        sp_manager = (SPManager.init_sp(tok=cos.size(0))
+            if attn_metadata is not None
+            else DummySPManager(get_tp_group())
+        ) if seq_parallel else None
+
         only_prefill = True if pd_mixed_flag else False
         q = self.q_a_proj(hidden_states)[0]
 
         if attn_metadata is None: # for memory usage recording in dummy_run
+            if sp_manager:
+                q = sp_manager.ag_tokens(q) # TD
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            if sp_manager:
+                latent_cache = sp_manager.ag_tokens(latent_cache) # TD
             latent_cache = latent_cache.view(-1, 1, latent_cache.size(-1))
             kv_a, k_pe = torch.split(latent_cache, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
@@ -565,6 +579,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
 
         with torch.npu.stream(sub_stream):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            if sp_manager:
+                latent_cache = sp_manager.ag_tokens(latent_cache) # TD
             if model_extra_config.operator_opt_config.use_noncontiguous_kv:
                 if self.conv is not None:
                     kv_c, k_pe = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -588,6 +604,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                             .reshape(-1, self.qk_rope_head_dim)
                     latent_cache = torch.cat([kv_c, k_pe], dim=-1)
 
+        if sp_manager:
+            q = sp_manager.ag_tokens(q) # TD
         if model_extra_config.operator_opt_config.use_noncontiguous_kv:
             if self.conv is not None:
                 q = self.conv(q, state_indice=0, is_prefill=True)
@@ -663,6 +681,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
                 kv_cache=kv_cache,
                 actual_seq_qlen=actual_seq_qlen,
                 attn_metadata=attn_metadata,
+                sp_manager=sp_manager,
                 only_prefill=only_prefill,
             )
             return self.o_proj.forward(attn_output)[0]
@@ -836,6 +855,7 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         actual_seq_qlen,
         attn_metadata: Union["NPUMLAPrefillMetadata", "NPUMLAMetadata"],
+        sp_manager: SPManager,
         only_prefill: bool,
     ) -> torch.Tensor:
         """
@@ -907,6 +927,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             if self.conv is not None:
                 attn_output = get_tp_group().all_gather(attn_output, dim=1)
                 attn_output = self.conv(attn_output, state_indice=2, is_prefill=True)
+                if self.o_proj.tp_size == 1 and sp_manager:
+                    attn_output = sp_manager.slice_tokens(attn_output)
                 if self.o_proj.tp_size > 1 and self.o_proj.x_transform == "NoOp":
                     if self.o_proj.tp_size > self.tp_size:
                         attn_output = layer_parallel_all_gather(attn_output, self.o_proj.layer_name_inside_block, "x", dim=0)
@@ -916,6 +938,8 @@ class NPUDeepseekMLAAttention(torch.nn.Module):
             if self.o_conv is not None:
                 attn_output = self.o_conv(attn_output, only_prefill=only_prefill) + attn_output
 
+        if self.o_proj.tp_size > 1 and sp_manager:
+            attn_output = sp_manager.align_tokens(attn_output)
         return attn_output
 
     @mla_attn_decorator
@@ -1221,9 +1245,6 @@ def npu_mla_forward(
     sin: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    if model_extra_config.parall_config.ena_seq_parallel:
-        hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
-
     full_hidden_states = hidden_states
     total_tokens = full_hidden_states.shape[0]
 
@@ -1301,7 +1322,16 @@ def npu_mla_forward(
         prefill_sin = sin[num_decode_tokens:num_actual_tokens]
         attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
         prefill_output = self._forward_prefill(_maybe_quant(prefill_hs), prefill_cos, prefill_sin, attn_metadata.prefill)
-        output = _pad_output_to_input_tokens(prefill_output)
+        if model_extra_config.parall_config.ena_seq_parallel and self.o_proj.tp_size > 1:
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            chunk_size = prefill_output.shape[0] // tp_size
+            begin = chunk_size * tp_rank
+            end = begin + chunk_size
+            output = prefill_output[begin:end]
+        else:
+            output = prefill_output
+        output = _pad_output_to_input_tokens(output)
     else:
         decode_hs = hidden_states[:num_decode_tokens]
         decode_cos = cos[:num_decode_tokens]
@@ -1316,16 +1346,6 @@ def npu_mla_forward(
         )
         output = _pad_output_to_input_tokens(decode_output)
 
-    if model_extra_config.parall_config.ena_seq_parallel:
-        if self.o_proj.tp_size == 1:
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-            chunk_size = output.shape[0] // tp_size
-            begin = chunk_size * tp_rank
-            end = begin + chunk_size
-            output = output[begin:end]
-        else:
-            output = get_tp_group().reduce_scatter(output, dim=0)
     return output
 
 def npu_mla_forward_fake(   

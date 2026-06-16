@@ -51,6 +51,7 @@ from vllm.sequence import IntermediateTensors
 from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.layers.mhc.mhc_rl import NPUmHCRL
 from omni_npu.plugin_decorators import post_model_forward_decorator
+from omni_npu.attention.backends.utils import SPManager
 from omni_npu.v1.layers.attention.npu_mla import NPUDeepseekMLAAttention
 from omni_npu.v1.layers.attention.npu_dsa import NPUDeepseekSparseAttention
 from omni_npu.v1.layers.fused_mlp.layer import FusedMLP
@@ -485,7 +486,7 @@ class OpenPanguModel(nn.Module):
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids, enable_scatter=model_extra_config.parall_config.ena_seq_parallel)
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -497,8 +498,16 @@ class OpenPanguModel(nn.Module):
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+                # inputs_embeds bypasses NPUVocabParallelEmbedding which does RS internally.
+                # In SP mode, we need to split tokens across ranks manually.
+                if model_extra_config.parall_config.ena_seq_parallel:
+                    sp_manager = SPManager.init_sp(sp_group=get_tp_group(), tok=hidden_states.size(0))
+                    hidden_states = sp_manager.slice_tokens(hidden_states)
             else:
-                hidden_states = self.embed_input_ids(input_ids)
+                hidden_states = self.embed_tokens(
+                    input_ids,
+                    enable_scatter=model_extra_config.parall_config.ena_seq_parallel,
+                )
             residual = None
             if self.use_mhc:
                 hidden_states = hidden_states.repeat(1, self.num_stream)

@@ -1,5 +1,7 @@
 {
     "model_parallel_config": {
+        "ena_seq_parallel": true,
+        "ena_context_parallel": true,
         "layer_parallel_config": {
             "self_attn.o_proj": {
                 "tp_size_or_ranks": 4,
@@ -12,7 +14,11 @@
                 }
             },
             "mlp.gate_up_proj": {
-                "tp_size_or_ranks": 4
+                "tp_size_or_ranks": 4,
+                "x_transform": {
+                    "type": "AllGather",
+                    "tp_size_or_ranks": 4
+                }
             },
             "mlp.down_proj": {
                 "tp_size_or_ranks": 4,
@@ -20,7 +26,7 @@
                     "type": "None"
                 },
                 "y_transform": {
-                    "type": "AllReduce",
+                    "type": "ReduceScatter",
                     "tp_size_or_ranks": 4
                 }
             },

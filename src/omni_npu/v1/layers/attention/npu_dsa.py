@@ -12,6 +12,7 @@ from vllm.platforms import current_platform
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     get_tp_group,
     split_tensor_along_last_dim,
 )
@@ -46,7 +47,6 @@ from omni_npu.layers.utils import named_stream
 from omni_npu.attention.backends.utils import (
     SPManager,
     DummySPManager,
-    lazy_init_cos_sin,
 )
 from omni_npu.v1.layers.utils import yarn_get_mscale
 from omni_npu.v1.layers.linear import (
@@ -58,6 +58,7 @@ from omni_npu.model_config.config_loader.loader import model_extra_config
 from omni_npu.v1.utils import current_stream
 from omni_npu.plugin_decorators import dsa_attn_decorator
 from omni_npu.v1.distributed.communication_op_ext import layer_parallel_all_gather
+
 
 class Indexer(torch.nn.Module):
     def __init__(
@@ -343,7 +344,6 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            disable_tp=model_extra_config.parall_config.ena_context_parallel,
         )
 
         self.rope_interleaved = getattr(config,"rope_interleaved", True)
@@ -761,9 +761,6 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         ) if seq_parallel else None
 
         if sp_manager:
-            lazy_init_cos_sin(sp_manager, cos, sin)
-
-        if sp_manager:
             cur_stream = torch.npu.current_stream()
             com_stream = named_stream("comm_stream")
             com_stream.wait_stream(cur_stream)
@@ -916,7 +913,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
 
     def _forward_prefill_cp(
         self,
-        x: torch.Tensor,   # TD
+        sp_x: torch.Tensor,   # TD
         cos: torch.Tensor, # BNSD
         sin: torch.Tensor, # BNSD
         attn_metadata: NPUDSAMetadata = None,
@@ -924,7 +921,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
     ) -> torch.Tensor:
         assert self.q_b_proj.tp_size == 1  # full head required
         assert self.kv_b_proj.tp_size == 1 # full head required
-        # assert model_extra_config.parall_config.ena_seq_parallel # dependency
+        assert model_extra_config.parall_config.ena_seq_parallel # dependency
         assert not self.use_omni_cache and kv_cache is not None
         """
         SP here refers to standard SP splitting, i.e., splitting tokens with ceil division
@@ -933,19 +930,25 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
         CP refers to zigzag-form SP splitting, aimed at adjusting query distribution to
         balance attention computation across ranks.
         """
-        sp_manager: SPManager = (
-            attn_metadata.prefill.sp_manager
-            if attn_metadata is not None
-            else DummySPManager(get_tp_group()))
+        if attn_metadata:
+            ki_cache = kv_cache[1] if model_extra_config.operator_opt_config.use_noncontiguous_kv else kv_cache[2]
+        else:
+            ki_cache = None
+        if attn_metadata:
+            sp_manager = getattr(attn_metadata.prefill, "sp_manager", DummySPManager())
+        else:
+            sp_manager = DummySPManager()
 
-        lazy_init_cos_sin(sp_manager, cos, sin, init_zigzag=True)
-
-        sp_cos_sin = (sp_manager.sp_cos, sp_manager.sp_sin)
-        cp_cos_sin = (sp_manager.cp_cos, sp_manager.cp_sin)
-        sp_x, cp_x = x, sp_manager.sp_to_cp(x) # TD
-
-        q_lora = self.q_a_proj(cp_x)[0]     # TD, cp
-        q_lora = self._apply_mome_prefill_cp(q_lora, state_indice=0, sp_manager=sp_manager)
+        sp_cos_sin = (sp_manager.slice_tokens(cos, cached="cos"),
+                      sp_manager.slice_tokens(sin, cached="sin"))
+        cp_cos_sin = (sp_manager.cp_slice(cos, cached="cos"),
+                      sp_manager.cp_slice(sin, cached="sin"))
+        q_lora = self.q_a_proj(sp_x)[0]     # TD, cp
+        # q mome
+        q_lora = sp_manager.ag_tokens(q_lora)
+        if self.conv is not None:
+            q_lora = self.conv(q_lora, state_indice=0, is_prefill=True)
+        q_lora = sp_manager.cp_slice(q_lora)                # TD, cp
         q_lora = self.q_a_layernorm(q_lora) # TD, cp
         q_nope, q_pe = self._q_absorb(q_lora, *cp_cos_sin) # TND, full head, cp
 
@@ -959,19 +962,19 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             kv, cos, sin, attn_metadata, kv_cache, fused_op=True)
 
         wi, qi, ki = self.indexer._li_prolog_ext(
-            cp_x, q_lora, sp_x, cp_cos_sin, sp_cos_sin)
+            sp_x, q_lora, sp_x, cp_cos_sin, sp_cos_sin)
+
+        wi = sp_manager.sp_to_cp(wi)
         ki = sp_manager.ag_tokens(ki)
+
         if attn_metadata:
             if hasattr(attn_metadata.prefill, "cache_fn"):
-                if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-                    attn_metadata.prefill.cache_fn(ki.view(-1, ki.size(-1)), kv_cache[1])
-                else:
-                    attn_metadata.prefill.cache_fn(ki.view(-1, ki.size(-1)), kv_cache[2])
+                attn_metadata.prefill.cache_fn(ki.view(-1, ki.size(-1)), ki_cache)
             else:
                 if model_extra_config.operator_opt_config.use_noncontiguous_kv:
-                    self.indexer._update_cache(ki, attn_metadata.slot_mapping_2d, kv_cache[1])
+                    self.indexer._update_cache(ki, attn_metadata.slot_mapping_2d, ki_cache)
                 else:
-                    self.indexer._update_cache(ki, attn_metadata.slot_mapping, kv_cache[2])
+                    self.indexer._update_cache(ki, attn_metadata.slot_mapping, ki_cache)
 
         q_cumlens, kv_lens, _, blk_table = sp_manager.cp_attn_meta()
         topk_idx = self.indexer._apply_lightning_indexer(
@@ -990,10 +993,23 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             kv_cache,
         )
 
-        cp_out = self._mla_epilog(attn_out, reorg=self.o_proj.tp_size > 1)
-        cp_out = self._apply_mome_prefill_cp(cp_out, state_indice=2, sp_manager=sp_manager)
-        cp_out= self.o_proj(cp_out)[0]
-        return sp_manager.cp_to_sp(cp_out) if attn_metadata else cp_out
+        attn_out = self._mla_epilog(attn_out)
+
+        sp_out = sp_manager.cp_to_sp(attn_out)  # sp
+        if self.o_proj.tp_size > 1:
+            out = get_tp_group().all_gather(sp_out, dim=0)
+        else:
+            out = sp_manager.ag_tokens(sp_out) # TD
+        num_actual_tokens = attn_metadata.num_actual_tokens if attn_metadata is not None else out.shape[0]
+        if self.conv is not None:
+            out[:num_actual_tokens] = self.conv(out[:num_actual_tokens], state_indice=2, is_prefill=True)
+
+        if self.o_proj.tp_size > 1:
+            out = split_tensor_along_last_dim(out, num_partitions=self.o_proj.tp_size)
+            out = out[self.o_proj.tp_rank].contiguous()
+        else:
+            out = sp_manager.slice_tokens(out)
+        return self.o_proj(out)[0]
 
     def _forward_mlaprolog(
         self,
@@ -1210,9 +1226,12 @@ def npu_dsa_forward(
 
     if attn_metadata is None:
         if model_extra_config.parall_config.ena_context_parallel:
-            return self._forward_prefill_cp(x, cos, sin, attn_metadata, kv_cache)
+            output = self._forward_prefill_cp(x, cos, sin, attn_metadata, kv_cache)
+            if model_extra_config.parall_config.ena_seq_parallel and self.o_proj.tp_size > 1:
+                output = get_tp_group().reduce_scatter(output, dim=0)
         else:
-            return self._forward_prefill(x, cos, sin, attn_metadata, kv_cache)
+            output = self._forward_prefill(x, cos, sin, attn_metadata, kv_cache)
+        return output
 
     num_actual_tokens = attn_metadata.num_actual_tokens
     num_decode_tokens = attn_metadata.num_decode_tokens
@@ -1240,7 +1259,14 @@ def npu_dsa_forward(
 
     if has_prefill:
         if model_extra_config.parall_config.ena_context_parallel:
-            return self._forward_prefill_cp(x, cos, sin, attn_metadata, kv_cache)
+            prefill_output = self._forward_prefill_cp(x, cos, sin, attn_metadata, kv_cache)
+            if model_extra_config.parall_config.ena_seq_parallel and self.o_proj.tp_size > 1:
+                tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_tensor_model_parallel_rank()
+                chunk_size = prefill_output.shape[0] // tp_size
+                begin = chunk_size * tp_rank
+                end = begin + chunk_size
+                prefill_output = prefill_output[begin:end]
         else:
             prefill_hs = x[num_decode_tokens:num_actual_tokens]
             prefill_cos = cos[num_decode_tokens:num_actual_tokens]
@@ -1248,7 +1274,7 @@ def npu_dsa_forward(
             attn_metadata.prefill.slot_mapping = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
             attn_metadata.prefill.slot_mapping_2d = attn_metadata.slot_mapping_2d[num_decode_tokens:num_actual_tokens]
             prefill_output = self._forward_prefill(prefill_hs, prefill_cos, prefill_sin, attn_metadata.prefill, kv_cache)
-            return _pad_output_to_input_tokens(prefill_output)
+        return _pad_output_to_input_tokens(prefill_output)
     else:
         decode_hs = x[:num_decode_tokens]
         decode_cos = cos[:num_decode_tokens]
