@@ -194,8 +194,41 @@ def test_is_prefill_node_falls_back_to_role(monkeypatch, role, expected):
 
 
 @pytest.mark.unit
-def test_init_buffer_uses_npu_and_int16_dtype(
+@pytest.mark.parametrize(
+    (
+        "config_kwargs",
+        "expected_torch_dtype",
+        "expected_numpy_dtype",
+    ),
+    [
+        ({"n_routed_experts": 256}, torch.uint8, np.uint8),
+        ({"n_routed_experts": 257}, torch.int16, np.int16),
+        ({"num_experts": 256}, torch.uint8, np.uint8),
+        ({"num_experts": 257}, torch.int16, np.int16),
+        (
+            {
+                "n_routed_experts": None,
+                "num_experts": 256,
+            },
+            torch.uint8,
+            np.uint8,
+        ),
+        (
+            {
+                "n_routed_experts": None,
+                "num_experts": None,
+            },
+            torch.int16,
+            np.int16,
+        ),
+        ({}, torch.int16, np.int16),
+    ],
+)
+def test_init_buffer_selects_dtype_from_total_expert_count(
     monkeypatch,
+    config_kwargs,
+    expected_torch_dtype,
+    expected_numpy_dtype,
 ):
     captured = {}
     num_experts_per_tok = 8
@@ -240,6 +273,7 @@ def test_init_buffer_uses_npu_and_int16_dtype(
         hf_text_config=SimpleNamespace(
             num_hidden_layers=3,
             num_experts_per_tok=num_experts_per_tok,
+            **config_kwargs,
         )
     )
 
@@ -252,18 +286,44 @@ def test_init_buffer_uses_npu_and_int16_dtype(
     )
 
     assert captured["zeros_shape"] == (8, 3, num_experts_per_tok)
-    assert captured["zeros_dtype"] is torch.int16
+    assert captured["zeros_dtype"] is expected_torch_dtype
     assert captured["zeros_device"] == "npu"
     assert captured["shm_size"] == (
-        16 * 3 * num_experts_per_tok * np.dtype(np.int16).itemsize
+        16 * 3 * num_experts_per_tok * np.dtype(expected_numpy_dtype).itemsize
     )
-    assert capturer._host_buffer_view.dtype == np.dtype(np.int16)
+    assert capturer._host_buffer_view.dtype == np.dtype(expected_numpy_dtype)
     assert capturer._host_buffer_view.shape == (16, 3, num_experts_per_tok)
 
 
 @pytest.mark.unit
-def test_attach_buffer_uses_int16_dtype(
+@pytest.mark.parametrize(
+    ("config_kwargs", "expected_numpy_dtype"),
+    [
+        ({"n_routed_experts": 256}, np.uint8),
+        ({"n_routed_experts": 257}, np.int16),
+        ({"num_experts": 256}, np.uint8),
+        ({"num_experts": 257}, np.int16),
+        (
+            {
+                "n_routed_experts": None,
+                "num_experts": 256,
+            },
+            np.uint8,
+        ),
+        (
+            {
+                "n_routed_experts": None,
+                "num_experts": None,
+            },
+            np.int16,
+        ),
+        ({}, np.int16),
+    ],
+)
+def test_attach_buffer_selects_dtype_from_total_expert_count(
     monkeypatch,
+    config_kwargs,
+    expected_numpy_dtype,
 ):
     class _FakeSharedMemory:
         def __init__(self, size: int):
@@ -275,7 +335,7 @@ def test_attach_buffer_uses_int16_dtype(
         patch_routed_experts.shared_memory,
         "SharedMemory",
         lambda name: _FakeSharedMemory(
-            16 * 3 * num_experts_per_tok * np.dtype(np.int16).itemsize
+            16 * 3 * num_experts_per_tok * np.dtype(expected_numpy_dtype).itemsize
         ),
     )
 
@@ -284,6 +344,7 @@ def test_attach_buffer_uses_int16_dtype(
         hf_text_config=SimpleNamespace(
             num_hidden_layers=3,
             num_experts_per_tok=num_experts_per_tok,
+            **config_kwargs,
         )
     )
     vllm_config = SimpleNamespace(
@@ -298,7 +359,7 @@ def test_attach_buffer_uses_int16_dtype(
         vllm_config=vllm_config,
     )
 
-    assert reader._host_buffer_view.dtype == np.dtype(np.int16)
+    assert reader._host_buffer_view.dtype == np.dtype(expected_numpy_dtype)
     assert reader._host_buffer_view.shape == (16, 3, num_experts_per_tok)
     assert reader.is_pd_disaggregation is True
     assert reader.is_pd_prefill is True
