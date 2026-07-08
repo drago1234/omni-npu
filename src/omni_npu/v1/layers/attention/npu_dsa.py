@@ -1118,6 +1118,7 @@ class NPUDeepseekSparseAttention(torch.nn.Module):
             block_table=attn_metadata.block_table,
             topk_idx=topk_idx, # int32 [T, 1, K]
             kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
         ) # [T, N, L]
 
         out = self._mla_epilog(attn_out)
